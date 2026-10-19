@@ -4,6 +4,7 @@ A review of the three documents currently in this repository, with feedback, sug
 
 - **Reviewed:** `ARCHITECTURE.md`, `CLI_SPEC.md`, `Cargo.toml` (the only files in the repo, one commit).
 - **Review date:** 2026-10-19.
+- **Revision 2 (2026-10-19):** §6 now carries a proposed solution under every open question, §5 and §7 are checkbox lists, and §4.1 records the facts re-verified for this revision (Zakura node source, Keystone SDK and firmware docs, wallet-libraries manifests, upstream docs.rs). A checked question means "there is a proposal to review", not "decided".
 - **External facts checked:** every `zakura-*` crate on crates.io (versions, repositories, feature flags), the `zakura-core` GitHub organisation, and the READMEs of `zakura-core/zakura` (the node) and `zakura-core/wallet-libraries`. Everything else below is reasoning from the Zcash protocol, ZIPs, and the upstream `librustzcash` APIs the Zakura crates are forked from.
 
 ---
@@ -23,7 +24,7 @@ The two design documents describe an ambitious and coherent product: a daemon/CL
 
 **Top findings, in priority order**
 
-1. **`Cargo.toml` pins versions of the Zakura crates that do not exist.** The pins are the *upstream librustzcash* version numbers (`0.15`, `0.13`, `0.19`, …). The published Zakura crates are at `0.1.0-rc9` / `0.1.0-rc6` / `0.0.1-rc1` (wallet-libraries) and `4.0.0-rc2` (common). Nothing resolves. (§4)
+1. **`Cargo.toml` pins versions of the Zakura crates that do not exist.** The pins are the *upstream librustzcash* version numbers (`0.15`, `0.13`, `0.19`, …). The published Zakura crates are at `0.1.0-rc9` / `0.1.0-rc6` / `0.0.1-rc1` (wallet-libraries) and `4.0.0-rc2` (common), and the published wallet-libraries crates themselves require common at `^3.0.0`, so the compatible common pin is `=3.0.0`. Nothing resolves as written. (§4, §4.1)
 2. **The architecture names Rust module paths that probably do not exist.** `zakura_client_backend::…`, `zakura_address::kind::tex`, `zakura_pczt::roles::…`. The wallet-libraries README states that library target names keep their *upstream* spelling (`zcash_client_backend`, `pczt`, …) and are consumed via `package = "zakura-…"` renames. The documents should use the real paths. (§2.1)
 3. **"Proving works while Locked / with only a UFVK" is only true for Orchard.** Sapling proving requires the proof generation key (`ak`, `nsk`), and `nsk` is not part of any viewing key. Either the vault must be unlocked to prove Sapling spends, the signer must supply the PGK inside the PCZT, or the wallet must be Orchard-only for spending. This affects the vault design, air-gapped mode, Keystone, and watch-only "proving-only" profiles. (§2.1, Q-K3)
 4. **No threat model.** The documents make strong security statements ("daemon-only key material", "air-gapped", "0600 socket") without saying who the adversary is. Several design choices (passphrase over the UDS, 60-second unlock windows that begin before proving, `export-seed` over the socket) only make sense once that is written down. (§5, Q-S1…S6)
@@ -49,14 +50,14 @@ Overall assessment: **good product spec, not yet an engineering spec.** The fast
 
 | Location | Statement | Issue |
 |---|---|---|
-| §1.2, §3.1 | `zakurad` has a "retention window" exposed via `getblockchaininfo` | Pruning with configurable retention is confirmed in the Zakura node README, so the premise holds. But *which RPC field* carries the retention height is unstated. Bitcoin Core uses `pruneheight`; Zebra has no such field; Zakura's choice must be verified. |
+| §1.2, §3.1 | `zakurad` has a "retention window" exposed via `getblockchaininfo` | Pruning with configurable retention is confirmed in the Zakura node README, so the premise holds. But *which RPC field* carries the retention height is unstated. Bitcoin Core uses `pruneheight`; Zebra has no such field. **Verified (§4.1):** Zakura returns `pruned` and `pruneheight` in `getblockchaininfo`; see Q-D1. |
 | §3.1 Case A | `zakura_client_backend::scanning::scan_blocks` | Module path uses the package name, not the library target name. Per the wallet-libraries README the target is still `zcash_client_backend`. Same for `zakura_address`, `zakura_pczt`, `zakura_primitives`, `zakura_client_backend::data_api::…`. |
 | §3.1 Case B | "`GetSubtreeRoots` (ZIP-315)" | `GetSubtreeRoots` is a lightwalletd gRPC method. ZIP 315 is "Best Practices for Wallet Handling of Multiple Pools". Check the ZIP reference; it is probably meant to cite the ShardTree/DAG-sync design, not a ZIP. |
 | §3.1 Case B | Trial decryption "1.5x vectorized … `zakura-pasta-curves`" | Trial decryption is dominated by Jubjub/Pallas scalar multiplication and ChaCha20-Poly1305, so the speed-up is plausible, but `Cargo.toml` does not enable the `x86_64-asm` / `aarch64-asm` features that exist on `zakura-pasta-curves` and `zakura-orchard`. The claim is unsupported by the manifest as written. |
 | §3.2.1 | "Background scanning **and PCZT creation/proving** work 24/7 while `Locked`" | True for Orchard. False for Sapling spends: the Sapling `Prover` needs the proof generation key, which is derived from the spending key. Decide (Q-K3). |
 | §3.2.2 | "`age` (scrypt/Argon2id passphrase protection)" | `age` passphrase recipients use scrypt only. There is no Argon2id in age. Either drop Argon2id or do not use age's passphrase mode. |
 | §3.2.3 | `UnlockKey(… ttl_secs=60)` | `CLI_SPEC.md` gives `key unlock` a default of `5m`. Pick one source of truth (a config key) and have both paths read it. Also see Q-S3 on *when* the TTL clock should start. |
-| §3.3 | Both PCZTs "proven and signed during the same user session" | Correct for ZIP-320, but Step 1 must produce *exactly* `amount + step2_fee` with no change on the ephemeral address, and the ephemeral address must be derived from the ZIP 32 ephemeral chain and never reused. Say so explicitly; these are consensus-irrelevant but protocol-mandated. |
+| §3.3 | Both PCZTs "proven and signed during the same user session" | Correct for ZIP-320, but Step 1 must produce *exactly* `amount + step2_fee` with no change on the ephemeral address, and the ephemeral address must be derived from the ZIP 32 ephemeral chain and never reused. Say so explicitly, and cite them correctly: ZIP 320 mandates only the two-transaction structure and seed-recoverable, unlinkable ephemeral addresses; the exact output value, derivation path and gap limit are librustzcash implementation behaviour (§4.1, Q-T1). |
 | §3.3 | "monitors mempool/block inclusion of Step 1's UTXO, and immediately broadcasts Step 2" | No persistence, retry, or failure semantics. See Top Finding 5. |
 | §3.4 | `Redactor` strips bloat, then Keystone output goes straight to `TxExtractor` | The redacted PCZT returned by Keystone does not contain the proofs. The daemon must keep the proven, unredacted PCZT and run the **Combiner** role to merge signatures back in before extraction. Add that step. |
 | §3.4 | "14x faster Halo2 proving" | Marketing number without a source or a baseline. Either cite the Zakura benchmark or remove it from an architecture document. |
@@ -92,7 +93,7 @@ Overall assessment: **good product spec, not yet an engineering spec.** The fast
 - **`address new --tex`** makes little sense for a privacy wallet. `tex1` addresses exist so *exchanges* can force senders to pay from transparent funds. A shielded wallet advertising a `tex1` receive address forces every sender to deshield. If there is a real use case, document it; otherwise drop the flag and keep `tex1` on the *send* side only.
 - **`tx shield` is labelled "ZIP-316 auto-shielding".** ZIP 316 is Unified Addresses. There is no ZIP for auto-shielding; just describe the behaviour.
 - **`key restore` requires `--birthday`.** Most users restoring a seed do not know it. Specify the fallback (e.g. Sapling activation height, 419200 on mainnet, with a warning that a full Tor backfill will follow).
-- **`key import-keystone --birthday`** says "override birthday height if not embedded in UR payload" while `ARCHITECTURE.md` §3.4 says the birthday is *extracted* from the UR. Check the `zcash-accounts` registry type; to my knowledge it carries UFVKs, account indices, and names, not a birthday. One of the two documents is wrong.
+- **`key import-keystone --birthday`** says "override birthday height if not embedded in UR payload" while `ARCHITECTURE.md` §3.4 says the birthday is *extracted* from the UR. **Verified (§4.1):** `zcash-accounts` carries a seed fingerprint, `{ufvk, index, name}` entries and an optional firmware version, and no birthday. `ARCHITECTURE.md` §3.4 is wrong; see Q-K4 for the proposed default.
 - **`pczt qr-import <UR_FRAME_1> …`** assumes the user will paste fountain-code frames by hand. A signed PCZT from Keystone is dozens of frames; typing them is not feasible. The input mechanism (webcam, file, phone bridge) is a real design question (Q-K2).
 - **`tx send --amount`** grammar ("1.25", "125000000z", "max") should be defined once with its parsing rules and reused by `pczt create` and `tx shield --threshold`.
 - **`--memo` says 512 bytes** but should say how text is encoded (UTF-8), how hex is detected, and what happens if the recipient has no shielded receiver (error vs. silently drop).
@@ -106,7 +107,7 @@ Overall assessment: **good product spec, not yet an engineering spec.** The fast
 
 ### 2.3 `Cargo.toml`
 
-- **All twelve Zakura version pins are unpublished.** See §4 for the table. The manifest must be rewritten against `0.1.0-rc*` (wallet-libraries) and `4.0.0-rc2` (common).
+- **All twelve Zakura version pins are unpublished.** See §4 for the table. The manifest must be rewritten against `0.1.0-rc*` (wallet-libraries) and `=3.0.0` (common; the published wallet-libraries crates require `^3.0.0`, see §4.1), plus `tonic 0.14`, `prost 0.14`, `arti-client 0.35`, `ur-registry 1.0`, `ur 0.5`.
 - **Crates should be renamed to upstream target names.** Per the wallet-libraries README convention: `zcash_client_backend = { package = "zakura-client-backend", version = "0.1.0-rc9", … }`. Without this, every `use` statement in the (future) code and in `ARCHITECTURE.md` is wrong.
 - **Performance features not enabled.** `zakura-pasta-curves` and `zakura-orchard` expose `x86_64-asm` / `aarch64-asm` / `multicore`; `zakura-proofs` exposes `multicore`. None are turned on, yet both documents cite the speed-ups. Enable them behind a workspace feature with a `portable` fallback.
 - **Feature flags that do exist** (`lightwalletd-tonic`, `tor`, `pczt`, `orchard`, `transparent-inputs` on client-backend; the full PCZT role set on `zakura-pczt`; `bundled-prover` on `zakura-proofs`) all check out against the published crates. Good.
@@ -124,38 +125,72 @@ Overall assessment: **good product spec, not yet an engineering spec.** The fast
 | Topic | `ARCHITECTURE.md` | `CLI_SPEC.md` | Resolution needed |
 |---|---|---|---|
 | Inline unlock TTL | 60 s | `key unlock` default 5 m | One config key, documented once |
-| Keystone birthday | Extracted from `ur:zcash-accounts` | `--birthday` "if not embedded" | Verify registry type; align |
+| Keystone birthday | Extracted from `ur:zcash-accounts` | `--birthday` "if not embedded" | **Verified:** the registry type carries no birthday (Q-K4). Make `--birthday` required or prompted, default NU5 activation |
 | Sync route condition | `scanned_tip` vs `retention_height` | `key restore` describes `birthday` vs `H_retain` | Same thing at restore time; say so |
 | Proving while locked | Possible for all pools | Watch-only profile is "proving-only" | Only Orchard; see Q-K3 |
-| Module paths | `zakura_*::…` | n/a | Use upstream target names |
+| Module paths | `zakura_*::…` | n/a | Use upstream target names (convention verified, §4.1) |
 | Node binary name | `zakurad` | `zakurad` | Confirmed: binary is `zakurad`, repo is `zakura-core/zakura` |
-| Keystone result ingestion | "pastes/scans back" | `qr-import <FRAME>…` | Define a real input path |
+| Keystone result ingestion | "pastes/scans back" | `qr-import <FRAME>…` | QR-only on the device (verified); webcam or pasted frames on the host, batch protocol for small returns (Q-K2) |
 
 ---
 
 ## 4. Dependency Reality Check (verified 2026-10-19)
 
-| Crate (`Cargo.toml` pin) | Published max version | Repository |
-|---|---|---|
-| `zakura-client-backend` (0.15) | 0.1.0-rc9 | zakura-core/wallet-libraries |
-| `zakura-client-sqlite` (0.13) | 0.1.0-rc9 | zakura-core/wallet-libraries |
-| `zakura-pczt` (0.2) | 0.1.0-rc6 | zakura-core/wallet-libraries |
-| `zakura-pir-status` (0.1) | 0.0.1-rc1 | zakura-core/wallet-libraries |
-| `zakura-keys` (0.5) | 4.0.0-rc2 | zakura-core/common |
-| `zakura-address` (0.6) | 4.0.0-rc2 | zakura-core/common |
-| `zakura-primitives` (0.19) | 4.0.0-rc2 | zakura-core/common |
-| `zakura-proofs` (0.19) | 4.0.0-rc2 | zakura-core/common |
-| `zakura-orchard` (0.10) | 4.0.0-rc2 | zakura-core/common |
-| `zakura-sapling-crypto` (0.4) | 4.0.0-rc2 | zakura-core/common |
-| `zakura-transparent` (0.2) | 4.0.0-rc2 | zakura-core/common |
-| `zakura-pasta-curves` (0.5) | 4.0.0-rc2 | zakura-core/common |
+| Crate (`Cargo.toml` pin) | Published max version | Repository | Pin for Gyges today |
+|---|---|---|---|
+| `zakura-client-backend` (0.15) | 0.1.0-rc9 | zakura-core/wallet-libraries | `=0.1.0-rc9` |
+| `zakura-client-sqlite` (0.13) | 0.1.0-rc9 | zakura-core/wallet-libraries | `=0.1.0-rc9` |
+| `zakura-pczt` (0.2) | 0.1.0-rc6 | zakura-core/wallet-libraries | `=0.1.0-rc6` |
+| `zakura-pir-status` (0.1) | 0.0.1-rc1 | zakura-core/wallet-libraries | `=0.0.1-rc1` (experimental) |
+| `zakura-keys` (0.5) | 4.0.0-rc2 | zakura-core/common | `=3.0.0` (see §4.1) |
+| `zakura-address` (0.6) | 4.0.0-rc2 | zakura-core/common | `=3.0.0` (see §4.1) |
+| `zakura-primitives` (0.19) | 4.0.0-rc2 | zakura-core/common | `=3.0.0` (see §4.1) |
+| `zakura-proofs` (0.19) | 4.0.0-rc2 | zakura-core/common | `=3.0.0` (see §4.1) |
+| `zakura-orchard` (0.10) | 4.0.0-rc2 | zakura-core/common | `=3.0.0` (see §4.1) |
+| `zakura-sapling-crypto` (0.4) | 4.0.0-rc2 | zakura-core/common | `=3.0.0` (see §4.1) |
+| `zakura-transparent` (0.2) | 4.0.0-rc2 | zakura-core/common | `=3.0.0` (see §4.1) |
+| `zakura-pasta-curves` (0.5) | 4.0.0-rc2 | zakura-core/common | `=3.0.0` (see §4.1) |
 
 Other relevant facts from the upstream READMEs:
 
-- The node (`zakura-core/zakura`) is a Zebra fork with **native block pruning and configurable retention**, published pruned snapshots, and a **zcashd-compatibility RPC mode**. The premise of Core Capability 1 is sound.
+- The node (`zakura-core/zakura`) is a Zebra fork with **native block pruning and configurable retention**, published pruned snapshots, and a **zcashd-compatibility mode** that, on closer reading, runs a real `zcashd` as a sidecar rather than offering a second RPC dialect (§4.1, Q-D2). The premise of Core Capability 1 is sound.
 - The node README shows a `~/.cache/zakura` directory, consistent with the `cookie_path` in the config example.
 - The wallet-libraries README describes a `zakura-wallet-lib` crate ("the backend selector"), NU7 exposure through the wallet APIs, and additional features (one-time IVKs, receiver directory, swap-status normalisation). Whether Gyges wants any of these is an open question (Q-D4).
 - The entire stack is pre-release (`-rc`). The documents should acknowledge that APIs will shift and that Gyges will track a moving target until Zakura 1.0.
+
+
+### 4.1 Facts re-verified for revision 2
+
+Checked on 2026-10-19 against the Zakura node source (`zakura-core/zakura`, `crates/zakura-rpc`, `crates/zakura-state`, `crates/zakurad`), the wallet-libraries manifests and README, crates.io metadata, the Keystone SDK registry and firmware protocol docs, and upstream docs.rs. Each item names the question it feeds.
+
+**Dependencies**
+
+- The published wallet-libraries crates (`0.1.0-rc9`, `0.1.0-rc6`) depend on the common crates at **`^3.0.0`**, and Cargo does not let a `^3.0.0` requirement resolve to `4.0.0-rc2`. The `4.0.0-rc*` common releases are only consumed by the wallet-libraries `main` branch (pinned `=4.0.0-rc1`), which is ahead of what is published. The correct pin for Gyges today is therefore `=3.0.0`, not the `4.0.0-rc2` the table above lists as the published maximum. (Q-D3)
+- `zakura-client-backend` rc9 depends on `tonic ^0.14`, `prost ^0.14`, `arti-client ^0.35`, `tor-rtcompat ^0.35`, `rusqlite ^0.37` (through sqlite), `shardtree ^0.7`; `Cargo.toml` pins `tonic 0.12`, `prost 0.13`, `arti-client 0.25`, which will produce duplicate major versions. `ur-registry` is at `1.0.9` and `ur` at `0.5.2` (manifest says `0.2` and `0.4`); `age` is at `0.12`. (Q-D3, Q-K6)
+- Feature names in `Cargo.toml` (`lightwalletd-tonic`, `tor`, `pczt`, `orchard`, `transparent-inputs`, the `zakura-pczt` role set, `bundled-prover`) all exist. Also available and relevant: `sync`, `sync-decryptor`, `spend-index`, `zcashd-compat`, `lightwalletd-tonic-tls-webpki-roots`; `multicore`, `x86_64-asm`, `aarch64-asm`, `portable` on the curve crates. (Q-D4, Q-D6)
+- The lib-target rename convention is confirmed: `[package] name = "zakura-client-backend"`, `[lib] name = "zcash_client_backend"`; the README's consumer snippet is `zcash_client_backend = { version = "0.1.0-rc9", package = "zakura-client-backend" }`. `zakura-wallet-lib` is a 33-line facade for building against either stack and is not needed by a Zakura-only consumer. (Q-D4)
+- Upstream `sync::run` takes a lightwalletd `CompactTxStreamerClient` and cannot be pointed at node RPC; `scan_cached_blocks`, `BlockSource` and `BlockCache` are source-agnostic. (Q-D4)
+
+**Zakura node**
+
+- `getblockchaininfo` has `pruned: bool` and `pruneheight` (present only when pruned): "the lowest height whose block body this node still stores". Only transaction bodies are pruned; headers, txids and consensus state remain, and `getblockhash` works at every height. Config key `state.storage_mode.pruned.tx_retention`; default and minimum 10,000 blocks on mainnet and testnet. (Q-D1, Q-Y1, Q-Y2)
+- There is no second RPC dialect. Zakura's native JSON-RPC is zcashd-style; "zcashd-compat mode" runs a real `zcashd` sidecar. All methods Gyges needs are in the `Unauthenticated` access class; cookie auth (`enable_cookie_auth`, default true, cookie at `~/.cache/zakura/.cookie`) is HTTP Basic. (Q-D2)
+- An optional indexer gRPC (`[rpc] indexer_listen_addr`, `indexer` build feature) streams raw blocks (`get_block_range`), `chain_tip_change` and `mempool_change`. It is not a lightwalletd `CompactTxStreamer`; Zakura has no CompactBlock API today. (Q-D2, Q-Y6)
+- A pruned node returns `HistoricalTreeUnavailable` from `z_gettreestate` for pruned heights, and stops maintaining transparent address indexes. (Q-Y5)
+- The mempool accepts transactions that spend unconfirmed transparent outputs of other mempool transactions, with `MissingOutput` / `TooManyAncestors` / `TooManyPackageTransactions` rejections and parent-with-descendant eviction; inherited from Zebra 2.1.0, whose changelog cites TEX support as the reason. (Q-T3)
+- `z_gettreestate` and `z_getsubtreesbyindex` expose an **Ironwood** pool in addition to Sapling and Orchard. (Q-D7)
+
+**Keystone**
+
+- Registry tags: `zcash-accounts` 49201, `zcash-full-viewing-key` 49202 (reserved, unimplemented), `zcash-unified-full-viewing-key` 49203, `zcash-pczt` 49204, `zcash-sign-batch` 49205, `zcash-sign-result` 49206, `zcash-batch-sig-result` 49207. `zcash-accounts` = `{seed_fingerprint, accounts: [{ufvk, index, name?}], device_version?}`; **no UR type carries a birthday height**, and Zodl (formerly Zashi) asks the user for it. (Q-K4, Q-K6)
+- Firmware signs Orchard and Ironwood spends and checks transparent inputs; it does not sign Sapling spends (Sapling outputs tolerated). The batch flow rejects transparent inputs and Sapling entirely. Shielded signing needs the Cypherpunk firmware edition. (Q-K1, Q-K3)
+- Transport is QR in both directions; no USB or file path is documented for Zcash. The batch result returns only `(pool, action_index, signature)` tuples, so the return payload is tiny. (Q-K2)
+
+**Upstream wallet API and ZIP 320**
+
+- `propose_standard_transfer_to_address` returns a multi-step `Proposal` for a TEX recipient; `create_proposed_transactions` builds, stores and returns every step's txid, takes one `expiry_height` for all steps, and only transparent outputs of a step may be spent by a later step. Ephemeral receivers are tracked by `get_ephemeral_transparent_receivers`. (Q-T1, Q-T2)
+- ZIP 320 mandates the two-transaction structure, that wallets MUST recognise and spend returned funds, and that ephemeral addresses SHOULD be ZIP 32-derivable and unlinkable. It does **not** specify the derivation path, a gap limit, the Step 1 output value rule, or waiting for confirmation; those are librustzcash implementation choices and §2.1 should cite them as such. (Q-T1)
+- `zcash_address::ZcashAddress` is an opaque struct with `from_tex` / `try_from_tex`, not an enum with a `Tex` variant; there is no `kind::tex` module. (§2.1)
 
 ---
 
@@ -163,91 +198,202 @@ Other relevant facts from the upstream READMEs:
 
 A wallet that holds spending keys needs more than an architecture sketch and a command list. Recommended additions, in order of leverage:
 
-1. **`README.md`** — what Gyges is, who it is for, status (pre-alpha, nothing implemented), how it relates to Zakura, and a pointer to the other docs.
-2. **`THREAT_MODEL.md`** — adversaries (malware running as the same user, a compromised archival lightwalletd, a malicious Zakura node, a stolen laptop at rest, a stolen laptop while unlocked), what each can learn or steal, and which design choice mitigates each. This will immediately surface the UDS-authentication question (Q-S1).
-3. **`proto/gyges.proto` + `API.md`** — the full gRPC service, including streaming events, error details, and versioning policy between `gyges` and `gygesd`.
-4. **`DATA_MODEL.md`** — `profile.json` schema, `config.toml` schema with defaults, what lives in `wallet.sqlite` beyond the upstream schema (labels, ZIP-320 queue, pending Keystone sessions), and the migration policy.
-5. **`SYNC.md`** — the state machine for each key: initial state from `z_gettreestate`, backend selection, reorg handling, pruning-race handling, handoff validation, and what "synced" means.
-6. **`TESTING.md`** — regtest harness, how Keystone is tested without hardware (recorded UR fixtures), how Tor fallback is tested (a local lightwalletd), and property tests for the PCZT pipeline.
-7. **`ROADMAP.md` / MVP cut** — see §7.
-8. **`GLOSSARY.md`** — UFVK, USK, PCZT, ShardTree, retention height, ephemeral address, `tex1`, BC-UR. The current documents assume the reader knows all of them.
+- [ ] **`README.md`** — what Gyges is, who it is for, status (pre-alpha, nothing implemented), how it relates to Zakura, and a pointer to the other docs.
+- [ ] **`THREAT_MODEL.md`** — adversaries (malware running as the same user, a compromised archival lightwalletd, a malicious Zakura node, a stolen laptop at rest, a stolen laptop while unlocked), what each can learn or steal, and which design choice mitigates each. This will immediately surface the UDS-authentication question (Q-S1). *The proposed answers to Q-S1…S7 below are the first draft of this document.*
+- [ ] **`proto/gyges.proto` + `API.md`** — the full gRPC service, including streaming events, error details, and versioning policy between `gyges` and `gygesd`. *See Q-C3, Q-O3 and the error-model proposal in §2.1.*
+- [ ] **`DATA_MODEL.md`** — `profile.json` schema, `config.toml` schema with defaults, what lives in `wallet.sqlite` beyond the upstream schema (labels, ZIP-320 queue, pending Keystone sessions), and the migration policy. *Tables proposed in Q-T1 (`tex_queue`), Q-K4 (`signing_sessions`), Q-Y3 (block cache).*
+- [ ] **`SYNC.md`** — the state machine for each key: initial state from `z_gettreestate`, backend selection, reorg handling, pruning-race handling, handoff validation, and what "synced" means. *Draft content in Q-Y1…Y6.*
+- [ ] **`TESTING.md`** — regtest harness, how Keystone is tested without hardware (recorded UR fixtures), how Tor fallback is tested (a local lightwalletd), and property tests for the PCZT pipeline. *Draft content in Q-O2.*
+- [ ] **`ROADMAP.md` / MVP cut** — see §7.
+- [ ] **`GLOSSARY.md`** — UFVK, USK, PCZT, ShardTree, retention height, ephemeral address, `tex1`, BC-UR. The current documents assume the reader knows all of them.
 
 ---
 
-## 6. Open Questions
+## 6. Open Questions and Proposed Solutions
 
-Grouped by area. Each should be answered in a design doc (or explicitly deferred) before the corresponding code is written. Where I have a recommended default I give it.
+Grouped by area. Each question is a checkbox; it is checked when a concrete proposal is written under it. A checked box means "there is a proposal to review", not "decided": every proposal below is open for feedback, and the ones marked **needs verification** rest on a fact that should be confirmed against the Zakura or Keystone source before code is written.
 
 ### Dependencies and node (D)
 
-- **Q-D1.** Which RPC and field exposes the retention height on Zakura? Native API, zcashd-compat API, or both? *Blocks §3.1 entirely.*
-- **Q-D2.** Will Gyges target Zakura's native RPC or its zcashd-compat mode? `z_gettreestate`, `z_getsubtreesbyindex`, `getblock(h, 0)`, `getrawmempool`, `sendrawtransaction` are zcashd names. If native mode differs, the `ChainBackend` trait needs a second implementation.
-- **Q-D3.** How are Zakura crate upgrades tracked while everything is `-rc`? Pin to exact versions and bump deliberately, or follow git `main`? *Recommend exact pins plus a `Cargo.lock` committed for the binaries.*
-- **Q-D4.** Should Gyges build on `zakura-wallet-lib` and the `sync` feature rather than its own `SyncScheduler` and `TxEngine`? What do they not provide that Gyges needs?
-- **Q-D5.** Which archival lightwalletd/zaino endpoints are acceptable defaults, and is shipping a hard-coded third-party URL (`mainnet.lightwalletd.com`) acceptable for a privacy-focused wallet?
-- **Q-D6.** Are the "14x" and "1.5x" numbers reproducible on the target hardware with the `*-asm` features, and will Gyges enable those features by default? What is the fallback on CPUs without BMI2/ADX?
+- [x] **Q-D1.** Which RPC and field exposes the retention height on Zakura? Native API, zcashd-compat API, or both? *Blocks §3.1 entirely.*
+
+  **Proposed solution.** Verified against `crates/zakura-rpc/src/methods.rs`: `getblockchaininfo` returns `pruned: bool` and, only when `pruned` is true, `pruneheight`, "the lowest height whose block body this node still stores". Zakura prunes only raw transaction data; headers, txids and consensus state are kept below `pruneheight`, and the genesis block is never pruned. There is no dedicated pruning RPC. Retention is configured as `state.storage_mode.pruned.tx_retention` (default and minimum 10,000 blocks on mainnet and testnet, enforced at node startup). Design: `ChainBackend::node_bounds() -> NodeBounds { tip_height, tip_hash, retained_from }` where `retained_from = pruneheight` if `pruned`, else `0`; keep a defensive fallback that treats a "block not available" error from `getblock` as a signal to re-poll bounds rather than binary-searching, since the field is authoritative. `gyges daemon status` shows both values and the node's `tx_retention`.
+- [x] **Q-D2.** Will Gyges target Zakura's native RPC or its zcashd-compat mode?
+
+  **Proposed solution.** Target Zakura's native JSON-RPC and nothing else. Verification showed the premise of the question was wrong: Zakura has no second RPC dialect. Its native JSON-RPC is the Zebra-derived zcashd-style API, and "zcashd-compat mode" (`zakurad start --zcashd-compat`) means running a real `zcashd` binary as a P2P sidecar for wallet and ZMQ users, which Gyges does not need. Every method the pipeline uses (`getblockchaininfo`, `getblockhash`, `getbestblockhash`, `getblock(h, 0)`, `getrawtransaction`, `z_gettreestate`, `z_getsubtreesbyindex`, `getrawmempool`, `sendrawtransaction`) exists on the native API and is classified `Unauthenticated`, so Gyges works both with cookie auth (`enable_cookie_auth = true`, HTTP Basic from `~/.cache/zakura/.cookie`, the default) and against an unauthenticated listener. Two additions worth designing for: (1) Zakura's optional **indexer gRPC** (`[rpc] indexer_listen_addr`, `indexer` build feature) streams `get_block_range` raw blocks, `chain_tip_change` and `mempool_change` events; `ZakuraRpcBackend` should use it when present and fall back to polling JSON-RPC otherwise; (2) `z_getsubtreesbyindex` and `z_gettreestate` already expose an `ironwood` pool alongside Sapling and Orchard (see Q-D7). Remove the "native vs compat" branch from `ARCHITECTURE.md` and the `ChainBackend` trait.
+- [x] **Q-D3.** How are Zakura crate upgrades tracked while everything is `-rc`?
+
+  **Proposed solution.** Exact pins (`=0.1.0-rc9`, `=3.0.0`) for every `zakura-*` crate in `[workspace.dependencies]`, with `Cargo.lock` committed and CI running `cargo build --locked`. Bumps are deliberate, one PR per Zakura release, and must pass the regtest suite (Q-O2). Use `[patch.crates-io]` pointing at a git revision only on feature branches, never on `main`. A short `docs/ZAKURA_VERSIONS.md` records which Zakura release each Gyges tag was built against. Note from the crates.io check (§4): the wallet-libraries `rc9` crates depend on the common crates at `^3.0.0`, so Gyges must pin common at `=3.0.0` and move to `4.x` only when wallet-libraries publishes a release that does.
+
+- [x] **Q-D4.** Should Gyges build on `zakura-wallet-lib` and the `sync` feature rather than its own `SyncScheduler` and `TxEngine`?
+
+  **Proposed solution.** Not `zakura-wallet-lib`: it is a 33-line `no_std` facade that re-exports either the upstream or the Zakura crates behind a feature flag, and its own README says "an end consumer that builds for exactly one stack does not need this crate at all". Depend on `zakura-client-backend`, `zakura-client-sqlite` and `zakura-pczt` directly with `package =` renames. The `sync` feature is only partly reusable: `sync::run` is bound to a lightwalletd `CompactTxStreamerClient` (its `client` parameter must implement the tonic `GrpcService`), so it cannot be fed from node RPC, but everything underneath it is source-agnostic: `BlockSource`, `BlockCache`, `scan_cached_blocks`, `suggest_scan_ranges`, `update_chain_tip`, `put_sapling_subtree_roots` and the continuity-error truncation loop documented in the `data_api::chain` module. Proposal: (a) implement `BlockCache` once (Q-Y3) and a `CompactBlockSource` trait with `latest_block()`, `subtree_roots()`, `block_range()`, with one implementation over node RPC (building `CompactBlock`s from `getblock(h, 0)`) and one over Tor lightwalletd; (b) port the ~300-line loop body of `sync::run` onto that trait rather than designing a scheduler from scratch; (c) enable the `spend-index` feature, which exists precisely "for consumers that have access to a spent-outpoint index (e.g. a full node's spend index)", so transparent spent-ness checks go to the node. If Zakura later inherits Zebra 6.4's experimental `CompactTxStreamer` server (`rpc.lightwalletd_listen_addr`), `sync::run` can be used unchanged for Case A and the custom loop shrinks to the Tor route. `TxEngine` stays thin: `propose_transfer` / `propose_standard_transfer_to_address` / `create_proposed_transactions` already do input selection, ZIP 317 fees and multi-step ZIP 320 proposals; Gyges adds PCZT role orchestration and the `TexQueue` broadcaster.
+- [x] **Q-D5.** Which archival lightwalletd/zaino endpoints are acceptable defaults, and is shipping a hard-coded third-party URL acceptable for a privacy-focused wallet?
+
+  **Proposed solution.** No hard-coded endpoint in the binary. `fallback_lightwalletd.grpc_url` is required when `enabled = true`, and the generated `config.toml` template lists a few well-known public endpoints as commented-out examples with their operator named (the ECC and community endpoints that Zashi uses) so the user makes an explicit choice. The first restore that needs backfill prompts once: "N blocks below the node's retention height must be fetched over Tor from `<url>`; continue? [y/N]" (`--yes` for scripts). Prefer `.onion` endpoints when the operator offers one (the `tor` feature enables `onion-service-client`), since they remove the exit-node hop. Document what the endpoint learns even over Tor: the requested block range (an approximate birthday) and, for transparent recovery, any addresses queried via `GetAddressUtxos`. Power users should run their own `zaino` and point the fallback at it.
+
+- [x] **Q-D6.** Are the "14x" and "1.5x" numbers reproducible with the `*-asm` features, and what is the fallback on CPUs without BMI2/ADX?
+
+  **Proposed solution.** Add a workspace feature `perf` that enables `zakura-pasta-curves/{x86_64-asm | aarch64-asm, multicore}`, `zakura-orchard/{x86_64-asm | aarch64-asm, multicore}` and `zakura-proofs/multicore` via `[target.'cfg(target_arch = "x86_64")'.dependencies]` blocks, on by default in release builds. Add `gyges-core/benches/prove.rs` (Criterion) that proves a 2-action Orchard bundle and trial-decrypts 1,000 compact outputs, and record results per CPU in `docs/BENCHMARKS.md`; replace "14x" and "1.5x" in `ARCHITECTURE.md` with a link to that table. The fallback question depends on whether the assembly paths do runtime feature detection (`is_x86_feature_detected!`) or assume BMI2/ADX unconditionally; until that is checked in the `zakura-pasta-curves` source, publish release binaries with the `portable` feature and let `perf` be a documented opt-in build flag. If runtime detection is confirmed, flip the default.
+
+- [x] **Q-D7 (new, found during verification).** The Zakura node, wallet libraries and Keystone firmware all expose an **Ironwood** shielded pool (`z_getsubtreesbyindex` accepts `"ironwood"`, upstream `Step` has `ironwood_action_count`, Keystone signs Ironwood spends). Neither design document mentions it. What is the policy?
+
+  **Proposed solution.** Treat pool support as data, not as code paths: `spend_pools` and `receive_pools` in `profile.json` (Q-K1), a `pools` list in `address new --receivers`, and per-pool rows in `balance`, so adding Ironwood is configuration plus the upstream crate's support rather than a redesign. For the MVP keep Orchard+transparent, make Sapling receive-only, and leave Ironwood off until the upstream wallet APIs for it are out of `-pre`; add a glossary entry and a one-paragraph note in `ARCHITECTURE.md` so readers are not surprised by the field in RPC responses.
 
 ### Synchronisation (Y)
 
-- **Q-Y1.** How is a reorg detected and handled on each backend? How deep a reorg is tolerated before manual intervention?
-- **Q-Y2.** What happens when the node prunes past a slow Case A scanner's position? Fall back to Tor transparently, or error?
-- **Q-Y3.** Is there a shared `CompactBlock` cache across key profiles, or does each profile fetch independently? What is the disk budget?
-- **Q-Y4.** What does `sync wait` wait for exactly: `scanned_tip == chain_tip`, or also "all ShardTree witnesses complete" so that notes are actually spendable?
-- **Q-Y5.** How is the handoff frontier at `retention_height` validated against `z_gettreestate` to catch a lying or buggy lightwalletd?
-- **Q-Y6.** Will `sync mempool` run continuously in the daemon or only on demand? Continuous polling has privacy and load implications on the node.
+- [x] **Q-Y1.** How is a reorg detected and handled on each backend? How deep a reorg is tolerated?
 
+  **Proposed solution.** Detection: (1) every poll compares the node's `getbestblockhash` chain against the stored hash at `scanned_tip` (the `blocks` table keeps block hashes); (2) the scanner's `ScanError::PrevHashMismatch` on a batch whose first block does not link to the stored tip. Handling: walk back with `getblockhash(h)` versus stored hashes to find the fork point `f`, call `WalletWrite::truncate_to_height(f)` (notes, nullifiers, ShardTree checkpoints are all rewound by the upstream implementation), and resume scanning from `f + 1`. Tolerance: the node itself cannot reorg deeper than its finality depth (100 blocks on the Zebra lineage), so Gyges searches at most 100 blocks for a fork point; if none is found the chain is inconsistent with the wallet's view and the key enters `SyncState::Stalled(ChainInconsistent)`, surfaced in `sync status` and fixable with `sync run --from <h>`. If the fork point lies below `retained_from`, the rewind goes through the Tor backfill path (Q-Y2). Unmined transactions survive truncation in the `transactions` table and are re-evaluated against their `expiry_height`.
+
+- [x] **Q-Y2.** What happens when the node prunes past a slow Case A scanner's position?
+
+  **Proposed solution.** State the invariant explicitly: Case A requires `scanned_tip + 1 >= retained_from`. It is checked before each batch and whenever a `getblock` returns the pruned error. On violation the scheduler switches that key to Case B for `[scanned_tip + 1, retained_from)` if a fallback endpoint is configured and the daemon is not air-gapped, logs a warning, and continues; otherwise the key enters `SyncState::Stalled(PrunedPastScanTip)`, `sync wait` exits non-zero, and `daemon status` explains the fix. Prevention: at startup `gygesd` compares the node's retention window with the longest gap it would have to close and warns if the window is under a configurable minimum (`min_retention_blocks`, default 10,000 ≈ 9 days at 75 s blocks). The daemon keeps all keys at the tip while running, so the race only matters after downtime.
+
+- [x] **Q-Y3.** Is there a shared `CompactBlock` cache across key profiles, and what is the disk budget?
+
+  **Proposed solution.** Yes, one cache per network at `~/.gyges/<network>/cache/blocks.sqlite` (schema: `height INTEGER PRIMARY KEY, hash BLOB, prev_hash BLOB, source TEXT, data BLOB`) implementing the upstream `BlockCache` trait, so `scan_cached_blocks` works unchanged. A single `BlockFetcher` task fills `[min(scanned_tip) + 1, tip]` and every key's scanner reads from the cache; the node is asked for each block once regardless of how many profiles exist. Eviction: a block is deletable once every registered key has scanned it, with `cache.retain_blocks = 1000` kept behind the slowest key for cheap rewinds and `cache.max_mb = 2048` as a hard cap (compact blocks are a few KB each on average, so the cap is generous). Tor-fetched ranges are cached too, so a second restore with a similar birthday does not hit the network again, with a documented privacy trade-off: the cached range reveals approximate birthdays, so cache files are 0600 and `cache.keep_historical = false` drops Tor-fetched ranges once consumed.
+
+- [x] **Q-Y4.** What does `sync wait` wait for exactly?
+
+  **Proposed solution.** Define "synced" in terms the upstream API already exposes: a key is **scanned** when `scanned_tip >= chain_tip`, and **spendable** when additionally `WalletRead::suggest_scan_ranges()` returns no range with priority above `Ignored`, i.e. all `ChainTip`, `FoundNote` and `Historic` gaps that affect witnesses are closed. `sync wait` defaults to `--until spendable`; `--until scanned` is the cheaper check for scripts that only need the tip. `--confirmations N` is redefined to require `--txid <TXID>` and waits until that transaction has `N` confirmations, which is what scripts actually want after a send. Both `sync status` and the `GetSyncStatus` RPC expose the two booleans so the CLI never computes them itself.
+
+- [x] **Q-Y5.** How is the handoff frontier at `retention_height` validated against the node to catch a lying or buggy lightwalletd?
+
+  **Proposed solution.** Validate *inside* the node's retention window, not at its edge. Verification showed a pruned Zakura node returns `HistoricalTreeUnavailable` from `z_gettreestate` for heights whose bodies are pruned, so the Tor stream must overlap the node by a few blocks: stream `[birthday, retained_from + k]` with `k = 10`, then at `V = retained_from + k` run three checks against the trusted local node: (1) **tree roots**: `z_gettreestate(V)` final-state Sapling and Orchard frontiers must have the same root and leaf count as the ShardTree checkpoints built from the stream; any omitted, injected or reordered commitment changes the root, so this alone defeats an endpoint that hides or forges outputs; (2) **hash chain**: the stream must link by `prev_hash`, and `getblockhash(h)` (which works for every height on a pruned node, since headers are kept) must match the stream's hash at `V` and at `retained_from`; (3) **subtree roots**: every completed subtree root from `GetSubtreeRoots` must equal `z_getsubtreesbyindex` for the same index, expected to work for pruned ranges because the commitment tree is consensus state, but to be confirmed on a pruned node. On failure the daemon truncates the key back to its birthday, marks the endpoint `untrusted` in `daemon status`, and refuses further backfill from it until the config changes. Transparent history is the residual gap in two directions: a pruned node's address indexes are explicitly unreliable (`getaddressutxos` and friends stop being maintained in pruned mode), and compact blocks carry no transparent outputs. Above `retained_from` Gyges sees full raw blocks in Case A and can index its own transparent outputs directly while building compact blocks; below it, `GetAddressUtxos` over Tor is the only source and cannot be root-checked, so each returned UTXO's transaction is fetched and its inclusion verified against a block hash the node confirms.
+- [x] **Q-Y6.** Will `sync mempool` run continuously in the daemon or only on demand?
+
+  **Proposed solution.** Continuously but cheaply. If the node's indexer gRPC is enabled, subscribe to its `mempool_change` stream (Added / Invalidated / Mined events with txid) and fetch only added transactions with `getrawtransaction`; otherwise, on every `poll_interval_secs` tick call `getrawmempool`, diff against seen txids, and fetch only the new ones. Trial-decrypt new transactions for every key. Load on a local node is negligible, and the request pattern is identical whether or not the wallet has activity, so it leaks nothing the block requests do not already. `mempool.scan = true` in config turns it off for users who do not want unconfirmed balances; `gyges sync mempool` forces an immediate pass. Decrypted unconfirmed notes are stored unmined and shown under "Pending Confirmation" in `balance`; `tex_queue` (Q-T1) consumes the same events.
 ### Keys, vault and security (S)
 
-- **Q-S1.** Who may connect to `gygesd.sock`? A 0600 socket admits every process running as the user, including malware, which can then call `UnlockKey`-dependent RPCs during the TTL window or `ExportSeed` with the passphrase. Is per-request passphrase, peer-credential checking, or a capability token in scope?
-- **Q-S2.** Is the passphrase sent over the UDS acceptable, or should key derivation happen in the CLI and only a session key cross the socket?
-- **Q-S3.** When does the unlock TTL start? If it starts before proving, a large Orchard transaction may outlive 60 seconds and fail at signing. *Recommend: prove first, then prompt and sign; hold the USK only for the signing step.*
-- **Q-S4.** Should `key export-seed` exist at all in a daemon-only-key-material design? If yes, require a fresh passphrase prompt and a confirmation, and never offer it over a non-TTY.
-- **Q-S5.** What is the at-rest encryption design given `age` is scrypt-only? Acceptable, or do you want Argon2id via a different construction?
-- **Q-S6.** Are `wallet.sqlite` contents (note values, memos, addresses, transaction graph) considered sensitive at rest? They reveal the full financial history even without the seed. Encrypt the database, rely on disk encryption, or document the assumption.
-- **Q-S7.** What is the policy for `profile.json` and `wallet.sqlite` file permissions, and for backups? Can a user safely copy `~/.gyges/keys/main/` to another machine?
+- [x] **Q-S1.** Who may connect to `gygesd.sock`?
+
+  **Proposed solution.** Three layers. (1) **Peer credentials, always**: the daemon reads `SO_PEERCRED` / `LOCAL_PEERCRED` on every accepted connection and rejects any uid other than its own (or, in the hardened deployment below, any uid not in an allow-list). (2) **Connection-scoped unlock**: `UnlockKey` does not make the key globally unlocked; it creates a *signing session* bound to the calling connection and returns a random 32-byte `session_token`. Only RPCs that present the token (`SendTransaction`, `SignPczt`, `ExportSeed`) can use the decrypted key, and the session is destroyed when the connection closes or the TTL expires, whichever is first. Malware with socket access therefore cannot ride on another process's unlock window; it must obtain the passphrase or steal the token from the CLI process, which is the same bar as reading the passphrase from the terminal. (3) **Hardened deployment, documented**: run `gygesd` as a dedicated user, socket mode 0660 with a `gyges` group, so a compromise of the interactive user cannot even read `seed.age` or `wallet.sqlite`. Same-user malware that replaces the `gyges` binary or keylogs the passphrase is explicitly out of scope and said so in `THREAT_MODEL.md`.
+
+- [x] **Q-S2.** Is the passphrase sent over the UDS acceptable, or should key derivation happen in the CLI?
+
+  **Proposed solution.** Send the passphrase over the socket. A Unix socket is kernel-local and not observable by other same-user processes without `ptrace`, which is the same assumption `ssh-agent` and `gpg-agent` make. Deriving in the CLI would require the CLI to read `seed.age`, putting key material in two processes and breaking the "daemon-only key material" property, which is worse. Mitigations: the request field is a `SecretString` zeroized after use, marked `[debug_redact = true]` in the proto so it never appears in logs, and the daemon rate-limits failed unlock attempts (exponential back-off per key) so the socket cannot be used as a passphrase oracle.
+
+- [x] **Q-S3.** When does the unlock TTL start?
+
+  **Proposed solution.** Prompt as late as possible and hold the key as briefly as possible. `SendTransaction` is a server stream whose order is: propose → report the proposal (`Proposed` event) → prove (works while locked for Orchard and transparent) → emit `SignatureRequired { key_id, kind: Passphrase | Keystone, session_id }` → the client unlocks or supplies the Keystone result → sign → broadcast. The USK is held only across the signing step and dropped immediately after, independent of any TTL. For the explicit `gyges key unlock --timeout` path (batch scripts) the TTL is a plain idle timer starting at unlock. One config key, `vault.unlock_ttl = "5m"`, is the single source of truth and the "60 s" in `ARCHITECTURE.md` is removed. Exception: a Sapling spend needs the proof generation key *before* proving (Q-K3), so for proposals with Sapling inputs the `SignatureRequired` event is emitted before the proving step instead; and if a session expires mid-flow the daemon emits `SignatureRequired` again rather than failing, so a slow proof never costs the user a retry from scratch.
+
+- [x] **Q-S4.** Should `key export-seed` exist at all?
+
+  **Proposed solution.** Keep it, because users need a backup path after `key init` (which must also display the mnemonic once and require the user to type three random words back before continuing). Constraints: TTY required (exit 4 otherwise); the passphrase is supplied in the same `ExportSeed` request and never reused from an existing session; the user must type the literal phrase `reveal seed` to confirm; output goes to the terminal only, never to `--json`, never to a file; the call is written to the audit log (Q-O1) with key id and time only; and `vault.allow_seed_export = false` in config disables the RPC entirely for hardened deployments.
+
+- [x] **Q-S5.** What is the at-rest encryption design given `age` is scrypt-only?
+
+  **Proposed solution.** Keep `age` as the container, because a standard format that `rage` can decrypt independently is a real recovery benefit, and accept scrypt: age's passphrase recipient uses scrypt with a tunable work factor; pin it to a value that takes ~1 s on a modern laptop and record it in `profile.json` (`seed_format = "age-scrypt-v1"`) so it can be raised in a migration. Encrypt the 32-byte BIP-39 *entropy* (the mnemonic is recoverable from it), not the 64-byte derived seed, so the exported backup is the same words the user wrote down. If Argon2id becomes a hard requirement, the compatible construction is: derive a 32-byte secret from the passphrase with Argon2id, use it as an age X25519 identity, and encrypt `seed.age` to that identity's recipient; the file is still a valid age file, only the identity derivation is Gyges-specific. Not recommended for v1 since it loses `rage`-compatible recovery.
+
+- [x] **Q-S6.** Are `wallet.sqlite` contents considered sensitive at rest?
+
+  **Proposed solution.** Yes: the database reveals the full financial history, memos and address set without the seed. For v1, state the assumption in `THREAT_MODEL.md`: at-rest confidentiality of `wallet.sqlite` relies on OS full-disk encryption plus 0700/0600 permissions, and the daemon must be able to scan while the vault is locked, which rules out encrypting the database under the vault passphrase. Provide `gyges key delete --wipe` (best-effort overwrite then unlink). As a later option, support SQLCipher via rusqlite's `bundled-sqlcipher` with a per-key random database key stored in the OS keychain (macOS Keychain, Linux secret-service); that keeps background scanning working and protects the file when copied off the machine, at the cost of a platform-specific dependency.
+
+- [x] **Q-S7.** What is the policy for file permissions and backups?
+
+  **Proposed solution.** `~/.gyges` and every subdirectory 0700, every file 0600, socket 0600 (0660 in the hardened deployment); the daemon refuses to start if it finds wider permissions, as `sshd` does, with a one-line fix in the error. Backups: the minimal backup is the mnemonic plus birthday height, since `wallet.sqlite` is derived state and ZIP 320 ephemeral addresses are recovered by gap-limit scanning. For convenience add `gyges key backup --id X -o X.tar` which runs a SQLite `wal_checkpoint(TRUNCATE)`, then archives `profile.json`, `seed.age` and optionally `wallet.sqlite`; and `gyges key import-backup`. Copying `keys/<id>/` by hand is supported only while the daemon is stopped (WAL files), and the docs say so.
 
 ### PCZT and hardware signing (K)
 
-- **Q-K1.** Which pools does Keystone 3 Pro actually sign for? To my knowledge the Zcash firmware supports Orchard and transparent, not Sapling spends. If so, Keystone profiles must be restricted to Orchard+transparent note selection.
-- **Q-K2.** How does the host ingest the signed PCZT from the Keystone? Terminal cannot scan QR codes. Options: webcam decode in the CLI, a phone "bridge" app, file transfer, or the Keystone's USB mode. This is a hard requirement for the feature to work at all.
-- **Q-K3.** Sapling proving needs the proof generation key. Decide between: (a) Orchard-only spends when locked / on Keystone / in watch-only, (b) unlock required for any Sapling spend, (c) signer supplies PGK into the PCZT. Each changes the vault and air-gap story.
-- **Q-K4.** Where does the Combiner step run after Keystone returns the redacted-and-signed PCZT, and how does the daemon correlate it to the stored proven PCZT (session id, PCZT hash)?
-- **Q-K5.** In `--airgapped` mode the daemon has no chain state. Does `pczt prove` on the air-gapped box receive anchors and witnesses entirely inside the PCZT, and how are PCZT files moved between machines (QR both ways, USB)?
-- **Q-K6.** Are the CBOR tags (49201 `zcash-accounts`, 49204 `zcash-pczt`) confirmed against the published `ur-registry` version Gyges will pin? Is there a `zcash-unified-full-viewing-key` type that should be accepted for import too?
-- **Q-K7.** Will Gyges verify what the Keystone shows the user (amounts, recipients) matches the PCZT it built, i.e. is the host trusted or is the device the root of trust?
+- [x] **Q-K1.** Which pools does Keystone 3 Pro actually sign for?
+
+  **Proposed solution.** Verified from the firmware source README and protocol docs: Keystone signs **Orchard** and **Ironwood** spends and checks **transparent** inputs in the single-PCZT flow; it does **not** sign Sapling spends ("proof generation requires signer participation, but Keystone lacks the necessary computational capacity"), though Sapling outputs are tolerated. The batch-signing flow is stricter and rejects transparent inputs and any Sapling component. Shielded support needs the Cypherpunk firmware edition; the Multi-Coin edition is transparent-only. The exported UFVK carries only transparent and Orchard components, so a Keystone profile can never receive Sapling funds through its own addresses. Design: `profile.json` carries `spend_pools = ["orchard", "ironwood", "transparent"]` for Keystone profiles and input selection is restricted to it; addresses default to `--receivers orchard,transparent`; `key import-keystone` records `device_version` from the UR payload and refuses firmware older than the minimum Zodl requires. ZIP 320 Step 2 is a transparent-only transaction, which the single-PCZT flow should accept, but no Keystone document mentions TEX, so this is marked **needs verification on hardware** before `tx send --to tex1…` is enabled for Keystone profiles.
+- [x] **Q-K2.** How does the host ingest the signed PCZT from the Keystone?
+
+  **Proposed solution.** QR only, confirmed: Keystone's Zcash flow has no USB or file transport, and Zodl (formerly Zashi) scans the device with the phone camera. Two decisions follow. (1) **Use the batch-signing protocol for pure shielded sends.** `zcash-sign-batch` (tag 49205) sends the PCZTs and `zcash-batch-sig-result` (49207) returns only `(pool, action_index, 64-byte signature)` tuples, so the return payload for a typical send is a single QR frame that can be scanned once or even typed. The host applies the signatures to its own proven copy (upstream provides `redact_pczt_for_batch_signer` and `extract_orchard_spend_auth_signatures`), so no multi-frame return and no Combiner. The single-PCZT flow (`zcash-pczt`, 49204, full PCZT back with signatures inserted) is kept only for transactions with transparent inputs, which batch mode rejects: shielding and ZIP 320 Step 2. (2) **Two input paths on the host**: `gyges pczt qr-scan` uses the laptop camera (`gyges-qr` gains a decoder built on a capture crate plus a pure-Rust QR decoder, feeding the `ur` fountain decoder until complete) and is used automatically by `tx send` when a camera is present; `gyges pczt qr-import --from-file frames.txt` or stdin accepts one `ur:…` frame per line as exported by any phone QR app, for headless machines. Positional `qr-import <FRAME>…` stays for single-frame payloads, which with batch mode is the common case. The signing session (Q-K4) records which protocol and path was used.
+- [x] **Q-K3.** Sapling proving needs the proof generation key. Which option?
+
+  **Proposed solution.** Option (b) for seed profiles, option (a) for everything else, implemented through mechanism (c). Concretely: the MVP spends from Orchard and transparent only (matching §7). When Sapling spending is enabled for `LocalEncryptedSeed` profiles, a proposal containing Sapling inputs requires an unlock *before* proving; the daemon then runs the PCZT **Updater** role to insert each Sapling spend's `proof_generation_key` into the PCZT (ZIP 374 defines this field), proves, signs, and drops the key. `KeystoneQr` and `WatchOnly` profiles have `spend_pools` without `sapling` (Q-K1), so the question never arises for them. Air-gapped signing boxes hold the seed, so they can prove Sapling after unlocking; the online watch-only side only creates the PCZT. Rename "proving-only" in `CLI_SPEC.md` to "Orchard proving-only" and state the rule in one place in `ARCHITECTURE.md` §3.2.
+
+- [x] **Q-K4.** Where does the Combiner step run after Keystone returns the signed PCZT, and how is it correlated?
+
+  **Proposed solution.** In the daemon, against a persisted session. New table `signing_sessions (session_id TEXT PK, key_id, protocol, created_at, expires_at, status, proven_pczt BLOB, sent_payload_hash BLOB, request_id BLOB, proposal BLOB)`. `SendTransaction` stores the proven PCZT and emits `SignatureRequired { session_id }`; the CLI's `CompleteKeystoneSign { session_id, payload }` looks up the row and dispatches on `protocol`: for **batch** results, the echoed `request_id` in `zcash-batch-sig-result` must match the row, and each `(pool, action_index, signature)` is applied to the stored proven PCZT; for **single-PCZT** results, the daemon runs **Combiner** (proven ⊕ signed; the upstream Combiner rejects structurally different PCZTs, which is the correlation check). Both paths then run **Verifier** to confirm the effects still match the stored proposal (Q-K7), then **Spend Finalizer** and **Tx Extractor**, then broadcast. Sessions survive daemon restarts, expire after `vault.signing_session_ttl = "24h"`, show in `tx list` as `awaiting-signature`, and can be listed and aborted with `gyges tx sessions` / `gyges tx abort <session_id>`. The same mechanism serves the non-interactive case in Q-C4. `ARCHITECTURE.md` §3.4 should also drop "extracts the birthday height" from the import step: verified, `zcash-accounts` carries `seed_fingerprint`, a list of `{ufvk, index, name}` and an optional `device_version`, and no birthday; Zodl asks the user for it. `key import-keystone` should require `--birthday` or prompt, defaulting to the NU5 activation height (1,687,104 on mainnet) because an Orchard-only key cannot have received shielded funds earlier.
+- [x] **Q-K5.** In `--airgapped` mode the daemon has no chain state. Does `pczt prove` receive anchors and witnesses inside the PCZT, and how are files moved?
+
+  **Proposed solution.** Yes: a PCZT produced by the online side after the Constructor and Updater roles contains, per spend, the note, `rseed`, Merkle `witness` and `anchor`, which is everything the Prover and Signer need; the air-gapped box needs no database at all. Introduce a fourth profile mode, `SignerOnly`, which has `seed.age` and `profile.json` but no `wallet.sqlite`, and is the only mode `--airgapped` requires. Transport: the primary path is a binary `.pczt` file (the `pczt` crate's postcard serialization) moved by USB stick or SD card: `gyges pczt create … -o tx.pczt` online → `gyges pczt prove tx.pczt | gyges pczt sign -o tx.signed.pczt` offline → `gyges pczt broadcast tx.signed.pczt` online. QR in both directions (`qr-export` / `qr-scan`) is supported for small transactions but a proven Orchard action is several kilobytes, so it is documented as slow. The online side runs Verifier before broadcast exactly as in Q-K4, so a tampered file is caught.
+
+- [x] **Q-K6.** Are the CBOR tags (49201, 49204) confirmed against the `ur-registry` version Gyges will pin? Is there a UFVK type to accept too?
+
+  **Proposed solution.** Confirmed from `keystone-sdk-rust` `registry_types.rs`: `zcash-accounts` 49201, `zcash-full-viewing-key` 49202 (a constant only, no implementation; treat as reserved), `zcash-unified-full-viewing-key` 49203, `zcash-pczt` 49204, `zcash-sign-batch` 49205, `zcash-sign-result` 49206 (SDK-only, not documented for firmware), `zcash-batch-sig-result` 49207. Pin `ur-registry` at the current `1.0.x` (the `0.2` in `Cargo.toml` is stale) and `ur` at `0.5`, take the constants from the crate, and add a unit test in `gyges-qr` asserting the seven values so a registry change fails CI. `key import-keystone` accepts `ur:zcash-accounts` (the device's export), a bare `ur:zcash-unified-full-viewing-key`, and a plain `uview1…` string.
+- [x] **Q-K7.** Is the host trusted or is the device the root of trust?
+
+  **Proposed solution.** The device is the root of trust for *what gets signed*; the host is the root of trust for *what gets broadcast*, and each checks the other. Against a compromised host the only defense is the Keystone display, so the Redactor must remove proofs and witnesses but never amounts, recipients or memos the device shows; `ARCHITECTURE.md` §3.4 should say which fields are redacted. Against a compromised or buggy device, the daemon runs the PCZT **Verifier** after Combining (Q-K4) and refuses to broadcast if any output, amount, fee or anchor differs from the stored proposal, and `tx send` prints the same summary the device shows so the user can compare. Document both directions in `THREAT_MODEL.md`.
 
 ### ZIP-320 / `tex1` (T)
 
-- **Q-T1.** What is persisted between Step 1 broadcast and Step 2 broadcast, and how does the daemon recover a stranded ephemeral UTXO after a crash or restart? Should `tx list` show a "pending step 2" state and should there be a `tx resume`?
-- **Q-T2.** What happens if Step 1 is reorged out or evicted from the mempool before Step 2 confirms? If Step 2 fails for fee reasons?
-- **Q-T3.** Does the Zakura node accept a Step 2 that spends an unconfirmed Step 1 output (mempool chaining) in both native and compat mode?
-- **Q-T4.** Will `tx send --dry-run` show both hops and both fees so the user sees total cost before signing?
-- **Q-T5.** Is receiving at a `tex1` address (`address new --tex`) a real requirement? If not, remove it.
+- [x] **Q-T1.** What is persisted between Step 1 and Step 2, and how is a stranded ephemeral UTXO recovered?
+
+  **Proposed solution.** Lean on upstream first. A `tex1` recipient makes `propose_standard_transfer_to_address` return a two-step `Proposal` ("depending upon the recipient address, more than one transaction may be constructed"); `create_proposed_transactions` builds both transactions, with Step 2 consuming Step 1's transparent output through `prior_step_inputs` (only transparent outputs of a step may be spent by a later step), stores both and returns both txids. The wallet tracks ephemeral receivers (`get_ephemeral_transparent_receivers`, with an exposure depth and used-flag) so the ephemeral address is known *before* anything is broadcast. ZIP 320 itself only mandates that wallets MUST recognise and be able to spend funds returned to an ephemeral address and SHOULD derive them from the ZIP 32 seed; the derivation path and gap limit are librustzcash implementation details, not ZIP text, and should be cited as such in `ARCHITECTURE.md`. What Gyges adds is the broadcaster, which is what `TexQueue` should be defined as: a durable table `tex_queue (step1_txid PK, step2_txid, step1_raw BLOB, step2_raw BLOB, state, created_at, last_attempt_at, attempts, last_error)` with states `built → step1_broadcast → step2_broadcast → step1_mined → step2_mined (done) | expired | failed`. On startup and on every poll (or `mempool_change` event) the queue re-checks each non-terminal row against the node and rebroadcasts whichever transaction is missing; raw bytes are persisted so no re-signing is needed. `tx list` shows `tex pending (step 2 of 2)`, `tx resume <txid>` forces a retry, `tx abort <txid>` is allowed only while state is `built`. Recovery from a seed alone works through the ephemeral-receiver gap scan, so a stranded UTXO reappears as transparent balance that `tx shield` or a fresh `tx send` can spend; ZIP 320 explicitly accepts that the "this was a TEX payment" label may be lost on seed recovery.
+- [x] **Q-T2.** What happens if Step 1 is reorged out or evicted before Step 2 confirms? If Step 2 fails for fee reasons?
+
+  **Proposed solution.** Reorg or eviction of Step 1 invalidates Step 2 automatically (its only input disappears; Zakura's mempool also evicts descendants together with their parent), and the queue simply rebroadcasts both when they drop out of the node's view. If Step 1 reaches its expiry unmined, both expire and funds never left the shielded pool; the queue marks the row `expired`. The one asymmetric case is Step 1 mined but Step 2 expired or rejected: funds sit at the ephemeral address, the queue marks the row `step2_failed`, and `tx resume` builds and signs a *new* Step 2 (one transparent input, one output, same recipient) through a fresh signing session. Note that `create_proposed_transactions` takes a single `expiry_height` that applies to every step, so the two transactions share an expiry; with mempool chaining accepted (Q-T3) they are normally mined in the same block, and the shared expiry is fine. Fees cannot fail in the market sense: ZIP 317 is deterministic, Step 2 is one input and one output so its fee is the 10,000-zatoshi minimum and is fixed into Step 1's output value at proposal time; a node rejecting Step 2 on fee grounds would indicate a bug and is treated as `failed` with the node's error text preserved.
+- [x] **Q-T3.** Does the Zakura node accept a Step 2 that spends an unconfirmed Step 1 output?
+
+  **Proposed solution.** Yes, verified in `crates/zakurad/src/components/mempool.rs`: the mempool resolves transparent inputs against outputs created by other mempool transactions (`AwaitOutput`, `spent_mempool_outpoints`, dependency tracking), with typed rejections `MissingOutput`, `TooManyAncestors` and `TooManyPackageTransactions`; the behaviour was inherited from Zebra 2.1.0, whose changelog cites TEX transactions as the motivation. Shielded spends still need anchors in the chain, which is why Step 2 must be transparent-only. Design: the queue broadcasts Step 2 immediately after Step 1 and expects success; a `MissingOutput` rejection (for example after a node restart that lost Step 1) is a soft failure that leaves the row in `step1_broadcast` and retries after Step 1 reappears or is mined. Covered by a regtest test that restarts the node between the two broadcasts.
+- [x] **Q-T4.** Will `tx send --dry-run` show both hops and both fees?
+
+  **Proposed solution.** Yes. `--dry-run` returns the full `Proposal` and the CLI renders one block per step: inputs (pool, count, total), outputs (recipient or "ephemeral t1…", value), ZIP 317 fee, and a final line "Total debit: amount + fee₁ + fee₂". With `--json` the output is the upstream proposal protobuf (`zcash_client_backend::proto::proposal`) serialized as proto3 JSON, which gives a stable schema for free. The same summary is printed before the signature prompt in a real send so the user confirms the total cost before unlocking.
+
+- [x] **Q-T5.** Is receiving at a `tex1` address a real requirement?
+
+  **Proposed solution.** No. Remove `address new --tex`. `tex1` is a sender-side constraint invented for exchanges; a privacy wallet advertising one forces every counterparty to deshield. Keep `tex1` on the send side only, keep `address inspect` able to parse it, and note in `CLI_SPEC.md` why it was dropped so it is not re-added by accident.
 
 ### CLI and UX (C)
 
-- **Q-C1.** Does the CLI read `config.toml`? (Recommend: no.)
-- **Q-C2.** How is a `--network` mismatch between CLI and daemon handled? Can multiple daemons (mainnet + testnet) run side by side?
-- **Q-C3.** What are the JSON schemas and exit codes for every command?
-- **Q-C4.** What happens in non-interactive contexts (no TTY) when a passphrase or Keystone scan is required?
-- **Q-C5.** Does the CLI auto-start the daemon if the socket is missing?
-- **Q-C6.** Which `--key` is used by `pczt` subcommands reading from stdin, and is the key id embedded in the PCZT stream so a pipe cannot mix keys?
+- [x] **Q-C1.** Does the CLI read `config.toml`?
+
+  **Proposed solution.** No. The CLI reads only flags and environment variables. `--key` defaults to empty, and the daemon substitutes `default_key` whenever `key_id` is empty in a request; `--socket` defaults to a deterministic path derived from `GYGES_HOME` (default `~/.gyges`) and `--network` (Q-C2) and needs no config. This keeps the CLI a pure gRPC client that can run on a different machine from the daemon via socket forwarding.
+
+- [x] **Q-C2.** How is a `--network` mismatch between CLI and daemon handled? Can multiple daemons run side by side?
+
+  **Proposed solution.** One daemon per network, each with its own home: `~/.gyges/<network>/{config.toml, gygesd.sock, gygesd.pid, keys/, cache/, logs/}`. `--network` on the CLI selects that home and therefore the socket; `--socket` overrides it explicitly. The daemon's `GetInfo` RPC returns its network, and the CLI compares it with `--network` whenever both are given, failing with exit code 6 on mismatch. This makes mainnet and testnet daemons coexist naturally and makes `-n` meaningful instead of advisory. `ARCHITECTURE.md` §4 should adopt the per-network layout.
+
+- [x] **Q-C3.** What are the JSON schemas and exit codes for every command?
+
+  **Proposed solution.** `--json` emits the gRPC response message serialized 1:1 as proto3 JSON (via `prost-reflect` or `serde` derives on the generated types), with a top-level `"schema_version"` field; `API.md` and `gyges.proto` are therefore the schema, and streaming commands emit one JSON object per line. Exit codes: `0` success, `1` unspecified failure, `2` usage error (clap), `3` daemon unreachable, `4` authorization required and non-interactive (vault locked, Keystone signature needed, seed export refused), `5` insufficient funds, `6` invalid argument or mismatch (bad address, wrong network), `7` not ready (chain not synced, node unreachable), `8` cancelled by user, `9` hardware signer error, `10` node rejected transaction. Each code maps from the `reason` enum in the typed `GygesError` detail proposed in §2.1, so the mapping lives in one function.
+
+- [x] **Q-C4.** What happens in non-interactive contexts when a passphrase or Keystone scan is required?
+
+  **Proposed solution.** Never block on a prompt when stdin is not a TTY or `--non-interactive` / `GYGES_NON_INTERACTIVE=1` is set. For passphrases, support `--passphrase-fd <N>` and `GYGES_PASSPHRASE_FILE` (the `gpg` conventions) and otherwise exit 4 with "key 'main' is locked; run `gyges key unlock` or pass --passphrase-fd". For Keystone, exit 4 after printing the `session_id` and the UR frames (or writing them with `--qr-out <file>`), so the signature can be completed later with `gyges pczt qr-import --session <id>`; the session persists per Q-K4. `--json` output in these cases carries the `reason` and `session_id` fields so wrappers can drive the flow.
+
+- [x] **Q-C5.** Does the CLI auto-start the daemon if the socket is missing?
+
+  **Proposed solution.** Not by default: implicit background processes are hard to discover and stop, and would start with whatever network and config the first command happened to use. The CLI exits 3 with "gygesd is not running; start it with `gyges daemon start` or install a service with `gyges daemon install`". Add `gyges daemon install` / `uninstall`, which write a `launchd` user agent on macOS or a `systemd --user` unit on Linux. `GYGES_AUTOSTART=1` enables auto-start for development.
+
+- [x] **Q-C6.** Which `--key` is used by `pczt` subcommands reading from stdin, and is the key id embedded in the PCZT?
+
+  **Proposed solution.** Embed it. ZIP 374 PCZTs carry a global `proprietary` map; `pczt create` writes `gyges.key_id`, `gyges.network` and `gyges.session_id` there, and `prove`, `sign`, `combine` and `broadcast` read the key id from the stream, using `--key` only as an assertion that fails with exit 6 on mismatch. `combine` refuses inputs whose key ids differ. The Redactor strips the proprietary map before the PCZT goes to a Keystone so no local identifiers leave the host.
 
 ### Operations and testing (O)
 
-- **Q-O1.** Where do logs go, how are they rotated, and are they guaranteed free of addresses, memos and amounts?
-- **Q-O2.** What is the regtest story: a scripted `zakurad --regtest` plus local lightwalletd so the hybrid sync path can be exercised in CI?
-- **Q-O3.** How is backward compatibility between a newer `gyges` and an older `gygesd` (or vice versa) handled? Proto versioning, a `GetVersion` RPC, minimum supported version?
-- **Q-O4.** What are the supported platforms (Linux, macOS, Windows without UDS)? Windows would need named pipes and changes to the "0600 socket" security assumption.
-- **Q-O5.** Release process: reproducible builds, signed binaries, supply-chain checks (`cargo-deny`, `cargo-vet`) for a key-handling binary?
+- [x] **Q-O1.** Where do logs go, how are they rotated, and are they free of sensitive data?
+
+  **Proposed solution.** `~/.gyges/<network>/logs/gygesd.log` written by `tracing-appender` with daily rotation and seven files retained; a separate `audit.log` records security-relevant events (unlock, lock, export, session creation, broadcast) with key id and timestamp only. `gyges daemon logs` streams through a `StreamLogs` RPC rather than tailing the file, so the CLI stays socket-only. Redaction is enforced by type: addresses, amounts, memos, txids and keys are wrapped in `Sensitive<T>` whose `Debug`/`Display` print a placeholder, and a workspace clippy configuration denies `Debug` derives on the key types. Level policy: `info` logs heights and counts only; `debug` may include txids; nothing ever logs memos, passphrases or key material. A regtest test runs a full send and greps the resulting logs for every address, memo and amount used.
+
+- [x] **Q-O2.** What is the regtest story?
+
+  **Proposed solution.** A `tests/regtest/` harness that downloads a pinned Zakura release (or builds it in a cached CI layer), starts `zakurad` in regtest with a small retention window (e.g. 200 blocks) so Case B is exercised, mines with the regtest generate RPC, and starts a local `zaino`/`lightwalletd` against the same node for the backfill path. In CI the fallback runs with `use_tor = false` (direct gRPC) because bootstrapping Tor is slow and non-deterministic; a nightly job runs the same tests through a local Tor test network. Keystone is tested with recorded UR fixtures (accounts export, redacted PCZT in, signed PCZT out) captured once from real hardware and replayed. Core scenarios: init → mine → send to `u1`/`t1` → reorg of 3 blocks → prune-race recovery → ZIP 320 with and without mempool chaining → air-gapped PCZT round trip → crash-restart with a pending `tex_queue` row.
+
+- [x] **Q-O3.** How is backward compatibility between `gyges` and `gygesd` handled?
+
+  **Proposed solution.** `GetInfo` returns `daemon_version` and `api_version` (`major.minor`). The CLI requires an equal major and warns on a newer daemon minor; the daemon accepts clients of its major and the previous major for one release cycle. Proto rules: never remove or renumber fields, every enum has an `_UNSPECIFIED = 0` value, new events in streams are ignorable by older clients. Ship `gyges` and `gygesd` as one release artifact so mismatches are rare in practice, and have the `daemon install` unit restart the daemon after upgrades.
+
+- [x] **Q-O4.** What are the supported platforms?
+
+  **Proposed solution.** Tier 1: Linux x86_64 and aarch64, macOS aarch64 (all with UDS). Tier 2 (built, lightly tested): macOS x86_64. Windows is out of scope for v1 and the docs say so; if added later it needs named pipes with an explicit ACL in place of the 0600 socket, and the hardened deployment story changes, so it deserves its own design note.
+
+- [x] **Q-O5.** Release process and supply-chain checks?
+
+  **Proposed solution.** CI on every PR: `cargo build --locked`, `clippy -D warnings`, `cargo test`, `cargo deny check` (advisories, licenses, bans, sources), plus the regtest job. Nightly: `cargo audit`. Releases: a tag triggers a GitHub Actions matrix that builds each Tier 1 target with a pinned `rust-toolchain.toml`, produces tarballs and `SHA256SUMS`, signs them with a project `minisign` key, and attaches SLSA build provenance via GitHub's artifact attestation. No auto-updater. `cargo vet` is deferred until the Zakura stack stabilizes, since the audit set would churn with every `-rc`.
 
 ---
 
 ## 7. Recommended Next Steps
 
-1. **Fix `Cargo.toml` against the published crates** (versions in §4, `package =` renames, enable asm/multicore features) and create empty crates so `cargo check` passes. Commit `Cargo.lock`.
-2. **Write `proto/gyges.proto`** and a short `API.md`. Everything in `CLI_SPEC.md` should map to exactly one RPC.
-3. **Write `THREAT_MODEL.md`** and answer Q-S1…S7. Several CLI details (TTL, export-seed, passphrase transport) fall out of it.
-4. **Correct the factual issues in `ARCHITECTURE.md`** listed in §2.1 (module paths, age/scrypt, Sapling PGK, Combiner step, ZIP numbers, invalid TOML, retention RPC) and add Reorg, Block cache, and Daemon lifecycle subsections.
-5. **Cut an MVP:** local-seed profiles, Orchard+transparent, Case A sync against a local Zakura node, `tx send` to `u1`/`t1`, regtest integration test. Defer Tor backfill, Keystone, ZIP-320 and PIR to later milestones, each with its own design note answering the questions above.
-6. **Add `README.md`, licence files, CI (`cargo check`, `clippy`, `cargo-deny`)** so the repo is honest about its state and safe to contribute to.
+- [ ] **Fix `Cargo.toml` against the published crates** (versions in §4, including the `=3.0.0` common pins, `package =` renames, `tonic 0.14`, `ur-registry 1.0`, asm/multicore features behind `perf`) and create empty crates so `cargo check` passes. Commit `Cargo.lock`.
+- [ ] **Write `proto/gyges.proto`** and a short `API.md`. Everything in `CLI_SPEC.md` should map to exactly one RPC, with the typed error detail, `GetInfo`, `StreamLogs`, and the signing-session RPCs from Q-K4.
+- [ ] **Write `THREAT_MODEL.md`** from the Q-S1…S7 and Q-K7 proposals once they have been reviewed.
+- [ ] **Correct the factual issues in `ARCHITECTURE.md`** listed in §2.1 (module paths, age/scrypt, Sapling PGK, Combiner step, ZIP numbers, invalid TOML, retention RPC) and add Reorg, Block cache, Daemon lifecycle and per-network layout subsections from the §6 proposals.
+- [ ] **Cut an MVP:** local-seed profiles, Orchard+transparent, Case A sync against a local Zakura node, `tx send` to `u1`/`t1`, regtest integration test. Defer Tor backfill, Keystone, ZIP-320 and PIR to later milestones, each with its own design note.
+- [ ] **Add `README.md`, licence files, CI (`cargo check`, `clippy`, `cargo-deny`)** so the repo is honest about its state and safe to contribute to.
