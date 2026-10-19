@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gyges-proto",
+    "crates/gyges-qr",
+    "crates/gyges-chain",
+    "crates/gyges-core",
+    "crates/gygesd",
+    "crates/gyges-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# --- Zakura Core Wallet & Crypto Stack ---
+# Pointed at zakura-core/wallet-libraries and zakura-core/common (or crates.io releases)
+zakura-client-backend = { version = "0.15", features = ["lightwalletd-tonic", "tor", "pczt", "orchard", "transparent-inputs"] }
+zakura-client-sqlite  = { version = "0.13", features = ["orchard", "transparent-inputs", "serde"] }
+zakura-pczt           = { version = "0.2", features = ["zcp-builder", "io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor", "orchard", "sapling", "transparent"] }
+zakura-keys           = { version = "0.5", features = ["orchard", "sapling", "transparent-inputs"] }
+zakura-address        = { version = "0.6" }
+zakura-primitives     = { version = "0.19" }
+zakura-proofs         = { version = "0.19", features = ["bundled-prover"] }
+zakura-orchard        = { version = "0.10" }
+zakura-sapling-crypto = { version = "0.4" }
+zakura-transparent    = { version = "0.2" }
+zakura-pasta-curves   = { version = "0.5" } # 14x Halo2 / 1.5x trial-decrypt BMI2+ADX assembly
+zakura-pir-status     = { version = "0.1" }
+
+# --- Async Runtime & IPC (gRPC over Unix Domain Socket) ---
+tokio        = { version = "1.42", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic        = { version = "0.12", features = ["tls", "tls-roots", "transport"] }
+prost        = "0.13"
+tower        = "0.5"
+hyper-util   = { version = "0.1", features = ["tokio"] }
+reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# --- Tor & Privacy ---
+arti-client  = { version = "0.25", features = ["tokio", "rustls"] }
+tor-rtcompat = { version = "0.25", features = ["tokio", "rustls"] }
+
+# --- Key Encryption & Memory Safety ---
+age          = { version = "0.11", features = ["armor"] }
+secrecy      = { version = "0.10", features = ["serde"] }
+zeroize      = { version = "1.8", features = ["derive"] }
+bip0039      = { version = "0.12", features = ["zeroize"] }
+rand         = "0.8"
+
+# --- Keystone Hardware Wallet (BC-UR) & Terminal QR ---
+ur           = "0.4"
+ur-registry  = "0.2"
+minicbor     = { version = "0.25", features = ["alloc", "derive"] }
+qrcode       = { version = "0.14", default-features = false }
+
+# --- CLI, Config & Observability ---
+clap         = { version = "4.5", features = ["derive", "env"] }
+rpassword    = "7.3"
+serde        = { version = "1.0", features = ["derive"] }
+serde_json   = "1.0"
+toml         = "0.8"
+anyhow       = "1.0"
+thiserror    = "2.0"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+hex          = "0.4"
