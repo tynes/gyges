@@ -1,6 +1,7 @@
 //! Compiles `proto/gyges.proto` into Rust with tonic 0.14 + prost 0.14.
 //!
-//! Requires `protoc` on `PATH` (Homebrew `protobuf`, apt `protobuf-compiler`).
+//! Requires `protoc` 22 or newer on `PATH` (for the `debug_redact` field option;
+//! Homebrew `protobuf` is fine, Ubuntu's apt `protobuf-compiler` 3.21 is not).
 //! Vendoring the compiler is deliberately avoided for now; see TESTING.md.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

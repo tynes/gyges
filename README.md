@@ -31,7 +31,7 @@ Gyges consumes [`zakura-core/common`](https://github.com/zakura-core/common) and
 
 ## Building
 
-Requires Rust 1.97.1 (pinned in `rust-toolchain.toml`) and `protoc`.
+Requires Rust 1.97.1 (pinned in `rust-toolchain.toml`) and `protoc` 22 or newer (Ubuntu's apt package is too old; use the release from protocolbuffers/protobuf).
 
 ```bash
 cargo build --locked --workspace

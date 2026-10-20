@@ -11,7 +11,20 @@ targets = [
 
 [advisories]
 version = 2
-ignore = []
+# Each ignore names the path that pulls the crate in and why it is tolerated.
+# Re-check on every Zakura / arti / age bump.
+ignore = [
+    # rsa 0.9: Marvin timing side channel. Pulled in by arti-client -> tor-key-forge
+    # -> ssh-key. No upstream fix exists; Gyges never performs RSA operations
+    # with a private key (the Tor client only verifies directory signatures).
+    { id = "RUSTSEC-2023-0071", reason = "unfixed upstream; arti-client transitive; no RSA private-key use in Gyges" },
+    # basic-toml unmaintained. Build-time only: age -> i18n-embed-fl (proc-macro)
+    # -> i18n-config. Not linked into the binaries.
+    { id = "RUSTSEC-2026-0374", reason = "proc-macro build dependency of age via i18n-config; not in the binaries" },
+    # paste unmaintained. Proc-macro used by arti-client (fs-mistrust -> pwd-grp)
+    # and others. Not linked into the binaries.
+    { id = "RUSTSEC-2024-0436", reason = "proc-macro build dependency via arti-client; not in the binaries" },
+]
 
 [licenses]
 version = 2
@@ -27,7 +40,7 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "BSL-1.0",
-    "OpenSSL",
+    "BlueOak-1.0.0",   # minicbor (via ur, ur-registry); OSI approved
     "Unlicense",
     "0BSD",
     "CDLA-Permissive-2.0",
@@ -37,6 +50,9 @@ confidence-threshold = 0.9
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# The workspace's own crates are path dependencies without a version and are
+# never published (`publish = false`); that is the one wildcard form allowed.
+allow-wildcard-paths = true
 highlight = "all"
 deny = [
     # The CLI and daemon must never link OpenSSL; rustls only.
