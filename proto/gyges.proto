@@ -1,0 +1,1184 @@
+// Gyges daemon/CLI contract.
+//
+// Transport: gRPC over a Unix domain socket at ~/.gyges/<network>/gygesd.sock.
+// One daemon per network. Every RPC is callable by `gyges` and by any other
+// same-uid client; see API.md for authentication, versioning and the error
+// model. Field numbers are never removed or renumbered; every enum has an
+// `_UNSPECIFIED = 0` value; new fields and new stream events must be
+// ignorable by older clients.
+//
+// Conventions: amounts are int64 zatoshis, heights are uint32, times are
+// Unix seconds (int64), identifiers (key ids, session ids, txids) are strings.
+// Txids are 64 hex characters in the byte-reversed display order used by
+// zcashd and block explorers.
+
+syntax = "proto3";
+
+package gyges.v1;
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+service Gyges {
+  // --- Daemon ------------------------------------------------------------
+
+  // `gyges daemon status`; also the first call every CLI invocation makes to
+  // check network and API version.
+  rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+  // `gyges daemon stop`.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+  // `gyges daemon logs [--follow] [--lines N]`.
+  rpc StreamLogs(StreamLogsRequest) returns (stream LogEntry);
+
+  // --- Keys and vault ----------------------------------------------------
+
+  // `gyges key list`.
+  rpc ListKeys(ListKeysRequest) returns (ListKeysResponse);
+  // `gyges key init`.
+  rpc InitKey(InitKeyRequest) returns (InitKeyResponse);
+  // `gyges key restore`.
+  rpc RestoreKey(RestoreKeyRequest) returns (RestoreKeyResponse);
+  // `gyges key import-keystone`.
+  rpc ImportKeystone(ImportKeystoneRequest) returns (ImportKeystoneResponse);
+  // `gyges key import-ufvk`.
+  rpc ImportUfvk(ImportUfvkRequest) returns (ImportUfvkResponse);
+  // `gyges key unlock`, and the inline unlock inside `gyges tx send`.
+  rpc UnlockKey(UnlockKeyRequest) returns (UnlockKeyResponse);
+  // `gyges key lock [--all]`.
+  rpc LockKey(LockKeyRequest) returns (LockKeyResponse);
+  // `gyges key export-ufvk`.
+  rpc ExportUfvk(ExportUfvkRequest) returns (ExportUfvkResponse);
+  // `gyges key export-seed`.
+  rpc ExportSeed(ExportSeedRequest) returns (ExportSeedResponse);
+  // `gyges key delete [--wipe]`.
+  rpc DeleteKey(DeleteKeyRequest) returns (DeleteKeyResponse);
+  // `gyges key backup -o FILE`.
+  rpc BackupKey(BackupKeyRequest) returns (stream BackupChunk);
+  // `gyges key import-backup FILE`.
+  rpc ImportBackup(stream ImportBackupChunk) returns (ImportBackupResponse);
+
+  // --- Synchronisation ---------------------------------------------------
+
+  // `gyges sync status [--key | --all]`.
+  rpc GetSyncStatus(GetSyncStatusRequest) returns (GetSyncStatusResponse);
+  // `gyges sync wait`.
+  rpc WaitSync(WaitSyncRequest) returns (stream SyncProgress);
+  // `gyges sync run`.
+  rpc RunSync(RunSyncRequest) returns (stream SyncProgress);
+  // `gyges sync mempool`.
+  rpc ScanMempool(ScanMempoolRequest) returns (ScanMempoolResponse);
+
+  // --- Addresses, balance, notes -------------------------------------------
+
+  // `gyges address current`, and `gyges address qr` with no argument.
+  rpc GetCurrentAddress(GetCurrentAddressRequest) returns (AddressInfo);
+  // `gyges address new`.
+  rpc NewAddress(NewAddressRequest) returns (AddressInfo);
+  // `gyges address inspect ADDRESS`.
+  rpc InspectAddress(InspectAddressRequest) returns (InspectAddressResponse);
+  // `gyges balance`.
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+  // `gyges notes`.
+  rpc ListNotes(ListNotesRequest) returns (ListNotesResponse);
+
+  // --- Transactions --------------------------------------------------------
+
+  // `gyges tx send` (including `--dry-run`).
+  rpc SendTransaction(SendTransactionRequest) returns (stream SendEvent);
+  // `gyges tx shield`.
+  rpc ShieldFunds(ShieldFundsRequest) returns (stream SendEvent);
+  // `gyges tx list`.
+  rpc ListTransactions(ListTransactionsRequest) returns (ListTransactionsResponse);
+  // `gyges tx status TXID [--pir]`.
+  rpc GetTransactionStatus(GetTransactionStatusRequest) returns (GetTransactionStatusResponse);
+  // `gyges tx resume TXID` (ZIP 320 step 2 retry).
+  rpc ResumeTexTransfer(ResumeTexTransferRequest) returns (TexQueueEntry);
+  // `gyges tx abort TXID` (ZIP 320 transfer still in `built`).
+  rpc AbortTexTransfer(AbortTexTransferRequest) returns (TexQueueEntry);
+
+  // --- Signing sessions ----------------------------------------------------
+
+  // `gyges tx sessions`.
+  rpc ListSigningSessions(ListSigningSessionsRequest) returns (ListSigningSessionsResponse);
+  // `gyges tx abort SESSION_ID`.
+  rpc AbortSigningSession(AbortSigningSessionRequest) returns (SigningSession);
+  // Completion of a Keystone signature: `gyges pczt qr-import --session ID`,
+  // and the scan step inside `gyges tx send` for keystone-qr profiles.
+  rpc CompleteKeystoneSign(CompleteKeystoneSignRequest) returns (CompleteKeystoneSignResponse);
+
+  // --- PCZT roles ----------------------------------------------------------
+
+  // `gyges pczt create`.
+  rpc CreatePczt(CreatePcztRequest) returns (CreatePcztResponse);
+  // `gyges pczt inspect`.
+  rpc InspectPczt(InspectPcztRequest) returns (InspectPcztResponse);
+  // `gyges pczt prove`.
+  rpc ProvePczt(ProvePcztRequest) returns (ProvePcztResponse);
+  // `gyges pczt sign`.
+  rpc SignPczt(SignPcztRequest) returns (stream SignPcztEvent);
+  // `gyges pczt combine`.
+  rpc CombinePczt(CombinePcztRequest) returns (CombinePcztResponse);
+  // `gyges pczt broadcast`.
+  rpc BroadcastPczt(BroadcastPcztRequest) returns (BroadcastPcztResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+// Attached to every failed RPC as a `grpc-status-details-bin` detail
+// (`google.rpc.Status.details[0]`, type URL `type.googleapis.com/gyges.v1.GygesError`).
+// The CLI maps `reason` to its exit code; see API.md §3.
+message GygesError {
+  ErrorReason reason = 1;
+  // Key the error concerns, when any.
+  string key_id = 2;
+  // Signing session the client can resume or abort, when any.
+  string session_id = 3;
+  // Human-readable detail. Never contains addresses, amounts, memos or key
+  // material.
+  string detail = 4;
+  // Node-side error text for NODE_REJECTED, verbatim.
+  string node_error = 5;
+}
+
+enum ErrorReason {
+  ERROR_REASON_UNSPECIFIED = 0;
+  // Exit 1: unexpected daemon failure.
+  ERROR_REASON_INTERNAL = 1;
+  // Exit 4: the key is locked and no session token was supplied.
+  ERROR_REASON_VAULT_LOCKED = 2;
+  // Exit 4: a hardware signature is needed; `session_id` is set.
+  ERROR_REASON_SIGNATURE_REQUIRED = 3;
+  // Exit 4: `vault.allow_seed_export = false`.
+  ERROR_REASON_SEED_EXPORT_DISABLED = 4;
+  // Exit 4: the request needs an explicit confirmation flag (e.g. Tor
+  // backfill, destructive rescan, key deletion).
+  ERROR_REASON_CONFIRMATION_REQUIRED = 5;
+  // Exit 4: wrong passphrase.
+  ERROR_REASON_INVALID_PASSPHRASE = 6;
+  // Exit 4: too many failed unlock attempts; `detail` names the back-off.
+  ERROR_REASON_RATE_LIMITED = 7;
+  // Exit 5.
+  ERROR_REASON_INSUFFICIENT_FUNDS = 8;
+  // Exit 6: malformed argument (address, amount, memo, UR payload, PCZT).
+  ERROR_REASON_INVALID_ARGUMENT = 9;
+  // Exit 6: the CLI's `--network` differs from the daemon's.
+  ERROR_REASON_NETWORK_MISMATCH = 10;
+  // Exit 6: the key id in a PCZT's proprietary map differs from `--key`.
+  ERROR_REASON_KEY_MISMATCH = 11;
+  // Exit 6.
+  ERROR_REASON_KEY_NOT_FOUND = 12;
+  // Exit 6.
+  ERROR_REASON_KEY_EXISTS = 13;
+  // Exit 6: the signing session does not exist or has expired.
+  ERROR_REASON_SESSION_NOT_FOUND = 14;
+  // Exit 6: the profile cannot spend from or receive to the requested pool.
+  ERROR_REASON_UNSUPPORTED_POOL = 15;
+  // Exit 6: client and daemon API major versions differ.
+  ERROR_REASON_API_VERSION_MISMATCH = 16;
+  // Exit 7: the key is not scanned/spendable to the requested height.
+  ERROR_REASON_NOT_SYNCED = 17;
+  // Exit 7: zakurad RPC unreachable or returned an error.
+  ERROR_REASON_NODE_UNREACHABLE = 18;
+  // Exit 7: the operation needs the network and the daemon is air-gapped.
+  ERROR_REASON_AIRGAPPED = 19;
+  // Exit 7: the Tor fallback endpoint is disabled, unreachable or marked
+  // untrusted.
+  ERROR_REASON_FALLBACK_UNAVAILABLE = 20;
+  // Exit 8.
+  ERROR_REASON_CANCELLED = 21;
+  // Exit 9: the Keystone payload failed to decode, verify or combine.
+  ERROR_REASON_HARDWARE_SIGNER = 22;
+  // Exit 10: `sendrawtransaction` rejected the transaction; `node_error` set.
+  ERROR_REASON_NODE_REJECTED = 23;
+  // Exit 4: the connecting process failed the peer-credential check.
+  ERROR_REASON_PERMISSION_DENIED = 24;
+}
+
+// ---------------------------------------------------------------------------
+// Shared types
+// ---------------------------------------------------------------------------
+
+enum Network {
+  NETWORK_UNSPECIFIED = 0;
+  NETWORK_MAINNET = 1;
+  NETWORK_TESTNET = 2;
+  NETWORK_REGTEST = 3;
+}
+
+enum Pool {
+  POOL_UNSPECIFIED = 0;
+  POOL_TRANSPARENT = 1;
+  POOL_SAPLING = 2;
+  POOL_ORCHARD = 3;
+  POOL_IRONWOOD = 4;
+}
+
+enum SigningMode {
+  SIGNING_MODE_UNSPECIFIED = 0;
+  // Encrypted seed on disk (`seed.age`); unlocked with a passphrase.
+  SIGNING_MODE_LOCAL_SEED = 1;
+  // Keystone 3 Pro over BC-UR QR codes.
+  SIGNING_MODE_KEYSTONE_QR = 2;
+  // UFVK only; can scan, propose and (Orchard) prove, never sign.
+  SIGNING_MODE_WATCH_ONLY = 3;
+  // Seed only, no wallet database; the air-gapped signer profile.
+  SIGNING_MODE_SIGNER_ONLY = 4;
+}
+
+message ApiVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+// An amount argument as typed on the CLI: a fixed number of zatoshis or
+// "max" (everything spendable minus fees).
+message Amount {
+  oneof value {
+    int64 zatoshis = 1;
+    bool max = 2;
+  }
+}
+
+message KeySummary {
+  string key_id = 1;
+  SigningMode signing_mode = 2;
+  bool is_default = 3;
+  bool locked = 4;
+  // Unix seconds; 0 when locked or when the key has no unlock state.
+  int64 unlock_expires_at = 5;
+  uint32 birthday_height = 6;
+  uint32 scanned_tip = 7;
+  repeated Pool spend_pools = 8;
+  repeated Pool receive_pools = 9;
+  // From `ur:zcash-accounts` for keystone-qr profiles, else empty.
+  string device_version = 10;
+  string seed_fingerprint = 11;
+}
+
+// ---------------------------------------------------------------------------
+// Daemon
+// ---------------------------------------------------------------------------
+
+message GetInfoRequest {}
+
+message GetInfoResponse {
+  Network network = 1;
+  // Semantic version of gygesd, e.g. "0.1.0".
+  string daemon_version = 2;
+  ApiVersion api_version = 3;
+  bool airgapped = 4;
+  NodeStatus node = 5;
+  TorStatus tor = 6;
+  FallbackStatus fallback = 7;
+  repeated KeySummary keys = 8;
+  // Resolved `default_key` from config; empty if none is set.
+  string default_key = 9;
+  // Unix seconds the daemon started.
+  int64 started_at = 10;
+  // Effective `vault.unlock_ttl` in seconds.
+  uint32 unlock_ttl_secs = 11;
+  // Effective anchor depth / minimum confirmations used by GetBalance and
+  // proposals when the request leaves it unset.
+  uint32 default_min_confirmations = 12;
+}
+
+message NodeStatus {
+  bool connected = 1;
+  // `getblockchaininfo.blocks`.
+  uint32 tip_height = 2;
+  string tip_hash = 3;
+  // `pruneheight` when `pruned`, else 0: the lowest height whose block body
+  // the node still stores.
+  uint32 retained_from = 4;
+  bool pruned = 5;
+  // Node-side `tx_retention` setting, 0 if unknown or not pruned.
+  uint32 tx_retention = 6;
+  // True when the optional indexer gRPC stream is in use instead of polling.
+  bool indexer_stream = 7;
+  // Last error from the node, empty when healthy.
+  string last_error = 8;
+  string node_version = 9;
+}
+
+enum TorState {
+  TOR_STATE_UNSPECIFIED = 0;
+  TOR_STATE_DISABLED = 1;
+  TOR_STATE_BOOTSTRAPPING = 2;
+  TOR_STATE_READY = 3;
+  TOR_STATE_FAILED = 4;
+}
+
+message TorStatus {
+  TorState state = 1;
+  // 0..100 while bootstrapping.
+  uint32 bootstrap_percent = 2;
+  string last_error = 3;
+}
+
+enum FallbackTrust {
+  FALLBACK_TRUST_UNSPECIFIED = 0;
+  FALLBACK_TRUST_UNTESTED = 1;
+  FALLBACK_TRUST_VERIFIED = 2;
+  // Handoff validation failed (Q-Y5); backfill from it is refused.
+  FALLBACK_TRUST_UNTRUSTED = 3;
+}
+
+message FallbackStatus {
+  bool enabled = 1;
+  string grpc_url = 2;
+  bool use_tor = 3;
+  FallbackTrust trust = 4;
+}
+
+message ShutdownRequest {
+  // Wait for in-flight proving and ZIP 320 step-2 broadcasts to finish
+  // (bounded by `daemon.shutdown_grace_secs`) instead of aborting them.
+  bool graceful = 1;
+}
+
+message ShutdownResponse {}
+
+enum LogLevel {
+  LOG_LEVEL_UNSPECIFIED = 0;
+  LOG_LEVEL_ERROR = 1;
+  LOG_LEVEL_WARN = 2;
+  LOG_LEVEL_INFO = 3;
+  LOG_LEVEL_DEBUG = 4;
+  LOG_LEVEL_TRACE = 5;
+}
+
+message StreamLogsRequest {
+  // Replay the last N lines before following; 0 means none.
+  uint32 lines = 1;
+  // Keep the stream open after the replay.
+  bool follow = 2;
+  // Minimum level to deliver; UNSPECIFIED means the daemon's configured level.
+  LogLevel min_level = 3;
+  // Stream the audit log instead of the main log.
+  bool audit = 4;
+}
+
+message LogEntry {
+  int64 timestamp_unix_ms = 1;
+  LogLevel level = 2;
+  // tracing target, e.g. "gyges_core::sync".
+  string target = 3;
+  string message = 4;
+  map<string, string> fields = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Keys and vault
+// ---------------------------------------------------------------------------
+
+message ListKeysRequest {}
+
+message ListKeysResponse {
+  repeated KeySummary keys = 1;
+}
+
+message InitKeyRequest {
+  string key_id = 1;
+  string passphrase = 2 [debug_redact = true];
+  bool set_default = 3;
+  // Mnemonic length; 0 means 24.
+  uint32 word_count = 4;
+}
+
+message InitKeyResponse {
+  string key_id = 1;
+  // Shown once by the CLI, which then requires three words typed back.
+  string mnemonic = 2 [debug_redact = true];
+  uint32 birthday_height = 3;
+  string ufvk = 4;
+}
+
+message RestoreKeyRequest {
+  string key_id = 1;
+  string mnemonic = 2 [debug_redact = true];
+  string passphrase = 3 [debug_redact = true];
+  // 0 means the network's Sapling activation height, with a full backfill.
+  uint32 birthday_height = 4;
+  bool set_default = 5;
+  // Must be true when `birthday_height < node.retained_from`; the CLI asks the
+  // user first using GetInfoResponse.fallback. Otherwise the daemon returns
+  // CONFIRMATION_REQUIRED and creates nothing.
+  bool allow_backfill = 6;
+}
+
+message RestoreKeyResponse {
+  string key_id = 1;
+  uint32 birthday_height = 2;
+  string ufvk = 3;
+  // Number of blocks that will be fetched over the fallback endpoint.
+  uint32 backfill_blocks = 4;
+}
+
+message ImportKeystoneRequest {
+  string key_id = 1;
+  // Either a `ur:zcash-accounts/...` or `ur:zcash-unified-full-viewing-key/...`
+  // string, or a bare `uview1...` UFVK.
+  string payload = 2;
+  // Required: no Keystone UR type carries a birthday. The CLI defaults to the
+  // NU5 activation height after confirming with the user.
+  uint32 birthday_height = 3;
+  bool set_default = 4;
+  // Which account from `zcash-accounts` to import when it lists several;
+  // 0 means the first.
+  uint32 account_index = 5;
+}
+
+message ImportKeystoneResponse {
+  string key_id = 1;
+  string seed_fingerprint = 2;
+  string device_version = 3;
+  string ufvk = 4;
+  repeated Pool spend_pools = 5;
+  uint32 birthday_height = 6;
+}
+
+message ImportUfvkRequest {
+  string key_id = 1;
+  string ufvk = 2;
+  uint32 birthday_height = 3;
+  bool set_default = 4;
+}
+
+message ImportUfvkResponse {
+  string key_id = 1;
+  repeated Pool receive_pools = 2;
+  uint32 birthday_height = 3;
+}
+
+enum UnlockScope {
+  UNLOCK_SCOPE_UNSPECIFIED = 0;
+  // Default. The unlock lives as long as the calling connection (or until
+  // the idle TTL elapses) and is usable only with the returned
+  // `session_token` on that connection. Used by the inline `tx send` flow.
+  UNLOCK_SCOPE_CONNECTION = 1;
+  // The key stays decrypted in gygesd RAM with an idle TTL and no token;
+  // any same-uid client may then spend until it expires or `LockKey` is
+  // called. Used by `gyges key unlock --timeout` for batch scripts. This is
+  // the weaker mode; see API.md §6.3.
+  UNLOCK_SCOPE_DAEMON = 2;
+}
+
+message UnlockKeyRequest {
+  string key_id = 1;
+  string passphrase = 2 [debug_redact = true];
+  // Idle timeout for the unlock; 0 means `vault.unlock_ttl`.
+  uint32 ttl_secs = 3;
+  // When set, the unlock is bound to a pending signing session that emitted
+  // `SignatureRequired { kind: PASSPHRASE }`; the paused stream resumes and
+  // no reusable token is returned. `scope` is ignored.
+  string session_id = 4;
+  // UNSPECIFIED means CONNECTION.
+  UnlockScope scope = 5;
+}
+
+message UnlockKeyResponse {
+  // 32 random bytes; present only for CONNECTION scope with an empty
+  // `session_id`. Destroyed on disconnect or expiry.
+  bytes session_token = 1 [debug_redact = true];
+  int64 expires_at = 2;
+  UnlockScope scope = 3;
+}
+
+message LockKeyRequest {
+  // Empty with `all = true` locks every key.
+  string key_id = 1;
+  bool all = 2;
+}
+
+message LockKeyResponse {
+  repeated string locked_key_ids = 1;
+}
+
+message ExportUfvkRequest {
+  string key_id = 1;
+}
+
+message ExportUfvkResponse {
+  string ufvk = 1;
+  uint32 birthday_height = 2;
+}
+
+message ExportSeedRequest {
+  string key_id = 1;
+  // Always required here; an existing unlock session is never reused.
+  string passphrase = 2 [debug_redact = true];
+  // Must equal the literal string "reveal seed".
+  string confirmation = 3;
+}
+
+message ExportSeedResponse {
+  string mnemonic = 1 [debug_redact = true];
+  uint32 birthday_height = 2;
+}
+
+message DeleteKeyRequest {
+  string key_id = 1;
+  // Best-effort overwrite of seed.age and wallet.sqlite before unlinking.
+  bool wipe = 2;
+  // Must equal `key_id`.
+  string confirmation = 3;
+}
+
+message DeleteKeyResponse {}
+
+message BackupKeyRequest {
+  string key_id = 1;
+  // Include wallet.sqlite (after a WAL checkpoint) in the archive.
+  bool include_wallet = 2;
+}
+
+message BackupChunk {
+  // Consecutive slices of a tar archive containing profile.json, seed.age
+  // (if present) and optionally wallet.sqlite.
+  bytes data = 1;
+}
+
+message ImportBackupChunk {
+  // Set on the first chunk only.
+  string key_id = 1;
+  bool set_default = 2;
+  bytes data = 3;
+}
+
+message ImportBackupResponse {
+  KeySummary key = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Synchronisation
+// ---------------------------------------------------------------------------
+
+enum SyncBackend {
+  SYNC_BACKEND_UNSPECIFIED = 0;
+  SYNC_BACKEND_ZAKURA_RPC = 1;
+  SYNC_BACKEND_TOR_LWD_FALLBACK = 2;
+  SYNC_BACKEND_DIRECT_LWD_FALLBACK = 3;
+}
+
+enum SyncState {
+  SYNC_STATE_UNSPECIFIED = 0;
+  SYNC_STATE_IDLE = 1;
+  SYNC_STATE_SCANNING = 2;
+  SYNC_STATE_VALIDATING_HANDOFF = 3;
+  SYNC_STATE_REWINDING = 4;
+  SYNC_STATE_STALLED = 5;
+}
+
+enum StallReason {
+  STALL_REASON_UNSPECIFIED = 0;
+  // Node pruned past this key's scan position and no fallback is available.
+  STALL_REASON_PRUNED_PAST_SCAN_TIP = 1;
+  // No fork point within the finality depth.
+  STALL_REASON_CHAIN_INCONSISTENT = 2;
+  // Handoff validation against the node failed (Q-Y5).
+  STALL_REASON_FALLBACK_UNTRUSTED = 3;
+  STALL_REASON_NODE_UNREACHABLE = 4;
+  STALL_REASON_FALLBACK_UNREACHABLE = 5;
+}
+
+message KeySyncStatus {
+  string key_id = 1;
+  SyncState state = 2;
+  StallReason stall_reason = 3;
+  SyncBackend backend = 4;
+  uint32 scanned_tip = 5;
+  uint32 chain_tip = 6;
+  // scanned_tip >= chain_tip.
+  bool scanned = 7;
+  // scanned, and no scan range with priority above Ignored remains.
+  bool spendable = 8;
+  double blocks_per_sec = 9;
+  // Remaining blocks across all open scan ranges.
+  uint32 blocks_remaining = 10;
+  // Outputs whose witnesses are not yet complete.
+  uint32 notes_awaiting_witness = 11;
+  // Human-readable detail for STALLED.
+  string detail = 12;
+}
+
+message GetSyncStatusRequest {
+  // Empty means all keys.
+  string key_id = 1;
+}
+
+message GetSyncStatusResponse {
+  repeated KeySyncStatus keys = 1;
+}
+
+enum SyncTarget {
+  SYNC_TARGET_UNSPECIFIED = 0;
+  SYNC_TARGET_SCANNED = 1;
+  SYNC_TARGET_SPENDABLE = 2;
+}
+
+message WaitSyncRequest {
+  string key_id = 1;
+  // UNSPECIFIED means SPENDABLE.
+  SyncTarget until = 2;
+  // When set, wait instead until `txid` has `confirmations` confirmations.
+  string txid = 3;
+  uint32 confirmations = 4;
+}
+
+message RunSyncRequest {
+  string key_id = 1;
+  // 0 means continue from scanned_tip + 1. A value at or below scanned_tip is
+  // a rewind and requires `confirm_rewind`.
+  uint32 from_height = 2;
+  // 0 means the chain tip.
+  uint32 to_height = 3;
+  bool force_tor_lwd = 4;
+  bool confirm_rewind = 5;
+}
+
+// One element per batch; the stream ends when the request's condition holds
+// or with a GygesError.
+message SyncProgress {
+  KeySyncStatus status = 1;
+  // Confirmations of `WaitSyncRequest.txid`, when that mode is in use.
+  uint32 confirmations = 2;
+  bool done = 3;
+}
+
+message ScanMempoolRequest {
+  // Empty means all keys.
+  string key_id = 1;
+}
+
+message ScanMempoolResponse {
+  uint32 transactions_scanned = 1;
+  uint32 notes_found = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Addresses, balance, notes
+// ---------------------------------------------------------------------------
+
+message Receiver {
+  Pool pool = 1;
+  // The receiver re-encoded standalone (zs1..., t1...), empty for Orchard and
+  // Ironwood which have no standalone encoding.
+  string encoded = 2;
+}
+
+message AddressInfo {
+  string address = 1;
+  // Diversifier index as a decimal string (it may exceed 64 bits).
+  string diversifier_index = 2;
+  repeated Receiver receivers = 3;
+  string label = 4;
+}
+
+message GetCurrentAddressRequest {
+  string key_id = 1;
+}
+
+message NewAddressRequest {
+  string key_id = 1;
+  // Empty means the profile's default receiver set.
+  repeated Pool receivers = 2;
+  string label = 3;
+}
+
+enum AddressKind {
+  ADDRESS_KIND_UNSPECIFIED = 0;
+  ADDRESS_KIND_UNIFIED = 1;
+  ADDRESS_KIND_SAPLING = 2;
+  ADDRESS_KIND_TRANSPARENT_P2PKH = 3;
+  ADDRESS_KIND_TRANSPARENT_P2SH = 4;
+  ADDRESS_KIND_TEX = 5;
+}
+
+message InspectAddressRequest {
+  string address = 1;
+}
+
+message InspectAddressResponse {
+  bool valid = 1;
+  Network network = 2;
+  AddressKind kind = 3;
+  repeated Receiver receivers = 4;
+  // True for ZIP 320 addresses: payment will use the two-step flow.
+  bool transparent_source_only = 5;
+  // Set when `valid` is false.
+  string error = 6;
+}
+
+message PoolBalance {
+  Pool pool = 1;
+  // Confirmed at or beyond min_confirmations and witnessed.
+  int64 spendable = 2;
+  // Received but below min_confirmations or unmined.
+  int64 pending = 3;
+  // Spent in an unmined transaction of ours.
+  int64 pending_spend = 4;
+}
+
+message GetBalanceRequest {
+  string key_id = 1;
+  // 0 means the daemon default (GetInfoResponse.default_min_confirmations).
+  uint32 min_confirmations = 2;
+}
+
+message GetBalanceResponse {
+  repeated PoolBalance pools = 1;
+  int64 total_spendable = 2;
+  int64 total_pending = 3;
+  uint32 min_confirmations = 4;
+  uint32 as_of_height = 5;
+}
+
+enum SpentFilter {
+  SPENT_FILTER_UNSPECIFIED = 0;
+  SPENT_FILTER_UNSPENT = 1;
+  SPENT_FILTER_SPENT = 2;
+  SPENT_FILTER_ALL = 3;
+}
+
+message Note {
+  Pool pool = 1;
+  string txid = 2;
+  uint32 output_index = 3;
+  int64 value = 4;
+  // 0 when unmined.
+  uint32 height = 5;
+  // First 64 bytes of the memo as UTF-8 if it decodes, else empty.
+  string memo_preview = 6;
+  bool spent = 7;
+  string spent_txid = 8;
+  bool witness_ready = 9;
+  // True for ZIP 320 ephemeral transparent outputs.
+  bool ephemeral = 10;
+}
+
+message ListNotesRequest {
+  string key_id = 1;
+  // UNSPECIFIED means all pools.
+  Pool pool = 2;
+  // UNSPECIFIED means UNSPENT.
+  SpentFilter spent = 3;
+}
+
+message ListNotesResponse {
+  repeated Note notes = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Transactions
+// ---------------------------------------------------------------------------
+
+message ProposedInput {
+  Pool pool = 1;
+  uint32 count = 2;
+  int64 value = 3;
+}
+
+message ProposedOutput {
+  // Recipient address, or "ephemeral" for the ZIP 320 intermediate output.
+  string address = 1;
+  Pool pool = 2;
+  int64 value = 3;
+  bool is_change = 4;
+  bool is_ephemeral = 5;
+  bool has_memo = 6;
+}
+
+message ProposalStep {
+  uint32 index = 1;
+  repeated ProposedInput inputs = 2;
+  repeated ProposedOutput outputs = 3;
+  int64 fee = 4;
+  // True for ZIP 320 step 2 (transparent -> tex).
+  bool transparent_only = 5;
+}
+
+message Proposal {
+  repeated ProposalStep steps = 1;
+  // Sum of all non-change outputs and fees.
+  int64 total_debit = 2;
+  int64 total_fee = 3;
+  uint32 anchor_height = 4;
+  uint32 expiry_height = 5;
+  uint32 min_confirmations = 6;
+  // The upstream `zcash_client_backend::proto::proposal::Proposal`, serialized,
+  // for `--json` consumers that want the full structure.
+  bytes upstream_proposal = 7;
+}
+
+enum SignatureKind {
+  SIGNATURE_KIND_UNSPECIFIED = 0;
+  // Call UnlockKey with `session_id`.
+  SIGNATURE_KIND_PASSPHRASE = 1;
+  // `payload` is a `zcash-pczt` (tag 49204) CBOR body; reply with the signed
+  // PCZT via CompleteKeystoneSign.
+  SIGNATURE_KIND_KEYSTONE_SINGLE_PCZT = 2;
+  // `payload` is a `zcash-sign-batch` (tag 49205) CBOR body; reply with the
+  // `zcash-batch-sig-result` (tag 49207) via CompleteKeystoneSign.
+  SIGNATURE_KIND_KEYSTONE_BATCH = 3;
+}
+
+message SignatureRequired {
+  string key_id = 1;
+  SignatureKind kind = 2;
+  string session_id = 3;
+  // Unix seconds the session expires.
+  int64 expires_at = 4;
+  // The CBOR body the CLI encodes as `ur:zcash-pczt` or `ur:zcash-sign-batch`
+  // fountain frames. Empty for PASSPHRASE.
+  bytes payload = 5;
+  // Which proposal step this signature covers.
+  uint32 step = 6;
+  // What the device will display, for the user to compare.
+  Proposal summary = 7;
+}
+
+message SendEvent {
+  oneof event {
+    // Always first. For `dry_run` it is also last.
+    Proposal proposed = 1;
+    ProvingProgress proving = 2;
+    SignatureRequired signature_required = 3;
+    StepSigned signed = 4;
+    StepBroadcast broadcast = 5;
+    TexQueued tex_queued = 6;
+    StepMined mined = 7;
+  }
+}
+
+message ProvingProgress {
+  uint32 step = 1;
+  Pool pool = 2;
+  uint32 actions_done = 3;
+  uint32 actions_total = 4;
+}
+
+message StepSigned {
+  uint32 step = 1;
+}
+
+message StepBroadcast {
+  uint32 step = 1;
+  string txid = 2;
+}
+
+message TexQueued {
+  string step1_txid = 1;
+  string step2_txid = 2;
+}
+
+message StepMined {
+  uint32 step = 1;
+  string txid = 2;
+  uint32 height = 3;
+}
+
+message SendTransactionRequest {
+  string key_id = 1;
+  string to = 2;
+  Amount amount = 3;
+  // UTF-8 text or raw bytes decoded by the CLI from hex; at most 512 bytes.
+  bytes memo = 4;
+  bool via_tor = 5;
+  bool dry_run = 6;
+  // From a prior CONNECTION-scoped UnlockKey; optional. Without it the stream
+  // pauses on SignatureRequired unless the key has a live DAEMON-scoped unlock.
+  bytes session_token = 7 [debug_redact = true];
+  // 0 means the daemon default.
+  uint32 min_confirmations = 8;
+  // Wait for the mined event(s) before closing the stream.
+  bool wait_for_mined = 9;
+}
+
+message ShieldFundsRequest {
+  string key_id = 1;
+  // Only shield when the transparent balance is at least this; 0 means any.
+  int64 threshold = 2;
+  bool dry_run = 3;
+  bytes session_token = 4 [debug_redact = true];
+  bool wait_for_mined = 5;
+}
+
+enum TransactionStatus {
+  TRANSACTION_STATUS_UNSPECIFIED = 0;
+  TRANSACTION_STATUS_AWAITING_SIGNATURE = 1;
+  TRANSACTION_STATUS_PENDING = 2;
+  TRANSACTION_STATUS_MINED = 3;
+  TRANSACTION_STATUS_EXPIRED = 4;
+  TRANSACTION_STATUS_FAILED = 5;
+  TRANSACTION_STATUS_TEX_PENDING = 6;
+}
+
+enum TexState {
+  TEX_STATE_UNSPECIFIED = 0;
+  TEX_STATE_BUILT = 1;
+  TEX_STATE_STEP1_BROADCAST = 2;
+  TEX_STATE_STEP2_BROADCAST = 3;
+  TEX_STATE_STEP1_MINED = 4;
+  TEX_STATE_STEP2_MINED = 5;
+  TEX_STATE_STEP2_FAILED = 6;
+  TEX_STATE_EXPIRED = 7;
+  TEX_STATE_FAILED = 8;
+  TEX_STATE_ABORTED = 9;
+}
+
+message TexQueueEntry {
+  string step1_txid = 1;
+  string step2_txid = 2;
+  TexState state = 3;
+  int64 created_at = 4;
+  int64 last_attempt_at = 5;
+  uint32 attempts = 6;
+  string last_error = 7;
+  string recipient = 8;
+  int64 amount = 9;
+}
+
+message TransactionOutput {
+  Pool pool = 1;
+  string address = 2;
+  int64 value = 3;
+  bool is_change = 4;
+  bool is_ephemeral = 5;
+  bytes memo = 6;
+}
+
+message TransactionSummary {
+  string txid = 1;
+  TransactionStatus status = 2;
+  // 0 when unmined.
+  uint32 height = 3;
+  // Block time, or first-seen time when unmined.
+  int64 timestamp = 4;
+  // Positive for received, negative for sent (fees included).
+  int64 net_value = 5;
+  int64 fee = 6;
+  uint32 expiry_height = 7;
+  repeated TransactionOutput outputs = 8;
+  // Set for ZIP 320 transfers.
+  TexQueueEntry tex = 9;
+  // Set while status is AWAITING_SIGNATURE.
+  string session_id = 10;
+}
+
+message ListTransactionsRequest {
+  string key_id = 1;
+  // 0 means the daemon default (50).
+  uint32 limit = 2;
+  // Return transactions older than this txid, for paging.
+  string before_txid = 3;
+}
+
+message ListTransactionsResponse {
+  repeated TransactionSummary transactions = 1;
+}
+
+enum StatusSource {
+  STATUS_SOURCE_UNSPECIFIED = 0;
+  STATUS_SOURCE_NODE = 1;
+  STATUS_SOURCE_PIR = 2;
+}
+
+message GetTransactionStatusRequest {
+  string key_id = 1;
+  string txid = 2;
+  // Query via zakura-pir-status instead of the node (experimental).
+  bool via_pir = 3;
+}
+
+message GetTransactionStatusResponse {
+  TransactionStatus status = 1;
+  uint32 height = 2;
+  uint32 confirmations = 3;
+  StatusSource source = 4;
+}
+
+message ResumeTexTransferRequest {
+  string key_id = 1;
+  string step1_txid = 2;
+  bytes session_token = 3 [debug_redact = true];
+}
+
+message AbortTexTransferRequest {
+  string key_id = 1;
+  string step1_txid = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Signing sessions
+// ---------------------------------------------------------------------------
+
+enum SessionStatus {
+  SESSION_STATUS_UNSPECIFIED = 0;
+  SESSION_STATUS_AWAITING_SIGNATURE = 1;
+  SESSION_STATUS_COMPLETED = 2;
+  SESSION_STATUS_EXPIRED = 3;
+  SESSION_STATUS_ABORTED = 4;
+  SESSION_STATUS_FAILED = 5;
+}
+
+enum SessionPurpose {
+  SESSION_PURPOSE_UNSPECIFIED = 0;
+  // Created by SendTransaction / ShieldFunds / ResumeTexTransfer; completion
+  // broadcasts.
+  SESSION_PURPOSE_SEND = 1;
+  // Created by SignPczt; completion returns the signed PCZT.
+  SESSION_PURPOSE_SIGN_PCZT = 2;
+}
+
+message SigningSession {
+  string session_id = 1;
+  string key_id = 2;
+  SignatureKind kind = 3;
+  SessionPurpose purpose = 4;
+  SessionStatus status = 5;
+  int64 created_at = 6;
+  int64 expires_at = 7;
+  Proposal summary = 8;
+  uint32 step = 9;
+  string last_error = 10;
+}
+
+message ListSigningSessionsRequest {
+  // Empty means all keys.
+  string key_id = 1;
+  bool include_finished = 2;
+}
+
+message ListSigningSessionsResponse {
+  repeated SigningSession sessions = 1;
+}
+
+message AbortSigningSessionRequest {
+  string session_id = 1;
+}
+
+message CompleteKeystoneSignRequest {
+  string session_id = 1;
+  // The CBOR body decoded by the CLI from the device's UR frames: a
+  // `zcash-pczt` for KEYSTONE_SINGLE_PCZT sessions or a
+  // `zcash-batch-sig-result` for KEYSTONE_BATCH sessions.
+  bytes payload = 2;
+}
+
+message CompleteKeystoneSignResponse {
+  SigningSession session = 1;
+  oneof result {
+    // SEND sessions: txids of every broadcast step, in order.
+    TxidList broadcast = 2;
+    // SIGN_PCZT sessions: the combined, verified PCZT.
+    bytes pczt = 3;
+  }
+}
+
+message TxidList {
+  repeated string txids = 1;
+}
+
+// ---------------------------------------------------------------------------
+// PCZT roles
+// ---------------------------------------------------------------------------
+
+enum PcztRole {
+  PCZT_ROLE_UNSPECIFIED = 0;
+  PCZT_ROLE_CREATOR = 1;
+  PCZT_ROLE_CONSTRUCTOR = 2;
+  PCZT_ROLE_IO_FINALIZER = 3;
+  PCZT_ROLE_UPDATER = 4;
+  PCZT_ROLE_REDACTOR = 5;
+  PCZT_ROLE_PROVER = 6;
+  PCZT_ROLE_SIGNER = 7;
+  PCZT_ROLE_COMBINER = 8;
+  PCZT_ROLE_SPEND_FINALIZER = 9;
+  PCZT_ROLE_TRANSACTION_EXTRACTOR = 10;
+}
+
+message CreatePcztRequest {
+  string key_id = 1;
+  string to = 2;
+  Amount amount = 3;
+  bytes memo = 4;
+  uint32 min_confirmations = 5;
+}
+
+message CreatePcztResponse {
+  // Postcard-serialized PCZT after Creator, Constructor, IO Finalizer and
+  // Updater, with `gyges.key_id`, `gyges.network` and `gyges.session_id` in
+  // the global proprietary map. A tex recipient yields one PCZT per step.
+  repeated bytes pczts = 1;
+  Proposal proposal = 2;
+}
+
+message InspectPcztRequest {
+  bytes pczt = 1;
+}
+
+message InspectPcztResponse {
+  string key_id = 1;
+  Network network = 2;
+  string session_id = 3;
+  Proposal summary = 4;
+  // Roles whose outputs are present, in order.
+  repeated PcztRole completed_roles = 5;
+  // Per pool: proofs present, signatures present/required.
+  repeated PcztPoolState pools = 6;
+}
+
+message PcztPoolState {
+  Pool pool = 1;
+  uint32 spends = 2;
+  uint32 outputs = 3;
+  bool proofs_present = 4;
+  uint32 signatures_present = 5;
+  uint32 signatures_required = 6;
+}
+
+message ProvePcztRequest {
+  bytes pczt = 1;
+  // Required for Sapling spends in a LOCAL_SEED or SIGNER_ONLY profile (the
+  // proof generation key is inserted before proving); ignored otherwise.
+  bytes session_token = 2 [debug_redact = true];
+}
+
+message ProvePcztResponse {
+  bytes pczt = 1;
+}
+
+message SignPcztRequest {
+  bytes pczt = 1;
+  // Optional; without it a locked LOCAL_SEED key pauses on SignatureRequired.
+  bytes session_token = 2 [debug_redact = true];
+}
+
+message SignPcztEvent {
+  oneof event {
+    SignatureRequired signature_required = 1;
+    // Final event: the signed (and, for Keystone, combined and verified) PCZT.
+    bytes signed = 2;
+  }
+}
+
+message CombinePcztRequest {
+  // Two or more PCZTs for the same transaction and key id.
+  repeated bytes pczts = 1;
+}
+
+message CombinePcztResponse {
+  bytes pczt = 1;
+}
+
+message BroadcastPcztRequest {
+  bytes pczt = 1;
+  bool via_tor = 2;
+}
+
+message BroadcastPcztResponse {
+  string txid = 1;
+}

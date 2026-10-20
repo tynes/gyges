@@ -1,15 +1,20 @@
 # Gyges Architecture Specification (`gygesd` & `gyges`)
 
+> Revision 2 (2026-10-20). Incorporates the corrections from `OVERVIEW.md` §2.1 and the proposals in §6. Companion documents: `API.md` (gRPC contract), `SYNC.md` (sync state machine), `DATA_MODEL.md` (on-disk schema), `THREAT_MODEL.md`, `TESTING.md`, `ROADMAP.md`, `GLOSSARY.md`.
+
 ## 1. Overview
-**Gyges** is a pure-Rust Zcash wallet daemon (`gygesd`) and CLI wrapper (`gyges`) built on the **Zakura Common** and **Zakura Wallet Libraries** stack.
+**Gyges** is a pure-Rust Zcash wallet daemon (`gygesd`) and CLI (`gyges`) built on the **Zakura** common and wallet-libraries stack (`zakura-core/common`, `zakura-core/wallet-libraries`), consumed under the upstream library-target names (`zcash_client_backend`, `zcash_client_sqlite`, `pczt`, `orchard`, …) via `package =` renames in `Cargo.toml`.
 
 ### Core Capabilities
-1. **Direct-to-`zakurad` Operation:** Syncs recent blocks, tree states (`z_gettreestate`), subtrees (`z_getsubtreesbyindex`), and broadcasts raw transactions (`sendrawtransaction`) directly against a local or remote pruned `zakurad` JSON-RPC endpoint without requiring `lightwalletd` middleware.
-2. **Embedded Tor Historical Backfill:** When restoring a key whose `birthday_height` precedes the local pruned `zakurad`'s retention window ($H_{\text{retain}}$), `gygesd` automatically routes historical `CompactBlock` queries (`birthday_height .. H_retain`) through an embedded `arti-client` Tor circuit to a configured archival `lightwalletd`/`zaino` gRPC endpoint, then cuts over to local `zakurad` for `H_retain .. tip`.
-3. **Independent Multi-Key Profiles:** Each managed key (`KeyId`) operates over an isolated SQLite database (`~/.gyges/keys/<key_id>/wallet.sqlite`) with its own `ShardTree` Merkle witnesses, `birthday_height`, `scanned_tip`, and signing backend (`LocalEncryptedSeed`, `KeystoneQr`, or `WatchOnly`).
-4. **Daemon-Only Key Material & Air-Gapped Mode:** All key material and SQLite state live strictly inside `gygesd`. Running `gygesd --airgapped` disables all network/Tor interfaces while keeping the local Unix Domain Socket (`gygesd.sock`), SQLite state, and PCZT `Prover`/`Signer` roles active.
-5. **Full Address & ZIP-320 (`tex1`) Support:** Supports sending and receiving across Unified (`u1`), Sapling (`zs1`), Transparent (`t1`), and ZIP-320 Transparent-Source-Only Exchange (`tex1` / `textest1`) addresses via automatic two-step deshielding orchestration.
-6. **Keystone 3 Pro Hardware Wallet Support:** Pairs via `ur:zcash-accounts` (CBOR tag `49201`) and signs redacted PCZTs via animated terminal UTF-8 QR codes (`ur:zcash-pczt`, CBOR tag `49204`).
+1. **Direct-to-`zakurad` operation.** Syncs recent blocks, tree states (`z_gettreestate`) and subtree roots (`z_getsubtreesbyindex`), and broadcasts raw transactions (`sendrawtransaction`) against a local or remote pruned `zakurad` JSON-RPC endpoint, with no `lightwalletd` in between. Zakura has one JSON-RPC dialect (zcashd-style, Zebra-derived); its "zcashd-compat mode" is a `zcashd` sidecar for other tools and is not used by Gyges.
+2. **Embedded Tor historical backfill.** When a key's `birthday_height` is below the node's `pruneheight` (the lowest height whose block body is still stored; `retained_from` in Gyges), `gygesd` streams `CompactBlock`s for `[birthday, retained_from + k]` over an embedded Tor client (`zcash_client_backend::tor`, backed by `arti-client`) from a user-configured archival `lightwalletd`/`zaino` gRPC endpoint, validates the result against the local node, then continues from the local node. No endpoint is hard-coded.
+3. **Independent multi-key profiles.** Each key (`KeyId`) has an isolated `zcash_client_sqlite` database under `~/.gyges/<network>/keys/<key_id>/` with its own ShardTree witnesses, birthday, `scanned_tip` and signing mode (`local-seed`, `keystone-qr`, `watch-only`, `signer-only`).
+4. **Daemon-only key material and air-gapped mode.** Key material and SQLite state live only inside `gygesd`. `gygesd --airgapped` disables every network interface and serves `signer-only` profiles over the Unix socket for PCZT proving and signing.
+5. **Full address and ZIP 320 (`tex1`) send support.** Sends to Unified (`u1`), Sapling (`zs1`), transparent (`t1`/`t3`) and ZIP 320 TEX (`tex1`/`textest1`) recipients. TEX payments use the upstream two-step proposal plus a durable `TexQueue` broadcaster. Gyges does not *issue* `tex1` receive addresses (OVERVIEW.md Q-T5).
+6. **Keystone 3 Pro hardware signing.** Pairs from `ur:zcash-accounts` (CBOR tag 49201) and signs over animated terminal QR codes using the batch protocol (`ur:zcash-sign-batch` 49205 / `ur:zcash-batch-sig-result` 49207) for shielded sends and the single-PCZT protocol (`ur:zcash-pczt` 49204) when transparent inputs are present.
+
+### Pools
+Pool support is data, not code paths: `profile.json` carries `spend_pools` and `receive_pools`, and `balance`, `notes` and `address new --receivers` are pool-generic. The node, wallet libraries and Keystone firmware all expose an **Ironwood** pool alongside Sapling and Orchard; it is off until the upstream wallet APIs leave `-rc`. MVP policy (ROADMAP.md): spend Orchard and transparent; receive Orchard, Sapling and transparent.
 
 ---
 
@@ -17,97 +22,140 @@
 
 ```text
 gyges/
-├── Cargo.toml
-├── proto/
-│   └── gyges.proto              # Tonic UDS gRPC contract between gyges and gygesd
+├── Cargo.toml                   # workspace; exact `=` pins on every zakura-* crate (Q-D3)
+├── Cargo.lock                   # committed; CI builds --locked
+├── proto/gyges.proto            # tonic UDS gRPC contract (see API.md)
 └── crates/
-    ├── gyges-proto/             # Generated protobuf types and gRPC client/server stubs
-    ├── gyges-qr/                # UTF-8 half-block QR renderer & BC-UR (49201/49204) codec
-    ├── gyges-chain/             # ChainBackend trait: ZakuraRpcBackend + ArtiTorLwdBackend
+    ├── gyges-proto/             # tonic-prost-build output, API version constants
+    ├── gyges-qr/                # UTF-8 half-block QR renderer, BC-UR codec, registry tags 49201-49207
+    ├── gyges-chain/             # CompactBlockSource: ZakuraRpcBackend (Case A) + ArtiTorLwdBackend (Case B)
     ├── gyges-core/              # KeyRegistry, VaultManager, SyncScheduler, TxEngine, TexQueue
-    ├── gygesd/                  # Daemon binary (hosts UDS tonic server + background loops)
-    └── gyges-cli/               # CLI binary (`gyges` command router, prompts, QR TUI)
+    ├── gygesd/                  # daemon binary: UDS tonic server + background loops
+    └── gyges-cli/               # `gyges` binary: command router, prompts, QR TUI
 ```
+
+### 2.1 `gyges-core` components
+
+| Component | Responsibility | Persistent state |
+|---|---|---|
+| `KeyRegistry` | Enumerates `keys/<id>/profile.json`, opens one `WalletDb` per key, enforces 0700/0600 permissions at startup, resolves `default_key` for requests with an empty `key_id`. | `profile.json` per key |
+| `VaultManager` | Encrypts/decrypts `seed.age`, derives the `UnifiedSpendingKey`, owns signing sessions (connection-scoped tokens or daemon-scoped idle TTL), rate-limits failed unlocks per key id, zeroizes on expiry and on `daemon stop`. | `seed.age`; `gyges_signing_sessions` table |
+| `SyncScheduler` | Per-key state machine over `gyges-chain` (SYNC.md): node bounds, route selection, shared block cache, reorg truncation, handoff validation, mempool scan. | upstream `WalletDb` tables; `cache/blocks.sqlite` |
+| `TxEngine` | Proposal (`propose_transfer`, `propose_standard_transfer_to_address`), PCZT construction (`create_pczt_from_proposal`) and the PCZT role pipeline: Updater → Prover → (Redactor →) Signer → Combiner → Verifier → Spend Finalizer → Tx Extractor. | `gyges_signing_sessions` |
+| `TexQueue` | Durable broadcaster for ZIP 320 two-step proposals: persists both raw transactions, re-checks every non-terminal row against the node on each poll or `mempool_change` event, rebroadcasts whichever is missing, builds a fresh Step 2 when Step 1 is mined but Step 2 expired. | `gyges_tex_queue` table |
 
 ---
 
 ## 3. Component Data-Flow & State Machines
 
-### 3.1 Hybrid Synchronization Pipeline (`SyncScheduler`)
-Each `KeyProfile` tracks its own `scanned_tip` independently in its SQLite database:
+### 3.1 Hybrid synchronisation pipeline (`SyncScheduler`)
+Full detail in `SYNC.md`; summary:
 
-1. **Poll Node Bounds:** `ZakuraRpcBackend` calls `getblockchaininfo` on `zakurad` to retrieve `(chain_tip, retention_height)`.
-2. **Determine Sync Route for `KeyProfile`:**
-   - **Case A (`key.scanned_tip >= retention_height`):**
-     - `ZakuraRpcBackend` fetches raw blocks via `getblock(height, 0)`, strips non-essential proofs/scripts in memory using `zakura-primitives`, constructs synthetic `CompactBlock` batches, and passes them to `zakura_client_backend::scanning::scan_blocks`.
-   - **Case B (`key.scanned_tip < retention_height` — Historical Restore):**
-     - `ArtiTorLwdBackend` bootstraps an in-memory Tor circuit (`arti-client`) to the configured fallback `lightwalletd` endpoint.
-     - Calls `GetSubtreeRoots` (ZIP-315) to pre-populate the Sapling and Orchard `ShardTree` roots.
-     - Streams `GetBlockRange(key.scanned_tip .. retention_height)` over Tor and executes batch trial decryption (`zakura-pasta-curves` 1.5x vectorized arithmetic).
-     - At `height == retention_height`, closes the Tor stream and hands off `retention_height .. chain_tip` to `ZakuraRpcBackend`.
+1. **Node bounds.** `ZakuraRpcBackend` calls `getblockchaininfo` and derives `NodeBounds { tip_height, tip_hash, retained_from }`, where `retained_from = pruneheight` when `pruned == true` and `0` otherwise. When the optional indexer gRPC (`[rpc] indexer_listen_addr`) is enabled, `chain_tip_change` and `mempool_change` streams replace polling.
+2. **Route selection per key.**
+   - **Case A** (`scanned_tip + 1 >= retained_from`): a single `BlockFetcher` fetches `getblock(h, 0)` once per height, builds synthetic `CompactBlock`s with `zcash_primitives`, and writes them to the shared cache at `cache/blocks.sqlite` (an implementation of `zcash_client_backend::data_api::chain::BlockCache`). Each key runs `scan_cached_blocks` over the cache. Transparent outputs for the wallet's addresses are indexed from the raw blocks at the same time, since compact blocks carry none and a pruned node's address indexes are not maintained.
+   - **Case B** (`scanned_tip + 1 < retained_from`, historical restore): `ArtiTorLwdBackend` bootstraps Tor, calls `GetSubtreeRoots` to seed the Sapling and Orchard ShardTrees (`put_sapling_subtree_roots` / `put_orchard_subtree_roots`), streams `GetBlockRange(scanned_tip + 1 .. retained_from + k)` with `k = 10`, and at `V = retained_from + k` validates the stream against the trusted local node: tree roots and leaf counts from `z_gettreestate(V)`, the `prev_hash` chain against `getblockhash`, and completed subtree roots against `z_getsubtreesbyindex`. On any mismatch the key is truncated to its birthday and the endpoint is marked untrusted. On success the key continues in Case A.
+3. **Reorgs.** Each poll compares the stored hash at `scanned_tip` with `getblockhash`; the scanner's `PrevHashMismatch` is the second detector. The fork point is found by walking back at most 100 blocks (the node's finality depth, needs verification), `truncate_to_height(f)` rewinds notes, nullifiers and ShardTree checkpoints, and scanning resumes from `f + 1`. Deeper inconsistency puts the key in `Stalled(ChainInconsistent)`.
+4. **Pruning race.** The Case A invariant is checked before every batch and on a "block not available" error; on violation the key falls back to Case B when a fallback endpoint is configured, else `Stalled(PrunedPastScanTip)`. `gygesd` warns at startup if the node's `tx_retention` is below `min_retention_blocks`.
+5. **"Synced".** *scanned*: `scanned_tip >= tip_height`. *spendable*: additionally `suggest_scan_ranges()` returns nothing above priority `Ignored`. Both are returned by `GetSyncStatus`; `sync wait` defaults to spendable.
 
-### 3.2 Vault Lifecycle & Inline CLI Unlock
-1. **Default State (`Locked`):** On startup, `gygesd` loads only the `UnifiedFullViewingKey` (UFVK) from each key's SQLite `accounts` table. Background scanning and PCZT creation/proving work 24/7 while `Locked`.
-2. **Encrypted Seed on Disk:** For `SigningMode::LocalEncryptedSeed`, the raw 64-byte seed is encrypted with `age` (scrypt/Argon2id passphrase protection) at `~/.gyges/keys/<key_id>/seed.age`.
-3. **Inline Unlock Flow:**
-   - User runs `gyges tx send --key main --to u1... --amount 1.0`.
-   - If `main` is `Locked`, `gygesd` returns `tonic::Status::failed_precondition("VAULT_LOCKED:main")`.
-   - `gyges-cli` intercepts `VAULT_LOCKED`, prompts `Enter passphrase to unlock key 'main': ` via `rpassword`, invokes `UnlockKey(key_id="main", passphrase, ttl_secs=60)`, and immediately re-invokes `SendTransaction`.
-   - Inside `gygesd`, the derived `UnifiedSpendingKey` (USK) is wrapped in `secrecy::SecretBox<UnifiedSpendingKey>` (`Zeroize` on drop) and evicted automatically by a Tokio timer when `expires_at` is reached.
+Reuse: `zcash_client_backend`'s `sync::run` is bound to a lightwalletd gRPC client and is not used for Case A; everything beneath it (`BlockSource`, `BlockCache`, `scan_cached_blocks`, `suggest_scan_ranges`, `update_chain_tip`, the continuity-error truncation loop) is, and the `spend-index` feature routes transparent spent-ness checks to the node.
 
-### 3.3 ZIP-320 (`tex1`) Two-Step Transaction Orchestration
-When the recipient address parses as `zakura_address::kind::tex` (`tex1...` on Mainnet, `textest1...` on Testnet):
-1. **Proposal Generation:** `TxEngine` calls `zakura_client_backend::data_api::wallet::propose_standard_transfer_to_address`.
-2. **Two-Step Plan Construction:**
-   - **Step 1 (Deshielding Hop):** Spends from the wallet's Orchard/Sapling notes to an internal ephemeral transparent P2PKH address (`t1...`) for `amount + step2_zip317_fee`.
-   - **Step 2 (Transparent Hop):** Spends the newly created ephemeral UTXO in a pure `Transparent -> Transparent` transaction to the decoded 20-byte pubkey hash of the `tex1` address.
-3. **Execution:**
-   - Both Step 1 and Step 2 PCZTs are proven and signed during the same user session (so the user only unlocks their vault or scans a Keystone QR once).
-   - `gygesd` broadcasts Step 1 via `sendrawtransaction`, monitors mempool/block inclusion of Step 1's UTXO, and immediately broadcasts Step 2.
+### 3.2 Vault lifecycle and inline unlock
+1. **Locked by default.** On startup `gygesd` loads only the `UnifiedFullViewingKey` from each key's `accounts` table. Scanning, proposal creation, PCZT construction and **Orchard and transparent** proving work while locked. **Sapling spends cannot be proven while locked**: the Sapling prover needs the proof generation key (`ak`, `nsk`), which is derived from the spending key and is not part of any viewing key. For a proposal with Sapling inputs the daemon requests the unlock *before* proving and uses the PCZT **Updater** role to insert each spend's `proof_generation_key` (ZIP 374 field), then proves, signs and drops the key. `watch-only` profiles are therefore "Orchard proving-only".
+2. **Encrypted entropy on disk.** For `local-seed` profiles the 32-byte BIP 39 entropy (not the derived 64-byte seed, so the backup words round-trip) is encrypted with an `age` **scrypt** passphrase recipient at `keys/<key_id>/seed.age`. `age` has no Argon2id mode; the work factor is tuned to about one second and recorded as `seed_format = "age-scrypt-v1"` in `profile.json` so it can be raised by migration. A `rage`-compatible file is a deliberate recovery property.
+3. **Inline unlock flow.**
+   - `gyges tx send --key main --to u1… --amount 1.0` opens the `SendTransaction` server stream.
+   - The daemon emits `Proposed`, proves what it can while locked, then emits `SignatureRequired { key_id, kind: PASSPHRASE, session_id }`.
+   - `gyges-cli` prompts `Enter passphrase to unlock key 'main':` (only on a TTY; otherwise exit 4, see CLI_SPEC.md §1.2), calls `UnlockKey { key_id, passphrase, scope: CONNECTION }`, receives a `session_token` bound to that connection, and continues the stream with it.
+   - Inside `gygesd` the derived `UnifiedSpendingKey` lives in `secrecy::Secret<…>` (zeroized on drop), is used only for the signing step and dropped immediately after. The explicit `gyges key unlock --timeout` path creates a daemon-scoped session with an idle TTL (`vault.unlock_ttl`, default `5m`) instead; it is the weaker mode and documented as such in `API.md`.
+   - Errors are typed: `failed_precondition` with a `GygesError { reason: VAULT_LOCKED, key_id }` detail, never a string the client has to parse.
 
-### 3.4 Keystone 3 Pro Hardware Signing (`KeystoneQr`)
-1. **Import (`gyges key import-keystone`):** Parses a `ur:zcash-accounts/...` string (CBOR tag `49201`), extracts the master fingerprint, UFVK, and birthday height, and initializes `~/.gyges/keys/<key_id>/wallet.sqlite`.
-2. **Signing (`gyges tx send` or `gyges pczt sign`):**
-   - `gygesd` builds the PCZT, runs `zakura_pczt::roles::prover::Prover` on the host CPU (14x faster Halo2 proving via `zakura-pasta-curves`), and strips witness bloat via `zakura_pczt::roles::redactor::Redactor`.
-   - `gygesd` streams the raw PCZT bytes in a `SendTransactionEvent::KeystoneSignRequired` gRPC message to `gyges-cli`.
-   - `gyges-cli` encodes the PCZT as a multi-part fountain `ur:zcash-pczt` (CBOR tag `49204`) and renders an 8 FPS UTF-8 half-block QR loop in the terminal.
-   - User signs on Keystone and pastes/scans the resulting `ur:zcash-pczt` string back into `gyges-cli`, which submits it to `gygesd` via `CompleteKeystoneSign` for final extraction (`TxExtractor`) and broadcast.
+### 3.3 ZIP 320 (`tex1`) two-step orchestration
+When the recipient parses as a TEX address (`zcash_address::ZcashAddress::try_from_tex` on the decoded form; there is no `kind::tex` module):
+1. **Proposal.** `propose_standard_transfer_to_address` returns a two-step `Proposal`.
+2. **Plan.** *Step 1* spends shielded notes to an ephemeral transparent P2PKH address derived from the ZIP 32 ephemeral chain, for exactly `amount + fee₂` with no change on that address. *Step 2* spends that single output to the 20-byte pubkey hash of the `tex1` address in a pure transparent transaction (one input, one output, so `fee₂` is the ZIP 317 minimum and fixed at proposal time). ZIP 320 mandates the two-transaction structure and seed-recoverable, unlinkable ephemeral addresses; the exact output value, derivation path and gap limit are `zcash_client_backend` implementation behaviour, not ZIP text.
+3. **Execution.** `create_proposed_transactions` builds, stores and returns both txids with a shared `expiry_height`; both are signed in the same session (one passphrase or one Keystone scan). `TexQueue` persists both raw transactions in `gyges_tex_queue`, broadcasts Step 1 then Step 2 immediately (the Zakura mempool accepts a transaction spending an unconfirmed transparent output of another mempool transaction and evicts descendants with their parent), and drives the row through `built → step1_broadcast → step2_broadcast → step1_mined → step2_mined`. Reorg or eviction of Step 1 invalidates Step 2 and the queue rebroadcasts both; shared expiry means both expire together and funds never leave the shielded pool; Step 1 mined with Step 2 expired is `step2_failed`, and `gyges tx resume` builds a new Step 2 through a fresh signing session. Seed-only recovery finds a stranded ephemeral UTXO through the ephemeral-receiver gap scan and it reappears as transparent balance.
+4. **Dry run.** `--dry-run` returns the full proposal, rendered one block per step with `Total debit: amount + fee₁ + fee₂`; `--json` emits the upstream proposal protobuf as proto3 JSON.
+
+### 3.4 Keystone 3 Pro hardware signing (`keystone-qr`)
+1. **Import (`gyges key import-keystone`).** Parses `ur:zcash-accounts` (49201): `seed_fingerprint`, `accounts: [{ufvk, index, name?}]`, `device_version?`. The payload carries **no birthday**; `--birthday` is required or prompted, defaulting to the NU5 activation height (1,687,104 on mainnet) because the exported UFVK has only transparent and Orchard components and cannot have received shielded funds earlier. `profile.json` records `spend_pools = ["orchard", "transparent"]` (Ironwood when enabled) and `device_version`; firmware older than the minimum Zodl requires is refused. Keystone does not sign Sapling spends.
+2. **Signing (`gyges tx send` or `gyges pczt sign`).**
+   - `gygesd` builds the PCZT and proves it on the host (`pczt::roles::prover::Prover` with `zcash_proofs::prover::LocalTxProver`), then stores the proven PCZT in a `gyges_signing_sessions` row and emits `SignatureRequired { kind: KEYSTONE, session_id }`.
+   - **Shielded-only sends** use the batch protocol: the daemon runs `redact_pczt_for_batch_signer`, `gyges-cli` encodes `ur:zcash-sign-batch` (49205) as fountain frames and renders an 8 FPS UTF-8 half-block QR loop; the device returns `ur:zcash-batch-sig-result` (49207), a single frame of `(pool, action_index, signature)` tuples with the echoed `request_id`, which the daemon applies to its stored proven PCZT. No Combiner is needed.
+   - **Sends with transparent inputs** (shielding, ZIP 320 Step 2) use the single-PCZT protocol: `Redactor` strips proofs, witnesses and the Gyges `proprietary` map but **never** amounts, recipients or memos the device displays; the device returns the signed `ur:zcash-pczt` (49204); the daemon runs **Combiner** on (proven ⊕ signed), which rejects structurally different PCZTs and is the correlation check. TEX Step 2 on Keystone is **needs verification on hardware**.
+   - Both paths then run **Verifier** against the stored proposal (refusing to broadcast if any output, amount, fee or anchor differs), **Spend Finalizer**, **Tx Extractor**, and broadcast. `tx send` prints the same summary the device shows.
+   - Host ingestion of the device's QR: `gyges pczt qr-scan` (laptop camera, used automatically when present), `gyges pczt qr-import --from-file` / stdin (one `ur:` frame per line), or positional frames for single-frame payloads. Sessions survive restarts, expire after `vault.signing_session_ttl` (default `24h`), and can be completed later with `--session <id>` (CLI_SPEC.md §2.6).
+
+### 3.5 Air-gapped PCZT flow (`signer-only`, `gygesd --airgapped`)
+A PCZT produced online after the Constructor and Updater roles carries, per spend, the note, `rseed`, Merkle witness and anchor, so the offline box needs no chain state and no `wallet.sqlite`. Transport is a binary `.pczt` file (postcard serialization) on removable media: `gyges pczt create … -o tx.pczt` online → `gyges pczt prove tx.pczt | gyges pczt sign -o tx.signed.pczt` offline → `gyges pczt broadcast tx.signed.pczt` online, where the online side runs Verifier first. QR transport works but a proven Orchard action is several kilobytes, so it is documented as slow. PCZTs carry `gyges.key_id`, `gyges.network` and `gyges.session_id` in the ZIP 374 global `proprietary` map; `--key` is only an assertion.
+
+### 3.6 Daemon lifecycle
+- **Start.** `gyges daemon start` (or the `launchd`/`systemd --user` unit written by `gyges daemon install`). The CLI does not auto-start the daemon (exit 3 with the fix) unless `GYGES_AUTOSTART=1`. Startup refuses to run if `~/.gyges/<network>` has permissions wider than 0700/0600.
+- **Connections.** One UDS per network at `~/.gyges/<network>/gygesd.sock`, mode 0600 (0660 with a `gyges` group in the hardened deployment). Every accepted connection is checked with `SO_PEERCRED`/`LOCAL_PEERCRED` against the daemon's uid (or an allow-list).
+- **Stop.** `gyges daemon stop` finishes the current scan batch (at most one `scan_cached_blocks` call), checkpoints SQLite WAL, leaves `gyges_tex_queue` and `gyges_signing_sessions` rows in place to resume on next start, aborts in-progress proving, and zeroizes every unlocked key.
+- **Logs.** `logs/gygesd.log` (daily rotation, seven files) and `logs/audit.log` (unlock, lock, export, session, broadcast events with key id and time only). `gyges daemon logs` uses the `StreamLogs` RPC. Sensitive values are wrapped in `Sensitive<T>` whose `Debug`/`Display` print a placeholder.
+
+### 3.7 Performance features
+Multi-threaded proving and trial decryption are behind the `gyges-core` features `perf`, `perf-asm-x86_64` and `perf-asm-aarch64` (`multicore` plus the `*-asm` back-ends of `zakura-pasta-curves` and `zakura-orchard`). Release binaries ship with `portable` until runtime CPU-feature detection in the assembly paths is confirmed. Speed-up claims belong in `docs/BENCHMARKS.md` with a per-CPU table, not here.
 
 ---
 
-## 4. Directory & Configuration Layout (`~/.gyges/`)
+## 4. Directory & Configuration Layout (`~/.gyges/<network>/`)
+
+One directory per network so mainnet, testnet and regtest daemons coexist (full schema in `DATA_MODEL.md`):
 
 ```text
 ~/.gyges/
-├── config.toml                  # Daemon & network configuration
-├── gygesd.sock                  # Unix Domain Socket (0600 permissions)
-├── gygesd.pid                   # Active daemon PID
-├── tor_cache/                   # Arti Tor directory & consensus cache
-└── keys/
-    ├── main/
-    │   ├── profile.json         # KeyProfile metadata (id, birthday, signing_mode)
-    │   ├── wallet.sqlite        # zakura-client-sqlite WalletDb (UFVK, notes, ShardTree)
-    │   └── seed.age             # Age-encrypted entropy (absent for KeystoneQr / WatchOnly)
-    └── keystone-vault/
-        ├── profile.json
-        └── wallet.sqlite
+└── mainnet/                     # 0700
+    ├── config.toml              # daemon configuration (the CLI never reads it)
+    ├── gygesd.sock              # Unix Domain Socket, 0600
+    ├── gygesd.pid
+    ├── tor_cache/               # arti directory and consensus cache
+    ├── cache/blocks.sqlite      # shared CompactBlock cache, 0600
+    ├── logs/{gygesd.log,audit.log}
+    └── keys/
+        ├── main/
+        │   ├── profile.json     # id, signing_mode, birthday_height, spend_pools, receive_pools, seed_format
+        │   ├── wallet.sqlite    # zcash_client_sqlite WalletDb + gyges_* tables
+        │   └── seed.age         # age-scrypt encrypted BIP 39 entropy (local-seed, signer-only only)
+        └── keystone-vault/
+            ├── profile.json
+            └── wallet.sqlite
 ```
 
-### Example `~/.gyges/config.toml`
+### Example `config.toml`
+Valid TOML; `~` is expanded by the daemon in every path value.
+
 ```toml
 network = "mainnet"
-socket_path = "~/.gyges/gygesd.sock"
 default_key = "main"
 airgapped = false
+min_retention_blocks = 10000
 
 [zakura_rpc]
-url = "[http://127.0.0.1:8232](http://127.0.0.1:8232)"
+url = "http://127.0.0.1:8232"
 cookie_path = "~/.cache/zakura/.cookie"
 poll_interval_secs = 15
+# indexer_grpc_url = "http://127.0.0.1:8233"   # optional zakurad indexer gRPC
 
 [fallback_lightwalletd]
-enabled = true
-grpc_url = "[https://mainnet.lightwalletd.com:9067](https://mainnet.lightwalletd.com:9067)"
+enabled = false
+# grpc_url is required when enabled = true; there is no default (Q-D5).
+# grpc_url = "https://example-archival-endpoint:9067"
 use_tor = true
 broadcast_via_tor = false
+
+[vault]
+unlock_ttl = "5m"
+signing_session_ttl = "24h"
+allow_seed_export = true
+
+[cache]
+retain_blocks = 1000
+max_mb = 2048
+keep_historical = false
+
+[mempool]
+scan = true
 ```

@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/gyges-proto",
     "crates/gyges-qr",
@@ -12,59 +12,130 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# The published Zakura crates (wallet-libraries 0.1.0-rc9.1, common 4.0.0-rc2)
+# all declare rust-version = 1.97, so Gyges cannot go lower.
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/tynes/gyges"
 
+# ---------------------------------------------------------------------------
+# Dependency policy (OVERVIEW.md Q-D3)
+#
+# * Every `zakura-*` crate is pinned with `=` and `Cargo.lock` is committed;
+#   CI runs `cargo build --locked`. Bumps are one PR per Zakura release.
+# * Crates are imported under their *upstream* library-target names
+#   (`zcash_client_backend`, `pczt`, `orchard`, ...) via `package =` renames,
+#   which is the convention documented in the zakura-core/wallet-libraries
+#   README. Code therefore reads `use zcash_client_backend::...`, never
+#   `use zakura_client_backend::...`.
+# * The wallet-libraries rc9.1 / rc7 releases depend on the common crates at
+#   exactly `=4.0.0-rc2` (verified on crates.io 2026-10-20). Any other pin for
+#   the common crates fails to resolve, including the newer `4.0.0-rc3`.
+# * Shared transitive crates (`rand`, `secrecy`, `rusqlite`, `shardtree`,
+#   `tonic`, `prost`, `bip0039`) are pinned to the major the Zakura crates
+#   use so that their types interoperate and only one major is linked.
+# ---------------------------------------------------------------------------
 [workspace.dependencies]
-# --- Zakura Core Wallet & Crypto Stack ---
-# Pointed at zakura-core/wallet-libraries and zakura-core/common (or crates.io releases)
-zakura-client-backend = { version = "0.15", features = ["lightwalletd-tonic", "tor", "pczt", "orchard", "transparent-inputs"] }
-zakura-client-sqlite  = { version = "0.13", features = ["orchard", "transparent-inputs", "serde"] }
-zakura-pczt           = { version = "0.2", features = ["zcp-builder", "io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor", "orchard", "sapling", "transparent"] }
-zakura-keys           = { version = "0.5", features = ["orchard", "sapling", "transparent-inputs"] }
-zakura-address        = { version = "0.6" }
-zakura-primitives     = { version = "0.19" }
-zakura-proofs         = { version = "0.19", features = ["bundled-prover"] }
-zakura-orchard        = { version = "0.10" }
-zakura-sapling-crypto = { version = "0.4" }
-zakura-transparent    = { version = "0.2" }
-zakura-pasta-curves   = { version = "0.5" } # 14x Halo2 / 1.5x trial-decrypt BMI2+ADX assembly
-zakura-pir-status     = { version = "0.1" }
+# --- Zakura wallet libraries (zakura-core/wallet-libraries) ---
+zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc9.1", features = [
+    "lightwalletd-tonic",            # CompactTxStreamer client for the Tor backfill route
+    "lightwalletd-tonic-transport",  # tonic transport for direct gRPC in tests (use_tor = false)
+    "tor",                           # embedded arti-client; pulls arti-client/tor-rtcompat at the version the backend wants
+    "pczt",                          # PCZT construction via `create_pczt_from_proposal`
+    "orchard",
+    "transparent-inputs",
+    "spend-index",                   # node-backed spent-outpoint lookups (Q-D4)
+    "sync",                          # the `BlockCache` trait is gated behind this feature (not source-agnostic as the review assumed)
+] }
+zcash_client_sqlite = { package = "zakura-client-sqlite", version = "=0.1.0-rc9.1", features = [
+    "orchard",
+    "transparent-inputs",
+    "spend-index",
+    "serde",
+] }
+pczt = { package = "zakura-pczt", version = "=0.1.0-rc7", features = [
+    "zcp-builder", "io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor",
+    "orchard", "sapling", "transparent",
+] }
+zakura-pir-status = { version = "=0.0.1-rc1" }   # experimental; only `gyges tx status --pir`
 
-# --- Async Runtime & IPC (gRPC over Unix Domain Socket) ---
+# --- Zakura common crates (zakura-core/common) ---
+zcash_keys        = { package = "zakura-keys",           version = "=4.0.0-rc2", features = ["orchard", "sapling", "transparent-inputs"] }
+zcash_address     = { package = "zakura-address",        version = "=4.0.0-rc2" }
+zcash_protocol    = { package = "zakura-protocol",       version = "=4.0.0-rc2" }
+zcash_primitives  = { package = "zakura-primitives",     version = "=4.0.0-rc2", features = ["transparent-inputs"] }
+zcash_proofs      = { package = "zakura-proofs",         version = "=4.0.0-rc2", features = ["bundled-prover"] }
+orchard           = { package = "zakura-orchard",        version = "=4.0.0-rc2" }
+sapling           = { package = "zakura-sapling-crypto", version = "=4.0.0-rc2" }
+transparent       = { package = "zakura-transparent",    version = "=4.0.0-rc2" }
+pasta_curves      = { package = "zakura-pasta-curves",   version = "=4.0.0-rc2" }
+
+# --- Shared crates whose major must match the Zakura stack ---
+rand       = "0.10"
+secrecy    = "0.8"                                   # zcash_keys takes `SecretVec<u8>` from secrecy 0.8
+zeroize    = { version = "1.8", features = ["derive"] }
+bip0039    = "0.12"                                  # 0.12 is what zcash_keys/zcash_client_sqlite use; it has no `zeroize` feature
+rusqlite   = { version = "0.37", features = ["bundled", "time"] }
+shardtree  = "0.7"
+time       = "0.3"
+
+# --- Async runtime & IPC (gRPC over Unix Domain Socket) ---
 tokio        = { version = "1.42", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["net"] }
-tonic        = { version = "0.12", features = ["tls", "tls-roots", "transport"] }
-prost        = "0.13"
-tower        = "0.5"
-hyper-util   = { version = "0.1", features = ["tokio"] }
-reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-stream = { version = "0.1", features = ["net"] }       # UnixListenerStream for the UDS server
+tonic        = { version = "0.14", features = ["transport"] }
+tonic-prost  = "0.14"                                         # prost codec for tonic 0.14
+prost        = "0.14"
+tower        = "0.5"                                          # service_fn connector for UDS clients
+hyper-util   = { version = "0.1", features = ["tokio"] }      # TokioIo adapter between tonic and UnixStream
+reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }  # zakurad JSON-RPC client
 
-# --- Tor & Privacy ---
-arti-client  = { version = "0.25", features = ["tokio", "rustls"] }
-tor-rtcompat = { version = "0.25", features = ["tokio", "rustls"] }
+# --- Key encryption ---
+age = { version = "0.12", features = ["armor"] }              # scrypt passphrase recipient (Q-S5); no Argon2id
 
-# --- Key Encryption & Memory Safety ---
-age          = { version = "0.11", features = ["armor"] }
-secrecy      = { version = "0.10", features = ["serde"] }
-zeroize      = { version = "1.8", features = ["derive"] }
-bip0039      = { version = "0.12", features = ["zeroize"] }
-rand         = "0.8"
+# --- Keystone hardware wallet (BC-UR) & terminal QR ---
+ur          = "0.5"
+ur-registry = { version = "1.0", default-features = false, features = ["std"] }  # tags 49201..49207 (Q-K6); default `core` feature needs nightly (thiserror-core)
+qrcode      = { version = "0.14", default-features = false }
 
-# --- Keystone Hardware Wallet (BC-UR) & Terminal QR ---
-ur           = "0.4"
-ur-registry  = "0.2"
-minicbor     = { version = "0.25", features = ["alloc", "derive"] }
-qrcode       = { version = "0.14", default-features = false }
-
-# --- CLI, Config & Observability ---
-clap         = { version = "4.5", features = ["derive", "env"] }
-rpassword    = "7.3"
-serde        = { version = "1.0", features = ["derive"] }
-serde_json   = "1.0"
-toml         = "0.8"
-anyhow       = "1.0"
-thiserror    = "2.0"
-tracing      = "0.1"
+# --- CLI, config & observability ---
+clap               = { version = "4.5", features = ["derive", "env"] }
+rpassword          = "7.3"
+serde              = { version = "1.0", features = ["derive"] }
+serde_json         = "1.0"
+toml               = "1"
+anyhow             = "1.0"
+thiserror          = "2.0"
+tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-hex          = "0.4"
+tracing-appender   = "0.2"                                    # daily rotation of gygesd.log (Q-O1)
+hex                = "0.4"
+
+# --- Build ---
+tonic-prost-build = "0.14"
+
+# --- Internal crates ---
+gyges-proto = { path = "crates/gyges-proto" }
+gyges-qr    = { path = "crates/gyges-qr" }
+gyges-chain = { path = "crates/gyges-chain" }
+gyges-core  = { path = "crates/gyges-core" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Key types must not derive Debug (Q-O1); enforce by review until a lint config exists.
+dbg_macro = "deny"
+print_stdout = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "unwind"
+
+# Proving and trial decryption are unusable at opt-level 0; keep dependencies
+# optimised in dev builds while Gyges' own crates stay fast to compile.
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,30 @@
+[package]
+name = "gygesd"
+description = "Gyges wallet daemon: hosts the UDS tonic server and the background sync, mempool and TexQueue loops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "gygesd"
+path = "src/main.rs"
+
+[dependencies]
+gyges-proto = { workspace = true }
+gyges-core = { workspace = true }
+gyges-chain = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+
+[lints]
+workspace = true
