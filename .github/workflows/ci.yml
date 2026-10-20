@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: check, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # Ubuntu's apt protoc is 3.21 (2022) and rejects the `debug_redact`
+      # field option, which needs protobuf 22 or newer.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo fmt --all -- --check
+      - run: cargo build --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets
+      - run: cargo test --locked --workspace
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+  docs:
+    name: proto and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Ubuntu's apt protoc is 3.21 (2022) and rejects the `debug_redact`
+      # field option, which needs protobuf 22 or newer.
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate proto
+        run: protoc --proto_path=proto --descriptor_set_out=/dev/null proto/gyges.proto
+      - name: Validate config example in DATA_MODEL.md parses as TOML
+        run: |
+          python3 - <<'PY'
+          import re, tomllib, sys
+          text = open("DATA_MODEL.md").read()
+          blocks = re.findall(r"```toml\n(.*?)```", text, re.S)
+          assert blocks, "no toml blocks found"
+          for b in blocks:
+              tomllib.loads(b)
+          print(f"{len(blocks)} toml block(s) parse")
+          PY
+
+  # Regtest end-to-end job (TESTING.md) is added once a pinned zakurad release
+  # exists for CI; see ROADMAP.md milestone M1.

@@ -1,0 +1,18 @@
+[package]
+name = "gyges-qr"
+description = "UTF-8 half-block terminal QR renderer and BC-UR (Keystone registry tags 49201-49207) codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+qrcode = { workspace = true }
+ur = { workspace = true }
+ur-registry = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

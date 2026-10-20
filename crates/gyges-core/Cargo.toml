@@ -1,0 +1,51 @@
+[package]
+name = "gyges-core"
+description = "KeyRegistry, VaultManager, SyncScheduler, TxEngine and TexQueue for gygesd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = []
+# Multi-threaded proving and trial decryption (OVERVIEW.md Q-D6). Enabled by
+# the release workflow; the assembly back-ends are selected per target there
+# because Cargo features cannot be conditioned on `target_arch`.
+perf = ["pasta_curves/multicore", "orchard/multicore", "zcash_proofs/multicore"]
+perf-asm-x86_64 = ["perf", "pasta_curves/x86_64-asm", "orchard/x86_64-asm"]
+perf-asm-aarch64 = ["perf", "pasta_curves/aarch64-asm", "orchard/aarch64-asm"]
+
+[dependencies]
+gyges-chain = { workspace = true }
+zcash_client_backend = { workspace = true }
+zcash_client_sqlite = { workspace = true }
+zcash_keys = { workspace = true }
+zcash_address = { workspace = true }
+zcash_protocol = { workspace = true }
+zcash_primitives = { workspace = true }
+zcash_proofs = { workspace = true }
+pczt = { workspace = true }
+orchard = { workspace = true }
+sapling = { workspace = true }
+transparent = { workspace = true }
+pasta_curves = { workspace = true }
+rusqlite = { workspace = true }
+shardtree = { workspace = true }
+rand = { workspace = true }
+secrecy = { workspace = true }
+zeroize = { workspace = true }
+bip0039 = { workspace = true }
+age = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+
+[lints]
+workspace = true
