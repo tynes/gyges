@@ -11,6 +11,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod config;
+pub mod network;
+pub mod paths;
+pub mod perms;
+
+pub use config::{Config, ConfigError};
+pub use network::Network;
+pub use paths::Home;
+
 /// How a key profile signs (DATA_MODEL.md `profile.json`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]

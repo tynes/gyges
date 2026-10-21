@@ -2259,13 +2259,12 @@ dependencies = [
  "clap",
  "gyges-proto",
  "gyges-qr",
- "hyper-util",
+ "humantime",
  "rpassword",
  "serde",
  "serde_json",
  "tokio",
  "tonic",
- "tower",
 ]
 
 [[package]]
@@ -2276,12 +2275,14 @@ dependencies = [
  "bip0039",
  "gyges-chain",
  "hex",
+ "humantime-serde",
  "rand 0.10.3",
  "rusqlite",
  "secrecy 0.8.0",
  "serde",
  "serde_json",
  "shardtree",
+ "tempfile",
  "thiserror 2.0.21",
  "time",
  "tokio",
@@ -2306,10 +2307,18 @@ dependencies = [
 name = "gyges-proto"
 version = "0.1.0"
 dependencies = [
+ "hyper-util",
+ "pbjson",
+ "pbjson-build",
  "prost 0.14.4",
+ "prost-types 0.14.4",
+ "serde",
+ "serde_json",
+ "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower",
 ]
 
 [[package]]
@@ -2323,6 +2332,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gyges-regtest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "gygesd"
 version = "0.1.0"
 dependencies = [
@@ -2331,11 +2349,14 @@ dependencies = [
  "gyges-chain",
  "gyges-core",
  "gyges-proto",
- "serde",
+ "http",
+ "nix",
+ "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
- "toml 1.1.8+spec-1.1.0",
  "tonic",
+ "tower",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -3442,6 +3463,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
 name = "no_std_io2"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3777,6 +3810,28 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pbjson"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8edd1efdd8ab23ba9cb9ace3d9987a72663d5d7c9f74fa00b51d6213645cf6c"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+]
+
+[[package]]
+name = "pbjson-build"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ed4d5c6ae95e08ac768883c8401cf0e8deb4e6e1d6a4e1fd3d2ec4f0ec63200"
+dependencies = [
+ "heck 0.5.0",
+ "itertools 0.14.0",
+ "prost 0.14.4",
+ "prost-types 0.14.4",
+]
 
 [[package]]
 name = "pbkdf2"

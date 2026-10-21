@@ -22,13 +22,13 @@
 
 Scope: `local-seed` profiles only; Case A sync against a local Zakura node; `tx send` to `u1` and `t1`; `balance`, `notes`, `tx list`; inline unlock; `daemon start/stop/status`.
 
-- [ ] `gyges-proto` build, UDS server in `gygesd` with `SO_PEERCRED` check, UDS client in `gyges-cli`, `GetInfo` handshake and version check.
+- [x] `gyges-proto` build, UDS server in `gygesd` with `SO_PEERCRED` check, UDS client in `gyges-cli`, `GetInfo` handshake and version check. Also landed with it: `config.toml` loading with the documented defaults, the 0700/0600 permission sweep, the `gygesd.pid` lock, `--airgapped` RPC gating, `Shutdown`, and `gyges daemon start/stop/status`.
 - [ ] `KeyRegistry` + `profile.json` + permission enforcement; `key init`, `key restore` (birthday inside retention window only), `key list`.
 - [ ] `VaultManager`: `seed.age` (age scrypt), connection-scoped and daemon-scoped sessions, rate limiting, zeroize on stop.
 - [ ] `ZakuraRpcBackend`: `getblockchaininfo` bounds, `getblock(h,0)` → `CompactBlock`, shared `cache/blocks.sqlite` implementing `BlockCache`, transparent output indexing from raw blocks.
 - [ ] `SyncScheduler` Case A only: `scan_cached_blocks`, `suggest_scan_ranges`, reorg truncation, `sync status` / `sync wait`.
 - [ ] `TxEngine`: `propose_transfer` → `create_pczt_from_proposal` → Prover → Signer → Verifier → Spend Finalizer → Tx Extractor → `sendrawtransaction`; `--dry-run`; typed `GygesError` and exit codes.
-- [ ] Regtest harness (`tests/regtest/`): pinned `zakurad`, generate, init → mine → send → reorg of 3 blocks. CI job added.
+- [ ] Regtest harness (`tests/regtest/`): pinned `zakurad`, generate, init → mine → send → reorg of 3 blocks. CI job added. *(The harness and the daemon-lifecycle scenarios exist and run in the ordinary `test` job; the node is not wired in yet.)*
 - [ ] Log redaction test; audit log.
 
 Exit criterion: a fresh user can run a regtest node, `gyges key init`, mine, `gyges tx send`, and see the balance move, with CI proving it.

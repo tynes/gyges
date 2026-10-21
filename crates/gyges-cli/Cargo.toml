@@ -17,12 +17,11 @@ gyges-proto = { workspace = true }
 gyges-qr = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
-tower = { workspace = true }
-hyper-util = { workspace = true }
 clap = { workspace = true }
 rpassword = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+humantime = { workspace = true }
 anyhow = { workspace = true }
 
 [lints]

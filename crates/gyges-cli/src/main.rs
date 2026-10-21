@@ -1,86 +1,152 @@
 //! `gyges` – thin gRPC client for `gygesd` (CLI_SPEC.md, API.md).
 //!
 //! The CLI reads flags and environment variables only, never `config.toml`
-//! (OVERVIEW.md Q-C1). Nothing is implemented yet; the command tree below is
-//! the top level of CLI_SPEC.md so that `gyges --help` matches the spec.
+//! (OVERVIEW.md Q-C1). Every invocation connects to the Unix socket, runs the
+//! `GetInfo` handshake (API version, network), then issues exactly one RPC.
+//! The command groups below `daemon` are declared so that `gyges --help`
+//! matches CLI_SPEC.md; those not yet implemented exit 1 with a pointer to
+//! ROADMAP.md.
 
 #![forbid(unsafe_code)]
+// Printing to stdout is this binary's purpose.
+#![allow(clippy::print_stdout)]
 
-use clap::{Parser, Subcommand};
+mod client;
+mod daemon;
+mod exit;
+mod output;
+
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// Process exit codes (OVERVIEW.md Q-C3, API.md). Kept in one place so the
-/// mapping from the typed `GygesError.reason` lives in a single function.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Exit {
-    Ok = 0,
-    Failure = 1,
-    Usage = 2,
-    DaemonUnreachable = 3,
-    AuthorizationRequired = 4,
-    InsufficientFunds = 5,
-    InvalidArgument = 6,
-    NotReady = 7,
-    Cancelled = 8,
-    HardwareSigner = 9,
-    NodeRejected = 10,
-}
+use clap::{Args, Parser, Subcommand};
+use gyges_proto::v1::Network;
+
+use crate::client::Ctx;
+use crate::exit::CliError;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "gyges",
-    version,
-    about = "Gyges Zcash wallet CLI (pre-alpha, not functional)"
-)]
+#[command(name = "gyges", version, about = "Gyges Zcash wallet CLI (pre-alpha)")]
 struct Cli {
-    /// Path to the gygesd Unix Domain Socket.
-    #[arg(short, long, env = "GYGES_SOCKET", global = true)]
-    socket: Option<String>,
-    /// Target key profile; empty means the daemon's `default_key`.
-    #[arg(short, long, env = "GYGES_KEY", global = true)]
-    key: Option<String>,
-    /// Network: mainnet | testnet | regtest. Selects `~/.gyges/<network>/`.
-    #[arg(short, long, env = "GYGES_NETWORK", global = true)]
-    network: Option<String>,
-    /// Emit machine-readable JSON (proto3 JSON of the gRPC response).
-    #[arg(short, long, global = true)]
-    json: bool,
-    /// Suppress progress bars, spinners and banners.
-    #[arg(short, long, global = true)]
-    quiet: bool,
-    /// Never prompt; exit 4 when a passphrase or hardware signature is needed.
-    #[arg(long, env = "GYGES_NON_INTERACTIVE", global = true)]
-    non_interactive: bool,
+    #[command(flatten)]
+    global: Global,
     #[command(subcommand)]
     command: Command,
+}
+
+/// Global options (CLI_SPEC.md §1.1).
+#[derive(Debug, Clone, Args)]
+pub struct Global {
+    /// gygesd Unix Domain Socket [default: $GYGES_HOME/<network>/gygesd.sock].
+    #[arg(short, long, env = "GYGES_SOCKET", global = true, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+    /// Target key profile [default: the daemon's config `default_key`].
+    #[arg(short, long, env = "GYGES_KEY", global = true, value_name = "KEY_ID")]
+    pub key: Option<String>,
+    /// mainnet | testnet | regtest; selects the daemon and is checked against it.
+    #[arg(short, long, env = "GYGES_NETWORK", global = true, value_name = "NET", value_parser = parse_network)]
+    pub network: Option<Network>,
+    /// Emit machine-readable JSON to stdout (one object per line for streams).
+    #[arg(short, long, global = true)]
+    pub json: bool,
+    /// Suppress progress bars, spinners and banners.
+    #[arg(short, long, global = true)]
+    pub quiet: bool,
+    /// Never prompt; exit 4 when a passphrase or hardware signature is needed.
+    #[arg(long, env = "GYGES_NON_INTERACTIVE", global = true)]
+    pub non_interactive: bool,
+    /// Read the vault passphrase from file descriptor N.
+    #[arg(long, global = true, value_name = "N")]
+    pub passphrase_fd: Option<u32>,
+}
+
+fn parse_network(s: &str) -> Result<Network, String> {
+    Network::from_name(s).ok_or_else(|| format!("expected mainnet, testnet or regtest, got `{s}`"))
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start, stop and inspect gygesd.
-    Daemon,
+    #[command(subcommand)]
+    Daemon(daemon::DaemonCmd),
     /// Key profiles and vault unlock/lock.
-    Key,
+    Key(Unimplemented),
     /// Synchronisation status and control.
-    Sync,
+    Sync(Unimplemented),
     /// Addresses and terminal QR codes.
-    Address,
+    Address(Unimplemented),
     /// Balances per pool.
-    Balance,
+    Balance(Unimplemented),
     /// Decrypted notes and UTXOs.
-    Notes,
+    Notes(Unimplemented),
     /// High-level transactions.
-    Tx,
+    Tx(Unimplemented),
     /// PCZT role pipeline for Unix pipes and air-gapped signing.
-    Pczt,
+    Pczt(Unimplemented),
 }
 
-fn main() -> ExitCode {
+/// Accepts any arguments so that `gyges key list` is "not implemented"
+/// (exit 1) rather than a usage error (exit 2).
+#[derive(Debug, Args)]
+struct Unimplemented {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    _rest: Vec<OsString>,
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
-    eprintln!(
-        "gyges: `{:?}` is not implemented yet; see ROADMAP.md",
-        cli.command
-    );
-    ExitCode::from(Exit::Failure as u8)
+    let json = cli.global.json;
+    match run(cli).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            if json {
+                println!("{}", output::error_json(&err));
+            } else {
+                eprintln!("gyges: {}", err.message());
+            }
+            err.exit().into()
+        }
+    }
+}
+
+async fn run(cli: Cli) -> Result<(), CliError> {
+    let ctx = Ctx::new(cli.global)?;
+    match cli.command {
+        Command::Daemon(cmd) => daemon::run(&ctx, cmd).await,
+        Command::Key(_) => Err(CliError::NotImplemented("key")),
+        Command::Sync(_) => Err(CliError::NotImplemented("sync")),
+        Command::Address(_) => Err(CliError::NotImplemented("address")),
+        Command::Balance(_) => Err(CliError::NotImplemented("balance")),
+        Command::Notes(_) => Err(CliError::NotImplemented("notes")),
+        Command::Tx(_) => Err(CliError::NotImplemented("tx")),
+        Command::Pczt(_) => Err(CliError::NotImplemented("pczt")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory as _;
+
+    #[test]
+    fn command_tree_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn global_flags_parse_anywhere() {
+        let cli =
+            Cli::try_parse_from(["gyges", "daemon", "status", "-n", "regtest", "--json"]).unwrap();
+        assert_eq!(cli.global.network, Some(Network::Regtest));
+        assert!(cli.global.json);
+        assert!(Cli::try_parse_from(["gyges", "-n", "devnet", "daemon", "status"]).is_err());
+    }
+
+    #[test]
+    fn unimplemented_groups_accept_any_arguments() {
+        Cli::try_parse_from(["gyges", "key", "list", "--all"]).unwrap();
+        Cli::try_parse_from(["gyges", "tx", "send", "--to", "u1x", "--amount", "1"]).unwrap();
+    }
 }

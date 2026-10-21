@@ -1,0 +1,25 @@
+[package]
+name = "gyges-regtest"
+description = "End-to-end harness and scenarios that drive gygesd through the gyges binary (TESTING.md §2-3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+autotests = false
+
+[lib]
+path = "harness/lib.rs"
+
+[[test]]
+name = "daemon"
+path = "scenarios/daemon.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
