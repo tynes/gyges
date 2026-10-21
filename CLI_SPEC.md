@@ -167,7 +167,7 @@ Static QR for the current address or any address given.
 Parses any Zcash address (`u1`, `utest1`, `zs1`, `t1`, `t3`, `tex1`, `textest1`), validates checksum and network, lists embedded receivers and whether the address is a ZIP 320 TEX address.
 
 #### `gyges balance [--min-conf <N>]`
-**Spendable**, **Pending confirmation** and **Transparent UTXO** balances per pool (Orchard, Sapling, Transparent; Ironwood when enabled). *Spendable* means confirmed to the daemon's anchor depth (`--min-conf`, default 10, the upstream default), with witnesses available.
+**Spendable** and **Pending** balances per pool (Orchard, Ironwood, Sapling, Transparent) with totals and the height they are as of. *Spendable* means confirmed to the daemon's anchor depth (`--min-conf`, default `policy.min_confirmations` = 10, the upstream default), with witnesses available; *pending* is received but below that depth, unmined, or change awaiting confirmation.
 
 #### `gyges notes [--pool <orchard|sapling|transparent>] [--unspent | --spent]`
 Decrypted notes and UTXOs with heights, values, memo previews and witness readiness.
@@ -177,7 +177,7 @@ Decrypted notes and UTXOs with heights, values, memo previews and witness readin
 ### 2.5 Transactions (`gyges tx`)
 
 #### `gyges tx send --to <ADDR> --amount <AMOUNT>`
-Proposes, proves, signs and broadcasts. The proposal summary (inputs per pool, outputs, ZIP 317 fee per step, total debit) is printed before any signature prompt.
+Proposes, proves, signs and broadcasts. The proposal summary (inputs per pool, outputs, ZIP 317 fee per step, total debit) is printed before any signature prompt; without `--yes` it comes from a dry run and is confirmed before the real send starts (no terminal: exit 4, `CONFIRMATION_REQUIRED`). The txid goes to stdout; progress goes to stderr.
 - **Inline unlock (`local-seed`):** on `SignatureRequired`, prompts for the passphrase, creates a connection-scoped session and continues; the key is dropped after signing.
 - **Keystone (`keystone-qr`):** renders the animated UR QR (batch protocol for shielded-only sends, single-PCZT when transparent inputs are present) and reads the result from the camera (`qr-scan`), a file, stdin or pasted frames.
 - **ZIP 320 (`tex1`):** runs the two-step plan through the durable `TexQueue`; prints `tex pending (step 2 of 2)` until Step 2 is mined.
@@ -189,10 +189,11 @@ Flags:
       --via-tor             Broadcast over an isolated Tor circuit
       --dry-run             Print the full proposal (every step, every fee) and exit without signing
       --yes                 Skip the confirmation prompt
+      --wait                Keep the stream open until the transaction is mined
 ```
 
-#### `gyges tx shield [--threshold <AMOUNT>]`
-Sweeps transparent UTXOs above the threshold into the key's Orchard pool (auto-shielding; no ZIP governs this behaviour).
+#### `gyges tx shield [--threshold <AMOUNT>] [--dry-run] [--yes] [--wait]`
+Sweeps transparent UTXOs of at least the threshold (in total; default: any) into the key's shielded pool (Ironwood after NU6.3; auto-shielding, no ZIP governs this behaviour). Same confirmation, signing and output as `tx send`.
 
 #### `gyges tx list [--limit <N>]`
 History with timestamps, pool flows, ZIP 317 fees, decrypted memos, and pending states (`awaiting-signature`, `tex pending`).
@@ -200,8 +201,8 @@ History with timestamps, pool flows, ZIP 317 fees, decrypted memos, and pending 
 #### `gyges tx status <TXID> [--pir]`
 Confirmation status from the node, or via `zakura-pir-status` with `--pir`. **Experimental:** the PIR servers queried, their operators and the privacy guarantee must be documented before this leaves experimental status.
 
-#### `gyges tx sessions` / `gyges tx abort <SESSION_ID | TXID>` / `gyges tx resume <TXID>`
-Lists pending signing sessions and ZIP 320 rows; `abort` cancels a signing session, or a TEX row while it is still `built`; `resume` forces a retry of a TEX row, building a new Step 2 if Step 1 was mined and Step 2 expired.
+#### `gyges tx sessions [--all] [--include-finished]` / `gyges tx abort <SESSION_ID | TXID>` / `gyges tx resume <TXID>`
+Lists pending signing sessions (and, with `--include-finished`, completed, expired, aborted and failed ones the daemon still remembers) and ZIP 320 rows; `abort` cancels a signing session, or a TEX row while it is still `built`; `resume` forces a retry of a TEX row, building a new Step 2 if Step 1 was mined and Step 2 expired.
 
 ---
 

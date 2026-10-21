@@ -50,6 +50,7 @@ time = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
+prost = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

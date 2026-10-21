@@ -2248,6 +2248,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "incrementalmerkletree",
  "prost 0.14.4",
  "reqwest",
  "rusqlite",
@@ -2262,6 +2263,7 @@ dependencies = [
  "zakura-orchard",
  "zakura-primitives",
  "zakura-protocol",
+ "zakura-sapling-crypto",
  "zakura-transparent",
 ]
 
@@ -2273,6 +2275,7 @@ dependencies = [
  "clap",
  "gyges-proto",
  "gyges-qr",
+ "hex",
  "humantime",
  "rand 0.10.3",
  "rpassword",
@@ -2295,6 +2298,7 @@ dependencies = [
  "hex",
  "humantime",
  "humantime-serde",
+ "prost 0.14.4",
  "rand 0.10.3",
  "rusqlite",
  "schemerz",
@@ -2358,9 +2362,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gyges-chain",
+ "gyges-core",
+ "rand 0.10.3",
  "serde_json",
  "tempfile",
  "tokio",
+ "zakura-client-backend",
+ "zakura-client-sqlite",
+ "zakura-protocol",
+ "zakura-transparent",
 ]
 
 [[package]]
@@ -2373,8 +2383,10 @@ dependencies = [
  "gyges-chain",
  "gyges-core",
  "gyges-proto",
+ "hex",
  "http",
  "nix",
+ "rand 0.10.3",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -2385,6 +2397,8 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "zakura-client-backend",
+ "zakura-keys",
+ "zakura-pczt",
  "zakura-protocol",
  "zakura-transparent",
  "zeroize",

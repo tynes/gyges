@@ -7,21 +7,24 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gyges_chain::{BlockDb, ChainBackend};
-use gyges_core::{Config, KeyRegistry, Network, VaultManager};
+use gyges_core::{Config, KeyRegistry, Network, Provers, VaultManager};
 use gyges_proto::v1::gyges_server::Gyges;
 use gyges_proto::v1::{
-    self, ApiVersion, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest, ExportUfvkResponse,
-    FallbackStatus, FallbackTrust, GetInfoRequest, GetInfoResponse, GetSyncStatusRequest,
+    self, AbortSigningSessionRequest, ApiVersion, ExportSeedRequest, ExportSeedResponse,
+    ExportUfvkRequest, ExportUfvkResponse, FallbackStatus, FallbackTrust, GetBalanceRequest,
+    GetBalanceResponse, GetInfoRequest, GetInfoResponse, GetSyncStatusRequest,
     GetSyncStatusResponse, InitKeyRequest, InitKeyResponse, ListKeysRequest, ListKeysResponse,
-    LockKeyRequest, LockKeyResponse, NodeStatus, RestoreKeyRequest, RestoreKeyResponse,
-    RunSyncRequest, ShutdownRequest, ShutdownResponse, TorState, TorStatus, UnlockKeyRequest,
-    UnlockKeyResponse, WaitSyncRequest,
+    ListSigningSessionsRequest, ListSigningSessionsResponse, LockKeyRequest, LockKeyResponse,
+    NodeStatus, RestoreKeyRequest, RestoreKeyResponse, RunSyncRequest, SendTransactionRequest,
+    ShieldFundsRequest, ShutdownRequest, ShutdownResponse, SigningSession, TorState, TorStatus,
+    UnlockKeyRequest, UnlockKeyResponse, WaitSyncRequest,
 };
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
 use crate::keys;
 use crate::sync::{self, ProgressStream, SyncHub};
+use crate::tx::{self, SendStream, SessionHub};
 
 /// Everything the RPC handlers share.
 #[derive(Debug)]
@@ -38,6 +41,11 @@ pub struct DaemonState {
     pub block_cache: Option<Arc<BlockDb>>,
     /// Per-key sync progress and the scheduler's wake-up (SYNC.md §3, §6).
     pub sync: SyncHub,
+    /// Passphrase signing sessions awaiting `UnlockKey { session_id }`
+    /// (API.md §6).
+    pub sessions: SessionHub,
+    /// Proving and verifying keys, built on first use.
+    pub provers: Arc<Provers>,
     /// Unix seconds the daemon started.
     pub started_at: i64,
     /// Signalled by `Shutdown` (and by the signal handlers in `main`).
@@ -61,6 +69,8 @@ impl DaemonState {
             chain,
             block_cache,
             sync: SyncHub::default(),
+            sessions: SessionHub::default(),
+            provers: Arc::new(Provers::new()),
             started_at: unix_now(),
             shutdown: Notify::new(),
         }
@@ -172,6 +182,45 @@ impl GygesService {
 
 #[tonic::async_trait]
 impl Gyges for GygesService {
+    async fn send_transaction(
+        &self,
+        request: Request<SendTransactionRequest>,
+    ) -> Result<Response<SendStream>, Status> {
+        let conn = crate::conn::of_request(&request);
+        tx::send_transaction(self.state.clone(), conn, request.into_inner()).map(Response::new)
+    }
+
+    async fn shield_funds(
+        &self,
+        request: Request<ShieldFundsRequest>,
+    ) -> Result<Response<SendStream>, Status> {
+        let conn = crate::conn::of_request(&request);
+        tx::shield_funds(self.state.clone(), conn, request.into_inner()).map(Response::new)
+    }
+
+    async fn get_balance(
+        &self,
+        request: Request<GetBalanceRequest>,
+    ) -> Result<Response<GetBalanceResponse>, Status> {
+        tx::get_balance(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn list_signing_sessions(
+        &self,
+        request: Request<ListSigningSessionsRequest>,
+    ) -> Result<Response<ListSigningSessionsResponse>, Status> {
+        tx::list_signing_sessions(&self.state, request.into_inner()).map(Response::new)
+    }
+
+    async fn abort_signing_session(
+        &self,
+        request: Request<AbortSigningSessionRequest>,
+    ) -> Result<Response<SigningSession>, Status> {
+        tx::abort_signing_session(&self.state, request.into_inner()).map(Response::new)
+    }
+
     async fn get_sync_status(
         &self,
         request: Request<GetSyncStatusRequest>,
@@ -204,8 +253,10 @@ impl Gyges for GygesService {
         &self,
         request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
-        // There is nothing in flight to drain yet (no proving, no TexQueue),
-        // so graceful and forced shutdown currently behave the same.
+        // In-flight sends end with their streams when the server stops (a
+        // proof in progress finishes on its blocking thread and is dropped);
+        // there is no TexQueue to drain yet, so graceful and forced shutdown
+        // behave the same.
         tracing::info!(
             graceful = request.get_ref().graceful,
             "shutdown requested over RPC"

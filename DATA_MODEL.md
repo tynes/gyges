@@ -119,8 +119,8 @@ Rules:
   "signing_mode": "local-seed",
   "birthday_height": 2650000,
   "created_at": "2026-10-20T10:00:00Z",
-  "spend_pools": ["orchard", "transparent"],
-  "receive_pools": ["orchard", "sapling", "transparent"],
+  "spend_pools": ["orchard", "ironwood", "transparent"],
+  "receive_pools": ["orchard", "ironwood", "sapling", "transparent"],
   "seed_format": "age-scrypt-v1",
   "seed_fingerprint": "f0a1…",
   "account_index": 0,
@@ -154,11 +154,11 @@ Mode examples (fields that differ from the `local-seed` example above):
 
 ```json
 { "signing_mode": "watch-only", "spend_pools": [],
-  "receive_pools": ["orchard", "sapling", "transparent"], "ufvk": "uview1…" }
+  "receive_pools": ["orchard", "ironwood", "sapling", "transparent"], "ufvk": "uview1…" }
 ```
 
 ```json
-{ "signing_mode": "signer-only", "spend_pools": ["orchard", "sapling", "transparent"],
+{ "signing_mode": "signer-only", "spend_pools": ["orchard", "ironwood", "sapling", "transparent"],
   "seed_format": "age-scrypt-v1", "seed_fingerprint": "f0a1…" }
 ```
 

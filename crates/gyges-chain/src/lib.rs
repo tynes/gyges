@@ -106,6 +106,10 @@ pub enum ChainError {
     /// The node returned an error or an unparseable response.
     #[error("node error: {0}")]
     Rpc(String),
+    /// `sendrawtransaction` refused the transaction; the text is the node's
+    /// verbatim rejection (`GygesError.node_error`, API.md §3).
+    #[error("node rejected the transaction: {0}")]
+    Rejected(String),
 }
 
 /// A boxed future, for the object-safe async methods below.
@@ -144,6 +148,13 @@ pub trait ChainBackend: Send + Sync + fmt::Debug {
         &self,
         range: Range<BlockHeight>,
     ) -> BoxFuture<'_, Result<Vec<CompactBlock>, ChainError>>;
+
+    /// `sendrawtransaction(hex)`: hand a signed transaction to the node's
+    /// mempool. Returns the txid in internal byte order. A node that
+    /// accepts the connection but refuses the transaction answers
+    /// [`ChainError::Rejected`] with its own text, which `tx send` shows
+    /// verbatim as `NODE_REJECTED`.
+    fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<[u8; 32], ChainError>>;
 }
 
 /// Block and transaction hashes as the JSON-RPC and explorers print them:

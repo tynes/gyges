@@ -8,7 +8,8 @@
 //! * [`sync`] – the per-key state machine's types and the scan, transparent
 //!   indexing and rewind steps over `gyges_chain` (SYNC.md); the scheduler
 //!   that drives them lives in `gygesd`;
-//! * `TxEngine` – proposal → PCZT roles → broadcast (Q-K3, Q-K4, Q-K7);
+//! * [`tx`] – the `TxEngine`: proposal → PCZT roles → raw transaction
+//!   (Q-K3, Q-K4, Q-K7); the daemon streams the steps and broadcasts;
 //! * `TexQueue` – durable two-step ZIP 320 broadcaster (Q-T1…T3).
 
 #![forbid(unsafe_code)]
@@ -21,6 +22,7 @@ pub mod perms;
 pub mod profile;
 pub mod registry;
 pub mod sync;
+pub mod tx;
 pub mod vault;
 
 pub use birthday::{BirthdayError, ResolvedBirthday};
@@ -30,6 +32,7 @@ pub use paths::Home;
 pub use profile::{KeyProfile, ProfileError};
 pub use registry::{KeyEntry, KeyRegistry, NewLocalSeedKey, RegistryError};
 pub use sync::{KeyProgress, StallReason, SyncError, SyncState};
+pub use tx::{Provers, TxError};
 pub use vault::manager::VaultManager;
 
 /// How a key profile signs (DATA_MODEL.md `profile.json`).
@@ -47,9 +50,10 @@ pub enum SigningMode {
 }
 
 /// Shielded and transparent pools, as data rather than code paths (Q-D7).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Pool {
+    #[default]
     Transparent,
     Sapling,
     Orchard,

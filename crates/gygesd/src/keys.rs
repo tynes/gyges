@@ -189,9 +189,11 @@ pub fn birthday_error(e: BirthdayError) -> GygesError {
                  and historical restore over Tor is not implemented yet (ROADMAP.md M2)"
             ),
         ),
-        BirthdayError::Chain(ChainError::Unreachable(detail) | ChainError::Rpc(detail)) => {
-            GygesError::new(ErrorReason::NodeUnreachable, detail)
-        }
+        BirthdayError::Chain(
+            ChainError::Unreachable(detail)
+            | ChainError::Rpc(detail)
+            | ChainError::Rejected(detail),
+        ) => GygesError::new(ErrorReason::NodeUnreachable, detail),
         BirthdayError::Chain(
             e @ (ChainError::TreeStateUnavailable { .. } | ChainError::BlockUnavailable { .. }),
         ) => GygesError::new(ErrorReason::FallbackUnavailable, e.to_string()),
@@ -372,8 +374,9 @@ pub async fn restore_key(
 }
 
 /// `UnlockKey` (API.md §6.3). Without `session_id`: a reusable unlock in
-/// the requested scope. With one: there are no signing sessions yet
-/// (ROADMAP.md M1, `TxEngine`), so `SESSION_NOT_FOUND`.
+/// the requested scope. With one: single-use, satisfies the signing session
+/// a paused `SendTransaction` stream is waiting on (API.md §6.2) and
+/// returns no token.
 pub async fn unlock_key(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
@@ -381,12 +384,7 @@ pub async fn unlock_key(
 ) -> Result<UnlockKeyResponse, Status> {
     let passphrase = take_passphrase(&mut req.passphrase)?;
     if !req.session_id.is_empty() {
-        return Err(GygesError::new(
-            ErrorReason::SessionNotFound,
-            "no such signing session (signing sessions arrive with the transaction engine)",
-        )
-        .with_session(req.session_id)
-        .into_status());
+        return crate::tx::satisfy_session(state, req.session_id, passphrase).await;
     }
     let key = state
         .registry

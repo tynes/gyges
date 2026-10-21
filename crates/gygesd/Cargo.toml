@@ -21,7 +21,11 @@ gyges-core = { workspace = true }
 gyges-chain = { workspace = true }
 zcash_client_backend = { workspace = true }
 zcash_protocol = { workspace = true }
+zcash_keys = { workspace = true }
+pczt = { workspace = true }
 age = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
 zeroize = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

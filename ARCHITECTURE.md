@@ -14,7 +14,7 @@
 6. **Keystone 3 Pro hardware signing.** Pairs from `ur:zcash-accounts` (CBOR tag 49201) and signs over animated terminal QR codes using the batch protocol (`ur:zcash-sign-batch` 49205 / `ur:zcash-batch-sig-result` 49207) for shielded sends and the single-PCZT protocol (`ur:zcash-pczt` 49204) when transparent inputs are present.
 
 ### Pools
-Pool support is data, not code paths: `profile.json` carries `spend_pools` and `receive_pools`, and `balance`, `notes` and `address new --receivers` are pool-generic. The node, wallet libraries and Keystone firmware all expose an **Ironwood** pool alongside Sapling and Orchard; it is off until the upstream wallet APIs leave `-rc`. MVP policy (ROADMAP.md): spend Orchard and transparent; receive Orchard, Sapling and transparent.
+Pool support is data, not code paths: `profile.json` carries `spend_pools` and `receive_pools`, and `balance`, `notes` and `address new --receivers` are pool-generic. The node, wallet libraries and Keystone firmware all expose an **Ironwood** pool alongside Sapling and Orchard, and after NU6.3 (regtest height 1, mainnet 3,428,143) the wallet libraries build every shielded output there while the ZIP 318 turnstile keeps value out of Orchard (`OVERVIEW.md` §4.3). MVP policy (ROADMAP.md): spend Orchard, Ironwood and transparent; receive Ironwood, Sapling and transparent; Orchard notes are spent, never created.
 
 ---
 

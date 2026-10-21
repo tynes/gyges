@@ -222,11 +222,6 @@ impl KeyProfile {
         if mode == SigningMode::SignerOnly && !self.receive_pools.is_empty() {
             return Err(invalid("receive_pools must be empty"));
         }
-        if self.spend_pools.contains(&Pool::Ironwood)
-            || self.receive_pools.contains(&Pool::Ironwood)
-        {
-            return Err(invalid("ironwood is not supported yet (ROADMAP.md)"));
-        }
         Ok(())
     }
 
@@ -406,8 +401,9 @@ mod tests {
         keystone.device_version = None;
         assert!(keystone.validate(Network::Mainnet, "main").is_err());
 
+        // Ironwood is the live shielded pool after NU6.3 (OVERVIEW.md §4.3).
         let mut ironwood = base;
         ironwood.spend_pools.push(Pool::Ironwood);
-        assert!(ironwood.validate(Network::Mainnet, "main").is_err());
+        ironwood.validate(Network::Mainnet, "main").unwrap();
     }
 }

@@ -11,6 +11,8 @@
 // Printing to stdout is this binary's purpose.
 #![allow(clippy::print_stdout)]
 
+mod amount;
+mod balance;
 mod client;
 mod daemon;
 mod exit;
@@ -18,6 +20,7 @@ mod key;
 mod output;
 mod prompt;
 mod sync;
+mod tx;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -82,11 +85,12 @@ enum Command {
     /// Addresses and terminal QR codes.
     Address(Unimplemented),
     /// Balances per pool.
-    Balance(Unimplemented),
+    Balance(balance::BalanceArgs),
     /// Decrypted notes and UTXOs.
     Notes(Unimplemented),
     /// High-level transactions.
-    Tx(Unimplemented),
+    #[command(subcommand)]
+    Tx(tx::TxCmd),
     /// PCZT role pipeline for Unix pipes and air-gapped signing.
     Pczt(Unimplemented),
 }
@@ -123,9 +127,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Key(cmd) => key::run(&ctx, cmd).await,
         Command::Sync(cmd) => sync::run(&ctx, cmd).await,
         Command::Address(_) => Err(CliError::NotImplemented("address")),
-        Command::Balance(_) => Err(CliError::NotImplemented("balance")),
+        Command::Balance(args) => balance::run(&ctx, args).await,
         Command::Notes(_) => Err(CliError::NotImplemented("notes")),
-        Command::Tx(_) => Err(CliError::NotImplemented("tx")),
+        Command::Tx(cmd) => tx::run(&ctx, cmd).await,
         Command::Pczt(_) => Err(CliError::NotImplemented("pczt")),
     }
 }
@@ -152,7 +156,49 @@ mod tests {
     #[test]
     fn unimplemented_groups_accept_any_arguments() {
         Cli::try_parse_from(["gyges", "key", "backup", "-o", "x.tar"]).unwrap();
-        Cli::try_parse_from(["gyges", "tx", "send", "--to", "u1x", "--amount", "1"]).unwrap();
+        Cli::try_parse_from(["gyges", "tx", "list", "--limit", "5"]).unwrap();
+    }
+
+    #[test]
+    fn tx_and_balance_commands_parse_per_spec() {
+        let cli = Cli::try_parse_from([
+            "gyges",
+            "tx",
+            "send",
+            "--to",
+            "u1x",
+            "--amount",
+            "1.25",
+            "--memo",
+            "hi",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Tx(tx::TxCmd::Send(ref a))
+                if a.to == "u1x"
+                    && a.amount == crate::amount::ParsedAmount::Zatoshis(125_000_000)
+                    && a.memo.as_ref().map(|m| m.0.as_slice()) == Some(b"hi".as_slice())
+                    && a.dry_run
+                    && !a.yes
+        ));
+        assert!(
+            Cli::try_parse_from(["gyges", "tx", "send", "--to", "u1x", "--amount", "1,000"])
+                .is_err(),
+            "thousands separators are a usage error"
+        );
+        assert!(Cli::try_parse_from(["gyges", "tx", "send", "--to", "u1x"]).is_err());
+        let cli =
+            Cli::try_parse_from(["gyges", "tx", "shield", "--threshold", "0.5", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Tx(tx::TxCmd::Shield(ref a)) if a.threshold == Some(50_000_000) && a.yes
+        ));
+        assert!(Cli::try_parse_from(["gyges", "tx", "shield", "--threshold", "max"]).is_err());
+        let cli = Cli::try_parse_from(["gyges", "balance", "--min-conf", "3"]).unwrap();
+        assert!(matches!(cli.command, Command::Balance(ref a) if a.min_conf == Some(3)));
+        Cli::try_parse_from(["gyges", "tx", "abort", "abcd"]).unwrap();
     }
 
     #[test]

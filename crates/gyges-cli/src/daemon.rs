@@ -216,9 +216,11 @@ async fn stop(ctx: &Ctx, force: bool) -> Result<(), CliError> {
         .await
         .map_err(CliError::from_status)?
         .into_inner();
-    // Wait for the socket to go away so that `stop && start` works in scripts.
+    // Wait for the socket to go away (the listener, then the file the
+    // daemon unlinks on its way out) so that `stop && start` works in
+    // scripts and "stopped" means the file is gone.
     let deadline = Instant::now() + Duration::from_secs(60);
-    while uds::probe(&ctx.socket).await.is_ok() {
+    while uds::probe(&ctx.socket).await.is_ok() || ctx.socket.exists() {
         if Instant::now() > deadline {
             return Err(CliError::Other(anyhow::anyhow!(
                 "gygesd acknowledged the shutdown but {} is still open after 60s",

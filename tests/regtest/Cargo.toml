@@ -24,6 +24,10 @@ path = "scenarios/keys.rs"
 name = "sync"
 path = "scenarios/sync.rs"
 
+[[test]]
+name = "tx"
+path = "scenarios/tx.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 serde_json = { workspace = true }
@@ -31,6 +35,12 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 gyges-chain = { workspace = true, features = ["test-util"] }
+gyges-core = { workspace = true }
+zcash_client_backend = { workspace = true }
+zcash_client_sqlite = { workspace = true }
+zcash_protocol = { workspace = true }
+transparent = { workspace = true }
+rand = { workspace = true }
 tokio = { workspace = true }
 
 [lints]

@@ -13,10 +13,12 @@ use gyges_core::{Home, Network, perms};
 use gyges_proto::uds;
 use gyges_proto::v1::gyges_client::GygesClient;
 use gyges_proto::v1::{
-    ErrorReason, ExportSeedRequest, ExportUfvkRequest, GetBalanceRequest, GetInfoRequest,
-    GetSyncStatusRequest, GygesError, InitKeyRequest, ListKeysRequest, LockKeyRequest,
-    RestoreKeyRequest, RunSyncRequest, ShutdownRequest, SigningMode, SyncProgress, SyncState,
-    SyncTarget, UnlockKeyRequest, UnlockScope, WaitSyncRequest,
+    AbortSigningSessionRequest, ErrorReason, ExportSeedRequest, ExportUfvkRequest,
+    GetBalanceRequest, GetBalanceResponse, GetInfoRequest, GetSyncStatusRequest, GygesError,
+    InitKeyRequest, ListKeysRequest, ListNotesRequest, ListSigningSessionsRequest, LockKeyRequest,
+    Proposal, RestoreKeyRequest, RunSyncRequest, SendEvent, SendTransactionRequest, SessionStatus,
+    ShieldFundsRequest, ShutdownRequest, SignatureKind, SigningMode, SyncProgress, SyncState,
+    SyncTarget, UnlockKeyRequest, UnlockScope, WaitSyncRequest, send_event,
 };
 use gygesd::{Daemon, DaemonState, Options};
 use tokio_stream::StreamExt as _;
@@ -124,10 +126,7 @@ async fn get_info_over_uds_and_socket_is_owner_only() {
     assert_eq!(info.started_at, running.state.started_at);
 
     // Unimplemented RPCs answer UNIMPLEMENTED without a GygesError detail.
-    let err = c
-        .get_balance(GetBalanceRequest::default())
-        .await
-        .unwrap_err();
+    let err = c.list_notes(ListNotesRequest::default()).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unimplemented);
     assert!(GygesError::from_status(&err).is_none());
 
@@ -1362,6 +1361,631 @@ async fn offline_node_keeps_keys_initializing_then_stalls_after_the_grace() {
         "{}",
         stalled.detail
     );
+    drop(state);
+    task.abort();
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// The transaction engine (ROADMAP.md M1, TxEngine)
+// ---------------------------------------------------------------------------
+
+/// Every event of a send stream, or the status that ended it.
+async fn collect_events(
+    stream: Result<tonic::Response<tonic::Streaming<SendEvent>>, tonic::Status>,
+) -> Result<Vec<SendEvent>, tonic::Status> {
+    let mut s = stream?.into_inner();
+    let mut out = Vec::new();
+    while let Some(item) = s.next().await {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
+fn event_names(events: &[SendEvent]) -> Vec<&'static str> {
+    events
+        .iter()
+        .map(|e| match e.event {
+            Some(send_event::Event::Proposed(_)) => "proposed",
+            Some(send_event::Event::Proving(_)) => "proving",
+            Some(send_event::Event::SignatureRequired(_)) => "signature_required",
+            Some(send_event::Event::Signed(_)) => "signed",
+            Some(send_event::Event::Broadcast(_)) => "broadcast",
+            Some(send_event::Event::TexQueued(_)) => "tex_queued",
+            Some(send_event::Event::Mined(_)) => "mined",
+            None => "none",
+        })
+        .collect()
+}
+
+fn proposal_of(events: &[SendEvent]) -> Proposal {
+    match &events[0].event {
+        Some(send_event::Event::Proposed(p)) => p.clone(),
+        other => panic!("expected Proposed first, got {other:?}"),
+    }
+}
+
+fn broadcast_txid(events: &[SendEvent]) -> String {
+    events
+        .iter()
+        .find_map(|e| match &e.event {
+            Some(send_event::Event::Broadcast(b)) => Some(b.txid.clone()),
+            _ => None,
+        })
+        .expect("a Broadcast event")
+}
+
+/// Drive a send stream to completion, answering `SignatureRequired` with
+/// `passphrase` through `UnlockKey { session_id }` on `c` (the inline
+/// unlock flow of API.md §6.2). Returns every event.
+async fn send_with_session(
+    c: &mut GygesClient<Channel>,
+    req: SendTransactionRequest,
+    passphrase: &str,
+) -> Result<Vec<SendEvent>, tonic::Status> {
+    let mut s = c.send_transaction(req).await?.into_inner();
+    let mut out = Vec::new();
+    while let Some(item) = s.next().await {
+        let ev = item?;
+        if let Some(send_event::Event::SignatureRequired(r)) = &ev.event {
+            assert_eq!(r.kind(), SignatureKind::Passphrase);
+            assert_eq!(r.session_id.len(), 32);
+            assert!(r.summary.is_some());
+            c.unlock_key(UnlockKeyRequest {
+                key_id: r.key_id.clone(),
+                passphrase: passphrase.into(),
+                session_id: r.session_id.clone(),
+                ..Default::default()
+            })
+            .await?;
+        }
+        out.push(ev);
+    }
+    Ok(out)
+}
+
+fn balance_of(resp: &GetBalanceResponse, pool: gyges_proto::v1::Pool) -> (i64, i64) {
+    resp.pools
+        .iter()
+        .find(|p| p.pool() == pool)
+        .map(|p| (p.spendable, p.pending))
+        .unwrap_or((0, 0))
+}
+
+/// The key's current unified address (every receiver), from its UFVK.
+fn unified_address(state: &DaemonState, key_id: &str) -> String {
+    use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
+    let params = Network::Regtest.consensus_params();
+    let key = state.registry.resolve(key_id).unwrap();
+    let ufvk = UnifiedFullViewingKey::decode(&params, &key.ufvk().unwrap()).unwrap();
+    let (ua, _) = ufvk
+        .default_address(UnifiedAddressRequest::AllAvailableKeys)
+        .unwrap();
+    ua.encode(&params)
+}
+
+/// Fund a transparent receiver, shield it, spend Orchard to the key's own
+/// unified address through the inline-unlock session, pay a transparent
+/// recipient with `max`, and see the balance move at every step; also the
+/// documented refusals (insufficient funds, memo to a t-addr, tex1, node
+/// rejection, an aborted session, a wrong passphrase).
+#[tokio::test]
+async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_node() {
+    use gyges_proto::v1::Pool;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(10);
+    let url = node.url().to_string();
+    let (dir, home) = fresh_home_with(
+        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n",
+    );
+    let mut opts = Options::new(home.clone(), Network::Regtest);
+    opts.zakura_rpc = Some(url);
+    let daemon = Daemon::prepare(opts).expect("prepare");
+    let socket = daemon.socket_path();
+    let state = daemon.state.clone();
+    let task = tokio::spawn(daemon.serve(std::future::pending()));
+    for _ in 0..400 {
+        if uds::probe(&socket).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut c = client(&socket).await;
+    let params = Network::Regtest.consensus_params();
+
+    // No key yet: a typed error before any stream.
+    let err = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::KeyNotFound);
+
+    c.init_key(InitKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    wait_spendable(&mut c, "main").await;
+
+    let key = state.registry.resolve("main").unwrap();
+    let (account, receiver) = {
+        let w = key.wallet().unwrap();
+        let account = w.get_account_ids().unwrap()[0];
+        let receivers = w.get_transparent_receivers(account, false, false).unwrap();
+        let addr = *receivers.keys().next().expect("a transparent receiver");
+        (account, addr)
+    };
+    let _ = account;
+    let t_recipient = zcash_keys::address::Address::Transparent(
+        transparent::address::TransparentAddress::PublicKeyHash([0x42; 20]),
+    )
+    .encode(&params);
+    let amount = |z: i64| {
+        Some(gyges_proto::v1::Amount {
+            value: Some(gyges_proto::v1::amount::Value::Zatoshis(z)),
+        })
+    };
+
+    // Empty wallet: INSUFFICIENT_FUNDS arrives as the stream's error.
+    let err = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to: t_recipient.clone(),
+            amount: amount(1_000),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InsufficientFunds, "{err:?}");
+
+    // Argument checks happen before the stream opens.
+    for (to, memo, want) in [
+        (
+            t_recipient.clone(),
+            b"hi".to_vec(),
+            ErrorReason::InvalidArgument,
+        ),
+        (
+            "t1nonsense".to_string(),
+            vec![],
+            ErrorReason::InvalidArgument,
+        ),
+        (
+            zcash_keys::address::Address::Tex([9; 20]).encode(&params),
+            vec![],
+            ErrorReason::UnsupportedPool,
+        ),
+    ] {
+        let Err(err) = c
+            .send_transaction(SendTransactionRequest {
+                key_id: "main".into(),
+                to,
+                amount: amount(1_000),
+                memo,
+                ..Default::default()
+            })
+            .await
+        else {
+            panic!("expected a refusal before streaming");
+        };
+        assert_eq!(reason(&err), want, "{err:?}");
+    }
+
+    // Fund the transparent receiver with 1 ZEC and let it confirm.
+    node.mine_with_payments(&[(receiver, 100_000_000)]);
+    node.mine(1);
+    wait_spendable(&mut c, "main").await;
+    let b = c
+        .get_balance(GetBalanceRequest {
+            key_id: "main".into(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(balance_of(&b, Pool::Transparent), (100_000_000, 0), "{b:?}");
+    assert_eq!(b.total_spendable, 100_000_000);
+    assert_eq!(b.min_confirmations, 1);
+
+    // Shield with a daemon-scoped unlock already in place: no
+    // SignatureRequired, the stream runs to Broadcast on its own.
+    c.unlock_key(UnlockKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        scope: UnlockScope::Daemon as i32,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let dry = collect_events(
+        c.shield_funds(ShieldFundsRequest {
+            key_id: "main".into(),
+            dry_run: true,
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_names(&dry), ["proposed"]);
+    let p = proposal_of(&dry);
+    assert_eq!(p.steps.len(), 1);
+    assert_eq!(p.steps[0].inputs[0].pool(), Pool::Transparent);
+    assert_eq!(p.steps[0].inputs[0].value, 100_000_000);
+    let shield_fee = p.total_fee;
+    assert!(shield_fee > 0 && shield_fee < 100_000, "{p:?}");
+    assert!(p.expiry_height > p.anchor_height, "{p:?}");
+    assert!(!p.upstream_proposal.is_empty());
+
+    let events = collect_events(
+        c.shield_funds(ShieldFundsRequest {
+            key_id: "main".into(),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        event_names(&events),
+        ["proposed", "proving", "proving", "signed", "broadcast"],
+        "{events:?}"
+    );
+    let shield_txid = broadcast_txid(&events);
+    assert_eq!(
+        node.mempool(),
+        vec![gyges_chain::parse_display_hash(&shield_txid).unwrap()]
+    );
+    c.lock_key(LockKeyRequest {
+        key_id: "main".into(),
+        all: false,
+    })
+    .await
+    .unwrap();
+
+    // Mined: the transparent value is gone and the change is Ironwood (the
+    // live Orchard-protocol pool after NU6.3; see OVERVIEW.md §4.3).
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    let b = c
+        .get_balance(GetBalanceRequest {
+            key_id: "main".into(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(balance_of(&b, Pool::Transparent), (0, 0), "{b:?}");
+    let orchard_after_shield = 100_000_000 - shield_fee;
+    assert_eq!(
+        balance_of(&b, Pool::Ironwood),
+        (orchard_after_shield, 0),
+        "{b:?}"
+    );
+    assert_eq!(balance_of(&b, Pool::Orchard), (0, 0), "{b:?}");
+    {
+        let w = key.wallet().unwrap();
+        let h = w
+            .get_tx_height(zcash_protocol::TxId::from_bytes(
+                gyges_chain::parse_display_hash(&shield_txid).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(h, Some(BlockHeight::from_u32(13)), "shield mined at 13");
+    }
+
+    // An Orchard spend to our own unified address through the session
+    // flow: a wrong passphrase is refused (and rate-limited) without ending
+    // the stream, then the right one signs.
+    let ua = unified_address(&state, "main");
+    let mut s = c
+        .send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to: ua.clone(),
+            amount: amount(30_000_000),
+            memo: b"to myself".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut names = Vec::new();
+    let mut send_fee = 0;
+    while let Some(item) = s.next().await {
+        let ev = item.unwrap();
+        match &ev.event {
+            Some(send_event::Event::Proposed(p)) => {
+                send_fee = p.total_fee;
+                assert_eq!(p.total_debit, 30_000_000 + send_fee);
+                let outs = &p.steps[0].outputs;
+                assert!(
+                    outs.iter().any(|o| o.address == ua && o.has_memo),
+                    "{outs:?}"
+                );
+                assert!(outs.iter().any(|o| o.is_change), "{outs:?}");
+                names.push("proposed");
+            }
+            Some(send_event::Event::SignatureRequired(r)) => {
+                names.push("signature_required");
+                let sessions = c
+                    .list_signing_sessions(ListSigningSessionsRequest::default())
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .sessions;
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].session_id, r.session_id);
+                assert_eq!(sessions[0].status(), SessionStatus::AwaitingSignature);
+                let err = c
+                    .unlock_key(UnlockKeyRequest {
+                        key_id: "main".into(),
+                        passphrase: "wrong".into(),
+                        session_id: r.session_id.clone(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(reason(&err), ErrorReason::InvalidPassphrase);
+                let err = c
+                    .unlock_key(UnlockKeyRequest {
+                        key_id: "main".into(),
+                        passphrase: "pw".into(),
+                        session_id: r.session_id.clone(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(reason(&err), ErrorReason::RateLimited);
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                let resp = c
+                    .unlock_key(UnlockKeyRequest {
+                        key_id: "main".into(),
+                        passphrase: "pw".into(),
+                        session_id: r.session_id.clone(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert!(
+                    resp.session_token.is_empty(),
+                    "a session unlock returns no token"
+                );
+                // Satisfied once only.
+                let err = c
+                    .unlock_key(UnlockKeyRequest {
+                        key_id: "main".into(),
+                        passphrase: "pw".into(),
+                        session_id: r.session_id.clone(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(reason(&err), ErrorReason::SessionNotFound);
+            }
+            Some(send_event::Event::Proving(_)) => names.push("proving"),
+            Some(send_event::Event::Signed(_)) => names.push("signed"),
+            Some(send_event::Event::Broadcast(_)) => names.push("broadcast"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(
+        names,
+        [
+            "proposed",
+            "proving",
+            "proving",
+            "signature_required",
+            "signed",
+            "broadcast"
+        ]
+    );
+    assert_eq!(
+        state.vault.unlock_count(),
+        0,
+        "no unlock survives the session"
+    );
+    let finished = c
+        .list_signing_sessions(ListSigningSessionsRequest {
+            key_id: "main".into(),
+            include_finished: true,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .sessions;
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].status(), SessionStatus::Completed);
+
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    let b = c
+        .get_balance(GetBalanceRequest {
+            key_id: "main".into(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let orchard_after_self_send = orchard_after_shield - send_fee;
+    assert_eq!(
+        balance_of(&b, Pool::Ironwood),
+        (orchard_after_self_send, 0),
+        "a send to ourselves costs the fee only: {b:?}"
+    );
+
+    // The node refuses: NODE_REJECTED with its text, nothing in the mempool.
+    node.set_reject_broadcasts(Some("tx-expired-test".into()));
+    let err = send_with_session(
+        &mut c,
+        SendTransactionRequest {
+            key_id: "main".into(),
+            to: t_recipient.clone(),
+            amount: amount(1_000_000),
+            ..Default::default()
+        },
+        "pw",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::NodeRejected, "{err:?}");
+    assert!(
+        GygesError::from_status(&err)
+            .unwrap()
+            .node_error
+            .contains("tx-expired-test")
+    );
+    assert!(node.mempool().is_empty());
+    node.set_reject_broadcasts(None);
+    // The refused transaction stays in the wallet as a pending spend until
+    // it expires, so the notes it chose are not spendable meanwhile; mine
+    // past its expiry so the rest of the test sees the funds again.
+    node.mine(45);
+    wait_spendable(&mut c, "main").await;
+
+    // An aborted session ends its stream with CANCELLED.
+    let mut s = c
+        .send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to: t_recipient.clone(),
+            amount: amount(1_000_000),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut aborted = None;
+    loop {
+        match s.next().await {
+            Some(Ok(ev)) => {
+                if let Some(send_event::Event::SignatureRequired(r)) = ev.event {
+                    let x = c
+                        .abort_signing_session(AbortSigningSessionRequest {
+                            session_id: r.session_id.clone(),
+                        })
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    assert_eq!(x.status(), SessionStatus::Aborted);
+                    aborted = Some(r.session_id);
+                }
+            }
+            Some(Err(status)) => {
+                assert_eq!(reason(&status), ErrorReason::Cancelled, "{status:?}");
+                assert_eq!(
+                    GygesError::from_status(&status).unwrap().session_id,
+                    aborted.clone().unwrap()
+                );
+                break;
+            }
+            None => panic!("the stream ended without an error after the abort"),
+        }
+    }
+    let err = c
+        .abort_signing_session(AbortSigningSessionRequest {
+            session_id: "00".repeat(16),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::SessionNotFound);
+
+    // `max` to a transparent recipient empties the shielded pool (no
+    // change), and `wait_for_mined` keeps the stream open until the block
+    // that includes it is scanned: mine once Broadcast has been seen.
+    let mut s = c
+        .send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to: t_recipient.clone(),
+            amount: Some(gyges_proto::v1::Amount {
+                value: Some(gyges_proto::v1::amount::Value::Max(true)),
+            }),
+            wait_for_mined: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut events = Vec::new();
+    while let Some(item) = s.next().await {
+        let ev = item.unwrap_or_else(|e| panic!("max send: {e:?}"));
+        match &ev.event {
+            Some(send_event::Event::SignatureRequired(r)) => {
+                c.unlock_key(UnlockKeyRequest {
+                    key_id: r.key_id.clone(),
+                    passphrase: "pw".into(),
+                    session_id: r.session_id.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            }
+            Some(send_event::Event::Broadcast(_)) => {
+                node.mine(2);
+            }
+            _ => {}
+        }
+        events.push(ev);
+    }
+    let p = proposal_of(&events);
+    let paid = p.steps[0]
+        .outputs
+        .iter()
+        .find(|o| o.address == t_recipient)
+        .expect("the payment")
+        .value;
+    assert_eq!(paid + p.total_fee, orchard_after_self_send, "{p:?}");
+    // Upstream always carries an Ironwood change output in a shielded
+    // spend, zero-valued when there is nothing left; `max` leaves no value
+    // behind.
+    assert!(
+        p.steps[0]
+            .outputs
+            .iter()
+            .all(|o| !o.is_change || o.value == 0),
+        "max leaves no change value: {p:?}"
+    );
+    assert_eq!(
+        event_names(&events).last(),
+        Some(&"mined"),
+        "{:?}",
+        event_names(&events)
+    );
+    let mined_height = events
+        .iter()
+        .find_map(|e| match &e.event {
+            Some(send_event::Event::Mined(m)) => Some(m.height),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        mined_height,
+        node.tip().0 - 1,
+        "mined in the first of the two blocks"
+    );
+    wait_spendable(&mut c, "main").await;
+    let b = c
+        .get_balance(GetBalanceRequest {
+            key_id: "main".into(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(b.total_spendable, 0, "{b:?}");
+    assert_eq!(b.total_pending, 0, "{b:?}");
+
     drop(state);
     task.abort();
     drop(dir);

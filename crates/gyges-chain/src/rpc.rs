@@ -433,6 +433,23 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
         })
     }
 
+    /// `sendrawtransaction(hex)`; the node answers the txid as display hex.
+    /// A JSON-RPC error is the node's rejection and is passed through
+    /// verbatim as [`ChainError::Rejected`]; transport failures stay
+    /// [`ChainError::Unreachable`].
+    pub async fn send_raw_transaction(&self, raw: &[u8]) -> Result<[u8; 32], ChainError> {
+        let txid: String = self
+            .call("sendrawtransaction", vec![json!(hex::encode(raw))])
+            .await
+            .map_err(|e| match e {
+                RpcFailure::Json { code, message } => {
+                    ChainError::Rejected(format!("{message} (code {code})"))
+                }
+                other => self.chain_error("sendrawtransaction", other),
+            })?;
+        parse_display_hash(&txid)
+    }
+
     /// `z_gettreestate(height)` as the `ChainState` an account born at
     /// `height + 1` starts from.
     pub async fn get_tree_state(&self, height: BlockHeight) -> Result<ChainState, ChainError> {
@@ -576,6 +593,10 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
 
     fn block_hash(&self, height: BlockHeight) -> BoxFuture<'_, Result<[u8; 32], ChainError>> {
         Box::pin(self.get_block_hash(height))
+    }
+
+    fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<[u8; 32], ChainError>> {
+        Box::pin(async move { self.send_raw_transaction(&raw).await })
     }
 
     fn compact_blocks(

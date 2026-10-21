@@ -186,6 +186,17 @@ impl ChainBackend for FixedChain {
         })
     }
 
+    fn send_raw_transaction(
+        &self,
+        _raw: Vec<u8>,
+    ) -> gyges_chain::BoxFuture<'_, Result<[u8; 32], ChainError>> {
+        Box::pin(async move {
+            Err(ChainError::Rejected(
+                "the fixed test chain accepts no transactions".into(),
+            ))
+        })
+    }
+
     fn chain_state(
         &self,
         height: BlockHeight,
