@@ -132,6 +132,7 @@ hyper          = { version = "1", features = ["server", "http1"] }   # fake zaku
 http-body-util = "0.1"
 bytes          = "1"
 base64         = "0.22"
+sha2           = "0.10"                                           # verifies the downloaded zakurad release (tests/regtest)
 
 # --- Internal crates ---
 gyges-proto = { path = "crates/gyges-proto" }

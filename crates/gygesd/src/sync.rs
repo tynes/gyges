@@ -667,7 +667,18 @@ impl Scheduler {
         }
         match fork {
             Some(f) => {
-                let actual = with_wallet(key, move |w| core_sync::rewind(w, f)).await?;
+                let actual = match with_wallet(key, move |w| core_sync::rewind(w, f)).await {
+                    Ok(h) => h,
+                    // Nothing scanned at or below the fork (the key was born
+                    // in a reorged block): reset to the node's tree state
+                    // at the fork instead of truncating.
+                    Err(SyncError::RewindInvalid { .. }) => {
+                        let state = self.chain.chain_state(f).await?;
+                        with_wallet(key, move |w| core_sync::rewind_to_chain_state(w, &state))
+                            .await?
+                    }
+                    Err(e) => return Err(e),
+                };
                 tracing::warn!(
                     key_id,
                     detected_at = u32::from(at_height),
