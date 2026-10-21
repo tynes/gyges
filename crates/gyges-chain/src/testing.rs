@@ -146,7 +146,11 @@ fn coinbase_tx(branch: BranchId, height: u32) -> Transaction {
         )],
         authorization: Authorized,
     };
-    transparent_only_tx(branch, Some(bundle))
+    // A v5 txid does not commit to the scriptSig, so the height push alone
+    // would give every coinbase the same txid; consensus makes a v5 coinbase
+    // set `nExpiryHeight` to its block height, which is what keeps them
+    // distinct.
+    transparent_only_tx(branch, BlockHeight::from_u32(height), Some(bundle))
 }
 
 fn payment_tx(
@@ -169,15 +173,19 @@ fn payment_tx(
             .collect(),
         authorization: Authorized,
     };
-    transparent_only_tx(branch, Some(bundle))
+    transparent_only_tx(branch, BlockHeight::from_u32(0), Some(bundle))
 }
 
-fn transparent_only_tx(branch: BranchId, bundle: Option<Bundle<Authorized>>) -> Transaction {
+fn transparent_only_tx(
+    branch: BranchId,
+    expiry_height: BlockHeight,
+    bundle: Option<Bundle<Authorized>>,
+) -> Transaction {
     TransactionData::<TxAuthorized>::from_parts(
         TxVersion::V5,
         branch,
         0,
-        BlockHeight::from_u32(0),
+        expiry_height,
         bundle,
         None,
         None,
@@ -230,6 +238,9 @@ struct State {
     cookie: Option<String>,
     tree_sizes: Option<TreeSizes>,
     calls: Vec<String>,
+    /// Bumped by `invalidate_from`, so re-mined blocks differ from the
+    /// ones they replace.
+    forks: u32,
 }
 
 impl State {
@@ -245,7 +256,7 @@ impl State {
     fn append(&mut self, payments: &[(TransparentAddress, u64)]) -> BuiltBlock {
         let (tip, prev) = self.tip();
         let height = tip + 1;
-        let time = 1_700_000_000 + height * 75;
+        let time = 1_700_000_000 + height * 75 + self.forks * 7;
         let spec = BlockSpec {
             height: BlockHeight::from_u32(height),
             prev_hash: prev,
@@ -329,6 +340,7 @@ impl FakeNode {
             cookie: None,
             tree_sizes: None,
             calls: Vec::new(),
+            forks: 0,
         }));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -384,7 +396,9 @@ impl FakeNode {
     /// mine again to grow a different chain).
     pub fn invalidate_from(&self, height: u32) {
         assert!(height > 0, "cannot invalidate genesis");
-        self.lock().blocks.retain(|h, _| *h < height);
+        let mut st = self.lock();
+        st.blocks.retain(|h, _| *h < height);
+        st.forks += 1;
     }
 
     /// `pruneheight`: bodies below it answer `-8 Block not found`.
@@ -612,15 +626,17 @@ fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
             if st.pruned(h) {
                 return Err((-8, "the requested block is not in the main chain".into()));
             }
-            // Sapling and Orchard: explicit empty frontiers; Ironwood: the
-            // `{}` an inactive or unserved pool gets.
+            // Explicit empty frontiers for every pool (all are active from
+            // height 1 on regtest); `sprout` is the `{}` an inactive pool gets.
+            let empty = json!({ "commitments": { "finalRoot": "00".repeat(32), "finalState": EMPTY_TREE_HEX } });
             Ok(json!({
                 "hash": display_hash(&block.hash),
                 "height": h,
                 "time": block.time,
-                "sapling": { "commitments": { "finalRoot": "00".repeat(32), "finalState": EMPTY_TREE_HEX } },
-                "orchard": { "commitments": { "finalRoot": "00".repeat(32), "finalState": EMPTY_TREE_HEX } },
-                "ironwood": { "commitments": {} },
+                "sprout": { "commitments": {} },
+                "sapling": empty,
+                "orchard": empty,
+                "ironwood": empty,
             }))
         }
         _ => Err((-32601, format!("Method not found: {method}"))),
@@ -659,6 +675,14 @@ mod tests {
         assert!(cs.final_ironwood_tree().value().is_none());
     }
 
+    #[test]
+    fn coinbase_txids_differ_per_height() {
+        let params = regtest_params();
+        let a = BlockSpec::new(BlockHeight::from_u32(10), [0; 32], 1).build(&params);
+        let b = BlockSpec::new(BlockHeight::from_u32(11), a.hash, 2).build(&params);
+        assert_ne!(a.txids[0], b.txids[0]);
+    }
+
     #[tokio::test]
     async fn fake_node_grows_links_and_prunes() {
         let node = FakeNode::start(regtest_params()).await;
@@ -671,6 +695,11 @@ mod tests {
         let b2 = node.mine_with_payments(&[(TransparentAddress::ScriptHash([1; 20]), 5)]);
         assert_eq!(b2.height, 2);
         assert_eq!(b2.txids.len(), 2);
-        assert_ne!(b2.hash, node.block(2).map(|_| b3.hash).unwrap_or_default());
+        // An empty re-mined block also differs from the one it replaced.
+        node.invalidate_from(2);
+        let b2_again = node.mine(1);
+        assert_eq!(b2_again, 2);
+        assert_ne!(node.block(2).unwrap().hash, b2.hash);
+        assert_ne!(node.block(2).unwrap().hash, b3.prev_hash);
     }
 }

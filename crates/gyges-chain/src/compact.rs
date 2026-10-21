@@ -213,14 +213,25 @@ pub fn transparent_outputs(block: &CompactBlock) -> Vec<TransparentOutput> {
 /// Decode a `scriptPubKey` into a P2PKH or P2SH address, through the
 /// upstream `TxOut` parser so that the standard-script rules stay upstream's.
 pub fn address_of_script(script_pub_key: &[u8]) -> Option<TransparentAddress> {
+    parse_txout(0, script_pub_key).and_then(|o| o.recipient_address())
+}
+
+/// The upstream `TxOut` for a decoded output, for
+/// `WalletTransparentOutput::from_parts`. `None` if the value is out of range.
+pub fn txout_of(output: &TransparentOutput) -> Option<transparent::bundle::TxOut> {
+    parse_txout(output.value_zat, &output.script_pubkey)
+}
+
+/// Build a `TxOut` by serialising its parts, so that no `zcash_script`
+/// dependency is needed here.
+fn parse_txout(value_zat: u64, script_pub_key: &[u8]) -> Option<transparent::bundle::TxOut> {
+    let value = i64::try_from(value_zat).ok()?;
     let mut encoded = Vec::with_capacity(8 + 9 + script_pub_key.len());
-    encoded.extend_from_slice(&0i64.to_le_bytes());
+    encoded.extend_from_slice(&value.to_le_bytes());
     write_compact_size(&mut encoded, script_pub_key.len());
     encoded.extend_from_slice(script_pub_key);
     let mut cursor = Cursor::new(encoded);
-    transparent::bundle::TxOut::read(&mut cursor)
-        .ok()
-        .and_then(|o| o.recipient_address())
+    transparent::bundle::TxOut::read(&mut cursor).ok()
 }
 
 /// Encode a transparent address for `network`.

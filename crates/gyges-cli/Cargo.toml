@@ -16,6 +16,7 @@ path = "src/main.rs"
 gyges-proto = { workspace = true }
 gyges-qr = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 tonic = { workspace = true }
 clap = { workspace = true }
 rpassword = { workspace = true }

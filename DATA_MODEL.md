@@ -244,7 +244,7 @@ CREATE TABLE gyges_address_labels (
 
 ### 5.4 `gyges_transparent_received_outputs`
 
-Transparent outputs seen in full raw blocks during Case A (`SYNC.md` §2.1). The compact blocks in the shared cache (§6) carry every transparent input and output of their blocks, so the scheduler finds a key's outputs by matching `scriptPubKey`s from the cache against the key's receivers; upstream already stores UTXOs it learns about through `put_received_transparent_utxo`, and this table is the staging area from which that call is made, and the source of truth for "which block did we see it in" when the node's address index is unavailable.
+Transparent outputs seen in full raw blocks during Case A (`SYNC.md` §2.1). The compact blocks in the shared cache (§6) carry every transparent input and output of their blocks, so the scheduler finds a key's outputs by matching `scriptPubKey`s from the cache against the key's receivers (external, change and ephemeral, re-read after each hit because a hit advances the gap limit); upstream already stores UTXOs it learns about through `put_received_transparent_utxo`, and this table is the staging area from which that call is made, and the source of truth for "which block did we see it in" when the node's address index is unavailable. *Status:* the scheduler calls `put_received_transparent_utxo` directly (the upstream `transparent_received_outputs` row carries `mined_height`); this table is created with the first `gyges_` migration set and filled from then on.
 
 ```sql
 CREATE TABLE gyges_transparent_received_outputs (

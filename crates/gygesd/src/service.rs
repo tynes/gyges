@@ -11,15 +11,17 @@ use gyges_core::{Config, KeyRegistry, Network, VaultManager};
 use gyges_proto::v1::gyges_server::Gyges;
 use gyges_proto::v1::{
     self, ApiVersion, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest, ExportUfvkResponse,
-    FallbackStatus, FallbackTrust, GetInfoRequest, GetInfoResponse, InitKeyRequest,
-    InitKeyResponse, ListKeysRequest, ListKeysResponse, LockKeyRequest, LockKeyResponse,
-    NodeStatus, RestoreKeyRequest, RestoreKeyResponse, ShutdownRequest, ShutdownResponse, TorState,
-    TorStatus, UnlockKeyRequest, UnlockKeyResponse,
+    FallbackStatus, FallbackTrust, GetInfoRequest, GetInfoResponse, GetSyncStatusRequest,
+    GetSyncStatusResponse, InitKeyRequest, InitKeyResponse, ListKeysRequest, ListKeysResponse,
+    LockKeyRequest, LockKeyResponse, NodeStatus, RestoreKeyRequest, RestoreKeyResponse,
+    RunSyncRequest, ShutdownRequest, ShutdownResponse, TorState, TorStatus, UnlockKeyRequest,
+    UnlockKeyResponse, WaitSyncRequest,
 };
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
 use crate::keys;
+use crate::sync::{self, ProgressStream, SyncHub};
 
 /// Everything the RPC handlers share.
 #[derive(Debug)]
@@ -34,6 +36,8 @@ pub struct DaemonState {
     /// The shared compact block cache (`cache/blocks.sqlite`); `None` only
     /// when air-gapped.
     pub block_cache: Option<Arc<BlockDb>>,
+    /// Per-key sync progress and the scheduler's wake-up (SYNC.md §3, §6).
+    pub sync: SyncHub,
     /// Unix seconds the daemon started.
     pub started_at: i64,
     /// Signalled by `Shutdown` (and by the signal handlers in `main`).
@@ -56,6 +60,7 @@ impl DaemonState {
             vault: Arc::new(vault),
             chain,
             block_cache,
+            sync: SyncHub::default(),
             started_at: unix_now(),
             shutdown: Notify::new(),
         }
@@ -167,6 +172,27 @@ impl GygesService {
 
 #[tonic::async_trait]
 impl Gyges for GygesService {
+    async fn get_sync_status(
+        &self,
+        request: Request<GetSyncStatusRequest>,
+    ) -> Result<Response<GetSyncStatusResponse>, Status> {
+        sync::get_sync_status(&self.state, request.into_inner()).map(Response::new)
+    }
+
+    async fn wait_sync(
+        &self,
+        request: Request<WaitSyncRequest>,
+    ) -> Result<Response<ProgressStream>, Status> {
+        sync::wait_sync(self.state.clone(), request.into_inner()).map(Response::new)
+    }
+
+    async fn run_sync(
+        &self,
+        request: Request<RunSyncRequest>,
+    ) -> Result<Response<ProgressStream>, Status> {
+        sync::run_sync(self.state.clone(), request.into_inner()).map(Response::new)
+    }
+
     async fn get_info(
         &self,
         _request: Request<GetInfoRequest>,

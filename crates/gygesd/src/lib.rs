@@ -27,6 +27,7 @@ pub mod lifecycle;
 pub mod node;
 pub mod policy;
 pub mod service;
+pub mod sync;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -236,18 +237,24 @@ impl Daemon {
 
         // Ask the node once before accepting clients, so that the `daemon
         // status` a user runs right after `daemon start` reflects it; then
-        // keep polling in the background (SYNC.md §1).
-        let poller = match &self.state.chain {
-            Some(chain) => {
-                let link = Arc::new(node::Link::default());
+        // hand the polling to the sync scheduler, which keeps every key at
+        // the tip (SYNC.md §1, §3).
+        let scheduler = match (&self.state.chain, &self.state.block_cache) {
+            (Some(chain), Some(cache)) => {
+                let link = node::Link::default();
                 let _ = tokio::time::timeout(
                     node::FIRST_POLL_TIMEOUT,
                     node::poll_once(&self.state, chain.as_ref(), &link),
                 )
                 .await;
-                Some(node::spawn_poller(self.state.clone(), chain.clone(), link))
+                Some(sync::spawn(
+                    self.state.clone(),
+                    chain.clone(),
+                    cache.clone(),
+                    link,
+                ))
             }
-            None => None,
+            _ => None,
         };
 
         tracing::info!(
@@ -275,8 +282,10 @@ impl Daemon {
             .context("gRPC server failed");
 
         sweeper.abort();
-        if let Some(p) = poller {
-            p.abort();
+        // Cancel at the next batch boundary: `scan_cached_blocks` commits per
+        // batch, so no partial batch is ever visible (SYNC.md §8 step 1).
+        if let Some(s) = scheduler {
+            s.abort();
         }
         // Zeroize every decrypted key before the process goes away
         // (CLI_SPEC.md §2.1 `daemon stop`).

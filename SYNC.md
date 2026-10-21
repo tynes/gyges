@@ -144,7 +144,9 @@ pub enum StallReason {
 | any | node unreachable > `offline_grace` | `Stalled(Offline)` | Retries every poll tick; auto-resumes |
 | `Stalled` | `sync run --from <h>` | `Initializing` | `truncate_to_height(h)` first |
 
-Each key's `SyncState` is held in memory and summarised in `GetSyncStatus`; `scanned_tip` itself is whatever `WalletRead::block_fully_scanned()` reports from the key's `wallet.sqlite`, so the daemon never persists a second copy of it.
+Each key's `SyncState` is held in memory and summarised in `GetSyncStatus`; `scanned_tip` itself is whatever `WalletRead::block_fully_scanned()` reports from the key's `wallet.sqlite` (or `birthday - 1` before the first batch), so the daemon never persists a second copy of it.
+
+**Status (landed with ROADMAP.md M1):** `gyges_core::sync::SyncState` has `Initializing`, `Scanning`, `Rewinding`, `Synced` and `Stalled(PrunedPastScanTip | ChainInconsistent | Offline)`; `Backfilling` and `UntrustedBackfill` arrive with M2, so a broken Case A invariant always stalls today, with the `daemon status` / `sync status` text above. A stalled key is re-evaluated every tick and leaves `Stalled` by itself once the cause is gone (node back, window widened, `sync run --from`). On the wire `Initializing` and `Synced` are both `SYNC_STATE_IDLE`, told apart by `scanned` / `spendable`; the CLI prints the words above.
 
 ---
 
@@ -163,7 +165,7 @@ Subtree roots are refreshed from `z_getsubtreesbyindex` whenever `tip_height` cr
 
 ### 4.2 Invariant and prune race
 
-**Invariant:** while in `Scanning`, `scanned_tip + 1 >= retained_from`.
+**Invariant:** while in `Scanning`, `scanned_tip + 1 >= retained_from`. The implementation is one block stricter: the next batch starts at `s = scanned_tip + 1` and needs `z_gettreestate(s - 1)` as its prior chain state, which a pruned node serves only for `s - 1 >= retained_from`, so `s - 1 < retained_from` stalls as well (unless `retained_from = 0`).
 
 It is checked before every batch and whenever `getblock` returns the pruned error. On violation:
 
@@ -187,6 +189,8 @@ Handling:
 4. No fork point within 100 blocks → `Stalled(ChainInconsistent)`; fix with `sync run --from <h>`.
 
 The `BlockCache` rows above `f` are deleted at the same time so no key re-reads stale blocks.
+
+**Status:** detector 1 runs once per tick on the *shared cache* (`cache tip` versus `getblockhash`, walking back to the fork point and truncating the cache) and once per key (the hash the wallet holds at `block_fully_scanned` versus the reconciled cache, falling back to the node); detector 2 is the scanner's continuity error. The fork search walks the wallet's own `blocks` hashes against the cache (or node) and calls `truncate_to_height`, which may truncate lower than asked; the key then rescans from there on the next tick. The subtree-root refresh (`z_getsubtreesbyindex`) is not implemented yet; witnesses are built from the scanned blocks alone, which is sufficient inside the retention window.
 
 ---
 
@@ -225,7 +229,7 @@ Compact blocks carry no transparent outputs and a pruned node stops maintaining 
 | **scanned** | `block_fully_scanned().height >= bounds.tip_height` | `WalletRead::block_fully_scanned` |
 | **spendable** | scanned, and `suggest_scan_ranges()` returns no range with priority above `Ignored` | `WalletRead::suggest_scan_ranges` |
 
-`GetSyncStatus` returns both booleans plus `scanned_tip`, `tip_height`, `retained_from`, the `SyncState`, blocks per second over the last minute, and the active source. The CLI never computes them itself.
+`GetSyncStatus` returns both booleans plus `scanned_tip`, `tip_height`, the `SyncState`, blocks per second over the last minute, the blocks remaining across open ranges and the active source (`retained_from` is in `GetInfo.node`). The CLI never computes them itself. `WaitSync` wakes the scheduler and reports `done` only from a tick that began after the request, so a `sync wait` issued right after new blocks never returns a stale "spendable"; a stalled key fails the stream at once with `NOT_SYNCED` (API.md §4.4).
 
 `gyges sync wait` defaults to `--until spendable`; `--until scanned` is cheaper for scripts that only need the tip. `--confirmations N --txid T` waits until `T` has `N` confirmations.
 

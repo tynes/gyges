@@ -14,11 +14,16 @@ use gyges_proto::uds;
 use gyges_proto::v1::gyges_client::GygesClient;
 use gyges_proto::v1::{
     ErrorReason, ExportSeedRequest, ExportUfvkRequest, GetBalanceRequest, GetInfoRequest,
-    GygesError, InitKeyRequest, ListKeysRequest, LockKeyRequest, RestoreKeyRequest,
-    ShutdownRequest, SigningMode, UnlockKeyRequest, UnlockScope,
+    GetSyncStatusRequest, GygesError, InitKeyRequest, ListKeysRequest, LockKeyRequest,
+    RestoreKeyRequest, RunSyncRequest, ShutdownRequest, SigningMode, SyncProgress, SyncState,
+    SyncTarget, UnlockKeyRequest, UnlockScope, WaitSyncRequest,
 };
 use gygesd::{Daemon, DaemonState, Options};
+use tokio_stream::StreamExt as _;
 use tonic::transport::Channel;
+use zcash_client_backend::data_api::WalletRead as _;
+use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
+use zcash_protocol::consensus::BlockHeight;
 
 struct Running {
     _home: tempfile::TempDir,
@@ -28,21 +33,25 @@ struct Running {
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
+/// A low scrypt work factor keeps `InitKey` / `RestoreKey` fast here
+/// (production uses the default of 20); a one-second poll keeps the sync
+/// tests short.
+const TEST_CONFIG: &str =
+    "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n";
+
 fn fresh_home() -> (tempfile::TempDir, Home) {
+    fresh_home_with(TEST_CONFIG)
+}
+
+fn fresh_home_with(config: &str) -> (tempfile::TempDir, Home) {
     let dir = tempfile::tempdir().unwrap();
     perms::set_mode(dir.path(), 0o700).unwrap();
     let home = Home::new(dir.path());
-    // A low scrypt work factor keeps `InitKey` / `RestoreKey` fast here;
-    // production uses the default of 20.
     let net = home.network_dir(Network::Regtest);
     std::fs::create_dir_all(&net).unwrap();
     perms::set_mode(&net, 0o700).unwrap();
     perms::create_private_file(&home.config_path(Network::Regtest)).unwrap();
-    std::fs::write(
-        home.config_path(Network::Regtest),
-        "[vault]\nscrypt_work_factor = 10\n",
-    )
-    .unwrap();
+    std::fs::write(home.config_path(Network::Regtest), config).unwrap();
     (dir, home)
 }
 
@@ -52,6 +61,11 @@ fn known_mnemonic() -> String {
 }
 
 async fn start(configure: impl FnOnce(&mut Options)) -> Running {
+    // `RUST_LOG=debug cargo test -- --nocapture` shows the daemon's tracing.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let (dir, home) = fresh_home();
     let mut opts = Options::new(home.clone(), Network::Regtest);
     configure(&mut opts);
@@ -980,4 +994,375 @@ async fn real_backend_against_the_fake_node_reports_bounds_and_seeds_birthdays()
         !wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0,
         "WAL not checkpointed"
     );
+}
+
+/// Drain a `WaitSync` / `RunSync` stream; returns the final element.
+async fn drain(
+    stream: Result<tonic::Response<tonic::Streaming<SyncProgress>>, tonic::Status>,
+) -> Result<SyncProgress, tonic::Status> {
+    let mut stream = stream?.into_inner();
+    let mut last = None;
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await
+        .expect("stream element within 30s")
+    {
+        let p = item?;
+        let done = p.done;
+        last = Some(p);
+        if done {
+            break;
+        }
+    }
+    Ok(last.expect("at least one element"))
+}
+
+async fn wait_spendable(
+    c: &mut GygesClient<Channel>,
+    key_id: &str,
+) -> gyges_proto::v1::KeySyncStatus {
+    let p = drain(
+        c.wait_sync(WaitSyncRequest {
+            key_id: key_id.into(),
+            until: SyncTarget::Spendable as i32,
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .expect("wait_sync");
+    assert!(p.done);
+    p.status.expect("status")
+}
+
+#[tokio::test]
+async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_reorg() {
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(10);
+    let url = node.url().to_string();
+    let running = start(|o| o.zakura_rpc = Some(url)).await;
+    let mut c = client(&running.socket).await;
+
+    // No keys: an empty status, and WaitSync on an unknown key is typed.
+    let st = c
+        .get_sync_status(GetSyncStatusRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(st.keys.is_empty());
+    let err = drain(
+        c.wait_sync(WaitSyncRequest {
+            key_id: "nope".into(),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        GygesError::from_status(&err).unwrap().reason(),
+        ErrorReason::KeyNotFound
+    );
+
+    // A key born at the tip is scanned and spendable after one batch.
+    let resp = c
+        .init_key(InitKeyRequest {
+            key_id: "main".into(),
+            passphrase: "pw".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.birthday_height, 10);
+    let status = wait_spendable(&mut c, "main").await;
+    assert_eq!(status.scanned_tip, 10, "{status:?}");
+    assert_eq!(status.chain_tip, 10);
+    assert!(status.scanned && status.spendable);
+    assert_eq!(status.state(), SyncState::Idle);
+    assert_eq!(status.blocks_remaining, 0);
+    let st = c
+        .get_sync_status(GetSyncStatusRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(st.keys.len(), 1);
+    assert!(
+        st.keys[0].detail.starts_with("synced"),
+        "{}",
+        st.keys[0].detail
+    );
+
+    // Pay the key's first transparent receiver in a new block, mine two
+    // more, and watch the scheduler pick it all up from its poll.
+    let key = running.state.registry.resolve("main").unwrap();
+    let (account, receiver) = {
+        let w = key.wallet().unwrap();
+        let account = w.get_account_ids().unwrap()[0];
+        let receivers = w.get_transparent_receivers(account, false, false).unwrap();
+        let addr = *receivers.keys().next().expect("a transparent receiver");
+        (account, addr)
+    };
+    let paid = node.mine_with_payments(&[(receiver, 70_000)]);
+    assert_eq!(paid.height, 11);
+    node.mine(2);
+    let status = wait_spendable(&mut c, "main").await;
+    assert_eq!(status.scanned_tip, 13, "{status:?}");
+    {
+        let w = key.wallet().unwrap();
+        let summary = w
+            .get_wallet_summary(ConfirmationsPolicy::MIN)
+            .unwrap()
+            .expect("summary");
+        let balance = &summary.account_balances()[&account];
+        assert_eq!(
+            u64::from(balance.unshielded_balance().total()),
+            70_000,
+            "the transparent output was credited from the raw block"
+        );
+        assert_eq!(
+            w.block_metadata(BlockHeight::from_u32(13))
+                .unwrap()
+                .unwrap()
+                .block_hash()
+                .0,
+            node.block(13).unwrap().hash
+        );
+    }
+    let cache = running.state.block_cache.as_ref().unwrap();
+    assert_eq!(
+        cache.hash_at(BlockHeight::from_u32(11)).unwrap(),
+        Some(paid.hash)
+    );
+
+    // A 2-block reorg: the node drops 12 and 13 and mines 12, 13, 14 anew.
+    let old_12 = node.block(12).unwrap().hash;
+    node.invalidate_from(12);
+    node.mine(3);
+    let new_12 = node.block(12).unwrap().hash;
+    assert_ne!(old_12, new_12);
+    let status = wait_spendable(&mut c, "main").await;
+    assert_eq!(status.scanned_tip, 14, "{status:?}");
+    {
+        let w = key.wallet().unwrap();
+        assert_eq!(
+            w.block_metadata(BlockHeight::from_u32(12))
+                .unwrap()
+                .unwrap()
+                .block_hash()
+                .0,
+            new_12,
+            "the wallet follows the new chain"
+        );
+        // Block 11 (below the fork) and its output survived the rewind.
+        let summary = w
+            .get_wallet_summary(ConfirmationsPolicy::MIN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            u64::from(
+                summary.account_balances()[&account]
+                    .unshielded_balance()
+                    .total()
+            ),
+            70_000
+        );
+    }
+    assert_eq!(
+        cache.hash_at(BlockHeight::from_u32(12)).unwrap(),
+        Some(new_12)
+    );
+
+    // RunSync: a rewind needs confirmation, then rescans to the tip.
+    let err = drain(
+        c.run_sync(RunSyncRequest {
+            key_id: "main".into(),
+            from_height: 11,
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        GygesError::from_status(&err).unwrap().reason(),
+        ErrorReason::ConfirmationRequired
+    );
+    let p = drain(
+        c.run_sync(RunSyncRequest {
+            key_id: "main".into(),
+            from_height: 11,
+            confirm_rewind: true,
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    let status = p.status.unwrap();
+    assert!(status.spendable && status.scanned_tip == 14, "{status:?}");
+    {
+        let w = key.wallet().unwrap();
+        let summary = w
+            .get_wallet_summary(ConfirmationsPolicy::MIN)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            u64::from(
+                summary.account_balances()[&account]
+                    .unshielded_balance()
+                    .total()
+            ),
+            70_000,
+            "re-indexed after the rescan"
+        );
+    }
+
+    // Pruning past the key's position stalls it with the documented fix,
+    // WaitSync fails fast, and the key recovers when the window widens.
+    node.mine(5);
+    node.set_prune_height(Some(18));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let stalled = loop {
+        let st = c
+            .get_sync_status(GetSyncStatusRequest {
+                key_id: "main".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let k = st.keys[0].clone();
+        if k.state() == SyncState::Stalled {
+            break k;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never stalled: {k:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        stalled.stall_reason(),
+        gyges_proto::v1::StallReason::PrunedPastScanTip
+    );
+    assert!(
+        stalled.detail.contains("retains from 18"),
+        "{}",
+        stalled.detail
+    );
+    let err = drain(
+        c.wait_sync(WaitSyncRequest {
+            key_id: "main".into(),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap_err();
+    let typed = GygesError::from_status(&err).unwrap();
+    assert_eq!(typed.reason(), ErrorReason::NotSynced);
+    assert!(
+        typed.detail.contains("pruned-past-scan-tip"),
+        "{}",
+        typed.detail
+    );
+
+    // Widen the window again: the next tick re-evaluates the invariant and
+    // the key leaves STALLED on its own. (WaitSync on a stalled key fails
+    // at once by design, so wait for the state to clear first.)
+    node.set_prune_height(None);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let st = c
+            .get_sync_status(GetSyncStatusRequest {
+                key_id: "main".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        if st.keys[0].state() != SyncState::Stalled {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "still stalled: {:?}",
+            st.keys[0]
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let status = wait_spendable(&mut c, "main").await;
+    assert_eq!(status.scanned_tip, 19, "{status:?}");
+
+    // Signer-only profiles have nothing to sync.
+    let err = c
+        .get_sync_status(GetSyncStatusRequest {
+            key_id: "nope".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        GygesError::from_status(&err).unwrap().reason(),
+        ErrorReason::KeyNotFound
+    );
+    running.task.abort();
+}
+
+#[tokio::test]
+async fn offline_node_keeps_keys_initializing_then_stalls_after_the_grace() {
+    let url = closed_port_url();
+    let (dir, home) = fresh_home_with(
+        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[daemon]\noffline_grace = \"2s\"\n",
+    );
+    let mut opts = Options::new(home.clone(), Network::Regtest);
+    opts.zakura_rpc = Some(url);
+    // A wallet-bearing key without a node: restore at the default birthday.
+    let daemon = Daemon::prepare(opts).unwrap();
+    let socket = daemon.socket_path();
+    let state = daemon.state.clone();
+    let task = tokio::spawn(daemon.serve(std::future::pending()));
+    for _ in 0..400 {
+        if uds::probe(&socket).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut c = client(&socket).await;
+    c.restore_key(RestoreKeyRequest {
+        key_id: "r".into(),
+        mnemonic: known_mnemonic(),
+        passphrase: "pw".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let stalled = loop {
+        let st = c
+            .get_sync_status(GetSyncStatusRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        let k = st.keys[0].clone();
+        if k.state() == SyncState::Stalled {
+            break k;
+        }
+        assert_eq!(k.state(), SyncState::Idle, "{k:?}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never stalled: {k:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(
+        stalled.stall_reason(),
+        gyges_proto::v1::StallReason::NodeUnreachable
+    );
+    assert!(
+        stalled.detail.contains("node unreachable"),
+        "{}",
+        stalled.detail
+    );
+    drop(state);
+    task.abort();
+    drop(dir);
 }

@@ -218,6 +218,13 @@ Read from `zakura-core/zakura` `crates/zakura-rpc/src/methods.rs`, `methods/tree
 - The cookie file is `__cookie__:` + base64 of 32 random bytes, written `0600` at every node start; the server ignores the username and compares only the part after the colon, and answers a wrong cookie with an **empty** response rather than a JSON error. Gyges re-reads the file on every request and treats an empty reply as an authentication failure. (Q-D2)
 - `zcash_protocol::consensus::Parameters` requires `Clone` (so `Self: Sized`) and cannot be used as `dyn Parameters`; type-erasure needs a wrapper. `zcash_primitives::block::Block::from_parts` is behind the `test-dependencies` feature, so test blocks are serialised by hand (header, CompactSize count, transactions).
 
+Learned while building the scheduler against the wallet crates (2026-10-21):
+
+- A `WalletDb` handle must select a **transparent ledger mode** (`with_transparent_ledger_mode(TransparentLedgerMode::Public)`); Zakura's transparent APIs, `put_received_transparent_utxo` included, fail closed with "Transparent ledger mode is not configured" otherwise. It is per handle, not persisted. Gyges picks `Public` because Case A discovery reads the local node's raw blocks. The `PrivateRequired` mode and the transparent PIR machinery are not used. (Q-D4)
+- Zakura's compact-block scanner records a `tx_locator_map` row for **every** transaction of a scanned block, and `scanning/compact.rs` still carries `TODO: Scan transparent data in CompactTx if present`: the `vin`/`vout` fields are not consumed upstream, so Gyges' own transparent indexing from the cache is needed and not redundant. (Q-D4, Q-Y3)
+- A v5 txid does not commit to the scriptSig (ZIP 244), so two coinbases that differ only in their height push collide; consensus avoids this by making a v5 coinbase's `nExpiryHeight` equal its block height. The fake node now does the same; before it did, the duplicate locator surfaced as the UNIQUE failure above during `put_blocks`.
+- `truncate_to_height` returns the height actually truncated to, which can be lower than requested (checkpoint granularity); the scheduler reports that height, not the one it asked for.
+
 ---
 
 ## 5. Missing Documents

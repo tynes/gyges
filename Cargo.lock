@@ -2280,6 +2280,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "zeroize",
 ]
@@ -2356,8 +2357,10 @@ name = "gyges-regtest"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "gyges-chain",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2381,6 +2384,9 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "zakura-client-backend",
+ "zakura-protocol",
+ "zakura-transparent",
  "zeroize",
 ]
 
