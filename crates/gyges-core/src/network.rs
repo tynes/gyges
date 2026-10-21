@@ -4,6 +4,11 @@
 use std::fmt;
 use std::str::FromStr;
 
+use zcash_protocol::consensus::{
+    BlockHeight, MAIN_NETWORK, NetworkType, NetworkUpgrade, Parameters, TEST_NETWORK,
+};
+use zcash_protocol::local_consensus::LocalNetwork;
+
 /// Which chain a `gygesd` instance serves; selects `$GYGES_HOME/<network>/`.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
@@ -48,6 +53,66 @@ impl Network {
             Network::Regtest => 1,
         }
     }
+
+    /// The consensus parameters `zcash_keys` and `zcash_client_sqlite` need
+    /// (address encodings, coin type, activation heights).
+    pub const fn consensus_params(self) -> ConsensusParams {
+        match self {
+            Network::Mainnet => ConsensusParams::Main,
+            Network::Testnet => ConsensusParams::Test,
+            Network::Regtest => ConsensusParams::Regtest,
+        }
+    }
+}
+
+/// `zcash_protocol::consensus::Parameters` for the three networks.
+///
+/// Mainnet and testnet are the upstream constants. Regtest activates every
+/// network upgrade at height 1, which is what the Zebra-derived `zakurad`
+/// does by default; the activation heights a regtest node actually reports
+/// (`getblockchaininfo.upgrades`) are checked against this table when the
+/// node backend connects (ROADMAP.md M1, **needs verification** against a
+/// running `zakurad`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsensusParams {
+    Main,
+    Test,
+    Regtest,
+}
+
+const REGTEST_ACTIVATION: BlockHeight = BlockHeight::from_u32(1);
+
+/// Every upgrade active from height 1.
+const REGTEST: LocalNetwork = LocalNetwork {
+    overwinter: Some(REGTEST_ACTIVATION),
+    sapling: Some(REGTEST_ACTIVATION),
+    blossom: Some(REGTEST_ACTIVATION),
+    heartwood: Some(REGTEST_ACTIVATION),
+    canopy: Some(REGTEST_ACTIVATION),
+    nu5: Some(REGTEST_ACTIVATION),
+    nu6: Some(REGTEST_ACTIVATION),
+    nu6_1: Some(REGTEST_ACTIVATION),
+    nu6_2: Some(REGTEST_ACTIVATION),
+    nu6_3: Some(REGTEST_ACTIVATION),
+    nu7: None,
+};
+
+impl Parameters for ConsensusParams {
+    fn network_type(&self) -> NetworkType {
+        match self {
+            ConsensusParams::Main => NetworkType::Main,
+            ConsensusParams::Test => NetworkType::Test,
+            ConsensusParams::Regtest => NetworkType::Regtest,
+        }
+    }
+
+    fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
+        match self {
+            ConsensusParams::Main => MAIN_NETWORK.activation_height(nu),
+            ConsensusParams::Test => TEST_NETWORK.activation_height(nu),
+            ConsensusParams::Regtest => REGTEST.activation_height(nu),
+        }
+    }
 }
 
 impl fmt::Display for Network {
@@ -83,6 +148,27 @@ mod tests {
             assert_eq!(n.to_string(), n.name());
         }
         assert!("Mainnet".parse::<Network>().is_err());
+    }
+
+    #[test]
+    fn activation_constants_agree_with_the_consensus_parameters() {
+        for n in Network::ALL {
+            let p = n.consensus_params();
+            assert_eq!(
+                p.activation_height(NetworkUpgrade::Sapling),
+                Some(BlockHeight::from_u32(n.sapling_activation_height())),
+                "{n}"
+            );
+            assert_eq!(
+                p.activation_height(NetworkUpgrade::Nu5),
+                Some(BlockHeight::from_u32(n.nu5_activation_height())),
+                "{n}"
+            );
+        }
+        assert_eq!(
+            Network::Regtest.consensus_params().network_type(),
+            NetworkType::Regtest
+        );
     }
 
     #[test]

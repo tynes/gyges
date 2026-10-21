@@ -234,7 +234,33 @@ subscriber, not from tailing the file, so the CLI stays socket-only (Q-O1).
 source; `fields` never contain addresses, amounts, memos or key material at
 any level.
 
-### 4.6 `BackupKey` / `ImportBackup`
+### 4.6 `InitKey` / `RestoreKey`
+
+`InitKey` takes the birthday from the node's tip (`NODE_UNREACHABLE` when no
+node is connected) and creates a `LOCAL_SEED` profile; on an air-gapped
+daemon it creates a `SIGNER_ONLY` profile instead (no wallet, `birthday_height
+= 0`, empty `ufvk`), which is why it is on the §8 allow-list. `RestoreKey`
+with `birthday_height = 0` uses the network's Sapling activation height; any
+birthday at or below Sapling activation needs no node, any other needs the
+node's tree state at `birthday - 1`, and one below `node.retained_from`
+returns `CONFIRMATION_REQUIRED` until `allow_backfill` is set, then
+`FALLBACK_UNAVAILABLE` until the Tor backfill exists (ROADMAP.md M2).
+`set_default` on either changes `GetInfo.default_key` for this daemon run
+only: the daemon never rewrites `config.toml`. Passphrases and mnemonics are
+moved into zeroizing wrappers on arrival; a mnemonic error never echoes a
+word back. Both calls run the scrypt and SQLite work on a blocking thread.
+
+`UnlockKey` without `session_id` behaves as §6.3 describes (`CONNECTION` by
+default, `DAEMON` on request); with a `session_id` it answers
+`SESSION_NOT_FOUND` until signing sessions exist. A `ttl_secs` of 0 means
+`vault.unlock_ttl`. `KeySummary.locked` is false only for a daemon-scoped
+unlock, with `unlock_expires_at` set. `ExportUfvk` on a `SIGNER_ONLY` profile
+derives the key from a live daemon-scoped unlock and answers `VAULT_LOCKED`
+without one. `ExportSeed` checks `vault.allow_seed_export`, then the literal
+confirmation, then the passphrase (through the same per-key back-off as
+`UnlockKey`), and never creates an unlock.
+
+### 4.7 `BackupKey` / `ImportBackup`
 
 Chunked tar archives. `BackupKey` runs `wal_checkpoint(TRUNCATE)` before
 reading `wallet.sqlite` and holds the key's write lock for the duration.

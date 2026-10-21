@@ -162,7 +162,7 @@ Mode examples (fields that differ from the `local-seed` example above):
   "seed_format": "age-scrypt-v1", "seed_fingerprint": "f0a1…" }
 ```
 
-A `signer-only` profile has no `wallet.sqlite` and no `birthday_height`; it exists only to prove and sign PCZTs that already contain anchors and witnesses (Q-K5). `watch-only` has no `seed.age`. `keystone-qr` has neither.
+A `signer-only` profile has no `wallet.sqlite` and no `birthday_height`; it exists only to prove and sign PCZTs that already contain anchors and witnesses (Q-K5), and is what `key init` creates on a `--airgapped` daemon. `watch-only` has no `seed.age`. `keystone-qr` has neither. `gyges_core::profile::KeyProfile::validate` enforces this table; a profile that breaks it, names another network, or has a `schema_version` newer than the daemon refuses the daemon's start with the key id and the rule in the message.
 
 Birthday defaults when the user does not know it: `key restore` falls back to Sapling activation (419,200 mainnet) with a warning that a full Tor backfill follows; `key import-keystone` defaults to NU5 activation (1,687,104 mainnet) because an Orchard-only key cannot have received shielded funds earlier.
 
@@ -173,7 +173,7 @@ Birthday defaults when the user does not know it: `key restore` falls back to Sa
 An ordinary age file (`rage` can decrypt it) with a single scrypt passphrase recipient, armored (`age-encryption.org/v1` ASCII), holding the 32-byte BIP-39 **entropy** of the 24-word mnemonic, not the 64-byte derived seed. Exporting the backup therefore yields the same words the user wrote down.
 
 - Work factor: `vault.scrypt_work_factor`, recorded alongside the file as `profile.json.seed_format` so it can be raised by a migration that re-encrypts.
-- Decryption produces `SecretBox<[u8; 32]>`; the mnemonic and the `UnifiedSpendingKey` derived from it are zeroized on drop.
+- Decryption produces `secrecy::Secret<[u8; 32]>` (`gyges_core::vault::Entropy`); the mnemonic and the `UnifiedSpendingKey` derived from it are zeroized on drop.
 - The file is written with `O_EXCL` and `0600`, then renamed into place; it is never rewritten except by `gyges key passphrase` (change passphrase) and migrations.
 
 Argon2id is not used; see Q-S5 for the compatible construction if it is ever required.

@@ -91,13 +91,17 @@ Streams structured daemon logs through the `StreamLogs` RPC (the CLI never tails
 ### 2.2 Keys and vault (`gyges key`)
 
 #### `gyges key list`
-Lists key profiles with `SigningMode` (`local-seed`, `keystone-qr`, `watch-only`, `signer-only`), `LOCKED`/`UNLOCKED`, `birthday_height`, `scanned_tip` and sync state.
+Lists key profiles with `SigningMode` (`local-seed`, `keystone-qr`, `watch-only`, `signer-only`), `locked`/`UNLOCKED`, `birthday_height`, `scanned_tip` and sync state (sync state arrives with `SyncScheduler`; `signer-only` profiles show `-` for birthday and scanned tip).
 
 #### `gyges key init --id <KEY_ID> [--set-default]`
 Generates 24-word BIP 39 entropy, sets `birthday_height` to the node's current tip, initialises `wallet.sqlite`, encrypts `seed.age` with a passphrase (prompted twice), displays the mnemonic once and requires three randomly chosen words to be typed back before continuing. TTY required (exit 4 otherwise).
 
-#### `gyges key restore --id <KEY_ID> [--birthday <HEIGHT>] [--stdin]`
-Restores a 24-word mnemonic. `--birthday` is strongly recommended; when omitted the CLI warns and uses the Sapling activation height (419,200 on mainnet), which implies a full backfill over Tor. If the birthday is below the node's `retained_from`, the daemon backfills over the configured fallback endpoint first; the first such restore asks `N blocks below the node's retention height must be fetched over Tor from <url>; continue? [y/N]` (`--yes` for scripts).
+- **Scripted form.** With `--json` *and* a passphrase source (`--passphrase-fd` or `GYGES_PASSPHRASE_FILE`) no terminal is needed: the `InitKeyResponse` (mnemonic included) is printed as JSON and nothing is typed back. This is the form the regtest suite uses. `--json` without a passphrase source is still refused (exit 4, `CONFIRMATION_REQUIRED`).
+- **Air-gapped daemon.** Against `gygesd --airgapped` the command creates a `signer-only` profile (seed and profile, no wallet, no birthday), the only mode an air-gapped box needs.
+- `--set-default` applies until the daemon restarts; the daemon never rewrites `config.toml`, so the CLI prints the `default_key = "<id>"` line to add. The same holds for `key restore --set-default`.
+
+#### `gyges key restore --id <KEY_ID> [--birthday <HEIGHT>] [--stdin] [--yes] [--set-default]`
+Restores a 24-word mnemonic, read from a hidden prompt or, with `--stdin`, from standard input. `--birthday` is strongly recommended; when omitted the CLI warns and uses the Sapling activation height (419,200 on mainnet), which implies a full backfill over Tor. If the birthday is below the node's `retained_from`, the daemon backfills over the configured fallback endpoint first; the first such restore asks `N blocks below the node's retention height must be fetched over Tor from <url>; continue? [y/N]` (`--yes` for scripts). Until the Tor backfill lands (ROADMAP.md M2) such a restore is refused with exit 7 (`FALLBACK_UNAVAILABLE`) after the consent step; any birthday above Sapling activation needs the node's tree state and exits 7 (`NODE_UNREACHABLE`) when no node is connected.
 
 #### `gyges key import-keystone --id <KEY_ID> --birthday <HEIGHT> [--ur <UR_STRING>]`
 Registers a Keystone 3 Pro profile from `ur:zcash-accounts` (tag 49201), `ur:zcash-unified-full-viewing-key` (49203) or a bare `uview1…` string. The accounts payload carries **no birthday**, so `--birthday` is required or prompted; the prompt defaults to the NU5 activation height (1,687,104 on mainnet). Records `device_version` and refuses firmware below the minimum.
@@ -106,16 +110,16 @@ Registers a Keystone 3 Pro profile from `ur:zcash-accounts` (tag 49201), `ur:zca
 Creates a watch-only profile (Orchard proving-only: Sapling spends need the proof generation key, which a UFVK does not contain).
 
 #### `gyges key unlock [--id <KEY_ID>] [--timeout <DURATION>]`
-Prompts for the passphrase and creates a **daemon-scoped** signing session with an idle TTL (`--timeout`, default `vault.unlock_ttl` = `5m`; e.g. `60s`, `15m`). This is the weaker of the two unlock modes (the inline `tx send` flow uses a connection-scoped session) and exists for batch scripts.
+Prompts for the passphrase (or takes it from `--passphrase-fd` / `GYGES_PASSPHRASE_FILE`) and creates a **daemon-scoped** unlock with an idle TTL (`--timeout`, default `vault.unlock_ttl` = `5m`; e.g. `60s`, `15m`). This is the weaker of the two unlock modes (the inline `tx send` flow uses a connection-scoped session) and exists for batch scripts; the confirmation line says so and names the expiry. `--id` falls back to `--key`, then to the daemon's `default_key`. A wrong passphrase exits 4 (`INVALID_PASSPHRASE`); further attempts on the same key are refused with `RATE_LIMITED` for 1 s, doubling per failure up to `vault.unlock_backoff_max`, whichever connection they come from.
 
 #### `gyges key lock [--id <KEY_ID> | --all]`
-Destroys the signing sessions and zeroizes the decrypted key(s) immediately.
+Destroys the unlocks of one key (every scope) or of every key and zeroizes the decrypted material immediately. `daemon stop` does the same for every key.
 
 #### `gyges key export-ufvk [--id <KEY_ID>]`
-Prints the `uview1…` UFVK.
+Prints the `uview1…` UFVK. A `signer-only` profile keeps no viewing key on disk, so it needs a live daemon-scoped unlock first (exit 4, `VAULT_LOCKED`, otherwise).
 
 #### `gyges key export-seed [--id <KEY_ID>]`
-Prints the 24-word mnemonic. TTY required; prompts for the passphrase (never reuses a session); requires typing `reveal seed`; output never goes to `--json` or a file; written to the audit log; disabled when `vault.allow_seed_export = false`.
+Prints the 24-word mnemonic. TTY required on stdin, stdout and stderr (exit 4 otherwise); requires typing `reveal seed` first; then prompts for the passphrase on the terminal (never `--passphrase-fd`, never an existing unlock); output never goes to `--json` (exit 6) or a file; written to the audit log; disabled when `vault.allow_seed_export = false` (exit 4, `SEED_EXPORT_DISABLED`). A failed passphrase here counts against the same per-key back-off as `key unlock`.
 
 #### `gyges key backup --id <KEY_ID> -o <FILE.tar>` / `gyges key import-backup <FILE.tar>`
 Checkpoints WAL and archives `profile.json`, `seed.age` and optionally `wallet.sqlite` (`--with-db`). Copying `keys/<id>/` by hand is supported only while the daemon is stopped.

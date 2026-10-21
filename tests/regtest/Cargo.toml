@@ -16,6 +16,10 @@ path = "harness/lib.rs"
 name = "daemon"
 path = "scenarios/daemon.rs"
 
+[[test]]
+name = "keys"
+path = "scenarios/keys.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 serde_json = { workspace = true }

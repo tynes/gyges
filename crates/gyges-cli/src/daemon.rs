@@ -341,7 +341,7 @@ pub fn render_status(info: &GetInfoResponse) -> String {
                 s,
                 "    {:<16} {:<12} {:<8} birthday {} scanned {}{}",
                 k.key_id,
-                format!("{:?}", k.signing_mode()).to_lowercase(),
+                crate::key::mode_name(k.signing_mode()),
                 if k.locked { "locked" } else { "UNLOCKED" },
                 k.birthday_height,
                 k.scanned_tip,
@@ -432,8 +432,13 @@ mod tests {
         let ctx = Ctx {
             socket: "/x".into(),
             network: Some(Network::Regtest),
+            key: String::new(),
             json: false,
             quiet: false,
+            prompter: crate::prompt::Prompter {
+                non_interactive: true,
+                passphrase_fd: None,
+            },
         };
         let args = StartArgs {
             foreground: true,

@@ -97,6 +97,7 @@ impl Run {
 #[derive(Debug)]
 pub struct Cmd {
     cmd: Command,
+    stdin: Option<Vec<u8>>,
 }
 
 impl Cmd {
@@ -105,9 +106,25 @@ impl Cmd {
         self
     }
 
+    /// Feed `text` on standard input (which is otherwise `/dev/null`).
+    pub fn stdin(mut self, text: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(text.into());
+        self
+    }
+
     pub fn run(mut self) -> Run {
-        let output = self.cmd.output().expect("spawn gyges");
-        Run::from(output)
+        let Some(input) = self.stdin.take() else {
+            let output = self.cmd.output().expect("spawn gyges");
+            return Run::from(output);
+        };
+        self.cmd.stdin(Stdio::piped());
+        let mut child = self.cmd.spawn().expect("spawn gyges");
+        {
+            use std::io::Write as _;
+            let mut pipe = child.stdin.take().expect("piped stdin");
+            pipe.write_all(&input).expect("write stdin");
+        }
+        Run::from(child.wait_with_output().expect("collect output"))
     }
 }
 
@@ -226,8 +243,28 @@ impl Fixture {
             .env_remove("GYGES_SOCKET")
             .env_remove("GYGES_NETWORK")
             .env_remove("GYGES_KEY")
-            .stdin(Stdio::null());
-        Cmd { cmd }
+            .env_remove("GYGES_PASSPHRASE_FILE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Cmd { cmd, stdin: None }
+    }
+
+    /// A `0600` file holding `passphrase`, for `GYGES_PASSPHRASE_FILE`.
+    pub fn passphrase_file(&self, passphrase: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = self
+            .home_path
+            .join(format!("pw-{}-{n}", std::process::id()));
+        std::fs::write(&path, format!("{passphrase}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    /// `keys/<id>/` for this network.
+    pub fn key_dir(&self, key_id: &str) -> PathBuf {
+        self.network_dir().join("keys").join(key_id)
     }
 
     /// Like [`Fixture::gyges`] but without `--network`, so the CLI adopts
@@ -240,8 +277,11 @@ impl Fixture {
             .env_remove("GYGES_SOCKET")
             .env_remove("GYGES_NETWORK")
             .env_remove("GYGES_KEY")
-            .stdin(Stdio::null());
-        Cmd { cmd }
+            .env_remove("GYGES_PASSPHRASE_FILE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Cmd { cmd, stdin: None }
     }
 
     /// Wait for the daemon this fixture started to exit.

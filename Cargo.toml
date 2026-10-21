@@ -63,7 +63,7 @@ zakura-pir-status = { version = "=0.0.1-rc1" }   # experimental; only `gyges tx 
 # --- Zakura common crates (zakura-core/common) ---
 zcash_keys        = { package = "zakura-keys",           version = "=4.0.0-rc2", features = ["orchard", "sapling", "transparent-inputs"] }
 zcash_address     = { package = "zakura-address",        version = "=4.0.0-rc2" }
-zcash_protocol    = { package = "zakura-protocol",       version = "=4.0.0-rc2" }
+zcash_protocol    = { package = "zakura-protocol",       version = "=4.0.0-rc2", features = ["local-consensus"] }  # LocalNetwork for regtest
 zcash_primitives  = { package = "zakura-primitives",     version = "=4.0.0-rc2", features = ["transparent-inputs"] }
 zcash_proofs      = { package = "zakura-proofs",         version = "=4.0.0-rc2", features = ["bundled-prover"] }
 orchard           = { package = "zakura-orchard",        version = "=4.0.0-rc2" }
@@ -78,6 +78,8 @@ zeroize    = { version = "1.8", features = ["derive"] }
 bip0039    = "0.12"                                  # 0.12 is what zcash_keys/zcash_client_sqlite use; it has no `zeroize` feature
 rusqlite   = { version = "0.37", features = ["bundled", "time"] }
 shardtree  = "0.7"
+zip32      = "0.2"                                   # AccountId and SeedFingerprint, the major zcash_keys uses
+schemerz   = "0.2"                                   # MigratorError, to match zcash_client_sqlite's SeedRequired
 time       = "0.3"
 
 # --- Async runtime & IPC (gRPC over Unix Domain Socket) ---
