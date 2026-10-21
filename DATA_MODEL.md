@@ -184,31 +184,34 @@ Argon2id is not used; see Q-S5 for the compatible construction if it is ever req
 
 The upstream `zcash_client_sqlite` schema is created and migrated by `zcash_client_sqlite::wallet::init::init_wallet_db` and is not modified. Gyges adds its own tables in the same database, prefixed `gyges_`, so that a key directory is self-contained and transactional with the wallet state.
 
-### 5.1 `gyges_tex_queue` (Q-T1)
+### 5.1 `ext_gyges_tex_queue` (Q-T1)
+
+**Landed (ROADMAP.md M3) as `gyges_core::tex`.** `zcash_client_sqlite` reserves the `ext_` prefix for application tables: they are created by an external migration (`WalletMigrator::with_external_migrations`, run with the upstream migrations when the registry opens a wallet) and written only through `WalletDb::transactionally_with_extension`, whose SQLite authorizer refuses writes to any other table, schema changes and transaction control. The table is therefore `ext_gyges_tex_queue`, not the `gyges_tex_queue` of the first draft; `gyges_signing_sessions` and `gyges_address_labels` below will follow the same rule when they land. Two consequences shape the code: the extension handle answers single rows only (`execute`, `query_row`), so listing goes through a `group_concat` of ids; and `AUTOINCREMENT` is unusable (it writes `sqlite_sequence`), which this table does not need.
 
 ```sql
-CREATE TABLE gyges_tex_queue (
-    step1_txid       BLOB NOT NULL PRIMARY KEY,   -- 32 bytes
-    step2_txid       BLOB NOT NULL,
-    proposal         BLOB NOT NULL,               -- proto3 Proposal, for `tx list` and resume
+CREATE TABLE ext_gyges_tex_queue (
+    step1_txid       BLOB NOT NULL PRIMARY KEY,   -- 32 bytes, internal order
+    step2_txid       BLOB NOT NULL,               -- replaced, with step2_raw, by `tx resume`
+    proposal         BLOB NOT NULL,               -- gyges.v1.Proposal the user approved, for `tx sessions` and the resume session's summary
     step1_raw        BLOB NOT NULL,               -- signed, serialised Step 1
-    step2_raw        BLOB,                        -- NULL after step2_failed until `tx resume` rebuilds it
+    step2_raw        BLOB NOT NULL,               -- signed, serialised Step 2 (the current one)
     ephemeral_addr   TEXT NOT NULL,               -- t1… receiving Step 1's output
     recipient        TEXT NOT NULL,               -- tex1… / textest1…
-    expiry_height    INTEGER NOT NULL,
+    amount           INTEGER NOT NULL,            -- Step 2's single output, zatoshis
+    expiry_height    INTEGER NOT NULL,            -- shared by both steps; a rebuilt Step 2 has its own
     state            TEXT NOT NULL CHECK (state IN (
                          'built', 'step1_broadcast', 'step2_broadcast',
                          'step1_mined', 'step2_mined', 'step2_failed',
-                         'expired', 'failed')),
+                         'expired', 'failed', 'aborted')),
     created_at       INTEGER NOT NULL,            -- unix seconds
     last_attempt_at  INTEGER,
     attempts         INTEGER NOT NULL DEFAULT 0,
     last_error       TEXT
 );
-CREATE INDEX gyges_tex_queue_state ON gyges_tex_queue (state);
+CREATE INDEX ext_gyges_tex_queue_state ON ext_gyges_tex_queue (state);
 ```
 
-State machine: `built → step1_broadcast → step2_broadcast → step1_mined → step2_mined` (terminal), with `expired` (both unmined at `expiry_height`), `step2_failed` (Step 1 mined, Step 2 expired or rejected; recoverable with `tx resume`) and `failed` (node rejection with the error text preserved) as the other terminals. `tx abort` is allowed only in `built`.
+State machine: `built → step1_broadcast → step2_broadcast → step1_mined → step2_mined` (terminal), with `expired` (both unmined at `expiry_height`), `step2_failed` (Step 1 mined, Step 2 unmined at `expiry_height`; `tx resume` stores a new Step 2 and puts the row back to `step1_mined`), `failed` (the node refused Step 1 with a reason other than already having it; its text is in `last_error`) and `aborted` (`tx abort`, allowed only in `built`) as the other terminals. The row is inserted as `built` before the first broadcast, so a crash between the two leaves something the queue finishes. A node that will not take Step 2 while Step 1 is unmined leaves the row in `step1_broadcast` with its text in `last_error`; the queue offers Step 2 again on every pass and keeps `step1_mined` as the furthest state once the node has Step 1 in a block. Mined heights are recorded in the upstream `transactions` table through `set_transaction_status`.
 
 ### 5.2 `gyges_signing_sessions` (Q-K4, Q-C4)
 
@@ -224,7 +227,7 @@ CREATE TABLE gyges_signing_sessions (
     sent_payload_hash BLOB NOT NULL,              -- BLAKE2b-256 of the redacted payload sent to the signer
     request_id        BLOB,                       -- echoed by zcash-batch-sig-result
     input_path        TEXT,                       -- 'camera' | 'file' | 'stdin', recorded on completion
-    tex_step1_txid    BLOB,                       -- links to gyges_tex_queue when the session is a ZIP 320 send
+    tex_step1_txid    BLOB,                       -- links to ext_gyges_tex_queue when the session is a ZIP 320 send
     last_error        TEXT
 );
 CREATE INDEX gyges_signing_sessions_status ON gyges_signing_sessions (status, expires_at);

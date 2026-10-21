@@ -1,8 +1,9 @@
 //! `gyges tx …` (CLI_SPEC.md §2.5, API.md §4.1, §4.3, §6).
 //!
-//! Implemented: `send`, `shield`, `sessions`, `abort SESSION_ID`. `list`,
-//! `status`, `resume` and `abort TXID` wait for the transaction history and
-//! ZIP 320 items.
+//! Implemented: `send` (including ZIP 320 `tex1` recipients), `shield`,
+//! `sessions` (signing sessions and ZIP 320 transfers), `abort SESSION_ID`,
+//! `abort TXID` and `resume TXID`. `list` and `status` wait for the
+//! transaction history item.
 //!
 //! `send` runs the `SendTransaction` stream and answers its
 //! `SignatureRequired` event in place: the passphrase is prompted (or read
@@ -16,9 +17,10 @@ use std::ffi::OsString;
 
 use clap::{Args, Subcommand};
 use gyges_proto::v1::{
-    AbortSigningSessionRequest, ErrorReason, GygesError, ListSigningSessionsRequest, Pool,
-    Proposal, SendEvent, SendTransactionRequest, SessionStatus, ShieldFundsRequest, SignatureKind,
-    SignatureRequired, SigningSession, UnlockKeyRequest, UnlockScope, send_event,
+    AbortSigningSessionRequest, AbortTexTransferRequest, ErrorReason, GygesError,
+    ListSigningSessionsRequest, Pool, Proposal, ResumeTexTransferRequest, SendEvent,
+    SendTransactionRequest, SessionStatus, ShieldFundsRequest, SignatureKind, SignatureRequired,
+    SigningSession, TexQueueEntry, TexState, UnlockKeyRequest, UnlockScope, send_event,
 };
 use tokio_stream::StreamExt as _;
 
@@ -42,8 +44,8 @@ pub enum TxCmd {
     Sessions(SessionsArgs),
     /// Abort a signing session (32 hex) or a ZIP 320 transfer still `built` (64 hex).
     Abort { id: String },
-    /// Retry a ZIP 320 transfer.
-    Resume(Unimplemented),
+    /// Retry a ZIP 320 transfer by its step-1 txid; rebuilds step 2 when step 1 was mined and step 2 expired.
+    Resume { txid: String },
 }
 
 #[derive(Debug, Args)]
@@ -54,7 +56,7 @@ pub struct Unimplemented {
 
 #[derive(Debug, Clone, Args)]
 pub struct SendArgs {
-    /// Recipient: u1, zs1, t1, t3 (tex1 arrives with ZIP 320 support).
+    /// Recipient: u1, zs1, t1, t3 or tex1 (ZIP 320, two transactions).
     #[arg(long, value_name = "ADDR")]
     pub to: String,
     /// Decimal ZEC (1.25), zatoshis (125000000z) or `max`.
@@ -111,7 +113,7 @@ pub async fn run(ctx: &Ctx, cmd: TxCmd) -> Result<(), CliError> {
         TxCmd::Status(_) => Err(CliError::NotImplemented("tx status")),
         TxCmd::Sessions(args) => sessions(ctx, args).await,
         TxCmd::Abort { id } => abort(ctx, id).await,
-        TxCmd::Resume(_) => Err(CliError::NotImplemented("tx resume")),
+        TxCmd::Resume { txid } => resume(ctx, txid).await,
     }
 }
 
@@ -464,8 +466,172 @@ async fn sessions(ctx: &Ctx, args: SessionsArgs) -> Result<(), CliError> {
         println!("{}", to_json(&resp)?);
     } else {
         print!("{}", render_sessions(&resp.sessions));
+        print!("{}", render_tex(&resp.tex_transfers));
     }
     Ok(())
+}
+
+pub fn tex_state_name(s: TexState) -> &'static str {
+    match s {
+        TexState::Built => "built",
+        TexState::Step1Broadcast => "step1_broadcast",
+        TexState::Step2Broadcast => "step2_broadcast",
+        TexState::Step1Mined => "step1_mined",
+        TexState::Step2Mined => "step2_mined",
+        TexState::Step2Failed => "step2_failed",
+        TexState::Expired => "expired",
+        TexState::Failed => "failed",
+        TexState::Aborted => "aborted",
+        TexState::Unspecified => "unknown",
+    }
+}
+
+/// CLI_SPEC.md §2.5: the ZIP 320 rows under the sessions.
+pub fn render_tex(rows: &[TexQueueEntry]) -> String {
+    use std::fmt::Write as _;
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "{:<64} {:<18} {:<16} {:<8} {:<10} AMOUNT",
+        "TEX STEP 1 TXID", "KEY", "STATE", "EXPIRES", "ATTEMPTS"
+    );
+    for r in rows {
+        let _ = writeln!(
+            s,
+            "{:<64} {:<18} {:<16} {:<8} {:<10} {} ZEC{}",
+            r.step1_txid,
+            r.key_id,
+            tex_state_name(r.state()),
+            r.expiry_height,
+            r.attempts,
+            format_zec(r.amount),
+            if r.last_error.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", r.last_error)
+            }
+        );
+    }
+    s
+}
+
+fn print_tex(ctx: &Ctx, entry: &TexQueueEntry) -> Result<(), CliError> {
+    if ctx.json {
+        println!("{}", to_json(entry)?);
+    } else {
+        println!("{}", entry.step2_txid);
+        if !ctx.quiet {
+            eprintln!(
+                "tex transfer {}: {} (step 2 {})",
+                entry.step1_txid,
+                tex_state_name(entry.state()),
+                entry.step2_txid
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_txid_arg(id: &str) -> Result<(), CliError> {
+    if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(CliError::Daemon(GygesError::new(
+            ErrorReason::InvalidArgument,
+            "expected the 64-hex step-1 txid `tx send` printed",
+        )))
+    }
+}
+
+/// How long `tx resume` waits for the daemon to rebuild step 2 after the
+/// passphrase was accepted.
+const RESUME_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `tx resume TXID` (API.md §6.5): unary; when the daemon needs a passphrase
+/// it answers `SIGNATURE_REQUIRED` with a session, the CLI satisfies it and
+/// then polls until the row has its new step 2 (or the session failed).
+async fn resume(ctx: &Ctx, txid: String) -> Result<(), CliError> {
+    parse_txid_arg(&txid)?;
+    let mut conn = ctx.connect().await?;
+    let key = shown_key(ctx, &conn);
+    let request = || ResumeTexTransferRequest {
+        key_id: ctx.key.clone(),
+        step1_txid: txid.clone(),
+        session_token: Vec::new(),
+    };
+    let err = match conn.client.resume_tex_transfer(request()).await {
+        Ok(resp) => return print_tex(ctx, &resp.into_inner()),
+        Err(status) => CliError::from_status(status),
+    };
+    let session_id = match &err {
+        CliError::Daemon(e)
+            if e.reason() == ErrorReason::SignatureRequired && !e.session_id.is_empty() =>
+        {
+            e.session_id.clone()
+        }
+        _ => return Err(err),
+    };
+    let key_id = match &err {
+        CliError::Daemon(e) if !e.key_id.is_empty() => e.key_id.clone(),
+        _ => key.clone(),
+    };
+    satisfy(
+        ctx,
+        &mut conn,
+        &key,
+        &SignatureRequired {
+            key_id,
+            kind: SignatureKind::Passphrase as i32,
+            session_id: session_id.clone(),
+            step: 2,
+            ..Default::default()
+        },
+    )
+    .await?;
+    if !ctx.quiet && !ctx.json {
+        eprintln!("building a new step 2…");
+    }
+    let deadline = tokio::time::Instant::now() + RESUME_WAIT;
+    loop {
+        let sessions = conn
+            .client
+            .list_signing_sessions(ListSigningSessionsRequest {
+                key_id: ctx.key.clone(),
+                include_finished: true,
+            })
+            .await
+            .map_err(CliError::from_status)?
+            .into_inner();
+        if let Some(s) = sessions
+            .sessions
+            .iter()
+            .find(|s| s.session_id == session_id)
+            && s.status() == SessionStatus::Failed
+        {
+            return Err(CliError::Daemon(
+                GygesError::new(ErrorReason::Internal, s.last_error.clone())
+                    .with_key(&key)
+                    .with_session(session_id),
+            ));
+        }
+        if let Some(row) = sessions.tex_transfers.iter().find(|r| r.step1_txid == txid)
+            && row.state() != TexState::Step2Failed
+        {
+            return print_tex(ctx, row);
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(CliError::Other(anyhow::anyhow!(
+                "the daemon is still building step 2; check `gyges tx sessions`"
+            )));
+        }
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
+            _ = tokio::signal::ctrl_c() => return Err(CliError::Cancelled),
+        }
+    }
 }
 
 pub fn render_sessions(sessions: &[SigningSession]) -> String {
@@ -515,7 +681,25 @@ async fn abort(ctx: &Ctx, id: String) -> Result<(), CliError> {
     let is_hex = id.bytes().all(|b| b.is_ascii_hexdigit());
     match id.len() {
         32 if is_hex => {}
-        64 if is_hex => return Err(CliError::NotImplemented("tx abort TXID")),
+        64 if is_hex => {
+            // A ZIP 320 transfer still `built` (API.md §4.3).
+            let mut conn = ctx.connect().await?;
+            let entry = conn
+                .client
+                .abort_tex_transfer(AbortTexTransferRequest {
+                    key_id: ctx.key.clone(),
+                    step1_txid: id,
+                })
+                .await
+                .map_err(CliError::from_status)?
+                .into_inner();
+            if ctx.json {
+                println!("{}", to_json(&entry)?);
+            } else if !ctx.quiet {
+                eprintln!("tex transfer {} aborted", entry.step1_txid);
+            }
+            return Ok(());
+        }
         _ => {
             return Err(CliError::Daemon(GygesError::new(
                 ErrorReason::InvalidArgument,

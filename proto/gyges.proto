@@ -939,6 +939,9 @@ message TexQueueEntry {
   string last_error = 7;
   string recipient = 8;
   int64 amount = 9;
+  // Shared by both steps; a step 2 rebuilt by ResumeTexTransfer has its own.
+  uint32 expiry_height = 10;
+  string key_id = 11;
 }
 
 message TransactionOutput {
@@ -1054,6 +1057,9 @@ message ListSigningSessionsRequest {
 
 message ListSigningSessionsResponse {
   repeated SigningSession sessions = 1;
+  // ZIP 320 transfers of the same keys (`gyges tx sessions` lists both);
+  // terminal rows only with `include_finished`.
+  repeated TexQueueEntry tex_transfers = 2;
 }
 
 message AbortSigningSessionRequest {

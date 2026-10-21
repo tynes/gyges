@@ -29,6 +29,7 @@ pub mod node;
 pub mod policy;
 pub mod service;
 pub mod sync;
+pub mod tex;
 pub mod tx;
 
 use std::future::Future;
@@ -265,6 +266,13 @@ impl Daemon {
             }
             _ => None,
         };
+        // The ZIP 320 queue finishes transfers the sends left in flight,
+        // across restarts (ARCHITECTURE.md §3.3).
+        let tex_queue = self
+            .state
+            .chain
+            .clone()
+            .map(|chain| tex::spawn(self.state.clone(), chain));
 
         tracing::info!(
             network = %self.network,
@@ -302,6 +310,10 @@ impl Daemon {
         // batch, so no partial batch is ever visible (SYNC.md §8 step 1).
         if let Some(s) = scheduler {
             s.abort();
+        }
+        // Rows stay in `wallet.sqlite`; the next start picks them up.
+        if let Some(t) = tex_queue {
+            t.abort();
         }
         // Zeroize every decrypted key before the process goes away
         // (CLI_SPEC.md §2.1 `daemon stop`).

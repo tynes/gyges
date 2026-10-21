@@ -180,7 +180,7 @@ Decrypted notes and UTXOs with heights, values, memo previews and witness readin
 Proposes, proves, signs and broadcasts. The proposal summary (inputs per pool, outputs, ZIP 317 fee per step, total debit) is printed before any signature prompt; without `--yes` it comes from a dry run and is confirmed before the real send starts (no terminal: exit 4, `CONFIRMATION_REQUIRED`). The txid goes to stdout; progress goes to stderr.
 - **Inline unlock (`local-seed`):** on `SignatureRequired`, prompts for the passphrase, creates a connection-scoped session and continues; the key is dropped after signing.
 - **Keystone (`keystone-qr`):** renders the animated UR QR (batch protocol for shielded-only sends, single-PCZT when transparent inputs are present) and reads the result from the camera (`qr-scan`), a file, stdin or pasted frames.
-- **ZIP 320 (`tex1`):** runs the two-step plan through the durable `TexQueue`; prints `tex pending (step 2 of 2)` until Step 2 is mined.
+- **ZIP 320 (`tex1`):** runs the two-step plan through the durable `TexQueue`; the passphrase prompt comes before proving (both steps are built together, API.md §9), each step's txid goes to stdout as the node takes it, and `tex pending (step 2 of 2): <step1> then <step2>` goes to stderr. A node that will not take Step 2 while Step 1 is unmined leaves one txid on stdout; the queue finishes the transfer and `tx sessions` shows its state.
 ```text
 Flags:
       --to <ADDR>           u1, zs1, t1, t3, tex1 (or testnet equivalents)
@@ -202,7 +202,7 @@ History with timestamps, pool flows, ZIP 317 fees, decrypted memos, and pending 
 Confirmation status from the node, or via `zakura-pir-status` with `--pir`. **Experimental:** the PIR servers queried, their operators and the privacy guarantee must be documented before this leaves experimental status.
 
 #### `gyges tx sessions [--all] [--include-finished]` / `gyges tx abort <SESSION_ID | TXID>` / `gyges tx resume <TXID>`
-Lists pending signing sessions (and, with `--include-finished`, completed, expired, aborted and failed ones the daemon still remembers) and ZIP 320 rows; `abort` cancels a signing session, or a TEX row while it is still `built`; `resume` forces a retry of a TEX row, building a new Step 2 if Step 1 was mined and Step 2 expired.
+Lists pending signing sessions (and, with `--include-finished`, completed, expired, aborted and failed ones the daemon still remembers) and ZIP 320 rows (a second table: step-1 txid, key, state, expiry, attempts, amount and the node's last refusal); `abort` cancels a signing session, or a TEX row while it is still `built`; `resume` forces a retry of a TEX row, building a new Step 2 if Step 1 was mined and Step 2 expired. `resume` prompts for the passphrase like `tx send` when the key is locked, waits for the daemon to store the new Step 2 (up to two minutes) and prints its txid on stdout; on a row the queue is still working on it only triggers an immediate re-check.
 
 ---
 

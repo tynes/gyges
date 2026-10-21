@@ -30,7 +30,7 @@ fn regtest() -> gyges_core::ConsensusParams {
 /// way the wallet derives it (`zcash_client_sqlite` → ZIP 32 account key →
 /// external chain, index 0), so the node can mine to it before the key
 /// exists in Gyges.
-fn test_key_transparent_address() -> String {
+fn test_key_transparent() -> TransparentAddress {
     use transparent::keys::IncomingViewingKey as _;
     let seed = bip0039::Mnemonic::<bip0039::English>::from_phrase(mnemonic())
         .unwrap()
@@ -44,7 +44,21 @@ fn test_key_transparent_address() -> String {
         .derive_external_ivk()
         .unwrap()
         .default_address();
-    gyges_chain::compact::encode_transparent_address(NetworkType::Regtest, &addr)
+    addr
+}
+
+fn test_key_transparent_address() -> String {
+    gyges_chain::compact::encode_transparent_address(NetworkType::Regtest, &test_key_transparent())
+}
+
+/// The ZIP 320 (`texregtest1…`) form of the same pubkey hash: a TEX payment
+/// to it comes back to the wallet as transparent balance, which is how the
+/// recipient side of TESTING.md §3 row 9 is observed without a second node.
+fn test_key_tex_address() -> String {
+    let TransparentAddress::PublicKeyHash(hash) = test_key_transparent() else {
+        panic!("the default address is P2PKH");
+    };
+    zcash_keys::address::Address::Tex(hash).encode(&regtest())
 }
 
 /// The default unified address of an exported UFVK (`key init --json`).
@@ -81,8 +95,108 @@ fn daemon_config(fx: &Fixture) {
     fx.write_config(
         "[vault]\nscrypt_work_factor = 10\n\
          [zakura_rpc]\npoll_interval_secs = 1\nmin_retention_blocks = 1000\n\
-         [policy]\nmin_confirmations = 1\n",
+         [policy]\nmin_confirmations = 1\n\
+         [tex]\nrebroadcast_interval = \"1s\"\n",
     );
+}
+
+/// Poll `tx sessions --include-finished --json` until the ZIP 320 row for
+/// `step1` is in `state` (a `TEX_STATE_*` name).
+fn wait_tex_state(fx: &Fixture, step1: &str, state: &str) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut last = serde_json::Value::Null;
+    loop {
+        let run = fx
+            .gyges(&[
+                "-k",
+                "main",
+                "tx",
+                "sessions",
+                "--include-finished",
+                "--json",
+            ])
+            .run();
+        assert_eq!(run.code(), 0, "{run:?}");
+        let v = run.json();
+        if let Some(row) = v["tex_transfers"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["step1_txid"] == step1))
+        {
+            if row["state"] == state {
+                return row.clone();
+            }
+            last = row.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "row never reached {state}; last {last}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Both txids of a `tx send --to tex…` run: step 1 is the first stdout
+/// line, step 2 the last word of the `tex pending` line on stderr. Whether
+/// step 2 is also on stdout depends on the node: a step 2 that arrives
+/// while the node is still verifying step 1 is refused on that first
+/// attempt and left to the queue (the refusal text ends up in the row's
+/// `last_error`, printed here for the record).
+fn tex_txids(fx: &Fixture, run: &gyges_regtest::Run) -> (String, String) {
+    let stdout: Vec<&str> = run.stdout.lines().collect();
+    assert!(!stdout.is_empty() && stdout.len() <= 2, "{run:?}");
+    let s1 = stdout[0].to_string();
+    assert_eq!(s1.len(), 64, "{run:?}");
+    let pending = run
+        .stderr
+        .lines()
+        .find(|l| l.starts_with("tex pending (step 2 of 2)"))
+        .unwrap_or_else(|| panic!("no tex pending line: {run:?}"));
+    let s2 = pending.rsplit(' ').next().unwrap().to_string();
+    assert_eq!(s2.len(), 64, "{pending}");
+    if stdout.len() == 2 {
+        assert_eq!(stdout[1], s2, "{run:?}");
+    } else {
+        // The queue re-offers step 2 within a second, so the row may already
+        // have moved on; this is for the record only.
+        let sessions = fx
+            .gyges(&[
+                "-k",
+                "main",
+                "tx",
+                "sessions",
+                "--include-finished",
+                "--json",
+            ])
+            .run()
+            .json();
+        let row = sessions["tex_transfers"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["step1_txid"] == s1))
+            .cloned()
+            .unwrap_or_default();
+        eprintln!(
+            "step 2 was not taken on the first attempt: state {} error {}",
+            row["state"], row["last_error"]
+        );
+    }
+    (s1, s2)
+}
+
+/// Wait until the node's mempool holds every txid in `want`.
+fn wait_mempool(node: &Node, want: &[&str]) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mp = node.mempool();
+        if want.iter().all(|t| mp.iter().any(|m| m == t)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "mempool never held {want:?}: {mp:?}\n{}",
+            node.log_tail()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn node_args(node: &Node) -> [String; 4] {
@@ -456,6 +570,163 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
             &shield_txid,
             &pay_bob_txid,
             &pay_t_txid,
+            PASSPHRASE,
+            &funded.to_string(),
+            "100000000",
+            "50000000",
+            BURN_MINER_ADDRESS,
+        ],
+    );
+}
+
+/// TESTING.md §3 rows 9, 10 and 12 against `zakurad`: a `texregtest1`
+/// payment chains both steps in the node's mempool and mines them in one
+/// block; the recipient (the wallet's own pubkey hash) sees exactly the
+/// amount as transparent balance; a second payment survives a node restart
+/// and a daemon crash between broadcast and mining, finished by the queue
+/// from the stored bytes with the same txids.
+#[test]
+fn zip320_against_the_real_node() {
+    let wallet_taddr = test_key_transparent_address();
+    let Some(mut node) = Node::start_or_skip(NodeOpts {
+        miner_address: wallet_taddr.clone(),
+        ..NodeOpts::default()
+    }) else {
+        return;
+    };
+    node.mine(2);
+    node.restart(NodeOpts::default()).unwrap();
+    node.mine(100);
+    let funded = node.coinbase_value(1) + node.coinbase_value(2);
+
+    let mut fx = Fixture::new("regtest");
+    daemon_config(&fx);
+    start_daemon(&mut fx, &node);
+    let pw = fx.passphrase_file(PASSPHRASE);
+    let run = fx
+        .gyges(&["key", "restore", "--id", "main", "--stdin", "--json"])
+        .env("GYGES_PASSPHRASE_FILE", &pw)
+        .stdin(mnemonic())
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    sync_wait(&fx, "main", &["--until", "spendable"]);
+    wait_balance(&fx, "main", |b| spendable(b, "POOL_TRANSPARENT") == funded);
+    let run = fx
+        .gyges(&["-k", "main", "tx", "shield", "--yes"])
+        .env("GYGES_PASSPHRASE_FILE", &pw)
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}\n{}", node.log_tail());
+    let shield_txid = run.stdout.trim().to_string();
+    node.mine(1);
+    wait_for_txid(&fx, "main", &shield_txid);
+    let b = wait_balance(&fx, "main", |b| spendable(b, "POOL_IRONWOOD") > 0);
+    let shielded = spendable(&b, "POOL_IRONWOOD");
+    assert_eq!(spendable(&b, "POOL_TRANSPARENT"), 0, "{b}");
+
+    let tex_addr = test_key_tex_address();
+    assert!(tex_addr.starts_with("texregtest1"), "{tex_addr}");
+
+    // Row 9: both steps accepted by the mempool at once (the node chains
+    // them), mined together.
+    let run = fx
+        .gyges(&[
+            "-k", "main", "tx", "send", "--to", &tex_addr, "--amount", "1", "--yes",
+        ])
+        .env("GYGES_PASSPHRASE_FILE", &pw)
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}\n{}", node.log_tail());
+    let (s1, s2) = tex_txids(&fx, &run);
+    // The queue gets step 2 in while step 1 is still unmined (the node
+    // chains them), whether or not the send's own attempt was accepted.
+    wait_mempool(&node, &[&s1, &s2]);
+    node.mine(1);
+    let mined_at = node.tip_height();
+    assert_eq!(node.mined_height(&s1), Some(mined_at));
+    assert_eq!(node.mined_height(&s2), Some(mined_at), "same block");
+    let row = wait_tex_state(&fx, &s1, "TEX_STATE_STEP2_MINED");
+    assert_eq!(row["step2_txid"], s2, "{row}");
+    assert_eq!(row["amount"], "100000000", "{row}");
+    wait_for_txid(&fx, "main", &s1);
+    // The exchange side: exactly the amount, as a plain transparent output.
+    let b = wait_balance(&fx, "main", |b| {
+        spendable(b, "POOL_TRANSPARENT") == 100_000_000
+    });
+    let fees = shielded - 100_000_000 - spendable(&b, "POOL_IRONWOOD");
+    assert!(fees > 0 && fees < 100_000, "two ZIP 317 fees: {fees} ({b})");
+
+    // Rows 10 and 12: a second payment, then the node restarts and the
+    // daemon is killed before anything is mined. The restarted queue puts
+    // back whatever the node lost, from the bytes it stored, and the txids
+    // do not change.
+    let run = fx
+        .gyges(&[
+            "-k", "main", "tx", "send", "--to", &tex_addr, "--amount", "0.5", "--yes",
+        ])
+        .env("GYGES_PASSPHRASE_FILE", &pw)
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}\n{}", node.log_tail());
+    let (s1b, s2b) = tex_txids(&fx, &run);
+    wait_mempool(&node, &[&s1b, &s2b]);
+    fx.kill_daemon();
+    node.restart(NodeOpts::default()).unwrap();
+    let kept = node.mempool();
+    eprintln!("mempool after the node restart: {kept:?}");
+    start_daemon(&mut fx, &node);
+    wait_mempool(&node, &[&s1b, &s2b]);
+    node.mine(1);
+    let row = wait_tex_state(&fx, &s1b, "TEX_STATE_STEP2_MINED");
+    assert_eq!(row["step2_txid"], s2b, "{row}");
+    assert!(
+        row["attempts"].as_u64().unwrap() >= 2,
+        "rebroadcast after the restart: {row}"
+    );
+    wait_for_txid(&fx, "main", &s1b);
+    // The recipient is this wallet, so only fees left it: the shield (two
+    // transparent inputs, 20,000) and two ZIP 320 pairs (15,000 + 10,000
+    // each). Where the 0.5 ZEC was funded from is the input selector's
+    // choice: the profile spends transparent, and the 1 ZEC the first
+    // payment returned is a spendable UTXO, so step 1 of the second payment
+    // may draw on it (with Ironwood change) instead of on shielded notes.
+    let b = wait_balance(&fx, "main", |b| {
+        b["total_spendable"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            == Some(funded - 70_000)
+    });
+    let transparent = spendable(&b, "POOL_TRANSPARENT");
+    assert!(
+        transparent == 150_000_000 || transparent == 50_000_000,
+        "both TEX payments came back as transparent funds, less what the second re-spent: {b}"
+    );
+    eprintln!(
+        "second step 1 funded from {}",
+        if transparent == 50_000_000 {
+            "the first payment's transparent output"
+        } else {
+            "shielded notes"
+        }
+    );
+    let run = fx
+        .gyges(&["-k", "main", "tx", "sessions", "--include-finished"])
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert_eq!(
+        run.stdout.matches("step2_mined").count(),
+        2,
+        "{}",
+        run.stdout
+    );
+
+    sweep_logs(
+        &fx.network_dir().join("logs"),
+        &[
+            &wallet_taddr,
+            &tex_addr,
+            &shield_txid,
+            &s1,
+            &s2,
+            &s1b,
+            &s2b,
             PASSPHRASE,
             &funded.to_string(),
             "100000000",

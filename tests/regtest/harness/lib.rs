@@ -288,6 +288,16 @@ impl Fixture {
         Cmd { cmd, stdin: None }
     }
 
+    /// SIGKILL the daemon this fixture started (a crash, TESTING.md §3 row
+    /// 12). The pid file's advisory lock dies with the process, so
+    /// `start_daemon` works again afterwards.
+    pub fn kill_daemon(&mut self) {
+        if let Some(mut child) = self.daemon.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
     /// Wait for the daemon this fixture started to exit.
     pub fn wait_daemon(&mut self, timeout: Duration) -> anyhow::Result<ExitStatus> {
         let Some(mut child) = self.daemon.take() else {

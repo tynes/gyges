@@ -10,14 +10,15 @@ use gyges_chain::{BlockDb, ChainBackend};
 use gyges_core::{Config, KeyRegistry, Network, Provers, VaultManager};
 use gyges_proto::v1::gyges_server::Gyges;
 use gyges_proto::v1::{
-    self, AbortSigningSessionRequest, ApiVersion, ExportSeedRequest, ExportSeedResponse,
-    ExportUfvkRequest, ExportUfvkResponse, FallbackStatus, FallbackTrust, GetBalanceRequest,
-    GetBalanceResponse, GetInfoRequest, GetInfoResponse, GetSyncStatusRequest,
+    self, AbortSigningSessionRequest, AbortTexTransferRequest, ApiVersion, ExportSeedRequest,
+    ExportSeedResponse, ExportUfvkRequest, ExportUfvkResponse, FallbackStatus, FallbackTrust,
+    GetBalanceRequest, GetBalanceResponse, GetInfoRequest, GetInfoResponse, GetSyncStatusRequest,
     GetSyncStatusResponse, InitKeyRequest, InitKeyResponse, ListKeysRequest, ListKeysResponse,
     ListSigningSessionsRequest, ListSigningSessionsResponse, LockKeyRequest, LockKeyResponse,
-    NodeStatus, RestoreKeyRequest, RestoreKeyResponse, RunSyncRequest, SendTransactionRequest,
-    ShieldFundsRequest, ShutdownRequest, ShutdownResponse, SigningSession, StreamLogsRequest,
-    TorState, TorStatus, UnlockKeyRequest, UnlockKeyResponse, WaitSyncRequest,
+    NodeStatus, RestoreKeyRequest, RestoreKeyResponse, ResumeTexTransferRequest, RunSyncRequest,
+    SendTransactionRequest, ShieldFundsRequest, ShutdownRequest, ShutdownResponse, SigningSession,
+    StreamLogsRequest, TexQueueEntry, TorState, TorStatus, UnlockKeyRequest, UnlockKeyResponse,
+    WaitSyncRequest,
 };
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
@@ -25,6 +26,7 @@ use tonic::{Request, Response, Status};
 use crate::keys;
 use crate::logs::{LogHub, LogStream};
 use crate::sync::{self, ProgressStream, SyncHub};
+use crate::tex::{self, TexHub};
 use crate::tx::{self, SendStream, SessionHub};
 
 /// Everything the RPC handlers share.
@@ -45,6 +47,8 @@ pub struct DaemonState {
     /// Passphrase signing sessions awaiting `UnlockKey { session_id }`
     /// (API.md §6).
     pub sessions: SessionHub,
+    /// The ZIP 320 queue's wake-up (ARCHITECTURE.md §3.3).
+    pub tex: TexHub,
     /// Proving and verifying keys, built on first use.
     pub provers: Arc<Provers>,
     /// The in-memory tail of the main and audit logs (`StreamLogs`).
@@ -74,6 +78,7 @@ impl DaemonState {
             block_cache,
             sync: SyncHub::default(),
             sessions: SessionHub::default(),
+            tex: TexHub::default(),
             provers: Arc::new(Provers::new()),
             logs,
             started_at: unix_now(),
@@ -216,7 +221,29 @@ impl Gyges for GygesService {
         &self,
         request: Request<ListSigningSessionsRequest>,
     ) -> Result<Response<ListSigningSessionsResponse>, Status> {
-        tx::list_signing_sessions(&self.state, request.into_inner()).map(Response::new)
+        let req = request.into_inner();
+        let mut resp = tx::list_signing_sessions(&self.state, &req)?;
+        resp.tex_transfers = tex::list(&self.state, &req.key_id, req.include_finished).await;
+        Ok(Response::new(resp))
+    }
+
+    async fn resume_tex_transfer(
+        &self,
+        request: Request<ResumeTexTransferRequest>,
+    ) -> Result<Response<TexQueueEntry>, Status> {
+        let conn = crate::conn::of_request(&request);
+        tex::resume_tex_transfer(self.state.clone(), conn, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn abort_tex_transfer(
+        &self,
+        request: Request<AbortTexTransferRequest>,
+    ) -> Result<Response<TexQueueEntry>, Status> {
+        tex::abort_tex_transfer(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn abort_signing_session(

@@ -17,7 +17,7 @@ use zcash_client_backend::data_api::transparent_ledger::TransparentLedgerMode;
 use zcash_client_backend::data_api::{Account as _, WalletRead as _, WalletWrite as _};
 use zcash_client_sqlite::WalletDb;
 use zcash_client_sqlite::util::SystemClock;
-use zcash_client_sqlite::wallet::init::{WalletMigrationError, init_wallet_db};
+use zcash_client_sqlite::wallet::init::{WalletMigrationError, WalletMigrator};
 use zcash_keys::keys::UnifiedSpendingKey;
 use zip32::fingerprint::SeedFingerprint;
 
@@ -331,7 +331,11 @@ impl KeyRegistry {
             path: path.to_path_buf(),
             source,
         })?;
-        match init_wallet_db(&mut wallet, None) {
+        // Upstream's schema plus Gyges' own `ext_gyges_*` tables, migrated
+        // together (DATA_MODEL.md §5).
+        let migrator = WalletMigrator::new()
+            .with_external_migrations(vec![Box::new(crate::tex::TexQueueMigration)]);
+        match migrator.init_or_migrate(&mut wallet) {
             Ok(()) => Ok(wallet),
             Err(schemerz::MigratorError::Migration {
                 error: WalletMigrationError::SeedRequired,

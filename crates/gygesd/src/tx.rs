@@ -35,6 +35,7 @@ use gyges_proto::v1::{
     SignatureRequired, SigningSession, UnlockKeyResponse, send_event,
 };
 use pczt::Pczt;
+use prost::Message as _;
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 use zcash_keys::keys::UnifiedSpendingKey;
@@ -108,7 +109,7 @@ impl SessionHub {
 
     /// Create a session awaiting a passphrase for `key_id`. Returns its id
     /// and the receiver the stream task waits on.
-    fn create(
+    pub(crate) fn create(
         &self,
         key_id: &str,
         step: u32,
@@ -168,9 +169,21 @@ impl SessionHub {
         true
     }
 
+    /// A session whose key was delivered but whose work then failed
+    /// (`tx resume` building step 2): `Completed` becomes `Failed` with the
+    /// reason, so `tx sessions --include-finished` shows it.
+    pub(crate) fn fail(&self, session_id: &str, error: &str) {
+        let mut all = self.lock();
+        if let Some(s) = all.get_mut(session_id) {
+            s.status = SessionStatus::Failed;
+            s.last_error = error.to_string();
+            s.deliver = None;
+        }
+    }
+
     /// Mark a session finished (expired, failed, aborted) without
     /// delivering a key; dropping the sender wakes the task.
-    fn finish(
+    pub(crate) fn finish(
         &self,
         session_id: &str,
         status: SessionStatus,
@@ -239,7 +252,7 @@ pub fn tx_error(e: TxError, key_id: &str) -> GygesError {
     err.with_key(key_id)
 }
 
-fn broadcast_error(e: ChainError, key_id: &str) -> GygesError {
+pub(crate) fn broadcast_error(e: ChainError, key_id: &str) -> GygesError {
     match e {
         ChainError::Rejected(text) => {
             let mut err = GygesError::new(
@@ -309,9 +322,9 @@ pub fn proto_proposal(s: &ProposalSummary) -> v1::Proposal {
 
 /// What every spending RPC checks before its stream starts, so that the
 /// errors arrive as the RPC's status rather than as the first stream item.
-struct Prepared {
-    key: Arc<KeyEntry>,
-    chain: Arc<dyn gyges_chain::ChainBackend>,
+pub(crate) struct Prepared {
+    pub(crate) key: Arc<KeyEntry>,
+    pub(crate) chain: Arc<dyn gyges_chain::ChainBackend>,
     auth: PreAuth,
     min_confirmations: u32,
 }
@@ -323,7 +336,7 @@ enum PreAuth {
     None,
 }
 
-fn prepare(
+pub(crate) fn prepare(
     state: &DaemonState,
     conn: Option<ConnInfo>,
     key_id: &str,
@@ -432,9 +445,18 @@ fn parse_amount(amount: Option<v1::Amount>) -> Result<AmountSpec, Status> {
 // The RPCs
 // ---------------------------------------------------------------------------
 
+/// What the proposing step built, unless dry-run.
+enum Built {
+    /// A single-step proposal as its PCZT, with what the Verifier checks.
+    Pczt(Expected, Box<Pczt>),
+    /// A two-step ZIP 320 proposal; the builder takes it whole once the key
+    /// is there (ARCHITECTURE.md §3.3).
+    Tex(Box<core_tx::SendProposal>),
+}
+
 /// What the proposing step produces: the summary for `Proposed`, and, unless
 /// dry-run, what the rest of the pipeline needs.
-type Proposed = (ProposalSummary, Option<(Expected, Pczt)>);
+type Proposed = (ProposalSummary, Option<Built>);
 
 /// `SendTransaction` (API.md §4.1).
 pub fn send_transaction(
@@ -480,9 +502,12 @@ pub fn send_transaction(
         if dry_run {
             return Ok((summary, None));
         }
+        if core_tx::is_two_step(&proposal) {
+            return Ok((summary, Some(Built::Tex(Box::new(proposal)))));
+        }
         let expected = Expected::from_proposal(&params, &proposal)?;
         let pczt = core_tx::build_pczt(wallet, &params, account, &proposal)?;
-        Ok((summary, Some((expected, pczt))))
+        Ok((summary, Some(Built::Pczt(expected, Box::new(pczt)))))
     };
     Ok(run(
         state,
@@ -521,7 +546,7 @@ pub fn shield_funds(
         }
         let expected = Expected::from_proposal(&params, &proposal)?;
         let pczt = core_tx::build_pczt(wallet, &params, account, &proposal)?;
-        Ok((summary, Some((expected, pczt))))
+        Ok((summary, Some(Built::Pczt(expected, Box::new(pczt)))))
     };
     Ok(run(
         state,
@@ -565,7 +590,7 @@ async fn emit(
 }
 
 /// Run `f` with the key's wallet on a blocking thread.
-async fn with_wallet<T: Send + 'static>(
+pub(crate) async fn with_wallet<T: Send + 'static>(
     key: &Arc<KeyEntry>,
     f: impl FnOnce(&mut gyges_core::registry::Wallet) -> Result<T, TxError> + Send + 'static,
 ) -> Result<T, TxError> {
@@ -605,9 +630,15 @@ async fn pipeline(
     let (summary, rest) = with_wallet(key, propose).await.map_err(err)?;
     let proto = proto_proposal(&summary);
     emit(tx, send_event::Event::Proposed(proto.clone())).await?;
-    let Some((expected, pczt)) = rest else {
-        debug_assert!(dry_run);
-        return Ok(());
+    let (expected, pczt) = match rest {
+        None => {
+            debug_assert!(dry_run);
+            return Ok(());
+        }
+        Some(Built::Tex(proposal)) => {
+            return tex_pipeline(state, prepared, *proposal, proto, wait_for_mined, tx).await;
+        }
+        Some(Built::Pczt(expected, pczt)) => (expected, *pczt),
     };
 
     // 4. Prove while locked: one `Proving` per shielded pool with work
@@ -663,7 +694,7 @@ async fn pipeline(
     );
 
     // 5. The spending key: token, daemon unlock, or a session.
-    let usk = obtain_key(state, prepared, &proto, tx).await?;
+    let usk = obtain_key(state, prepared, &proto, tx, 1).await?;
     let pczt = {
         let key = key.clone();
         blocking(move || {
@@ -739,17 +770,14 @@ async fn pipeline(
     Ok(())
 }
 
-/// Step 5's key: the request's token on this connection, else a live
-/// daemon-scoped unlock, else a signing session the client satisfies with
-/// `UnlockKey { session_id }`. A session that times out is replaced by a
-/// fresh `SignatureRequired` while the proposal can still be mined
-/// (API.md §4.1), and ends the stream with `NOT_SYNCED` otherwise.
-async fn obtain_key(
+/// The spending key from the request's token on this connection or from a
+/// live daemon-scoped unlock; `Ok(None)` when neither applies and a
+/// signing session is the way forward. A token that does not unlock is an
+/// error (the client meant to use it).
+pub(crate) fn key_from_unlock(
     state: &Arc<DaemonState>,
     prepared: &Prepared,
-    summary: &v1::Proposal,
-    tx: &mpsc::Sender<Result<SendEvent, Status>>,
-) -> Result<UnifiedSpendingKey, Status> {
+) -> Result<Option<UnifiedSpendingKey>, Status> {
     let key = &prepared.key;
     let key_id = key.key_id().to_string();
     let params = state.registry.params();
@@ -770,7 +798,7 @@ async fn obtain_key(
         Ok(usk) => {
             let usk = usk.map_err(|e| tx_error(e, &key_id).into_status())?;
             tracing::info!(target: AUDIT_TARGET, key_id, event = "sign", via = "unlock");
-            return Ok(usk);
+            Ok(Some(usk))
         }
         Err(gyges_core::vault::VaultError::Locked) => {
             if matches!(prepared.auth, PreAuth::Token { .. }) {
@@ -781,13 +809,34 @@ async fn obtain_key(
                 .with_key(&key_id)
                 .into_status());
             }
+            Ok(None)
         }
-        Err(e) => return Err(vault_error(e, &key_id).into_status()),
+        Err(e) => Err(vault_error(e, &key_id).into_status()),
+    }
+}
+
+/// Step 5's key: the request's token on this connection, else a live
+/// daemon-scoped unlock, else a signing session the client satisfies with
+/// `UnlockKey { session_id }`. A session that times out is replaced by a
+/// fresh `SignatureRequired` while the proposal can still be mined
+/// (API.md §4.1), and ends the stream with `NOT_SYNCED` otherwise.
+async fn obtain_key(
+    state: &Arc<DaemonState>,
+    prepared: &Prepared,
+    summary: &v1::Proposal,
+    tx: &mpsc::Sender<Result<SendEvent, Status>>,
+    step: u32,
+) -> Result<UnifiedSpendingKey, Status> {
+    let key = &prepared.key;
+    let key_id = key.key_id().to_string();
+    if let Some(usk) = key_from_unlock(state, prepared)? {
+        return Ok(usk);
     }
 
     let ttl = state.config.vault.signing_session_ttl;
     loop {
-        let (session_id, expires_at, rx) = state.sessions.create(&key_id, 1, ttl, summary.clone());
+        let (session_id, expires_at, rx) =
+            state.sessions.create(&key_id, step, ttl, summary.clone());
         tracing::info!(target: AUDIT_TARGET, key_id, event = "session_created");
         emit(
             tx,
@@ -797,7 +846,7 @@ async fn obtain_key(
                 session_id: session_id.clone(),
                 expires_at,
                 payload: Vec::new(),
-                step: 1,
+                step,
                 summary: Some(summary.clone()),
             }),
         )
@@ -846,6 +895,266 @@ async fn obtain_key(
             }
         }
     }
+}
+
+/// The ZIP 320 branch of the pipeline (ARCHITECTURE.md §3.3, API.md §4.1
+/// for `n = 2`): the key comes first, because `create_proposed_transactions`
+/// proves and signs both steps in one go; then both are stored, the row is
+/// inserted, step 1 and step 2 are offered to the node, and the queue owns
+/// the rest.
+async fn tex_pipeline(
+    state: &Arc<DaemonState>,
+    prepared: &Prepared,
+    proposal: core_tx::SendProposal,
+    proto: v1::Proposal,
+    wait_for_mined: bool,
+    tx: &mpsc::Sender<Result<SendEvent, Status>>,
+) -> Result<(), Status> {
+    use gyges_core::TexState;
+    use gyges_core::tex::{self as core_tex, TexRow};
+
+    let key = &prepared.key;
+    let key_id = key.key_id().to_string();
+    let err = |e: TxError| tx_error(e, &key_id).into_status();
+
+    // One signature prompt per send: the key is obtained once and used for
+    // both steps inside the builder.
+    let usk = obtain_key(state, prepared, &proto, tx, 1).await?;
+    let pools: Vec<(v1::Pool, u32)> = proto
+        .steps
+        .first()
+        .map(|s| {
+            s.inputs
+                .iter()
+                .filter(|i| i.pool() != v1::Pool::Transparent)
+                .map(|i| (i.pool(), i.count))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (pool, total) in &pools {
+        emit(
+            tx,
+            send_event::Event::Proving(v1::ProvingProgress {
+                step: 1,
+                pool: *pool as i32,
+                actions_done: 0,
+                actions_total: *total,
+            }),
+        )
+        .await?;
+    }
+    let params = state.registry.params();
+    let provers = state.provers.clone();
+    let t0 = std::time::Instant::now();
+    let built = with_wallet(key, move |w| {
+        let account = core_tx::account_of(w)?;
+        core_tx::create_tex_transactions(w, &params, account, &proposal, usk, &provers)
+    })
+    .await
+    .map_err(err)?;
+    for (pool, total) in &pools {
+        emit(
+            tx,
+            send_event::Event::Proving(v1::ProvingProgress {
+                step: 1,
+                pool: *pool as i32,
+                actions_done: *total,
+                actions_total: *total,
+            }),
+        )
+        .await?;
+    }
+    tracing::info!(
+        key_id,
+        ms = t0.elapsed().as_millis(),
+        "zip 320 transactions built"
+    );
+    emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
+    emit(tx, send_event::Event::Signed(v1::StepSigned { step: 2 })).await?;
+
+    // Persist before the first broadcast, so a crash between the two leaves
+    // a row the queue finishes (TESTING.md §3 row 12).
+    let id = *built.step1_txid.as_ref();
+    let row = TexRow {
+        step1_txid: id,
+        step2_txid: *built.step2_txid.as_ref(),
+        proposal: proto.encode_to_vec(),
+        step1_raw: built.step1_raw.clone(),
+        step2_raw: built.step2_raw.clone(),
+        ephemeral_addr: built.ephemeral_addr.clone(),
+        recipient: built.recipient.clone(),
+        amount: built.amount,
+        expiry_height: built.expiry_height,
+        state: TexState::Built,
+        created_at: unix_now(),
+        last_attempt_at: None,
+        attempts: 0,
+        last_error: None,
+    };
+    let queue_err = |e: core_tex::TexQueueError| TxError::Internal(e.to_string());
+    with_wallet(key, move |w| core_tex::insert(w, &row).map_err(queue_err))
+        .await
+        .map_err(err)?;
+    tracing::info!(target: AUDIT_TARGET, key_id, event = "tex_queued");
+    let step1_hex = built.step1_txid.to_string();
+    let step2_hex = built.step2_txid.to_string();
+
+    // Step 1: a refusal fails the transfer (nothing left the shielded pool).
+    let now = unix_now();
+    match prepared.chain.send_raw_transaction(built.step1_raw).await {
+        Ok(_) => {
+            with_wallet(key, move |w| {
+                core_tex::record_attempt(w, id, now, None).map_err(queue_err)?;
+                core_tex::set_state(w, id, TexState::Step1Broadcast, None).map_err(queue_err)
+            })
+            .await
+            .map_err(err)?;
+            tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast");
+            tracing::info!(key_id, step = 1, "transaction broadcast");
+        }
+        Err(e) => {
+            let text = e.to_string();
+            let rejected = matches!(e, ChainError::Rejected(_));
+            let _ = with_wallet(key, move |w| {
+                core_tex::record_attempt(w, id, now, Some(&text)).map_err(queue_err)?;
+                if rejected {
+                    core_tex::set_state(w, id, TexState::Failed, Some(&text)).map_err(queue_err)?;
+                }
+                Ok(())
+            })
+            .await;
+            state.tex.wake();
+            return Err(broadcast_error(e, &key_id).into_status());
+        }
+    }
+    emit(
+        tx,
+        send_event::Event::Broadcast(v1::StepBroadcast {
+            step: 1,
+            txid: step1_hex.clone(),
+        }),
+    )
+    .await?;
+    emit(
+        tx,
+        send_event::Event::TexQueued(v1::TexQueued {
+            step1_txid: step1_hex.clone(),
+            step2_txid: step2_hex.clone(),
+        }),
+    )
+    .await?;
+
+    // Step 2: offered at once; a node that does not chain mempool
+    // transactions refuses it now and takes it from the queue once step 1
+    // is mined.
+    let now = unix_now();
+    match prepared.chain.send_raw_transaction(built.step2_raw).await {
+        Ok(_) => {
+            with_wallet(key, move |w| {
+                core_tex::record_attempt(w, id, now, None).map_err(queue_err)?;
+                core_tex::set_state(w, id, TexState::Step2Broadcast, None).map_err(queue_err)
+            })
+            .await
+            .map_err(err)?;
+            tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast");
+            tracing::info!(key_id, step = 2, "transaction broadcast");
+            emit(
+                tx,
+                send_event::Event::Broadcast(v1::StepBroadcast {
+                    step: 2,
+                    txid: step2_hex.clone(),
+                }),
+            )
+            .await?;
+        }
+        Err(e) => {
+            let text = e.to_string();
+            let _ = with_wallet(key, move |w| {
+                core_tex::record_attempt(w, id, now, Some(&text)).map_err(queue_err)
+            })
+            .await;
+            tracing::warn!(
+                key_id,
+                "the node did not take zip 320 step 2 yet; the queue retries once step 1 is mined"
+            );
+        }
+    }
+    state.tex.wake();
+    state.sync.wake();
+
+    if wait_for_mined {
+        let mut step1_done = false;
+        loop {
+            let s1 = prepared.chain.transaction_status(id).await;
+            if let Ok(gyges_chain::TxStatus::Mined(h)) = s1
+                && !step1_done
+            {
+                step1_done = true;
+                emit(
+                    tx,
+                    send_event::Event::Mined(v1::StepMined {
+                        step: 1,
+                        txid: step1_hex.clone(),
+                        height: u32::from(h),
+                    }),
+                )
+                .await?;
+            }
+            let row = with_wallet(key, move |w| core_tex::get(w, id).map_err(queue_err))
+                .await
+                .map_err(err)?;
+            let Some(row) = row else {
+                return Err(Status::internal("the tex queue row disappeared"));
+            };
+            match row.state {
+                TexState::Step2Mined => {
+                    let h = match prepared.chain.transaction_status(row.step2_txid).await {
+                        Ok(gyges_chain::TxStatus::Mined(h)) => u32::from(h),
+                        _ => 0,
+                    };
+                    emit(
+                        tx,
+                        send_event::Event::Mined(v1::StepMined {
+                            step: 2,
+                            txid: gyges_chain::display_hash(&row.step2_txid),
+                            height: h,
+                        }),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                TexState::Expired
+                | TexState::Failed
+                | TexState::Step2Failed
+                | TexState::Aborted => {
+                    let mut e = GygesError::new(
+                        if row.state == TexState::Failed {
+                            ErrorReason::NodeRejected
+                        } else {
+                            ErrorReason::Internal
+                        },
+                        format!(
+                            "the ZIP 320 transfer is `{}`: {}",
+                            row.state.as_str(),
+                            row.last_error.clone().unwrap_or_default()
+                        ),
+                    )
+                    .with_key(&key_id);
+                    if row.state == TexState::Failed {
+                        e.node_error = row.last_error.unwrap_or_default();
+                    }
+                    return Err(e.into_status());
+                }
+                _ => {}
+            }
+            state.tex.wake();
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                () = tx.closed() => return Err(Status::cancelled("client disconnected")),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Finishes a session as failed when the waiting task goes away (client
@@ -919,13 +1228,15 @@ pub async fn satisfy_session(
     })
 }
 
-/// `ListSigningSessions`.
+/// `ListSigningSessions` (the ZIP 320 rows are added by the service, from
+/// `crate::tex`).
 pub fn list_signing_sessions(
     state: &DaemonState,
-    req: ListSigningSessionsRequest,
+    req: &ListSigningSessionsRequest,
 ) -> Result<ListSigningSessionsResponse, Status> {
     Ok(ListSigningSessionsResponse {
         sessions: state.sessions.list(&req.key_id, req.include_finished),
+        tex_transfers: Vec::new(),
     })
 }
 
