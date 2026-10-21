@@ -16,7 +16,7 @@
 - [x] `proto/gyges.proto` validates with `protoc`; `API.md` written.
 - [x] `THREAT_MODEL.md`, `SYNC.md`, `DATA_MODEL.md`, `TESTING.md`, `GLOSSARY.md`, `README.md`, licences, CI workflow, `deny.toml`.
 - [x] `ARCHITECTURE.md` and `CLI_SPEC.md` corrected per the review.
-- [ ] Review the Q-S1…S7 / Q-K7 proposals and promote `THREAT_MODEL.md` from draft.
+- [x] Review the Q-S1…S7 / Q-K7 proposals and promote `THREAT_MODEL.md` from draft. Landed 2026-10-21 as a **Decision** paragraph under each of those questions in `OVERVIEW.md` §6, and `THREAT_MODEL.md` at status "reviewed": §1 and §5 corrected against the code (the spending key is a plain upstream value for one signing task, not a `SecretBox`; the CLI never requests connection tokens; passphrase sessions are memory-only; the non-interactive, `cache` mode and USK rows checked off with their tests), §6 turned into decisions with four items still needing verification (asm CPU detection, the Keystone display, `z_getsubtreesbyindex` on pruned ranges, TLS in the `tor` feature), each assigned to a milestone. Code the decisions asked for: `RLIMIT_CORE = 0` at daemon start (`gygesd::disable_core_dumps`), a one-time warning when `zakura_rpc.url` is not this machine (`gygesd::node::is_local_host`), a policy-layer test with foreign and missing credentials, and a test of the 0660 socket-group mode.
 
 ## M1 — MVP: local-seed, Orchard + transparent, local node
 
@@ -40,7 +40,7 @@ Design note: `SYNC.md` §Case B.
 - [ ] `ArtiTorLwdBackend` on `zcash_client_backend::tor`; `GetSubtreeRoots`, `GetBlockRange` streaming into the shared cache.
 - [ ] Handoff validation at `retained_from + k` (tree roots, hash chain, subtree roots); endpoint trust state in `daemon status`.
 - [ ] Pruning-race fallback (Case A → Case B) and `Stalled` states.
-- [ ] Transparent recovery below `retained_from` via `GetAddressUtxos` with per-UTXO inclusion checks.
+- [ ] Transparent recovery below `retained_from` via `GetAddressUtxos` with per-UTXO inclusion checks; every restore with a birthday below `retained_from` warns that transparent history there is best-effort (`THREAT_MODEL.md` §6 item 9).
 - [ ] Restore prompt and `--yes`; no default endpoint; `.onion` preference.
 - [ ] Regtest: small retention window with local `zaino`, `use_tor = false` in CI; nightly job through a local Tor network.
 
@@ -56,7 +56,7 @@ Design note: `ARCHITECTURE.md` §3.3, `DATA_MODEL.md` `gyges_tex_queue`.
 
 - [ ] `gyges pczt create/inspect/prove/sign/combine/broadcast` over files and pipes; `proprietary` map with key id, network, session id.
 - [ ] `signer-only` profiles and `gygesd --airgapped` with the RPC allow-list from `API.md`.
-- [ ] Verifier before broadcast; property tests for the role pipeline.
+- [ ] Verifier before broadcast; `pczt sign` checks that every change output belongs to the signer's own keys, since the upstream Signer role does not (`THREAT_MODEL.md` §6 item 8); property tests for the role pipeline.
 
 ## M5 — Keystone 3 Pro
 
@@ -70,10 +70,10 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
 
 ## M6 — Hardening and release
 
-- [ ] Sapling spending for `local-seed` profiles (Updater inserts the proof generation key before proving).
+- [ ] Sapling spending for `local-seed` profiles (Updater inserts the proof generation key before proving; proven and signed inside the one stream, nothing persisted, `THREAT_MODEL.md` §6 item 1).
 - [ ] `perf` features with benchmarks in `docs/BENCHMARKS.md`; decide the release default once runtime CPU detection is confirmed.
-- [ ] `daemon install/uninstall` units; hardened deployment (dedicated user, 0660 socket, `gyges` group) documented and tested.
-- [ ] Optional SQLCipher for `wallet.sqlite`; `key delete --wipe`; `key backup` / `import-backup`.
+- [ ] `daemon install/uninstall` units; hardened deployment (dedicated user, 0660 socket, `gyges` group, `daemon install --hardened`, `THREAT_MODEL.md` §6 item 4) documented and tested.
+- [ ] Optional SQLCipher for `wallet.sqlite` (database key in the OS keychain only, `THREAT_MODEL.md` §6 item 3); `key delete --wipe`; `key backup` / `import-backup`.
 - [ ] Release pipeline: `rust-toolchain.toml`-pinned matrix builds, `SHA256SUMS`, `minisign`, SLSA attestation.
 - [ ] `tx status --pir` leaves experimental only with a documented server set and privacy guarantee.
 

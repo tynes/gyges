@@ -1,6 +1,6 @@
 # Gyges Testing Strategy (`TESTING.md`)
 
-How Gyges is tested, from unit tests to a nightly run through a real Tor network. Derived from the Q-O1, Q-O2 and Q-O5 proposals in `OVERVIEW.md`. Nothing described here exists yet; paths and commands are the planned ones and are marked as such where it matters.
+How Gyges is tested, from unit tests to a nightly run through a real Tor network. Derived from the Q-O1, Q-O2 and Q-O5 proposals in `OVERVIEW.md`. Most of what it describes exists (§2 says what runs today); what does not is marked planned where it matters: the archival `zaino` and the Tor tier (M2), the Keystone fixtures (M5), the migration fixtures and the benchmarks (M6).
 
 ---
 

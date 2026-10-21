@@ -80,6 +80,12 @@ fn main() -> ExitCode {
     // (DATA_MODEL.md §1); a restrictive umask makes that hold without
     // per-site care.
     nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+    // A core dump of this process would hold decrypted key material
+    // (THREAT_MODEL.md §6 item 10). Refusing is not fatal: the daemon still
+    // starts on a platform that will not let it, and says so once.
+    if let Err(e) = gygesd::disable_core_dumps() {
+        eprintln!("gygesd: cannot disable core dumps: {e}");
+    }
 
     let args = Args::parse();
     let daemonized = std::env::var_os(DAEMONIZED_ENV).is_some();
