@@ -2,7 +2,7 @@
 
 A pure-Rust Zcash wallet daemon (`gygesd`) and CLI (`gyges`) that talks straight to a pruned [Zakura](https://github.com/zakura-core/zakura) node, backfills older history over Tor, isolates keys per profile, and supports Keystone 3 Pro hardware signing and ZIP 320 `tex1` payments.
 
-**Status: pre-alpha.** The daemon starts, enforces the 0700/0600 layout and the peer-credential check on its Unix socket, and answers `GetInfo` and `Shutdown`; the CLI connects, runs the API-version and network handshake, and drives `daemon start`, `daemon stop` and `daemon status` (with `--json`). No wallet logic (keys, sync, transactions) exists yet. See [`ROADMAP.md`](ROADMAP.md) for the MVP cut.
+**Status: pre-alpha.** The daemon starts, enforces the 0700/0600 layout and the peer-credential check on its Unix socket, keeps `local-seed` key profiles (`key init / restore / unlock / lock / export-*`), syncs them against a local Zakura node's JSON-RPC through a shared block cache (`sync status / wait / run`), and builds, proves, signs, verifies and broadcasts transactions (`tx send`, `tx shield`, `balance`, with inline passphrase unlock and `--dry-run`). Everything has been exercised against an in-process fake node only; the pinned `zakurad` regtest harness, ZIP 320, air-gapped PCZT files and Keystone signing are still ahead. See [`ROADMAP.md`](ROADMAP.md) for the MVP cut.
 
 ## Why
 

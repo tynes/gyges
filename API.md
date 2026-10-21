@@ -182,9 +182,29 @@ Rules:
   `SignatureRequired` for `PASSPHRASE` kinds. It is never valid for Keystone
   profiles.
 
-`ShieldFunds` emits the same events for a one-step transparent-to-Orchard
-proposal. A `KEYSTONE_QR` profile always gets `KEYSTONE_SINGLE_PCZT` for it,
-because the batch protocol rejects transparent inputs.
+`ShieldFunds` emits the same events for a one-step transparent-to-shielded
+proposal (the output pool is Ironwood after NU6.3, see `OVERVIEW.md` §4.3).
+A `KEYSTONE_QR` profile always gets `KEYSTONE_SINGLE_PCZT` for it, because
+the batch protocol rejects transparent inputs.
+
+Status (ROADMAP.md M1, `TxEngine`): implemented for `LOCAL_SEED` profiles
+with `n = 1`; `Proving` is emitted once per shielded pool with work before
+the proofs and once after. A `WATCH_ONLY` profile answers
+`INVALID_ARGUMENT`, a `KEYSTONE_QR` one `HARDWARE_SIGNER`, until their items
+land. Passphrase sessions live in daemon memory only (§6.1) and show in
+`ListSigningSessions` with their status; a session that is aborted ends its
+stream with `CANCELLED`. A transaction the node refuses (`NODE_REJECTED`)
+has already been recorded in the wallet as unmined and its inputs stay
+unspendable until its expiry height. `wait_for_mined` relies on the scanner
+recognising the transaction (a change output or a nullifier of ours); a
+fully transparent transaction without change is not recognised yet
+(`OVERVIEW.md` §4.3).
+
+The CLI approves before it signs: without `--yes`, `gyges tx send` runs the
+request as `dry_run` first, prints the proposal, asks, and only then opens
+the real stream (the daemon never waits on a prompt, and a daemon-scoped
+unlock would otherwise sign at once). The fee can differ between the two
+only if the chain moved in between.
 
 ### 4.2 `SignPczt`
 
@@ -251,9 +271,11 @@ moved into zeroizing wrappers on arrival; a mnemonic error never echoes a
 word back. Both calls run the scrypt and SQLite work on a blocking thread.
 
 `UnlockKey` without `session_id` behaves as §6.3 describes (`CONNECTION` by
-default, `DAEMON` on request); with a `session_id` it answers
-`SESSION_NOT_FOUND` until signing sessions exist. A `ttl_secs` of 0 means
-`vault.unlock_ttl`. `KeySummary.locked` is false only for a daemon-scoped
+default, `DAEMON` on request); with a `session_id` it is the single-use
+form of §6.2: the passphrase is verified (same per-key back-off), the
+spending key is derived and handed to the paused `SendTransaction` /
+`ShieldFunds` stream, and no token or unlock results. A `ttl_secs` of 0
+means `vault.unlock_ttl`. `KeySummary.locked` is false only for a daemon-scoped
 unlock, with `unlock_expires_at` set. `ExportUfvk` on a `SIGNER_ONLY` profile
 derives the key from a live daemon-scoped unlock and answers `VAULT_LOCKED`
 without one. `ExportSeed` checks `vault.allow_seed_export`, then the literal

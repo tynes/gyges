@@ -78,6 +78,7 @@ zeroize    = { version = "1.8", features = ["derive"] }
 bip0039    = "0.12"                                  # 0.12 is what zcash_keys/zcash_client_sqlite use; it has no `zeroize` feature
 rusqlite   = { version = "0.37", features = ["bundled", "time"] }
 shardtree  = "0.7"
+incrementalmerkletree = "0.8"                        # legacy CommitmentTree, for the fake node's z_gettreestate
 zip32      = "0.2"                                   # AccountId and SeedFingerprint, the major zcash_keys uses
 schemerz   = "0.2"                                   # MigratorError, to match zcash_client_sqlite's SeedRequired
 time       = "0.3"

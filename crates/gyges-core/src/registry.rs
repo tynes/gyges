@@ -461,7 +461,12 @@ impl KeyRegistry {
                 signing_mode: SigningMode::SignerOnly,
                 birthday_height: None,
                 created_at: profile::now_rfc3339(),
-                spend_pools: vec![Pool::Orchard, Pool::Sapling, Pool::Transparent],
+                spend_pools: vec![
+                    Pool::Orchard,
+                    Pool::Ironwood,
+                    Pool::Sapling,
+                    Pool::Transparent,
+                ],
                 receive_pools: Vec::new(),
                 seed_format: Some(SEED_FORMAT_AGE_SCRYPT_V1.into()),
                 seed_fingerprint: Some(fingerprint),
@@ -520,8 +525,17 @@ impl KeyRegistry {
             birthday_height: Some(req.birthday.height),
             created_at: profile::now_rfc3339(),
             // MVP pools (ROADMAP.md "Pools are data"): Sapling receive-only.
-            spend_pools: vec![Pool::Orchard, Pool::Transparent],
-            receive_pools: vec![Pool::Orchard, Pool::Sapling, Pool::Transparent],
+            // After NU6.3 every shielded output the wallet libraries build
+            // is Ironwood and the ZIP 318 turnstile keeps value out of
+            // Orchard, so Ironwood is both spent from and received to
+            // (OVERVIEW.md §4.3).
+            spend_pools: vec![Pool::Orchard, Pool::Ironwood, Pool::Transparent],
+            receive_pools: vec![
+                Pool::Orchard,
+                Pool::Ironwood,
+                Pool::Sapling,
+                Pool::Transparent,
+            ],
             seed_format: Some(SEED_FORMAT_AGE_SCRYPT_V1.into()),
             seed_fingerprint: Some(fingerprint),
             device_version: None,

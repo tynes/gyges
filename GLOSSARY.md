@@ -34,7 +34,7 @@ Terms used across `ARCHITECTURE.md`, `CLI_SPEC.md`, `THREAT_MODEL.md` and `OVERV
 
 **Hardened deployment.** The documented configuration in which `gygesd` runs as a dedicated OS user with a 0660 socket and a `gyges` group, so the interactive user's processes cannot read `seed.age` or `wallet.sqlite` (Q-S1).
 
-**Ironwood.** A third shielded pool exposed by the Zakura node (`z_gettreestate`, `z_getsubtreesbyindex` accept `"ironwood"`), the Zakura wallet libraries (`ironwood_action_count` on a proposal `Step`) and Keystone firmware (signs Ironwood spends). Not yet supported by Gyges; pool support is designed as configuration so it can be added later (Q-D7).
+**Ironwood.** A third shielded pool, using the Orchard protocol with its own note commitment tree, exposed by the Zakura node (`z_gettreestate`, `z_getsubtreesbyindex` accept `"ironwood"`), the Zakura wallet libraries (`ironwood_action_count` on a proposal `Step`, a separate v6 transaction bundle) and Keystone firmware (signs Ironwood spends). After NU6.3 every shielded output the wallet libraries build is Ironwood and the ZIP 318 turnstile keeps value out of Orchard, so Gyges spends Orchard and Ironwood and receives Ironwood (Q-D7, `OVERVIEW.md` §4.3).
 
 **Keystone 3 Pro.** An air-gapped hardware wallet that communicates only by QR code. With the Cypherpunk firmware edition it signs Zcash Orchard and Ironwood spends and checks transparent inputs; it does not sign Sapling spends (Q-K1). Pairs by exporting `ur:zcash-accounts`.
 

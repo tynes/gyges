@@ -28,6 +28,7 @@ pub mod node;
 pub mod policy;
 pub mod service;
 pub mod sync;
+pub mod tx;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -281,6 +282,13 @@ impl Daemon {
             .await
             .context("gRPC server failed");
 
+        // The listener is closed; unlink its file first so that a `daemon
+        // stop` waiting on it returns while the rest of the shutdown runs.
+        if let Err(e) = std::fs::remove_file(&socket)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, "could not remove socket file");
+        }
         sweeper.abort();
         // Cancel at the next batch boundary: `scan_cached_blocks` commits per
         // batch, so no partial batch is ever visible (SYNC.md §8 step 1).
@@ -298,11 +306,6 @@ impl Daemon {
             && let Err(e) = cache.checkpoint()
         {
             tracing::warn!(error = %e, "block cache checkpoint failed");
-        }
-        if let Err(e) = std::fs::remove_file(&socket)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(error = %e, "could not remove socket file");
         }
         tracing::info!("gygesd stopped");
         result

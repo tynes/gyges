@@ -1,9 +1,16 @@
-//! Test support (`test-util` feature): synthetic transparent-only blocks that
+//! Test support (`test-util` feature): synthetic blocks that
 //! `zcash_primitives::block::Block::read` accepts, and an in-process fake
 //! `zakurad` JSON-RPC server speaking the subset of methods
 //! [`crate::ZakuraRpcBackend`] uses, with the response shapes recorded in
 //! OVERVIEW.md §4.2. Used by this crate's tests, by `gygesd`'s, and by the
 //! regtest harness until a pinned `zakurad` is wired in (TESTING.md §2).
+//!
+//! Blocks the fake mines itself are transparent-only, but `sendrawtransaction`
+//! puts any transaction (shielded bundles included) into a mempool that the
+//! next mined block drains, and the fake keeps the Sapling and Orchard note
+//! commitment trees so that `getblock(h, 1).trees` and `z_gettreestate`
+//! stay consistent with what it served, which is what a wallet needs to scan
+//! and spend its own shielded outputs.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -18,10 +25,13 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use incrementalmerkletree::frontier::CommitmentTree;
+use orchard::tree::MerkleHashOrchard;
 use serde_json::{Value, json};
 use transparent::address::{Script, TransparentAddress};
 use transparent::bundle::{Authorized, Bundle, OutPoint, TxIn, TxOut};
 use zcash_primitives::block::{BlockHash, BlockHeaderData};
+use zcash_primitives::merkle_tree::write_commitment_tree;
 use zcash_primitives::transaction::{
     Authorized as TxAuthorized, Transaction, TransactionData, TxVersion,
 };
@@ -54,14 +64,16 @@ pub fn regtest_params() -> LocalNetwork {
 /// Where the fake coinbase pays.
 pub const COINBASE_ADDRESS: TransparentAddress = TransparentAddress::PublicKeyHash([0xc0; 20]);
 
-/// A block to build: coinbase plus one payment transaction when there are
-/// payments.
+/// A block to build: coinbase, one payment transaction when there are
+/// payments, then any serialised transactions handed in (the mempool).
 #[derive(Clone, Debug)]
 pub struct BlockSpec {
     pub height: BlockHeight,
     pub prev_hash: [u8; 32],
     pub time: u32,
     pub payments: Vec<(TransparentAddress, u64)>,
+    /// Serialised transactions appended after the fake's own, in order.
+    pub extra_raw: Vec<Vec<u8>>,
 }
 
 /// A built block: what the fake node serves and what tests compare against.
@@ -75,6 +87,14 @@ pub struct BuiltBlock {
     pub raw: Vec<u8>,
     /// Internal byte order, block order.
     pub txids: Vec<[u8; 32]>,
+    /// Each transaction's own serialisation, block order.
+    pub tx_raw: Vec<Vec<u8>>,
+    /// Sapling note commitments (`cmu`) the block appends, in order.
+    pub sapling_cmus: Vec<[u8; 32]>,
+    /// Orchard note commitments (`cmx`) the block appends, in order.
+    pub orchard_cmxs: Vec<[u8; 32]>,
+    /// Ironwood note commitments the block appends, in order (its own tree).
+    pub ironwood_cmxs: Vec<[u8; 32]>,
 }
 
 impl BlockSpec {
@@ -84,6 +104,7 @@ impl BlockSpec {
             prev_hash,
             time,
             payments: Vec::new(),
+            extra_raw: Vec::new(),
         }
     }
 
@@ -92,14 +113,19 @@ impl BlockSpec {
         self
     }
 
-    /// Serialise the block. Transparent only; the consensus branch id is the
-    /// one `params` prescribes for `height`, as `Block::read` demands.
+    /// Serialise the block. The fake's own transactions are transparent
+    /// only; the consensus branch id is the one `params` prescribes for
+    /// `height`, as `Block::read` demands, and every `extra_raw`
+    /// transaction must parse under it.
     pub fn build<P: Parameters>(&self, params: &P) -> BuiltBlock {
         let branch = BranchId::for_height(params, self.height);
         let height = u32::from(self.height);
         let mut vtx = vec![coinbase_tx(branch, height)];
         if !self.payments.is_empty() {
             vtx.push(payment_tx(branch, height, &self.payments));
+        }
+        for raw in &self.extra_raw {
+            vtx.push(Transaction::read(&raw[..], branch).expect("mempool transaction parses"));
         }
         let header = BlockHeaderData {
             version: 4,
@@ -118,9 +144,25 @@ impl BlockSpec {
         assert!(vtx.len() < 0xfd, "compact size");
         raw.push(vtx.len() as u8);
         let mut txids = Vec::new();
+        let mut tx_raw = Vec::new();
+        let mut sapling_cmus = Vec::new();
+        let mut orchard_cmxs = Vec::new();
+        let mut ironwood_cmxs = Vec::new();
         for tx in &vtx {
-            tx.write(&mut raw).expect("tx");
+            let mut one = Vec::new();
+            tx.write(&mut one).expect("tx");
+            raw.extend_from_slice(&one);
+            tx_raw.push(one);
             txids.push(*tx.txid().as_ref());
+            if let Some(b) = tx.sapling_bundle() {
+                sapling_cmus.extend(b.shielded_outputs().iter().map(|o| o.cmu().to_bytes()));
+            }
+            if let Some(b) = tx.orchard_bundle() {
+                orchard_cmxs.extend(b.actions().iter().map(|a| a.cmx().to_bytes()));
+            }
+            if let Some(b) = tx.ironwood_bundle() {
+                ironwood_cmxs.extend(b.actions().iter().map(|a| a.cmx().to_bytes()));
+            }
         }
         BuiltBlock {
             height,
@@ -129,6 +171,10 @@ impl BlockSpec {
             time: self.time,
             raw,
             txids,
+            tx_raw,
+            sapling_cmus,
+            orchard_cmxs,
+            ironwood_cmxs,
         }
     }
 }
@@ -236,11 +282,17 @@ struct State {
     blocks: BTreeMap<u32, BuiltBlock>,
     prune_height: Option<u32>,
     cookie: Option<String>,
+    /// Overrides the computed sizes in `getblock(h, 1).trees` when set.
     tree_sizes: Option<TreeSizes>,
     calls: Vec<String>,
     /// Bumped by `invalidate_from`, so re-mined blocks differ from the
     /// ones they replace.
     forks: u32,
+    /// `(txid, raw)` accepted by `sendrawtransaction`, mined in order by the
+    /// next block.
+    mempool: Vec<([u8; 32], Vec<u8>)>,
+    /// When set, `sendrawtransaction` refuses everything with this text.
+    reject_broadcasts: Option<String>,
 }
 
 impl State {
@@ -262,10 +314,66 @@ impl State {
             prev_hash: prev,
             time,
             payments: payments.to_vec(),
+            extra_raw: self.mempool.drain(..).map(|(_, raw)| raw).collect(),
         };
         let built = spec.build(&self.params);
         self.blocks.insert(height, built.clone());
         built
+    }
+
+    /// Note commitment tree sizes after block `height`: the override, else
+    /// the count of commitments in every block up to and including it.
+    fn tree_sizes_at(&self, height: u32) -> Option<TreeSizes> {
+        if let Some(s) = self.tree_sizes {
+            return Some(s);
+        }
+        let mut sizes = TreeSizes::default();
+        for (_, b) in self.blocks.range(..=height) {
+            sizes.sapling += b.sapling_cmus.len() as u32;
+            sizes.orchard += b.orchard_cmxs.len() as u32;
+            sizes.ironwood += b.ironwood_cmxs.len() as u32;
+        }
+        (sizes.sapling > 0 || sizes.orchard > 0 || sizes.ironwood > 0).then_some(sizes)
+    }
+
+    /// `finalState` hex of each pool's legacy `CommitmentTree` after block
+    /// `height`: `(sapling, orchard, ironwood)`.
+    fn frontiers_at(&self, height: u32) -> (String, String, String) {
+        let mut sapling: CommitmentTree<sapling::Node, 32> = CommitmentTree::empty();
+        let mut orchard: CommitmentTree<MerkleHashOrchard, 32> = CommitmentTree::empty();
+        let mut ironwood: CommitmentTree<MerkleHashOrchard, 32> = CommitmentTree::empty();
+        let orchard_node = |cmx: &[u8; 32]| {
+            MerkleHashOrchard::from_bytes(cmx)
+                .into_option()
+                .expect("cmx is a valid node")
+        };
+        for (_, b) in self.blocks.range(..=height) {
+            for cmu in &b.sapling_cmus {
+                let node = sapling::Node::from_bytes(*cmu).expect("cmu is a valid node");
+                sapling.append(node).expect("sapling tree not full");
+            }
+            for cmx in &b.orchard_cmxs {
+                orchard
+                    .append(orchard_node(cmx))
+                    .expect("orchard tree not full");
+            }
+            for cmx in &b.ironwood_cmxs {
+                ironwood
+                    .append(orchard_node(cmx))
+                    .expect("ironwood tree not full");
+            }
+        }
+        let encode = |tree: &CommitmentTree<_, 32>| {
+            let mut out = Vec::new();
+            write_commitment_tree(tree, &mut out).expect("serialise");
+            hex::encode(out)
+        };
+        let s = {
+            let mut out = Vec::new();
+            write_commitment_tree(&sapling, &mut out).expect("serialise");
+            hex::encode(out)
+        };
+        (s, encode(&orchard), encode(&ironwood))
     }
 }
 
@@ -341,6 +449,8 @@ impl FakeNode {
             tree_sizes: None,
             calls: Vec::new(),
             forks: 0,
+            mempool: Vec::new(),
+            reject_broadcasts: None,
         }));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -378,7 +488,8 @@ impl FakeNode {
         &self.url
     }
 
-    /// Append `n` empty blocks; returns the new tip height.
+    /// Append `n` blocks (the first drains the mempool); returns the new
+    /// tip height.
     pub fn mine(&self, n: u32) -> u32 {
         let mut st = self.lock();
         for _ in 0..n {
@@ -417,10 +528,22 @@ impl FakeNode {
         std::fs::write(path, format!("__cookie__:{secret}")).expect("write cookie");
     }
 
-    /// Tree sizes reported in `getblock(h, 1).trees` for every block
-    /// (`None`: omitted, as a node with empty trees does).
+    /// Override the tree sizes reported in `getblock(h, 1).trees` for every
+    /// block (`None`: the sizes the mined commitments imply, omitted while
+    /// both trees are empty, as a node with empty trees does).
     pub fn set_tree_sizes(&self, sizes: Option<TreeSizes>) {
         self.lock().tree_sizes = sizes;
+    }
+
+    /// Make `sendrawtransaction` refuse everything with `message` (`None`
+    /// accepts again), to exercise `NODE_REJECTED`.
+    pub fn set_reject_broadcasts(&self, message: Option<String>) {
+        self.lock().reject_broadcasts = message;
+    }
+
+    /// Txids (internal byte order) waiting to be mined, in arrival order.
+    pub fn mempool(&self) -> Vec<[u8; 32]> {
+        self.lock().mempool.iter().map(|(id, _)| *id).collect()
     }
 
     /// Method names of every request served so far.
@@ -478,7 +601,20 @@ async fn handle(
         }
     }
 
-    let outcome = dispatch(&st, &method, &params);
+    let mut outcome = dispatch(&st, &method, &params);
+    if let Ok(Value::Object(obj)) = &outcome
+        && let Some(Value::String(txid_hex)) = obj.get("__accept__")
+    {
+        let raw = params
+            .first()
+            .and_then(Value::as_str)
+            .and_then(|h| hex::decode(h).ok())
+            .expect("decoded once already");
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&hex::decode(txid_hex).expect("hex"));
+        st.mempool.push((txid, raw));
+        outcome = Ok(obj["txid"].clone());
+    }
     drop(st);
     let body = match outcome {
         Ok(result) => json!({ "result": result, "error": Value::Null, "id": id }),
@@ -584,7 +720,7 @@ fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
                 }
                 1 => {
                     let mut trees = serde_json::Map::new();
-                    if let Some(s) = st.tree_sizes {
+                    if let Some(s) = st.tree_sizes_at(h) {
                         if s.sapling > 0 {
                             trees.insert("sapling".into(), json!({ "size": s.sapling }));
                         }
@@ -626,18 +762,62 @@ fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
             if st.pruned(h) {
                 return Err((-8, "the requested block is not in the main chain".into()));
             }
-            // Explicit empty frontiers for every pool (all are active from
-            // height 1 on regtest); `sprout` is the `{}` an inactive pool gets.
-            let empty = json!({ "commitments": { "finalRoot": "00".repeat(32), "finalState": EMPTY_TREE_HEX } });
+            // Explicit frontiers for every pool (all are active from height
+            // 1 on regtest); `sprout` is the `{}` an inactive pool gets.
+            let (sapling, orchard, ironwood) = st.frontiers_at(h);
+            let pool = |state: String| json!({ "commitments": { "finalRoot": "00".repeat(32), "finalState": state } });
             Ok(json!({
                 "hash": display_hash(&block.hash),
                 "height": h,
                 "time": block.time,
                 "sprout": { "commitments": {} },
-                "sapling": empty,
-                "orchard": empty,
-                "ironwood": empty,
+                "sapling": pool(sapling),
+                "orchard": pool(orchard),
+                "ironwood": pool(ironwood),
             }))
+        }
+        "sendrawtransaction" => {
+            let hex_str = params
+                .first()
+                .and_then(Value::as_str)
+                .ok_or((-32602, "missing hexstring".to_string()))?;
+            let raw = hex::decode(hex_str).map_err(|_| (-22, "TX decode failed".to_string()))?;
+            let branch = BranchId::for_height(&st.params, BlockHeight::from_u32(tip + 1));
+            let tx = Transaction::read(&raw[..], branch)
+                .map_err(|e| (-22, format!("TX decode failed: {e}")))?;
+            if let Some(reason) = &st.reject_broadcasts {
+                return Err((-26, reason.clone()));
+            }
+            let txid = *tx.txid().as_ref();
+            if st.mempool.iter().any(|(id, _)| *id == txid) {
+                return Err((-27, "transaction already in mempool".into()));
+            }
+            // `dispatch` takes `&State`; the caller applies the mutation.
+            Ok(json!({ "__accept__": hex::encode(txid), "txid": display_hash(&txid) }))
+        }
+        "getrawtransaction" => {
+            let txid = params
+                .first()
+                .and_then(Value::as_str)
+                .ok_or((-32602, "missing txid".to_string()))?;
+            let wanted = crate::parse_display_hash(txid)
+                .map_err(|_| (-8, "parameter 1 must be hexadecimal string".to_string()))?;
+            for (h, b) in &st.blocks {
+                if let Some(i) = b.txids.iter().position(|t| *t == wanted) {
+                    return Ok(json!({
+                        "hex": hex::encode(&b.tx_raw[i]),
+                        "height": h,
+                        "confirmations": tip - h + 1,
+                        "txid": txid,
+                    }));
+                }
+            }
+            if let Some((_, raw)) = st.mempool.iter().find(|(id, _)| *id == wanted) {
+                return Ok(
+                    json!({ "hex": hex::encode(raw), "height": -1, "confirmations": 0, "txid": txid }),
+                );
+            }
+            Err((-5, "No such mempool or main chain transaction".into()))
         }
         _ => Err((-32601, format!("Method not found: {method}"))),
     }
