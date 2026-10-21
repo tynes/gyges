@@ -144,6 +144,17 @@ impl KeyEntry {
             .unwrap_or(0)
     }
 
+    /// Derive the account's UFVK from decrypted entropy, for profiles whose
+    /// viewing key is not on disk (`signer-only`).
+    pub fn derive_ufvk(&self, entropy: &Entropy) -> Result<String, RegistryError> {
+        let account = zip32::AccountId::try_from(self.profile.account_index)
+            .map_err(|_| RegistryError::Invalid("account index out of range".into()))?;
+        let seed = vault::seed_from_entropy(entropy);
+        let usk = UnifiedSpendingKey::from_seed(&self.params, seed.expose_secret(), account)
+            .map_err(|e| RegistryError::Invalid(format!("key derivation failed: {e:?}")))?;
+        Ok(usk.to_unified_full_viewing_key().encode(&self.params))
+    }
+
     /// The account's encoded UFVK. `None` for `signer-only` (whose viewing
     /// key lives behind the passphrase) and for a wallet without accounts.
     pub fn ufvk(&self) -> Option<String> {

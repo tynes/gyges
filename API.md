@@ -250,6 +250,16 @@ only: the daemon never rewrites `config.toml`. Passphrases and mnemonics are
 moved into zeroizing wrappers on arrival; a mnemonic error never echoes a
 word back. Both calls run the scrypt and SQLite work on a blocking thread.
 
+`UnlockKey` without `session_id` behaves as §6.3 describes (`CONNECTION` by
+default, `DAEMON` on request); with a `session_id` it answers
+`SESSION_NOT_FOUND` until signing sessions exist. A `ttl_secs` of 0 means
+`vault.unlock_ttl`. `KeySummary.locked` is false only for a daemon-scoped
+unlock, with `unlock_expires_at` set. `ExportUfvk` on a `SIGNER_ONLY` profile
+derives the key from a live daemon-scoped unlock and answers `VAULT_LOCKED`
+without one. `ExportSeed` checks `vault.allow_seed_export`, then the literal
+confirmation, then the passphrase (through the same per-key back-off as
+`UnlockKey`), and never creates an unlock.
+
 ### 4.7 `BackupKey` / `ImportBackup`
 
 Chunked tar archives. `BackupKey` runs `wal_checkpoint(TRUNCATE)` before

@@ -110,16 +110,16 @@ Registers a Keystone 3 Pro profile from `ur:zcash-accounts` (tag 49201), `ur:zca
 Creates a watch-only profile (Orchard proving-only: Sapling spends need the proof generation key, which a UFVK does not contain).
 
 #### `gyges key unlock [--id <KEY_ID>] [--timeout <DURATION>]`
-Prompts for the passphrase and creates a **daemon-scoped** signing session with an idle TTL (`--timeout`, default `vault.unlock_ttl` = `5m`; e.g. `60s`, `15m`). This is the weaker of the two unlock modes (the inline `tx send` flow uses a connection-scoped session) and exists for batch scripts.
+Prompts for the passphrase (or takes it from `--passphrase-fd` / `GYGES_PASSPHRASE_FILE`) and creates a **daemon-scoped** unlock with an idle TTL (`--timeout`, default `vault.unlock_ttl` = `5m`; e.g. `60s`, `15m`). This is the weaker of the two unlock modes (the inline `tx send` flow uses a connection-scoped session) and exists for batch scripts; the confirmation line says so and names the expiry. `--id` falls back to `--key`, then to the daemon's `default_key`. A wrong passphrase exits 4 (`INVALID_PASSPHRASE`); further attempts on the same key are refused with `RATE_LIMITED` for 1 s, doubling per failure up to `vault.unlock_backoff_max`, whichever connection they come from.
 
 #### `gyges key lock [--id <KEY_ID> | --all]`
-Destroys the signing sessions and zeroizes the decrypted key(s) immediately.
+Destroys the unlocks of one key (every scope) or of every key and zeroizes the decrypted material immediately. `daemon stop` does the same for every key.
 
 #### `gyges key export-ufvk [--id <KEY_ID>]`
-Prints the `uview1…` UFVK.
+Prints the `uview1…` UFVK. A `signer-only` profile keeps no viewing key on disk, so it needs a live daemon-scoped unlock first (exit 4, `VAULT_LOCKED`, otherwise).
 
 #### `gyges key export-seed [--id <KEY_ID>]`
-Prints the 24-word mnemonic. TTY required; prompts for the passphrase (never reuses a session); requires typing `reveal seed`; output never goes to `--json` or a file; written to the audit log; disabled when `vault.allow_seed_export = false`.
+Prints the 24-word mnemonic. TTY required on stdin, stdout and stderr (exit 4 otherwise); requires typing `reveal seed` first; then prompts for the passphrase on the terminal (never `--passphrase-fd`, never an existing unlock); output never goes to `--json` (exit 6) or a file; written to the audit log; disabled when `vault.allow_seed_export = false` (exit 4, `SEED_EXPORT_DISABLED`). A failed passphrase here counts against the same per-key back-off as `key unlock`.
 
 #### `gyges key backup --id <KEY_ID> -o <FILE.tar>` / `gyges key import-backup <FILE.tar>`
 Checkpoints WAL and archives `profile.json`, `seed.age` and optionally `wallet.sqlite` (`--with-db`). Copying `keys/<id>/` by hand is supported only while the daemon is stopped.

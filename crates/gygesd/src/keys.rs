@@ -7,19 +7,32 @@
 //! never appear in a log line or an error detail.
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use age::secrecy::SecretString;
 use gyges_chain::ChainError;
 use gyges_core::registry::NewLocalSeedKey;
+use gyges_core::vault::VaultError;
+use gyges_core::vault::manager::{Auth, Scope, UnlockState};
 use gyges_core::{BirthdayError, KeyEntry, RegistryError, SigningMode, birthday, vault};
 use gyges_proto::v1::{
-    self, ErrorReason, GygesError, InitKeyRequest, InitKeyResponse, KeySummary, RestoreKeyRequest,
-    RestoreKeyResponse,
+    self, ErrorReason, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest,
+    ExportUfvkResponse, GygesError, InitKeyRequest, InitKeyResponse, KeySummary, LockKeyRequest,
+    LockKeyResponse, RestoreKeyRequest, RestoreKeyResponse, UnlockKeyRequest, UnlockKeyResponse,
+    UnlockScope,
 };
 use tonic::Status;
 use zeroize::Zeroizing;
 
+use crate::conn::ConnInfo;
 use crate::service::DaemonState;
+
+/// Security-relevant events, key id and time only (OVERVIEW.md Q-O1). The
+/// target lets the audit appender (ROADMAP.md M1, last item) pick them out.
+pub const AUDIT_TARGET: &str = "gyges::audit";
+
+/// The literal `ExportSeed.confirmation` must equal (CLI_SPEC.md §2.2).
+pub const REVEAL_SEED: &str = "reveal seed";
 
 /// `gyges_core::SigningMode` → wire enum.
 pub fn proto_signing_mode(mode: SigningMode) -> v1::SigningMode {
@@ -41,16 +54,18 @@ pub fn proto_pool(pool: gyges_core::Pool) -> v1::Pool {
     }
 }
 
-/// One `KeySummary` row. Every key reports `locked`: the vault sessions
-/// that could say otherwise are the next ROADMAP.md item.
-pub fn summary(entry: &KeyEntry, default_key: &str) -> KeySummary {
+/// One `KeySummary` row. `locked` is false only for a daemon-scoped unlock:
+/// connection-scoped ones are usable by nobody else and are not shown
+/// (API.md §6.3).
+pub fn summary(entry: &KeyEntry, default_key: &str, unlocks: &[UnlockState]) -> KeySummary {
     let p = entry.profile();
+    let unlock = unlocks.iter().find(|u| u.key_id == p.key_id);
     KeySummary {
         key_id: p.key_id.clone(),
         signing_mode: proto_signing_mode(p.signing_mode) as i32,
         is_default: p.key_id == default_key,
-        locked: true,
-        unlock_expires_at: 0,
+        locked: unlock.is_none(),
+        unlock_expires_at: unlock.map_or(0, |u| unix_secs(u.expires_at)),
         birthday_height: p.birthday_height.unwrap_or(0),
         scanned_tip: entry.scanned_tip(),
         spend_pools: p
@@ -71,12 +86,48 @@ pub fn summary(entry: &KeyEntry, default_key: &str) -> KeySummary {
 /// Every key, sorted by id (`ListKeys`, `GetInfo.keys`).
 pub fn summaries(state: &DaemonState) -> Vec<KeySummary> {
     let default = state.registry.default_key();
+    let unlocks = state.vault.daemon_unlocks();
     state
         .registry
         .list()
         .iter()
-        .map(|e| summary(e, &default))
+        .map(|e| summary(e, &default, &unlocks))
         .collect()
+}
+
+fn unix_secs(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// `VaultError` → typed error.
+pub fn vault_error(e: VaultError, key_id: &str) -> GygesError {
+    let err = match e {
+        VaultError::WrongPassphrase => {
+            GygesError::new(ErrorReason::InvalidPassphrase, "wrong passphrase")
+        }
+        VaultError::RateLimited(wait) => GygesError::new(
+            ErrorReason::RateLimited,
+            format!(
+                "too many failed unlock attempts; retry in {}s",
+                wait.as_secs().max(1)
+            ),
+        ),
+        VaultError::Locked => GygesError::new(
+            ErrorReason::VaultLocked,
+            "the key is locked; run `gyges key unlock` or pass --passphrase-fd",
+        ),
+        VaultError::NoSeed => GygesError::new(
+            ErrorReason::InvalidArgument,
+            "this profile has no seed on disk and cannot be unlocked",
+        ),
+        other => {
+            tracing::error!(error = %other, key_id, "vault failure");
+            GygesError::new(ErrorReason::Internal, other.to_string())
+        }
+    };
+    err.with_key(key_id)
 }
 
 /// `RegistryError` → the typed error the CLI dispatches on.
@@ -310,6 +361,144 @@ pub async fn restore_key(
         birthday_height: height,
         ufvk: entry.ufvk().unwrap_or_default(),
         backfill_blocks: 0,
+    })
+}
+
+/// `UnlockKey` (API.md §6.3). Without `session_id`: a reusable unlock in
+/// the requested scope. With one: there are no signing sessions yet
+/// (ROADMAP.md M1, `TxEngine`), so `SESSION_NOT_FOUND`.
+pub async fn unlock_key(
+    state: Arc<DaemonState>,
+    conn: Option<ConnInfo>,
+    mut req: UnlockKeyRequest,
+) -> Result<UnlockKeyResponse, Status> {
+    let passphrase = take_passphrase(&mut req.passphrase)?;
+    if !req.session_id.is_empty() {
+        return Err(GygesError::new(
+            ErrorReason::SessionNotFound,
+            "no such signing session (signing sessions arrive with the transaction engine)",
+        )
+        .with_session(req.session_id)
+        .into_status());
+    }
+    let key = state
+        .registry
+        .resolve(&req.key_id)
+        .map_err(|e| registry_error(e).into_status())?;
+    let scope = match req.scope() {
+        UnlockScope::Daemon => Scope::Daemon,
+        UnlockScope::Connection | UnlockScope::Unspecified => Scope::Connection(
+            conn.ok_or_else(|| Status::internal("no connection info on this request"))?
+                .id,
+        ),
+    };
+    let ttl = (req.ttl_secs > 0).then(|| Duration::from_secs(u64::from(req.ttl_secs)));
+    let key_id = key.key_id().to_string();
+    let st = state.clone();
+    let k = key.clone();
+    let unlocked = tokio::task::spawn_blocking(move || st.vault.unlock(&k, passphrase, scope, ttl))
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(|e| vault_error(e, &key_id).into_status())?;
+    tracing::info!(target: AUDIT_TARGET, key_id, event = "unlock", scope = ?unlocked.scope);
+    Ok(UnlockKeyResponse {
+        session_token: unlocked
+            .token
+            .as_ref()
+            .map(|t| t.as_bytes().to_vec())
+            .unwrap_or_default(),
+        expires_at: unix_secs(unlocked.expires_at),
+        scope: match unlocked.scope {
+            Scope::Daemon => UnlockScope::Daemon,
+            Scope::Connection(_) => UnlockScope::Connection,
+        } as i32,
+    })
+}
+
+/// `LockKey`: one key (every scope) or all of them.
+pub fn lock_key(state: &DaemonState, req: LockKeyRequest) -> Result<LockKeyResponse, Status> {
+    let locked_key_ids = if req.all {
+        state.vault.lock_all()
+    } else {
+        let key = state
+            .registry
+            .resolve(&req.key_id)
+            .map_err(|e| registry_error(e).into_status())?;
+        if state.vault.lock(key.key_id()) {
+            vec![key.key_id().to_string()]
+        } else {
+            Vec::new()
+        }
+    };
+    for key_id in &locked_key_ids {
+        tracing::info!(target: AUDIT_TARGET, key_id, event = "lock");
+    }
+    Ok(LockKeyResponse { locked_key_ids })
+}
+
+/// `ExportUfvk`. A `signer-only` profile keeps no viewing key on disk, so
+/// it needs a live daemon-scoped unlock (`VAULT_LOCKED` otherwise).
+pub fn export_ufvk(
+    state: &DaemonState,
+    _conn: Option<ConnInfo>,
+    req: ExportUfvkRequest,
+) -> Result<ExportUfvkResponse, Status> {
+    let key = state
+        .registry
+        .resolve(&req.key_id)
+        .map_err(|e| registry_error(e).into_status())?;
+    let ufvk = match key.ufvk() {
+        Some(u) => u,
+        None => state
+            .vault
+            .with_entropy(key.key_id(), Auth::Daemon, |e| key.derive_ufvk(e))
+            .map_err(|e| vault_error(e, key.key_id()).into_status())?
+            .map_err(|e| registry_error(e).into_status())?,
+    };
+    Ok(ExportUfvkResponse {
+        ufvk,
+        birthday_height: key.profile().birthday_height.unwrap_or(0),
+    })
+}
+
+/// `ExportSeed` (OVERVIEW.md Q-S4): disabled by config, a fresh passphrase
+/// (never a session), the literal confirmation, audit-logged.
+pub async fn export_seed(
+    state: Arc<DaemonState>,
+    mut req: ExportSeedRequest,
+) -> Result<ExportSeedResponse, Status> {
+    if !state.vault.allow_seed_export() {
+        return Err(GygesError::new(
+            ErrorReason::SeedExportDisabled,
+            "seed export is disabled by vault.allow_seed_export = false",
+        )
+        .into_status());
+    }
+    let passphrase = take_passphrase(&mut req.passphrase)?;
+    if req.confirmation != REVEAL_SEED {
+        return Err(GygesError::new(
+            ErrorReason::ConfirmationRequired,
+            format!("type `{REVEAL_SEED}` to confirm"),
+        )
+        .into_status());
+    }
+    let key = state
+        .registry
+        .resolve(&req.key_id)
+        .map_err(|e| registry_error(e).into_status())?;
+    let key_id = key.key_id().to_string();
+    let st = state.clone();
+    let k = key.clone();
+    let entropy = tokio::task::spawn_blocking(move || st.vault.verify_passphrase(&k, passphrase))
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(|e| vault_error(e, &key_id).into_status())?;
+    let mnemonic = vault::mnemonic_phrase(&entropy);
+    drop(entropy);
+    tracing::info!(target: AUDIT_TARGET, key_id, event = "export_seed");
+    Ok(ExportSeedResponse {
+        mnemonic: mnemonic.to_string(),
+        birthday_height: key.profile().birthday_height.unwrap_or(0),
     })
 }
 

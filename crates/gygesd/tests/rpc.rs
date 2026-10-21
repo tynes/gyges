@@ -12,8 +12,9 @@ use gyges_core::{Home, Network, perms};
 use gyges_proto::uds;
 use gyges_proto::v1::gyges_client::GygesClient;
 use gyges_proto::v1::{
-    ErrorReason, GetBalanceRequest, GetInfoRequest, GygesError, InitKeyRequest, ListKeysRequest,
-    RestoreKeyRequest, ShutdownRequest, SigningMode,
+    ErrorReason, ExportSeedRequest, ExportUfvkRequest, GetBalanceRequest, GetInfoRequest,
+    GygesError, InitKeyRequest, ListKeysRequest, LockKeyRequest, RestoreKeyRequest,
+    ShutdownRequest, SigningMode, UnlockKeyRequest, UnlockScope,
 };
 use gygesd::{Daemon, DaemonState, Options};
 use tonic::transport::Channel;
@@ -551,4 +552,318 @@ fn a_broken_key_directory_refuses_start() {
     let msg = format!("{err:#}");
     assert!(msg.contains("key \"main\""), "{msg}");
     assert!(msg.contains("profile.json"), "{msg}");
+}
+
+fn reason(err: &tonic::Status) -> ErrorReason {
+    GygesError::from_status(err).expect("typed error").reason()
+}
+
+#[tokio::test]
+async fn daemon_unlock_lock_and_the_key_list_window() {
+    let running = start(|o| o.airgapped = true).await;
+    let mut c = client(&running.socket).await;
+    c.init_key(InitKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        set_default: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    // Locked: a signer-only key cannot even export its UFVK.
+    let err = c
+        .export_ufvk(ExportUfvkRequest { key_id: "".into() })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::VaultLocked);
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let resp = c
+        .unlock_key(UnlockKeyRequest {
+            key_id: "".into(),
+            passphrase: "pw".into(),
+            ttl_secs: 120,
+            scope: UnlockScope::Daemon as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.session_token.is_empty(), "daemon scope has no token");
+    assert_eq!(resp.scope(), UnlockScope::Daemon);
+    assert!(
+        resp.expires_at >= before + 119 && resp.expires_at <= before + 122,
+        "{}",
+        resp.expires_at
+    );
+
+    let keys = c
+        .list_keys(ListKeysRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .keys;
+    assert!(!keys[0].locked);
+    assert_eq!(keys[0].unlock_expires_at, resp.expires_at);
+    let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
+    assert!(!info.keys[0].locked);
+
+    // Unlocked: the UFVK is derived on demand.
+    let ufvk = c
+        .export_ufvk(ExportUfvkRequest {
+            key_id: "main".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(ufvk.ufvk.starts_with("uviewregtest1"), "{}", ufvk.ufvk);
+    assert_eq!(ufvk.birthday_height, 0);
+
+    let locked = c
+        .lock_key(LockKeyRequest {
+            key_id: "main".into(),
+            all: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(locked.locked_key_ids, ["main"]);
+    assert!(
+        c.list_keys(ListKeysRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .keys[0]
+            .locked
+    );
+    let again = c
+        .lock_key(LockKeyRequest {
+            key_id: "".into(),
+            all: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(again.locked_key_ids.is_empty());
+    let err = c
+        .lock_key(LockKeyRequest {
+            key_id: "nope".into(),
+            all: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::KeyNotFound);
+
+    // A bound session id is refused until signing sessions exist.
+    let err = c
+        .unlock_key(UnlockKeyRequest {
+            key_id: "main".into(),
+            passphrase: "pw".into(),
+            session_id: "abcd".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::SessionNotFound);
+    running.task.abort();
+}
+
+#[tokio::test]
+async fn connection_unlock_dies_with_its_connection_and_shutdown_zeroizes() {
+    let running = start(|o| o.airgapped = true).await;
+    let mut c = client(&running.socket).await;
+    c.init_key(InitKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let resp = c
+        .unlock_key(UnlockKeyRequest {
+            key_id: "main".into(),
+            passphrase: "pw".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.session_token.len(), 32);
+    assert_eq!(resp.scope(), UnlockScope::Connection);
+    assert_eq!(running.state.vault.unlock_count(), 1);
+    // Not visible as unlocked to anyone, and not usable without the token.
+    assert!(
+        c.list_keys(ListKeysRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .keys[0]
+            .locked
+    );
+    let err = c
+        .export_ufvk(ExportUfvkRequest {
+            key_id: "main".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::VaultLocked);
+
+    // Closing the connection drops it.
+    drop(c);
+    for _ in 0..200 {
+        if running.state.vault.unlock_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        running.state.vault.unlock_count(),
+        0,
+        "unlock outlived its connection"
+    );
+
+    // A daemon unlock survives the connection but not the daemon.
+    let mut c = client(&running.socket).await;
+    c.unlock_key(UnlockKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        scope: UnlockScope::Daemon as i32,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(running.state.vault.unlock_count(), 1);
+    let mut c = client(&running.socket).await;
+    c.shutdown(ShutdownRequest { graceful: true })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), running.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.state.vault.unlock_count(), 0, "zeroized on stop");
+}
+
+#[tokio::test]
+async fn wrong_passphrases_are_rate_limited_per_key() {
+    let running = start(|o| o.airgapped = true).await;
+    let mut c = client(&running.socket).await;
+    for id in ["a", "b"] {
+        c.init_key(InitKeyRequest {
+            key_id: id.into(),
+            passphrase: "pw".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let attempt = |key_id: &str, pass: &str| UnlockKeyRequest {
+        key_id: key_id.into(),
+        passphrase: pass.into(),
+        scope: UnlockScope::Daemon as i32,
+        ..Default::default()
+    };
+    let err = c.unlock_key(attempt("a", "wrong")).await.unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidPassphrase);
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    // Even the right passphrase waits now, on a new connection too.
+    let mut c2 = client(&running.socket).await;
+    let err = c2.unlock_key(attempt("a", "pw")).await.unwrap_err();
+    let detail = GygesError::from_status(&err).unwrap();
+    assert_eq!(detail.reason(), ErrorReason::RateLimited);
+    assert!(detail.detail.contains("retry in 1s"), "{}", detail.detail);
+    assert_eq!(detail.key_id, "a");
+    // Key b is unaffected.
+    c.unlock_key(attempt("b", "pw")).await.unwrap();
+    // Empty passphrase is an argument error, not an attempt.
+    let err = c.unlock_key(attempt("b", "")).await.unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument);
+    running.task.abort();
+}
+
+#[tokio::test]
+async fn export_seed_round_trips_with_its_guards() {
+    let running = start(|o| o.airgapped = true).await;
+    let mut c = client(&running.socket).await;
+    let created = c
+        .init_key(InitKeyRequest {
+            key_id: "main".into(),
+            passphrase: "pw".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let req = |pass: &str, confirmation: &str| ExportSeedRequest {
+        key_id: "main".into(),
+        passphrase: pass.into(),
+        confirmation: confirmation.into(),
+    };
+    let err = c.export_seed(req("pw", "reveal")).await.unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::ConfirmationRequired);
+    let err = c.export_seed(req("nope", "reveal seed")).await.unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidPassphrase);
+    // The failed attempt counts against the same back-off as unlocks.
+    let err = c.export_seed(req("pw", "reveal seed")).await.unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::RateLimited);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let resp = c
+        .export_seed(req("pw", "reveal seed"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.mnemonic, created.mnemonic);
+    // Exporting never created an unlock.
+    assert_eq!(running.state.vault.unlock_count(), 0);
+    running.task.abort();
+}
+
+#[tokio::test]
+async fn seed_export_can_be_disabled_by_config() {
+    let (dir, home) = fresh_home();
+    std::fs::write(
+        home.config_path(Network::Regtest),
+        "[vault]\nscrypt_work_factor = 10\nallow_seed_export = false\n",
+    )
+    .unwrap();
+    let mut opts = Options::new(home, Network::Regtest);
+    opts.airgapped = true;
+    let daemon = Daemon::prepare(opts).expect("prepare");
+    let socket = daemon.socket_path();
+    let task = tokio::spawn(daemon.serve(std::future::pending()));
+    for _ in 0..400 {
+        if uds::probe(&socket).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut c = client(&socket).await;
+    c.init_key(InitKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let err = c
+        .export_seed(ExportSeedRequest {
+            key_id: "main".into(),
+            passphrase: "pw".into(),
+            confirmation: "reveal seed".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::SeedExportDisabled);
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    task.abort();
+    drop(dir);
 }

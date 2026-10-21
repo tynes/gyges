@@ -3,8 +3,8 @@
 //! Components, each with its own module:
 //! * [`registry::KeyRegistry`] – enumerates `keys/<id>/profile.json`, owns one
 //!   `WalletDb` per key, validates permissions at startup (Q-S7);
-//! * `VaultManager` – `seed.age` encryption ([`vault`], done), connection-scoped
-//!   signing sessions and TTL eviction (Q-S1, Q-S3, Q-S5; next);
+//! * [`vault::manager::VaultManager`] – `seed.age` encryption, connection- and
+//!   daemon-scoped unlocks with idle TTL, per-key back-off (Q-S1…S3, Q-S5);
 //! * `SyncScheduler` – per-key state machine over `gyges_chain` (SYNC.md);
 //! * `TxEngine` – proposal → PCZT roles → broadcast (Q-K3, Q-K4, Q-K7);
 //! * `TexQueue` – durable two-step ZIP 320 broadcaster (Q-T1…T3).
@@ -26,6 +26,7 @@ pub use network::{ConsensusParams, Network};
 pub use paths::Home;
 pub use profile::{KeyProfile, ProfileError};
 pub use registry::{KeyEntry, KeyRegistry, NewLocalSeedKey, RegistryError};
+pub use vault::manager::VaultManager;
 
 /// How a key profile signs (DATA_MODEL.md `profile.json`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

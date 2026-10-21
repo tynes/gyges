@@ -20,8 +20,9 @@ use gyges_proto::v1::{ErrorReason, GygesError};
 use http::{Request, Response};
 use tokio::net::UnixStream;
 use tonic::body::Body;
-use tonic::transport::server::UdsConnectInfo;
 use tower::{Layer, Service};
+
+use crate::conn::ConnInfo;
 
 /// Who may connect to the socket.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,7 +59,8 @@ impl PeerPolicy {
     }
 
     /// Read the peer's credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED`
-    /// on macOS, via tokio) and decide. Returns the admitted uid.
+    /// on macOS, via tokio) and decide. Returns the admitted uid, which
+    /// [`crate::conn::Conn`] carries into every request.
     pub fn admit(&self, stream: &UnixStream) -> Result<u32, PeerRejected> {
         let cred = stream.peer_cred().map_err(PeerRejected::Unavailable)?;
         let uid = cred.uid();
@@ -145,13 +147,13 @@ pub struct Policy<S> {
 impl<S> Policy<S> {
     /// The error to answer with instead of routing, if any.
     fn refuse<B>(&self, req: &Request<B>) -> Option<GygesError> {
-        if let Some(info) = req.extensions().get::<UdsConnectInfo>() {
-            match info.peer_cred {
-                Some(cred) if self.peer.allows(cred.uid()) => {}
-                Some(cred) => {
+        if let Some(info) = req.extensions().get::<ConnInfo>() {
+            match info.uid {
+                Some(uid) if self.peer.allows(uid) => {}
+                Some(uid) => {
                     return Some(GygesError::new(
                         ErrorReason::PermissionDenied,
-                        format!("uid {} may not use this daemon", cred.uid()),
+                        format!("uid {uid} may not use this daemon"),
                     ));
                 }
                 None => {

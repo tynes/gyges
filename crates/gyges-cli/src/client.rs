@@ -18,9 +18,7 @@ pub struct Ctx {
     /// Given explicitly (flag or `GYGES_NETWORK`); checked against the daemon.
     pub network: Option<Network>,
     /// `--key` / `GYGES_KEY`, passed through verbatim; empty means the
-    /// daemon's default (API.md §1.4). Consumed by the per-key commands
-    /// (`balance`, `sync`, `tx`) as they land.
-    #[allow(dead_code)]
+    /// daemon's default (API.md §1.4).
     pub key: String,
     pub json: bool,
     pub quiet: bool,

@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod conn;
 pub mod keys;
 pub mod lifecycle;
 pub mod policy;
@@ -28,13 +29,14 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use gyges_chain::ChainBackend;
-use gyges_core::{Config, Home, KeyRegistry, Network, perms};
+use gyges_core::{Config, Home, KeyRegistry, Network, VaultManager, perms};
 use gyges_proto::v1::gyges_server::GygesServer;
 use tokio::net::UnixListener;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
+pub use conn::{Conn, ConnInfo};
 pub use lifecycle::{PidLock, PidLockError};
 pub use policy::{PeerPolicy, PolicyLayer};
 pub use service::{DaemonState, GygesService};
@@ -137,7 +139,10 @@ impl Daemon {
         // migrations, which must not race a running daemon.
         let registry = KeyRegistry::open(home.clone(), network, &config)
             .context("refusing to start: a key directory is unusable")?;
-        let state = Arc::new(DaemonState::new(config, network, registry, opts.chain));
+        let vault = VaultManager::new(&config.vault);
+        let state = Arc::new(DaemonState::new(
+            config, network, registry, vault, opts.chain,
+        ));
         Ok(Self {
             home,
             network,
@@ -166,21 +171,36 @@ impl Daemon {
         );
 
         let listener = bind(&socket, &cfg.daemon.socket_group)?;
-        let incoming = UnixListenerStream::new(listener).filter({
+        let incoming = UnixListenerStream::new(listener).filter_map({
             let peer = peer.clone();
+            let vault = self.state.vault.clone();
             move |item| match item {
-                Ok(stream) => match peer.admit(stream) {
+                Ok(stream) => match peer.admit(&stream) {
                     Ok(uid) => {
-                        tracing::debug!(uid, "connection accepted");
-                        true
+                        let conn = Conn::new(stream, Some(uid), vault.clone());
+                        tracing::debug!(uid, conn = conn.info().id.0, "connection accepted");
+                        Some(Ok(conn))
                     }
                     Err(reason) => {
                         tracing::warn!(%reason, "connection rejected");
-                        false
+                        None
                     }
                 },
                 // Accept errors are passed through so tonic logs them.
-                Err(_) => true,
+                Err(e) => Some(Err(e)),
+            }
+        });
+
+        // Idle unlocks are also evicted lazily on every use; the sweep bounds
+        // how long expired entropy can sit in memory untouched.
+        let sweeper = tokio::spawn({
+            let vault = self.state.vault.clone();
+            async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    tick.tick().await;
+                    vault.evict_expired();
+                }
             }
         });
 
@@ -208,6 +228,13 @@ impl Daemon {
             .await
             .context("gRPC server failed");
 
+        sweeper.abort();
+        // Zeroize every decrypted key before the process goes away
+        // (CLI_SPEC.md §2.1 `daemon stop`).
+        let locked = self.state.vault.lock_all();
+        if !locked.is_empty() {
+            tracing::info!(keys = locked.len(), "keys zeroized on stop");
+        }
         if let Err(e) = std::fs::remove_file(&socket)
             && e.kind() != std::io::ErrorKind::NotFound
         {

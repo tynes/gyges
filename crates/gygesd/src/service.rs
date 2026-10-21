@@ -7,12 +7,14 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gyges_chain::ChainBackend;
-use gyges_core::{Config, KeyRegistry, Network};
+use gyges_core::{Config, KeyRegistry, Network, VaultManager};
 use gyges_proto::v1::gyges_server::Gyges;
 use gyges_proto::v1::{
-    self, ApiVersion, FallbackStatus, FallbackTrust, GetInfoRequest, GetInfoResponse,
-    InitKeyRequest, InitKeyResponse, ListKeysRequest, ListKeysResponse, NodeStatus,
-    RestoreKeyRequest, RestoreKeyResponse, ShutdownRequest, ShutdownResponse, TorState, TorStatus,
+    self, ApiVersion, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest, ExportUfvkResponse,
+    FallbackStatus, FallbackTrust, GetInfoRequest, GetInfoResponse, InitKeyRequest,
+    InitKeyResponse, ListKeysRequest, ListKeysResponse, LockKeyRequest, LockKeyResponse,
+    NodeStatus, RestoreKeyRequest, RestoreKeyResponse, ShutdownRequest, ShutdownResponse, TorState,
+    TorStatus, UnlockKeyRequest, UnlockKeyResponse,
 };
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
@@ -25,6 +27,8 @@ pub struct DaemonState {
     pub config: Config,
     pub network: Network,
     pub registry: KeyRegistry,
+    /// Shared with every [`crate::Conn`], which drops its unlocks on close.
+    pub vault: Arc<VaultManager>,
     /// `None` until the node backend exists (ROADMAP.md M1).
     pub chain: Option<Arc<dyn ChainBackend>>,
     /// Unix seconds the daemon started.
@@ -38,12 +42,14 @@ impl DaemonState {
         config: Config,
         network: Network,
         registry: KeyRegistry,
+        vault: VaultManager,
         chain: Option<Arc<dyn ChainBackend>>,
     ) -> Self {
         Self {
             config,
             network,
             registry,
+            vault: Arc::new(vault),
             chain,
             started_at: unix_now(),
             shutdown: Notify::new(),
@@ -106,7 +112,7 @@ pub fn proto_network(network: Network) -> v1::Network {
     }
 }
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
@@ -174,6 +180,40 @@ impl Gyges for GygesService {
             .await
             .map(Response::new)
     }
+
+    async fn unlock_key(
+        &self,
+        request: Request<UnlockKeyRequest>,
+    ) -> Result<Response<UnlockKeyResponse>, Status> {
+        let conn = crate::conn::of_request(&request);
+        keys::unlock_key(self.state.clone(), conn, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn lock_key(
+        &self,
+        request: Request<LockKeyRequest>,
+    ) -> Result<Response<LockKeyResponse>, Status> {
+        keys::lock_key(&self.state, request.into_inner()).map(Response::new)
+    }
+
+    async fn export_ufvk(
+        &self,
+        request: Request<ExportUfvkRequest>,
+    ) -> Result<Response<ExportUfvkResponse>, Status> {
+        let conn = crate::conn::of_request(&request);
+        keys::export_ufvk(&self.state, conn, request.into_inner()).map(Response::new)
+    }
+
+    async fn export_seed(
+        &self,
+        request: Request<ExportSeedRequest>,
+    ) -> Result<Response<ExportSeedResponse>, Status> {
+        keys::export_seed(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
 }
 
 #[cfg(test)]
@@ -191,7 +231,8 @@ mod tests {
             ..Config::default()
         };
         let registry = KeyRegistry::open(Home::new(dir.path()), Network::Regtest, &cfg).unwrap();
-        let state = DaemonState::new(cfg, Network::Regtest, registry, None);
+        let vault = VaultManager::new(&cfg.vault);
+        let state = DaemonState::new(cfg, Network::Regtest, registry, vault, None);
         let info = state.info();
         assert_eq!(info.network, v1::Network::Regtest as i32);
         assert_eq!(info.api_version.unwrap().major, gyges_proto::API_MAJOR);

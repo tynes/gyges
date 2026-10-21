@@ -18,7 +18,7 @@ How Gyges is tested, from unit tests to a nightly run through a real Tor network
 
 ## 2. Regtest Harness (`tests/regtest/`)
 
-**Status:** the crate exists. `harness/lib.rs` runs `gygesd` and `gyges` against a temporary `GYGES_HOME` (building both binaries once per test process so they are never stale); `scenarios/daemon.rs` covers the daemon lifecycle, the handshake and the permission and single-instance refusals; `scenarios/keys.rs` covers `key list / init / restore` without a node (scripted `--json` init on an air-gapped daemon, restore from stdin at the default birthday, the exit-4 and exit-7 refusals, the permission re-check on restart, and a log grep for the passphrase and mnemonic). The node and archival processes below are not wired in yet.
+**Status:** the crate exists. `harness/lib.rs` runs `gygesd` and `gyges` against a temporary `GYGES_HOME` (building both binaries once per test process so they are never stale); `scenarios/daemon.rs` covers the daemon lifecycle, the handshake and the permission and single-instance refusals; `scenarios/keys.rs` covers `key list / init / restore / unlock / lock / export-ufvk / export-seed` without a node (scripted `--json` init on an air-gapped daemon, restore from stdin at the default birthday, the exit-4 and exit-7 refusals, the permission re-check on restart, a log grep for the passphrase and mnemonic, the rate-limited wrong passphrase, the daemon-scoped unlock window in `key list`, and the terminal-only rule of `export-seed`). The node and archival processes below are not wired in yet.
 
 ### 2.1 Components
 

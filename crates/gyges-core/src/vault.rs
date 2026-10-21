@@ -7,10 +7,11 @@
 //! `vault.scrypt_work_factor` and is recorded in `profile.json` as
 //! `seed_format = "age-scrypt-v1"`.
 //!
-//! The signing sessions, idle TTLs and unlock rate limiting that make up the
-//! rest of the `VaultManager` (ARCHITECTURE.md §2.1) are the next ROADMAP.md
-//! item; this module is only the file format and the key derivation that
-//! `key init` / `key restore` need.
+//! This file is the format and the key derivation; [`manager::VaultManager`]
+//! holds decrypted entropy for the lifetime of an unlock, enforces the idle
+//! TTL and rate-limits failed passphrases.
+
+pub mod manager;
 
 use std::io::{self, Read as _, Write as _};
 use std::path::Path;
@@ -40,6 +41,12 @@ pub enum VaultError {
     Encrypt(String),
     #[error("invalid mnemonic: {0}")]
     Mnemonic(String),
+    #[error("too many failed unlock attempts; retry in {}s", .0.as_secs().max(1))]
+    RateLimited(std::time::Duration),
+    #[error("the key is locked")]
+    Locked,
+    #[error("this profile has no seed on disk")]
+    NoSeed,
     #[error("{context}: {source}")]
     Io {
         context: &'static str,

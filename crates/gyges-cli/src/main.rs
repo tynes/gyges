@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn unimplemented_groups_accept_any_arguments() {
-        Cli::try_parse_from(["gyges", "key", "unlock", "--timeout", "5m"]).unwrap();
+        Cli::try_parse_from(["gyges", "key", "backup", "-o", "x.tar"]).unwrap();
         Cli::try_parse_from(["gyges", "tx", "send", "--to", "u1x", "--amount", "1"]).unwrap();
     }
 
@@ -182,5 +182,14 @@ mod tests {
         );
         let cli = Cli::try_parse_from(["gyges", "--passphrase-fd", "3", "key", "list"]).unwrap();
         assert_eq!(cli.global.passphrase_fd, Some(3));
+        let cli = Cli::try_parse_from(["gyges", "key", "unlock", "--timeout", "15m"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Key(key::KeyCmd::Unlock(ref a))
+                if a.timeout == Some(std::time::Duration::from_secs(900)) && a.key.id.is_none()
+        ));
+        assert!(Cli::try_parse_from(["gyges", "key", "lock", "--all", "--id", "x"]).is_err());
+        let cli = Cli::try_parse_from(["gyges", "-k", "main", "key", "export-ufvk"]).unwrap();
+        assert_eq!(cli.global.key.as_deref(), Some("main"));
     }
 }

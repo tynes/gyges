@@ -252,7 +252,11 @@ impl Fixture {
 
     /// A `0600` file holding `passphrase`, for `GYGES_PASSPHRASE_FILE`.
     pub fn passphrase_file(&self, passphrase: &str) -> PathBuf {
-        let path = self.home_path.join(format!("pw-{}", std::process::id()));
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = self
+            .home_path
+            .join(format!("pw-{}-{n}", std::process::id()));
         std::fs::write(&path, format!("{passphrase}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         path

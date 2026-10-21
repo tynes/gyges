@@ -5,10 +5,13 @@
 
 use std::ffi::OsString;
 
+use std::io::IsTerminal as _;
+
 use clap::{Args, Subcommand};
 use gyges_proto::v1::{
-    GetInfoResponse, InitKeyRequest, KeySummary, ListKeysRequest, Network, RestoreKeyRequest,
-    SigningMode,
+    ErrorReason, ExportSeedRequest, ExportUfvkRequest, GetInfoResponse, GygesError, InitKeyRequest,
+    KeySummary, ListKeysRequest, LockKeyRequest, Network, RestoreKeyRequest, SigningMode,
+    UnlockKeyRequest, UnlockScope,
 };
 use zeroize::Zeroizing;
 
@@ -28,14 +31,14 @@ pub enum KeyCmd {
     ImportKeystone(Unimplemented),
     /// Create a watch-only profile from a UFVK.
     ImportUfvk(Unimplemented),
-    /// Unlock a key for a limited time (daemon-scoped session).
-    Unlock(Unimplemented),
-    /// Lock a key, or every key.
-    Lock(Unimplemented),
+    /// Unlock a key for a limited time; any process of this user may then spend from it.
+    Unlock(UnlockArgs),
+    /// Lock a key, or every key, zeroizing the decrypted material now.
+    Lock(LockArgs),
     /// Print the uview1… UFVK.
-    ExportUfvk(Unimplemented),
-    /// Print the 24-word mnemonic (TTY only).
-    ExportSeed(Unimplemented),
+    ExportUfvk(KeyIdArg),
+    /// Print the 24-word mnemonic (terminal only, passphrase always asked).
+    ExportSeed(KeyIdArg),
     /// Archive profile.json and seed.age (and optionally the wallet).
     Backup(Unimplemented),
     /// Restore an archive written by `key backup`.
@@ -81,6 +84,39 @@ pub struct RestoreArgs {
     pub set_default: bool,
 }
 
+/// `--id`, falling back to the global `--key`; empty means the daemon's
+/// default key (API.md §1.4).
+#[derive(Debug, Clone, Args)]
+pub struct KeyIdArg {
+    /// Key id [default: --key, then the daemon's default_key].
+    #[arg(long, value_name = "KEY_ID")]
+    pub id: Option<String>,
+}
+
+impl KeyIdArg {
+    fn resolve(&self, ctx: &Ctx) -> String {
+        self.id.clone().unwrap_or_else(|| ctx.key.clone())
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct UnlockArgs {
+    #[command(flatten)]
+    pub key: KeyIdArg,
+    /// Idle timeout, e.g. 60s, 15m [default: the daemon's vault.unlock_ttl].
+    #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
+    pub timeout: Option<std::time::Duration>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct LockArgs {
+    #[command(flatten)]
+    pub key: KeyIdArg,
+    /// Lock every key.
+    #[arg(long, conflicts_with = "id")]
+    pub all: bool,
+}
+
 pub async fn run(ctx: &Ctx, cmd: KeyCmd) -> Result<(), CliError> {
     match cmd {
         KeyCmd::List => list(ctx).await,
@@ -88,10 +124,10 @@ pub async fn run(ctx: &Ctx, cmd: KeyCmd) -> Result<(), CliError> {
         KeyCmd::Restore(args) => restore(ctx, args).await,
         KeyCmd::ImportKeystone(_) => Err(CliError::NotImplemented("key import-keystone")),
         KeyCmd::ImportUfvk(_) => Err(CliError::NotImplemented("key import-ufvk")),
-        KeyCmd::Unlock(_) => Err(CliError::NotImplemented("key unlock")),
-        KeyCmd::Lock(_) => Err(CliError::NotImplemented("key lock")),
-        KeyCmd::ExportUfvk(_) => Err(CliError::NotImplemented("key export-ufvk")),
-        KeyCmd::ExportSeed(_) => Err(CliError::NotImplemented("key export-seed")),
+        KeyCmd::Unlock(args) => unlock(ctx, args).await,
+        KeyCmd::Lock(args) => lock(ctx, args).await,
+        KeyCmd::ExportUfvk(args) => export_ufvk(ctx, args).await,
+        KeyCmd::ExportSeed(args) => export_seed(ctx, args).await,
         KeyCmd::Backup(_) => Err(CliError::NotImplemented("key backup")),
         KeyCmd::ImportBackup(_) => Err(CliError::NotImplemented("key import-backup")),
         KeyCmd::Delete(_) => Err(CliError::NotImplemented("key delete")),
@@ -373,6 +409,151 @@ fn backfill_consent(
         "--yes",
     )?;
     Ok(true)
+}
+
+/// `key unlock`: a daemon-scoped unlock with an idle timeout (API.md §6.3,
+/// the weaker mode; the inline `tx send` flow uses connection scope).
+async fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<(), CliError> {
+    let mut conn = ctx.connect().await?;
+    let key_id = args.key.resolve(ctx);
+    let shown = if key_id.is_empty() {
+        conn.info.default_key.clone()
+    } else {
+        key_id.clone()
+    };
+    let passphrase = ctx
+        .prompter
+        .passphrase(&format!("Enter passphrase to unlock key '{shown}'"), false)?;
+    let resp = conn
+        .client
+        .unlock_key(UnlockKeyRequest {
+            key_id,
+            passphrase: passphrase.to_string(),
+            ttl_secs: args
+                .timeout
+                .map(|d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
+                .unwrap_or(0),
+            session_id: String::new(),
+            scope: UnlockScope::Daemon as i32,
+        })
+        .await
+        .map_err(CliError::from_status)?
+        .into_inner();
+    drop(passphrase);
+    if ctx.json {
+        println!("{}", to_json(&resp)?);
+    } else if !ctx.quiet {
+        eprintln!(
+            "key '{shown}' unlocked until {} (daemon scope: any process of this user can spend              from it until then; `gyges key lock` ends it early)",
+            format_unix(resp.expires_at)
+        );
+    }
+    Ok(())
+}
+
+async fn lock(ctx: &Ctx, args: LockArgs) -> Result<(), CliError> {
+    let mut conn = ctx.connect().await?;
+    let resp = conn
+        .client
+        .lock_key(LockKeyRequest {
+            key_id: if args.all {
+                String::new()
+            } else {
+                args.key.resolve(ctx)
+            },
+            all: args.all,
+        })
+        .await
+        .map_err(CliError::from_status)?
+        .into_inner();
+    if ctx.json {
+        println!("{}", to_json(&resp)?);
+    } else if !ctx.quiet {
+        if resp.locked_key_ids.is_empty() {
+            eprintln!("nothing was unlocked");
+        } else {
+            eprintln!("locked: {}", resp.locked_key_ids.join(", "));
+        }
+    }
+    Ok(())
+}
+
+async fn export_ufvk(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
+    let mut conn = ctx.connect().await?;
+    let resp = conn
+        .client
+        .export_ufvk(ExportUfvkRequest {
+            key_id: args.resolve(ctx),
+        })
+        .await
+        .map_err(CliError::from_status)?
+        .into_inner();
+    if ctx.json {
+        println!("{}", to_json(&resp)?);
+    } else {
+        println!("{}", resp.ufvk);
+    }
+    Ok(())
+}
+
+/// `key export-seed` (OVERVIEW.md Q-S4): terminal only, never `--json`, the
+/// passphrase is always asked, `reveal seed` typed back.
+async fn export_seed(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
+    if ctx.json {
+        return Err(CliError::Daemon(GygesError::new(
+            ErrorReason::InvalidArgument,
+            "key export-seed prints to a terminal only and has no --json form",
+        )));
+    }
+    if !ctx.prompter.interactive() || !std::io::stdout().is_terminal() {
+        return Err(CliError::Daemon(GygesError::new(
+            ErrorReason::ConfirmationRequired,
+            "key export-seed needs an interactive terminal on stdin, stdout and stderr",
+        )));
+    }
+    let mut conn = ctx.connect().await?;
+    let key_id = args.resolve(ctx);
+    let shown = if key_id.is_empty() {
+        conn.info.default_key.clone()
+    } else {
+        key_id.clone()
+    };
+    eprintln!(
+        "This prints the 24 words that control every fund of key '{shown}'. Anyone who sees them          can spend. Make sure nobody is watching your screen."
+    );
+    let typed = ctx.prompter.line("Type `reveal seed` to continue")?;
+    if typed != "reveal seed" {
+        return Err(CliError::Cancelled);
+    }
+    // Always a fresh passphrase, never from `--passphrase-fd` or a session.
+    let passphrase = Zeroizing::new(rpassword::prompt_password(format!(
+        "Enter passphrase for key '{shown}': "
+    ))?);
+    let resp = conn
+        .client
+        .export_seed(ExportSeedRequest {
+            key_id,
+            passphrase: passphrase.to_string(),
+            confirmation: typed,
+        })
+        .await
+        .map_err(CliError::from_status)?
+        .into_inner();
+    drop(passphrase);
+    let mnemonic = Zeroizing::new(resp.mnemonic);
+    let words: Vec<&str> = mnemonic.split_whitespace().collect();
+    for (i, chunk) in words.chunks(6).enumerate() {
+        let line: Vec<String> = chunk
+            .iter()
+            .enumerate()
+            .map(|(j, w)| format!("{:>2}. {:<10}", i * 6 + j + 1, w))
+            .collect();
+        println!("  {}", line.join(" "));
+    }
+    if resp.birthday_height > 0 {
+        println!("birthday height: {}", resp.birthday_height);
+    }
+    Ok(())
 }
 
 /// Default restore birthday per network (DATA_MODEL.md §3). Duplicated
