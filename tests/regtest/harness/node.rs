@@ -101,6 +101,13 @@ fn download_pinned() -> anyhow::Result<PathBuf> {
     if bin.is_file() {
         return Ok(bin);
     }
+    if dir.exists() {
+        // The directory without its binary: an interrupted earlier run, or a
+        // CI cache that kept the tree but trimmed the file. `rename` below
+        // cannot replace a non-empty directory, so clear it first.
+        eprintln!("removing incomplete {}", dir.display());
+        fs::remove_dir_all(&dir).with_context(|| format!("remove incomplete {}", dir.display()))?;
+    }
     fs::create_dir_all(regtest_bin_dir())?;
     let archive = format!("zakurad-{}-{platform}.tar.gz", v.tag);
     let url = format!(
@@ -147,13 +154,20 @@ fn download_pinned() -> anyhow::Result<PathBuf> {
     if !staging.join("bin/zakurad").is_file() {
         bail!("{archive} has no bin/zakurad");
     }
-    // Another test binary may have raced us to the same directory.
+    // Another test process may have raced us to the same directory: keep
+    // whichever copy is complete.
     match fs::rename(&staging, &dir) {
         Ok(()) => {}
         Err(_) if bin.is_file() => {
             let _ = fs::remove_dir_all(&staging);
         }
-        Err(e) => return Err(e).context("move the extracted node into place"),
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(e).context(format!(
+                "move the extracted node into place at {}",
+                dir.display()
+            ));
+        }
     }
     Ok(bin)
 }
