@@ -2,7 +2,7 @@
 
 A pure-Rust Zcash wallet daemon (`gygesd`) and CLI (`gyges`) that talks straight to a pruned [Zakura](https://github.com/zakura-core/zakura) node, backfills older history over Tor, isolates keys per profile, and supports Keystone 3 Pro hardware signing and ZIP 320 `tex1` payments.
 
-**Status: pre-alpha design.** Nothing is functional. The workspace compiles against the published Zakura crates and the binaries print their intended flags, but no wallet logic is implemented. See [`ROADMAP.md`](ROADMAP.md) for the MVP cut.
+**Status: pre-alpha.** The daemon starts, enforces the 0700/0600 layout and the peer-credential check on its Unix socket, and answers `GetInfo` and `Shutdown`; the CLI connects, runs the API-version and network handshake, and drives `daemon start`, `daemon stop` and `daemon status` (with `--json`). No wallet logic (keys, sync, transactions) exists yet. See [`ROADMAP.md`](ROADMAP.md) for the MVP cut.
 
 ## Why
 
@@ -39,6 +39,18 @@ cargo build --locked --workspace
 
 ```bash
 cargo test --locked --workspace
+```
+
+The test run includes the end-to-end daemon scenarios in `tests/regtest/`, which build and spawn both binaries against a temporary `GYGES_HOME`.
+
+To try the daemon by hand on regtest (no node is needed yet):
+
+```bash
+cargo run -p gygesd -- --network regtest --foreground
+```
+
+```bash
+cargo run -p gyges-cli -- -n regtest daemon status
 ```
 
 ## Licence

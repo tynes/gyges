@@ -114,23 +114,23 @@ These are stated so that nobody mistakes silence for a guarantee.
 
 ## 5. Security Controls Checklist
 
-Each control, the component responsible for it, the question that proposed it, and the test that should prove it. Unchecked boxes are not implemented; nothing is implemented yet.
+Each control, the component responsible for it, the question that proposed it, and the test that should prove it. Unchecked boxes are not implemented; a checked box names where the proof lives.
 
 | ✓ | Control | Implemented in | Proposed by | Proof |
 |---|---|---|---|---|
-| ☐ | Reject UDS connections whose peer uid is not the daemon's (or not in the allow-list) using `SO_PEERCRED` / `LOCAL_PEERCRED` | `gygesd` accept loop | Q-S1 | Integration test connecting as another uid (CI runs as two users, or a mocked peer-cred layer) |
-| ☐ | Socket mode 0600 by default, 0660 with a group in the hardened deployment | `gygesd` startup | Q-S1, Q-S7 | Stat the socket after start |
+| ☑ | Reject UDS connections whose peer uid is not the daemon's (or not in the allow-list) using `SO_PEERCRED` / `LOCAL_PEERCRED` | `gygesd::policy` (accept-loop filter, plus a tower layer that answers `PERMISSION_DENIED` as defence in depth) | Q-S1 | `policy::tests` for the decision; same-uid path in `crates/gygesd/tests/rpc.rs`. **Still owed:** an integration test connecting as another uid (CI as two users, or a mocked peer-cred layer) |
+| ☑ | Socket mode 0600 by default, 0660 with a group in the hardened deployment | `gygesd::bind` | Q-S1, Q-S7 | `rpc.rs::get_info_over_uds_and_socket_is_owner_only` stats the socket (0660 path untested: needs a second group in CI) |
 | ☐ | `UnlockKey` creates a session bound to the calling connection and returns a random 32-byte token; only `SendTransaction`, `SignPczt`, `ExportSeed` with a valid token use the key; session dies with the connection or at TTL | `gyges-core::VaultManager`, `gygesd` interceptor | Q-S1, Q-S3 | Test: unlock on connection A, attempt sign on connection B, expect `PERMISSION_DENIED` |
 | ☐ | USK held only across the signing step of `SendTransaction` and dropped after; `SecretBox` with `Zeroize` on drop | `gyges-core::VaultManager` | Q-S3 | Unit test that the `SecretBox` is dropped before the broadcast event is emitted |
 | ☐ | Passphrase field marked `[debug_redact = true]`, wrapped in `SecretString`, zeroized after derivation | `proto/gyges.proto`, `gygesd` | Q-S2 | Log-grep test (Q-O1) |
 | ☐ | Per-key exponential back-off on failed `UnlockKey` | `gyges-core::VaultManager` | Q-S2 | Test: N failures, measure delay |
 | ☐ | `seed.age` encrypts 32-byte entropy with age scrypt at a work factor of ~1 s; parameters recorded as `seed_format` in `profile.json` | `gyges-core::VaultManager` | Q-S5 | `rage -d` can decrypt the file with the passphrase |
-| ☐ | `~/.gyges` tree 0700/0600; daemon refuses to start on wider permissions with a one-line fix | `gygesd` startup | Q-S7 | Test with a 0644 `seed.age` |
+| ☑ | `~/.gyges` tree 0700/0600; daemon refuses to start on wider permissions with a one-line fix | `gyges_core::perms`, `gygesd::Daemon::prepare` (umask 077 for everything the daemon creates) | Q-S7 | `perms::tests::wide_file_is_named_with_its_fix` (0644 file), `rpc.rs` and `scenarios/daemon.rs` `wide_permissions_refuse_start_with_a_chmod_hint` |
 | ☐ | `key export-seed`: TTY required, passphrase supplied in-request and never from a session, `reveal seed` confirmation, terminal output only, audit-logged, disabled by `vault.allow_seed_export = false` | `gyges-cli`, `gygesd` | Q-S4 | Test each refusal path |
 | ☐ | `key init` displays the mnemonic once and requires three random words typed back | `gyges-cli` | Q-S4 | UX test |
 | ☐ | Case B stream validated at `V = retained_from + k` against the node's tree roots, hash chain and subtree roots; endpoint marked `untrusted` on mismatch and the key truncated to birthday | `gyges-chain::ArtiTorLwdBackend`, `gyges-core::SyncScheduler` | Q-Y5 | Regtest with a lightwalletd that omits one block, one output, and serves a fork |
 | ☐ | Transparent UTXOs from `GetAddressUtxos` are accepted only after fetching the transaction and verifying inclusion against a node-confirmed block hash | `gyges-chain::ArtiTorLwdBackend` | Q-Y5 | Regtest with a fabricated UTXO |
-| ☐ | No hard-coded archival endpoint; explicit consent before the first backfill; `.onion` preferred | `gygesd` config loading, `gyges-cli` | Q-D5 | Config test: `enabled = true` without `grpc_url` fails to start |
+| ☐ | No hard-coded archival endpoint; explicit consent before the first backfill; `.onion` preferred | `gygesd` config loading, `gyges-cli` | Q-D5 | Config half done: `Config::validate` refuses `enabled = true` without `grpc_url` and `http://` outside regtest (`config::tests`, `rpc.rs::fallback_without_endpoint_refuses_start`); the consent prompt is M2 |
 | ☐ | Verifier runs after Combiner (Keystone) and after loading a signed `.pczt` (air-gapped), and the daemon refuses to broadcast on any difference from the stored proposal | `gyges-core::TxEngine` | Q-K4, Q-K7, Q-K5 | Test: mutate one output in the signed PCZT, expect refusal |
 | ☐ | Redactor removes proofs, witnesses and the `gyges.*` proprietary map, and nothing the device displays; the redacted field list is documented in `ARCHITECTURE.md` §3.4 | `gyges-core::TxEngine` | Q-K7, Q-C6 | Fixture test on a recorded PCZT |
 | ☐ | `tx send` prints the same transaction summary the device shows | `gyges-cli` | Q-K7 | Fixture comparison with recorded device screens (**needs verification** of the firmware display format) |

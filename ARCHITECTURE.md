@@ -25,13 +25,14 @@ gyges/
 ├── Cargo.toml                   # workspace; exact `=` pins on every zakura-* crate (Q-D3)
 ├── Cargo.lock                   # committed; CI builds --locked
 ├── proto/gyges.proto            # tonic UDS gRPC contract (see API.md)
-└── crates/
-    ├── gyges-proto/             # tonic-prost-build output, API version constants
-    ├── gyges-qr/                # UTF-8 half-block QR renderer, BC-UR codec, registry tags 49201-49207
-    ├── gyges-chain/             # CompactBlockSource: ZakuraRpcBackend (Case A) + ArtiTorLwdBackend (Case B)
-    ├── gyges-core/              # KeyRegistry, VaultManager, SyncScheduler, TxEngine, TexQueue
-    ├── gygesd/                  # daemon binary: UDS tonic server + background loops
-    └── gyges-cli/               # `gyges` binary: command router, prompts, QR TUI
+├── crates/
+│   ├── gyges-proto/             # tonic-prost-build output, proto3 JSON impls, GygesError <-> Status, UDS connector, API version constants
+│   ├── gyges-qr/                # UTF-8 half-block QR renderer, BC-UR codec, registry tags 49201-49207
+│   ├── gyges-chain/             # CompactBlockSource: ZakuraRpcBackend (Case A) + ArtiTorLwdBackend (Case B)
+│   ├── gyges-core/              # config.toml, paths, permission sweep; KeyRegistry, VaultManager, SyncScheduler, TxEngine, TexQueue
+│   ├── gygesd/                  # daemon: library (startup checks, pid lock, UDS server, policy layer, service) + thin binary
+│   └── gyges-cli/               # `gyges` binary: command router, handshake, exit codes, prompts, QR TUI
+└── tests/regtest/               # gyges-regtest: end-to-end harness and scenarios (TESTING.md §2)
 ```
 
 ### 2.1 `gyges-core` components

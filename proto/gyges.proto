@@ -335,7 +335,7 @@ message FallbackStatus {
 
 message ShutdownRequest {
   // Wait for in-flight proving and ZIP 320 step-2 broadcasts to finish
-  // (bounded by `daemon.shutdown_grace_secs`) instead of aborting them.
+  // (bounded by `daemon.shutdown_grace`) instead of aborting them.
   bool graceful = 1;
 }
 

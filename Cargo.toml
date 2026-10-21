@@ -7,6 +7,7 @@ members = [
     "crates/gyges-core",
     "crates/gygesd",
     "crates/gyges-cli",
+    "tests/regtest",
 ]
 
 [workspace.package]
@@ -85,6 +86,9 @@ tokio-stream = { version = "0.1", features = ["net"] }       # UnixListenerStrea
 tonic        = { version = "0.14", features = ["transport"] }
 tonic-prost  = "0.14"                                         # prost codec for tonic 0.14
 prost        = "0.14"
+prost-types  = "0.14"                                         # `google.protobuf.Any` for grpc-status-details-bin
+pbjson       = "0.9"                                          # proto3 JSON (de)serialisation of the generated types (API.md §5)
+http         = "1"                                            # request paths in the gygesd policy layer
 tower        = "0.5"                                          # service_fn connector for UDS clients
 hyper-util   = { version = "0.1", features = ["tokio"] }      # TokioIo adapter between tonic and UnixStream
 reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }  # zakurad JSON-RPC client
@@ -103,6 +107,9 @@ rpassword          = "7.3"
 serde              = { version = "1.0", features = ["derive"] }
 serde_json         = "1.0"
 toml               = "1"
+humantime          = "2"                                      # `5m`, `24h` durations in config.toml and CLI flags
+humantime-serde    = "1"
+nix                = { version = "0.30", features = ["user"] }  # daemon uid, group lookup for `daemon.socket_group`
 anyhow             = "1.0"
 thiserror          = "2.0"
 tracing            = "0.1"
@@ -112,6 +119,10 @@ hex                = "0.4"
 
 # --- Build ---
 tonic-prost-build = "0.14"
+pbjson-build      = "0.9"
+
+# --- Tests ---
+tempfile = "3"
 
 # --- Internal crates ---
 gyges-proto = { path = "crates/gyges-proto" }

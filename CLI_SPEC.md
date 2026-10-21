@@ -72,7 +72,7 @@ Flags:
       --fallback-lwd <GRPC_URL>    Archival lightwalletd/zaino gRPC URL for historical restores (no default)
       --no-tor                     Reach the fallback endpoint directly instead of over Tor
 ```
-The CLI does not start the daemon implicitly (exit 3 when the socket is absent) unless `GYGES_AUTOSTART=1` is set for development.
+The CLI locates `gygesd` through `GYGES_DAEMON_BIN`, then next to its own executable, then on `PATH`. Without `--foreground` the daemon detaches itself after validating its configuration, so configuration and permission errors are reported by `daemon start` (exit 1). Running `daemon start` against an already running daemon is a no-op (exit 0). The CLI does not start the daemon implicitly (exit 3 when the socket is absent) unless `GYGES_AUTOSTART=1` is set for development.
 
 #### `gyges daemon install` / `gyges daemon uninstall`
 Writes or removes a `launchd` user agent (macOS) or `systemd --user` unit (Linux) that runs `gygesd --foreground` for `--network` and restarts it after upgrades.

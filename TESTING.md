@@ -16,17 +16,20 @@ How Gyges is tested, from unit tests to a nightly run through a real Tor network
 
 ---
 
-## 2. Regtest Harness (planned: `tests/regtest/`)
+## 2. Regtest Harness (`tests/regtest/`)
+
+**Status:** the crate exists. `harness/lib.rs` runs `gygesd` and `gyges` against a temporary `GYGES_HOME` (building both binaries once per test process so they are never stale) and `scenarios/daemon.rs` covers the daemon lifecycle, the handshake and the permission and single-instance refusals. The node and archival processes below are not wired in yet.
 
 ### 2.1 Components
 
 ```text
 tests/regtest/
-├── harness/            # Rust library: spawns the processes below, exposes a Fixture
-├── zakurad.toml        # regtest config: tx_retention = 200, indexer enabled, cookie auth on
-├── zaino.toml          # lightwalletd-compatible gRPC against the same node
-├── fixtures/           # Keystone UR recordings (§4), schema fixtures (§6)
-└── scenarios/          # one file per row in §3
+├── Cargo.toml          # package gyges-regtest; `autotests = false`, one [[test]] per scenario file
+├── harness/lib.rs      # Rust library: spawns the processes below, exposes a Fixture (today: gygesd + gyges only)
+├── zakurad.toml        # (planned) regtest config: tx_retention = 200, indexer enabled, cookie auth on
+├── zaino.toml          # (planned) lightwalletd-compatible gRPC against the same node
+├── fixtures/           # (planned) Keystone UR recordings (§4), schema fixtures (§6)
+└── scenarios/          # one file per group of rows in §3 (today: daemon.rs)
 ```
 
 - **Node:** a pinned `zakurad` release downloaded by tag (or built in a cached CI layer), started in regtest with `state.storage_mode.pruned.tx_retention = 200` so that Case B is exercised after mining a few hundred blocks. Blocks are produced with the regtest `generate` RPC.
@@ -130,7 +133,7 @@ Every pull request (all must pass to merge):
 | lint | `cargo clippy --locked --workspace --all-targets -- -D warnings` and `cargo fmt --check` |
 | test | `cargo test --locked --workspace` |
 | deny | `cargo deny check` (advisories, licenses, bans, sources) |
-| regtest | `cargo test --locked -p gyges-regtest` with the pinned `zakurad` and `zaino` from a cached layer |
+| regtest | `cargo test --locked -p gyges-regtest` with the pinned `zakurad` and `zaino` from a cached layer (the node-free daemon scenarios already run inside `test`) |
 | docs | `cargo doc --no-deps` with `-D warnings` |
 
 Nightly:
@@ -147,7 +150,7 @@ Release tags additionally run the Tier 1 build matrix (Linux x86_64 and aarch64,
 
 ## 8. Running Locally
 
-Planned commands; the `justfile` targets do not exist yet.
+The first two commands work today (the second runs the daemon-only scenarios); the rest are planned.
 
 ```bash
 cargo test --workspace

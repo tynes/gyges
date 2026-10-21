@@ -18,7 +18,7 @@ One home per network (Q-C2). `GYGES_HOME` (default `~/.gyges`) is the root.
     ├── cache/
     │   └── blocks.sqlite        # Shared CompactBlock cache (§6)
     ├── logs/
-    │   ├── gygesd.log           # tracing-appender, daily rotation, 7 kept
+    │   ├── gygesd.YYYY-MM-DD.log  # tracing-appender, daily rotation, 7 kept
     │   └── audit.log            # Security-relevant events, key id + time only
     └── keys/
         └── <key_id>/
@@ -47,14 +47,16 @@ Complete schema with defaults. Every key is optional except `fallback_lightwalle
 
 ```toml
 # ~/.gyges/mainnet/config.toml
-network = "mainnet"              # must match the directory; mismatch refuses to start
+network = "mainnet"              # optional; when set it must match the directory, else the daemon refuses to start
 default_key = "main"             # substituted by the daemon when a request has an empty key_id
 airgapped = false                # true disables every network interface (Tor, RPC, indexer)
 
 [daemon]
-socket_group = ""                # non-empty: socket mode 0660 owned by this group
+socket_group = ""                # non-empty: socket mode 0660 owned by this group (name or numeric gid)
+allowed_uids = []                # peer uids besides the daemon's own that may connect (API.md §1.2)
 log_level = "info"               # tracing filter; overridden by RUST_LOG
 offline_grace = "2m"             # node unreachable longer than this -> Stalled(Offline)
+shutdown_grace = "30s"           # bound on how long `daemon stop` waits for in-flight proving and broadcasts
 
 [zakura_rpc]
 url = "http://127.0.0.1:8232"
