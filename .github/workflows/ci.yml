@@ -67,5 +67,28 @@ jobs:
           print(f"{len(blocks)} toml block(s) parse")
           PY
 
-  # Regtest end-to-end job (TESTING.md) is added once a pinned zakurad release
-  # exists for CI; see ROADMAP.md milestone M1.
+  # End-to-end scenarios against the pinned real zakurad (TESTING.md §2,
+  # tests/regtest/versions.toml). The harness downloads the release asset
+  # into target/regtest-bin/ and verifies its sha256; the directory is cached
+  # on the pinned tag. The node-free scenarios of the same crate also run in
+  # `check`; this job is where the node ones stop skipping.
+  regtest:
+    name: regtest (real zakurad)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache the pinned zakurad
+        uses: actions/cache@v4
+        with:
+          path: target/regtest-bin
+          key: zakurad-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/regtest/versions.toml') }}
+      - run: cargo test --locked -p gyges-regtest --test node -- --nocapture

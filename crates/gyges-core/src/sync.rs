@@ -20,9 +20,11 @@ use zcash_client_backend::data_api::chain::error::Error as ScanChainError;
 use zcash_client_backend::data_api::chain::{
     BlockSource as _, ChainState, ScanSummary, scan_cached_blocks,
 };
+use zcash_client_backend::data_api::error::RewindError;
 use zcash_client_backend::data_api::scanning::{ScanPriority, ScanRange};
 use zcash_client_backend::data_api::{WalletRead as _, WalletWrite as _};
 use zcash_client_backend::wallet::WalletTransparentOutput;
+use zcash_client_sqlite::error::SqliteClientError;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::network::ConsensusParams;
@@ -145,6 +147,17 @@ pub enum SyncError {
     /// overflow): the cache holds something the wallet cannot digest.
     #[error("scan: {0}")]
     Scan(String),
+    /// `truncate_to_height` has no scanned block at or below the fork point
+    /// to truncate to (a reorg at or below the key's first scanned block):
+    /// the wallet must be reset to the node's tree state at the fork
+    /// instead ([`rewind_to_chain_state`]).
+    #[error(
+        "wallet cannot be truncated to {requested}: no scanned block at or below it (safe: {safe:?})"
+    )]
+    RewindInvalid {
+        requested: BlockHeight,
+        safe: Option<BlockHeight>,
+    },
 }
 
 fn wallet_err(e: impl std::fmt::Display) -> SyncError {
@@ -394,9 +407,45 @@ pub fn wallet_hashes(wallet: &Wallet, from: BlockHeight) -> Result<WalletHashes,
 
 /// SYNC.md §4.3 step 2: rewind notes, nullifiers, received outputs and
 /// ShardTree checkpoints to `fork_point`. Returns the height actually
-/// truncated to, which upstream may choose lower.
+/// truncated to, which upstream may choose lower. Fails with
+/// [`SyncError::RewindInvalid`] when the wallet has scanned nothing at or
+/// below `fork_point` (a reorg at or below its birthday), in which case the
+/// caller resets it with [`rewind_to_chain_state`].
 pub fn rewind(wallet: &mut Wallet, fork_point: BlockHeight) -> Result<BlockHeight, SyncError> {
-    wallet.truncate_to_height(fork_point).map_err(wallet_err)
+    match wallet.truncate_to_height(fork_point) {
+        Ok(h) => Ok(h),
+        Err(SqliteClientError::RequestedRewindInvalid {
+            safe_rewind_height,
+            requested_height,
+        }) => Err(SyncError::RewindInvalid {
+            requested: requested_height,
+            safe: safe_rewind_height,
+        }),
+        Err(e) => Err(wallet_err(e)),
+    }
+}
+
+/// SYNC.md §4.3 step 2 when the fork is at or below the key's first scanned
+/// block: reset the wallet's trees to the node's state at the end of the
+/// fork block (`z_gettreestate(fork)`), lowering account birthdays to
+/// `fork + 1` where the fork is below them. Scan ranges from `fork + 1`
+/// are requeued by the wallet. Returns the fork height.
+pub fn rewind_to_chain_state(
+    wallet: &mut Wallet,
+    state: &ChainState,
+) -> Result<BlockHeight, SyncError> {
+    let height = state.block_height();
+    match wallet.rewind_to_chain_state(state.clone(), HashSet::new()) {
+        Ok(()) => Ok(height),
+        Err(RewindError::RewindBeyondBirthdays(birthdays)) => {
+            let all: HashSet<_> = birthdays.keys().copied().collect();
+            wallet
+                .rewind_to_chain_state(state.clone(), all)
+                .map_err(wallet_err)?;
+            Ok(height)
+        }
+        Err(e) => Err(wallet_err(e)),
+    }
 }
 
 /// Height of the block containing `txid`, if the wallet has seen it mined.

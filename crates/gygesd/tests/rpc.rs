@@ -1271,6 +1271,22 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
         Some(paid.hash)
     );
 
+    // A second key born at the tip (13): its only scanned blocks are about
+    // to be reorged away, so its rewind cannot truncate (nothing scanned at
+    // or below the fork) and resets to the node's tree state instead.
+    let late = c
+        .init_key(InitKeyRequest {
+            key_id: "late".into(),
+            passphrase: "pw".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(late.birthday_height, 13);
+    let status = wait_spendable(&mut c, "late").await;
+    assert_eq!(status.scanned_tip, 13, "{status:?}");
+
     // A 2-block reorg: the node drops 12 and 13 and mines 12, 13, 14 anew.
     let old_12 = node.block(12).unwrap().hash;
     node.invalidate_from(12);
@@ -1279,6 +1295,37 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
     assert_ne!(old_12, new_12);
     let status = wait_spendable(&mut c, "main").await;
     assert_eq!(status.scanned_tip, 14, "{status:?}");
+    let status = wait_spendable(&mut c, "late").await;
+    assert_eq!(status.scanned_tip, 14, "{status:?}");
+    {
+        // Its fork point is 12 (it never scanned lower, so there is nothing
+        // older to disagree about): the reset to the node's state at 12
+        // keeps the birthday at 13 and rescans 13 and 14 on the new chain.
+        let late_key = running.state.registry.resolve("late").unwrap();
+        let w = late_key.wallet().unwrap();
+        assert_eq!(
+            w.get_wallet_birthday().unwrap(),
+            Some(BlockHeight::from_u32(13))
+        );
+        assert!(
+            w.block_metadata(BlockHeight::from_u32(12))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            w.block_metadata(BlockHeight::from_u32(13))
+                .unwrap()
+                .unwrap()
+                .block_hash()
+                .0,
+            node.block(13).unwrap().hash,
+            "the late key follows the new chain from its birthday"
+        );
+        assert_eq!(
+            w.block_fully_scanned().unwrap().map(|m| m.block_height()),
+            Some(BlockHeight::from_u32(14))
+        );
+    }
     {
         let w = key.wallet().unwrap();
         assert_eq!(
