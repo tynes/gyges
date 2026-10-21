@@ -19,6 +19,8 @@ path = "src/main.rs"
 gyges-proto = { workspace = true }
 gyges-core = { workspace = true }
 gyges-chain = { workspace = true }
+zcash_client_backend = { workspace = true }
+zcash_protocol = { workspace = true }
 age = { workspace = true }
 zeroize = { workspace = true }
 tokio = { workspace = true }
@@ -35,7 +37,9 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 
 [dev-dependencies]
+gyges-chain = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+transparent = { workspace = true }
 
 [lints]
 workspace = true

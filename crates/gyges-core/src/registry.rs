@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use age::secrecy::SecretString;
 use secrecy::ExposeSecret as _;
+use zcash_client_backend::data_api::transparent_ledger::TransparentLedgerMode;
 use zcash_client_backend::data_api::{Account as _, WalletRead as _, WalletWrite as _};
 use zcash_client_sqlite::WalletDb;
 use zcash_client_sqlite::util::SystemClock;
@@ -317,7 +318,12 @@ impl KeyRegistry {
             SystemClock,
             rand::rand_core::UnwrapErr(rand::rngs::SysRng),
         )
-        .map_err(|e| wallet_error(key_id, e))?;
+        .map_err(|e| wallet_error(key_id, e))?
+        // Per-handle, not persisted: transparent discovery in Case A reads the
+        // local node's raw blocks (SYNC.md §2.1), which upstream classes as
+        // the "public" ledger source; Zakura's transparent APIs fail closed
+        // until a mode is chosen.
+        .with_transparent_ledger_mode(TransparentLedgerMode::Public);
         // The daemon's umask makes this a no-op; tests and tools without it
         // still get a private file.
         perms::set_mode(path, 0o600).map_err(|source| RegistryError::Io {

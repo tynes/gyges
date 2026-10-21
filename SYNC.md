@@ -32,36 +32,43 @@ The `pruneheight` field is authoritative. As a defensive measure, a "block not a
 
 ## 2. Block Sources and the Shared Cache
 
-### 2.1 `CompactBlockSource`
+### 2.1 `ChainBackend` as the compact block source
 
-Both routes feed the same scanner through one trait:
+Both routes feed the same scanner through one trait, `gyges_chain::ChainBackend` (the design's `CompactBlockSource`, merged into the trait the key registry already used for node bounds and tree states):
 
 ```rust
-#[async_trait]
-pub trait CompactBlockSource: Send + Sync {
-    /// Height and hash of the source's current tip.
-    async fn latest_block(&self) -> Result<(BlockHeight, BlockHash), SourceError>;
-    /// Completed subtree roots for `pool`, starting at `start_index`.
-    async fn subtree_roots(&self, pool: ShieldedPool, start_index: u32)
-        -> Result<Vec<SubtreeRoot>, SourceError>;
-    /// Stream compact blocks for `range`, in ascending height order.
-    async fn block_range(&self, range: Range<BlockHeight>)
-        -> Result<BoxStream<'_, Result<CompactBlock, SourceError>>, SourceError>;
+pub trait ChainBackend: Send + Sync + Debug {
+    /// `getblockchaininfo` → NodeBounds; also refreshes `status()`.
+    fn node_bounds(&self) -> BoxFuture<'_, Result<NodeBounds, ChainError>>;
+    /// Outcome of the last poll, never touching the network (feeds GetInfo.node).
+    fn status(&self) -> NodeStatus;
+    /// `z_gettreestate(height)` as the ChainState an account born at height + 1 starts from.
+    fn chain_state(&self, height: BlockHeight) -> BoxFuture<'_, Result<ChainState, ChainError>>;
+    /// `getblockhash(height)`, internal byte order; works below retained_from too.
+    fn block_hash(&self, height: BlockHeight) -> BoxFuture<'_, Result<[u8; 32], ChainError>>;
+    /// Compact blocks for `range`, ascending, contiguous, linked by prev_hash.
+    /// The caller bounds the range to `cache.fetch_batch`.
+    fn compact_blocks(&self, range: Range<BlockHeight>)
+        -> BoxFuture<'_, Result<Vec<CompactBlock>, ChainError>>;
 }
 ```
 
+Subtree roots (`z_getsubtreesbyindex` / `GetSubtreeRoots`) are added to the trait with the scheduler. A bounded `Vec` per batch replaced the stream of the first draft: the fetcher works in `fetch_batch`-sized ranges anyway, and a `Vec` lets the backend check that the batch links end to end before anything is cached.
+
 | Implementation | Crate | Backing calls | Used for |
 |---|---|---|---|
-| `ZakuraRpcSource` | `gyges-chain` | `getblock(h, 0)` → parse with `zcash_primitives::transaction::Transaction`, keep for each tx: txid, Sapling spends' nullifiers, Sapling outputs' `(cmu, ephemeral_key, enc_ciphertext[..52])`, Orchard actions' `(nullifier, cmx, ephemeral_key, enc_ciphertext[..52])`; `z_getsubtreesbyindex`; `getbestblockhash` | Case A: `[retained_from, tip]` |
-| `TorLwdSource` | `gyges-chain` | lightwalletd `GetLatestBlock`, `GetSubtreeRoots`, `GetBlockRange` over an `arti-client` circuit (`zcash_client_backend::tor`) | Case B: `[birthday, retained_from + k)` |
+| `ZakuraRpcBackend` (landed) | `gyges-chain` | per height, concurrently and in order: `getblock(h, 0)` parsed with `zcash_primitives::block::Block::read`, plus `getblock(h, 1)` for the hash, txids and `trees` (the note commitment tree sizes the scanner needs as `ChainMetadata`); the two are cross-checked and the batch is checked for `prev_hash` links; `getblockchaininfo`; `getblockhash`; `z_gettreestate` | Case A: `[retained_from, tip]` |
+| `ArtiTorLwdBackend` (M2) | `gyges-chain` | lightwalletd `GetLatestBlock`, `GetSubtreeRoots`, `GetBlockRange` over an `arti-client` circuit (`zcash_client_backend::tor`) | Case B: `[birthday, retained_from + k)` |
 
-`ZakuraRpcSource` prefers the indexer gRPC (`[rpc] indexer_listen_addr`, `get_block_range` of raw blocks) when configured, and falls back to JSON-RPC `getblock` otherwise. The synthetic `CompactBlock` format is the lightwalletd protobuf (`zcash_client_backend::proto::compact_formats`), so `scan_cached_blocks` sees no difference between the two sources.
+Per transaction the compact form keeps: txid, Sapling spends' nullifiers, Sapling outputs' `(cmu, ephemeral_key, enc_ciphertext[..52])`, Orchard and Ironwood actions' `(nullifier, cmx, ephemeral_key, enc_ciphertext[..52])`, and, because the raw block is at hand, every transparent input (`prevout`) and output (`value`, `scriptPubKey`) in the `CompactTx.vin` / `vout` fields the lightwalletd protobuf already defines. The format is `zcash_client_backend::proto::compact_formats`, so `scan_cached_blocks` sees no difference between the two sources; it ignores `vin`/`vout`. The indexer gRPC (`[rpc] indexer_listen_addr`, `get_block_range` of raw blocks) is not used yet; when it is, it replaces the `getblock` pair, not the parser.
 
-Because Case A sees full raw blocks, `ZakuraRpcSource` also emits every transparent output paying a wallet-known address into the per-key `transparent_received_outputs` table while building compact blocks. Compact blocks carry no transparent outputs, so below `retained_from` transparent history comes only from `GetAddressUtxos` over Tor (§6).
+The cache is therefore also the transparent index for Case A: the scheduler reads `vout` from cached blocks (`gyges_chain::compact::transparent_outputs`), matches `scriptPubKey`s against the key's transparent and ephemeral receivers, stages hits in the per-key `gyges_transparent_received_outputs` table and hands them to `put_received_transparent_utxo`. Blocks from the Tor route carry no transparent outputs, so below `retained_from` transparent history comes only from `GetAddressUtxos` over Tor (§5.3).
+
+The cookie file is re-read on every request: `zakurad` rewrites `~/.cache/zakura/.cookie` at each start, so a daemon that cached it would lose the node at the first node restart. A missing or stale cookie is reported as `NODE_UNREACHABLE` with the path and the fix.
 
 ### 2.2 `BlockCache` and `BlockFetcher`
 
-One cache per network at `~/.gyges/<network>/cache/blocks.sqlite` (schema in `DATA_MODEL.md` §6) implements the upstream `zcash_client_backend::data_api::chain::BlockCache` trait, so `scan_cached_blocks` reads from it unchanged.
+One cache per network at `~/.gyges/<network>/cache/blocks.sqlite` (schema in `DATA_MODEL.md` §6) implements the upstream `zcash_client_backend::data_api::chain::BlockCache` trait, so `scan_cached_blocks` reads from it unchanged. Landed as `gyges_chain::cache::BlockDb`: `BlockSource::with_blocks` stops at the first missing height, `BlockCache::read` reports a hole inside the requested range as an error, rows are tagged `source = 'node' | 'tor-lwd'`, and `evict_below` / `evict_source_below` / `checkpoint` are what the fetcher below and the daemon's stop path call. The daemon opens it at start (refusing a file from another network or a newer schema) and checkpoints it on stop.
 
 A single `BlockFetcher` task per daemon:
 
@@ -137,7 +144,9 @@ pub enum StallReason {
 | any | node unreachable > `offline_grace` | `Stalled(Offline)` | Retries every poll tick; auto-resumes |
 | `Stalled` | `sync run --from <h>` | `Initializing` | `truncate_to_height(h)` first |
 
-Each key's `SyncState` is held in memory and summarised in `GetSyncStatus`; `scanned_tip` itself is whatever `WalletRead::block_fully_scanned()` reports from the key's `wallet.sqlite`, so the daemon never persists a second copy of it.
+Each key's `SyncState` is held in memory and summarised in `GetSyncStatus`; `scanned_tip` itself is whatever `WalletRead::block_fully_scanned()` reports from the key's `wallet.sqlite` (or `birthday - 1` before the first batch), so the daemon never persists a second copy of it.
+
+**Status (landed with ROADMAP.md M1):** `gyges_core::sync::SyncState` has `Initializing`, `Scanning`, `Rewinding`, `Synced` and `Stalled(PrunedPastScanTip | ChainInconsistent | Offline)`; `Backfilling` and `UntrustedBackfill` arrive with M2, so a broken Case A invariant always stalls today, with the `daemon status` / `sync status` text above. A stalled key is re-evaluated every tick and leaves `Stalled` by itself once the cause is gone (node back, window widened, `sync run --from`). On the wire `Initializing` and `Synced` are both `SYNC_STATE_IDLE`, told apart by `scanned` / `spendable`; the CLI prints the words above.
 
 ---
 
@@ -156,7 +165,7 @@ Subtree roots are refreshed from `z_getsubtreesbyindex` whenever `tip_height` cr
 
 ### 4.2 Invariant and prune race
 
-**Invariant:** while in `Scanning`, `scanned_tip + 1 >= retained_from`.
+**Invariant:** while in `Scanning`, `scanned_tip + 1 >= retained_from`. The implementation is one block stricter: the next batch starts at `s = scanned_tip + 1` and needs `z_gettreestate(s - 1)` as its prior chain state, which a pruned node serves only for `s - 1 >= retained_from`, so `s - 1 < retained_from` stalls as well (unless `retained_from = 0`).
 
 It is checked before every batch and whenever `getblock` returns the pruned error. On violation:
 
@@ -180,6 +189,8 @@ Handling:
 4. No fork point within 100 blocks → `Stalled(ChainInconsistent)`; fix with `sync run --from <h>`.
 
 The `BlockCache` rows above `f` are deleted at the same time so no key re-reads stale blocks.
+
+**Status:** detector 1 runs once per tick on the *shared cache* (`cache tip` versus `getblockhash`, walking back to the fork point and truncating the cache) and once per key (the hash the wallet holds at `block_fully_scanned` versus the reconciled cache, falling back to the node); detector 2 is the scanner's continuity error. The fork search walks the wallet's own `blocks` hashes against the cache (or node) and calls `truncate_to_height`, which may truncate lower than asked; the key then rescans from there on the next tick. The subtree-root refresh (`z_getsubtreesbyindex`) is not implemented yet; witnesses are built from the scanned blocks alone, which is sufficient inside the retention window.
 
 ---
 
@@ -218,7 +229,7 @@ Compact blocks carry no transparent outputs and a pruned node stops maintaining 
 | **scanned** | `block_fully_scanned().height >= bounds.tip_height` | `WalletRead::block_fully_scanned` |
 | **spendable** | scanned, and `suggest_scan_ranges()` returns no range with priority above `Ignored` | `WalletRead::suggest_scan_ranges` |
 
-`GetSyncStatus` returns both booleans plus `scanned_tip`, `tip_height`, `retained_from`, the `SyncState`, blocks per second over the last minute, and the active source. The CLI never computes them itself.
+`GetSyncStatus` returns both booleans plus `scanned_tip`, `tip_height`, the `SyncState`, blocks per second over the last minute, the blocks remaining across open ranges and the active source (`retained_from` is in `GetInfo.node`). The CLI never computes them itself. `WaitSync` wakes the scheduler and reports `done` only from a tick that began after the request, so a `sync wait` issued right after new blocks never returns a stale "spendable"; a stalled key fails the stream at once with `NOT_SYNCED` (API.md §4.4).
 
 `gyges sync wait` defaults to `--until spendable`; `--until scanned` is cheaper for scripts that only need the tip. `--confirmations N --txid T` waits until `T` has `N` confirmations.
 

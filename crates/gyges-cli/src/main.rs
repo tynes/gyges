@@ -17,6 +17,7 @@ mod exit;
 mod key;
 mod output;
 mod prompt;
+mod sync;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -76,7 +77,8 @@ enum Command {
     #[command(subcommand)]
     Key(key::KeyCmd),
     /// Synchronisation status and control.
-    Sync(Unimplemented),
+    #[command(subcommand)]
+    Sync(sync::SyncCmd),
     /// Addresses and terminal QR codes.
     Address(Unimplemented),
     /// Balances per pool.
@@ -119,7 +121,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Daemon(cmd) => daemon::run(&ctx, cmd).await,
         Command::Key(cmd) => key::run(&ctx, cmd).await,
-        Command::Sync(_) => Err(CliError::NotImplemented("sync")),
+        Command::Sync(cmd) => sync::run(&ctx, cmd).await,
         Command::Address(_) => Err(CliError::NotImplemented("address")),
         Command::Balance(_) => Err(CliError::NotImplemented("balance")),
         Command::Notes(_) => Err(CliError::NotImplemented("notes")),
@@ -191,5 +193,50 @@ mod tests {
         assert!(Cli::try_parse_from(["gyges", "key", "lock", "--all", "--id", "x"]).is_err());
         let cli = Cli::try_parse_from(["gyges", "-k", "main", "key", "export-ufvk"]).unwrap();
         assert_eq!(cli.global.key.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn sync_commands_parse_per_spec() {
+        let cli = Cli::try_parse_from(["gyges", "sync", "status", "--all"]).unwrap();
+        assert!(matches!(cli.command, Command::Sync(sync::SyncCmd::Status(ref a)) if a.all));
+        let cli = Cli::try_parse_from([
+            "gyges",
+            "sync",
+            "wait",
+            "--until",
+            "scanned",
+            "--timeout",
+            "30s",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sync(sync::SyncCmd::Wait(ref a))
+                if a.until == Some(sync::Until::Scanned)
+                    && a.timeout == Some(std::time::Duration::from_secs(30))
+        ));
+        let cli = Cli::try_parse_from([
+            "gyges",
+            "sync",
+            "wait",
+            "--txid",
+            "ab",
+            "--confirmations",
+            "3",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sync(sync::SyncCmd::Wait(ref a)) if a.confirmations == Some(3)
+        ));
+        assert!(
+            Cli::try_parse_from(["gyges", "sync", "wait", "--txid", "ab"]).is_err(),
+            "--txid needs --confirmations"
+        );
+        let cli = Cli::try_parse_from(["gyges", "sync", "run", "--from", "100", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sync(sync::SyncCmd::Run(ref a)) if a.from == Some(100) && a.yes
+        ));
     }
 }

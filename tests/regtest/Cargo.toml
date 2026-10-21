@@ -20,10 +20,18 @@ path = "scenarios/daemon.rs"
 name = "keys"
 path = "scenarios/keys.rs"
 
+[[test]]
+name = "sync"
+path = "scenarios/sync.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+
+[dev-dependencies]
+gyges-chain = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

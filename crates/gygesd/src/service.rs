@@ -6,20 +6,22 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gyges_chain::ChainBackend;
+use gyges_chain::{BlockDb, ChainBackend};
 use gyges_core::{Config, KeyRegistry, Network, VaultManager};
 use gyges_proto::v1::gyges_server::Gyges;
 use gyges_proto::v1::{
     self, ApiVersion, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest, ExportUfvkResponse,
-    FallbackStatus, FallbackTrust, GetInfoRequest, GetInfoResponse, InitKeyRequest,
-    InitKeyResponse, ListKeysRequest, ListKeysResponse, LockKeyRequest, LockKeyResponse,
-    NodeStatus, RestoreKeyRequest, RestoreKeyResponse, ShutdownRequest, ShutdownResponse, TorState,
-    TorStatus, UnlockKeyRequest, UnlockKeyResponse,
+    FallbackStatus, FallbackTrust, GetInfoRequest, GetInfoResponse, GetSyncStatusRequest,
+    GetSyncStatusResponse, InitKeyRequest, InitKeyResponse, ListKeysRequest, ListKeysResponse,
+    LockKeyRequest, LockKeyResponse, NodeStatus, RestoreKeyRequest, RestoreKeyResponse,
+    RunSyncRequest, ShutdownRequest, ShutdownResponse, TorState, TorStatus, UnlockKeyRequest,
+    UnlockKeyResponse, WaitSyncRequest,
 };
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
 use crate::keys;
+use crate::sync::{self, ProgressStream, SyncHub};
 
 /// Everything the RPC handlers share.
 #[derive(Debug)]
@@ -29,8 +31,13 @@ pub struct DaemonState {
     pub registry: KeyRegistry,
     /// Shared with every [`crate::Conn`], which drops its unlocks on close.
     pub vault: Arc<VaultManager>,
-    /// `None` until the node backend exists (ROADMAP.md M1).
+    /// `None` only when air-gapped.
     pub chain: Option<Arc<dyn ChainBackend>>,
+    /// The shared compact block cache (`cache/blocks.sqlite`); `None` only
+    /// when air-gapped.
+    pub block_cache: Option<Arc<BlockDb>>,
+    /// Per-key sync progress and the scheduler's wake-up (SYNC.md §3, §6).
+    pub sync: SyncHub,
     /// Unix seconds the daemon started.
     pub started_at: i64,
     /// Signalled by `Shutdown` (and by the signal handlers in `main`).
@@ -44,6 +51,7 @@ impl DaemonState {
         registry: KeyRegistry,
         vault: VaultManager,
         chain: Option<Arc<dyn ChainBackend>>,
+        block_cache: Option<Arc<BlockDb>>,
     ) -> Self {
         Self {
             config,
@@ -51,6 +59,8 @@ impl DaemonState {
             registry,
             vault: Arc::new(vault),
             chain,
+            block_cache,
+            sync: SyncHub::default(),
             started_at: unix_now(),
             shutdown: Notify::new(),
         }
@@ -67,13 +77,7 @@ impl DaemonState {
                 minor: gyges_proto::API_MINOR,
             }),
             airgapped: self.config.airgapped,
-            // No ZakuraRpcBackend yet (ROADMAP.md M1): report "not connected"
-            // honestly rather than omitting the field.
-            node: Some(NodeStatus {
-                connected: false,
-                last_error: "node backend not implemented".to_string(),
-                ..Default::default()
-            }),
+            node: Some(self.node_status()),
             tor: Some(TorStatus {
                 state: TorState::Disabled as i32,
                 ..Default::default()
@@ -99,6 +103,41 @@ impl DaemonState {
                 .try_into()
                 .unwrap_or(u32::MAX),
             default_min_confirmations: self.config.policy.min_confirmations,
+        }
+    }
+}
+
+impl DaemonState {
+    /// `GetInfo.node` from the backend's last poll (API.md `NodeStatus`).
+    /// Air-gapped: not connected, with the reason.
+    pub fn node_status(&self) -> NodeStatus {
+        let Some(chain) = &self.chain else {
+            return NodeStatus {
+                connected: false,
+                last_error: "air-gapped: no node interface".to_string(),
+                ..Default::default()
+            };
+        };
+        let st = chain.status();
+        let bounds = st.bounds.as_ref();
+        NodeStatus {
+            connected: st.connected,
+            tip_height: bounds.map_or(0, |b| u32::from(b.tip_height)),
+            tip_hash: bounds.map_or_else(String::new, |b| gyges_chain::display_hash(&b.tip_hash)),
+            retained_from: bounds.map_or(0, |b| u32::from(b.retained_from)),
+            pruned: st.pruned,
+            // Zakura does not expose its `tx_retention` setting over RPC.
+            tx_retention: 0,
+            indexer_stream: false,
+            last_error: if st.connected {
+                String::new()
+            } else if st.last_polled.is_none() {
+                "not polled yet".to_string()
+            } else {
+                st.last_error
+            },
+            // No RPC in the set Gyges uses reports the node's version yet.
+            node_version: String::new(),
         }
     }
 }
@@ -133,6 +172,27 @@ impl GygesService {
 
 #[tonic::async_trait]
 impl Gyges for GygesService {
+    async fn get_sync_status(
+        &self,
+        request: Request<GetSyncStatusRequest>,
+    ) -> Result<Response<GetSyncStatusResponse>, Status> {
+        sync::get_sync_status(&self.state, request.into_inner()).map(Response::new)
+    }
+
+    async fn wait_sync(
+        &self,
+        request: Request<WaitSyncRequest>,
+    ) -> Result<Response<ProgressStream>, Status> {
+        sync::wait_sync(self.state.clone(), request.into_inner()).map(Response::new)
+    }
+
+    async fn run_sync(
+        &self,
+        request: Request<RunSyncRequest>,
+    ) -> Result<Response<ProgressStream>, Status> {
+        sync::run_sync(self.state.clone(), request.into_inner()).map(Response::new)
+    }
+
     async fn get_info(
         &self,
         _request: Request<GetInfoRequest>,
@@ -232,7 +292,7 @@ mod tests {
         };
         let registry = KeyRegistry::open(Home::new(dir.path()), Network::Regtest, &cfg).unwrap();
         let vault = VaultManager::new(&cfg.vault);
-        let state = DaemonState::new(cfg, Network::Regtest, registry, vault, None);
+        let state = DaemonState::new(cfg, Network::Regtest, registry, vault, None, None);
         let info = state.info();
         assert_eq!(info.network, v1::Network::Regtest as i32);
         assert_eq!(info.api_version.unwrap().major, gyges_proto::API_MAJOR);
@@ -242,7 +302,13 @@ mod tests {
         assert!(info.keys.is_empty());
         assert_eq!(info.unlock_ttl_secs, 300);
         assert_eq!(info.default_min_confirmations, 10);
-        assert!(!info.node.unwrap().connected);
+        let node = info.node.unwrap();
+        assert!(!node.connected);
+        assert!(
+            node.last_error.contains("air-gapped"),
+            "{}",
+            node.last_error
+        );
         assert_eq!(info.tor.unwrap().state, TorState::Disabled as i32);
         assert!(info.started_at > 0);
     }

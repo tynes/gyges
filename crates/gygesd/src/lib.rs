@@ -13,22 +13,28 @@
 //! 3. take the advisory lock on `gygesd.pid`;
 //! 4. load every `keys/<id>/` profile and open its wallet database
 //!    (`KeyRegistry`), refusing on a broken or too-wide key directory;
-//! 5. bind `gygesd.sock`, set its mode, serve until a shutdown signal.
+//! 5. unless air-gapped, build the node backend (`ZakuraRpcBackend`, which
+//!    contacts nothing yet) and open the shared block cache
+//!    (`cache/blocks.sqlite`), refusing a cache from another network;
+//! 6. poll the node once (bounded), bind `gygesd.sock`, set its mode, serve
+//!    until a shutdown signal; checkpoint the cache on the way out.
 
 #![forbid(unsafe_code)]
 
 pub mod conn;
 pub mod keys;
 pub mod lifecycle;
+pub mod node;
 pub mod policy;
 pub mod service;
+pub mod sync;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use gyges_chain::ChainBackend;
+use gyges_chain::{BlockDb, ChainBackend, ZakuraRpcBackend};
 use gyges_core::{Config, Home, KeyRegistry, Network, VaultManager, perms};
 use gyges_proto::v1::gyges_server::GygesServer;
 use tokio::net::UnixListener;
@@ -56,9 +62,8 @@ pub struct Options {
     pub fallback_lwd: Option<String>,
     /// `--no-tor`.
     pub no_tor: bool,
-    /// The node backend. `None` until `ZakuraRpcBackend` lands (ROADMAP.md
-    /// M1); tests inject a fake. Anything needing the node answers
-    /// `NODE_UNREACHABLE` meanwhile.
+    /// The node backend. `None` means "build a `ZakuraRpcBackend` from the
+    /// configuration" (or nothing, when air-gapped); tests inject a fake.
     pub chain: Option<Arc<dyn ChainBackend>>,
 }
 
@@ -140,8 +145,34 @@ impl Daemon {
         let registry = KeyRegistry::open(home.clone(), network, &config)
             .context("refusing to start: a key directory is unusable")?;
         let vault = VaultManager::new(&config.vault);
+        let chain: Option<Arc<dyn ChainBackend>> = match opts.chain {
+            Some(injected) => Some(injected),
+            None if config.airgapped => None,
+            None => Some(Arc::new(
+                ZakuraRpcBackend::new(
+                    config.zakura_rpc.url.clone(),
+                    config.zakura_cookie_path(),
+                    network.consensus_params(),
+                )
+                .context("cannot set up the node backend")?,
+            )),
+        };
+        let block_cache = if config.airgapped {
+            None
+        } else {
+            let path = home.block_cache_path(network);
+            Some(Arc::new(
+                BlockDb::open(&path, network.name())
+                    .with_context(|| format!("cannot open the block cache {}", path.display()))?,
+            ))
+        };
         let state = Arc::new(DaemonState::new(
-            config, network, registry, vault, opts.chain,
+            config,
+            network,
+            registry,
+            vault,
+            chain,
+            block_cache,
         ));
         Ok(Self {
             home,
@@ -204,6 +235,28 @@ impl Daemon {
             }
         });
 
+        // Ask the node once before accepting clients, so that the `daemon
+        // status` a user runs right after `daemon start` reflects it; then
+        // hand the polling to the sync scheduler, which keeps every key at
+        // the tip (SYNC.md §1, §3).
+        let scheduler = match (&self.state.chain, &self.state.block_cache) {
+            (Some(chain), Some(cache)) => {
+                let link = node::Link::default();
+                let _ = tokio::time::timeout(
+                    node::FIRST_POLL_TIMEOUT,
+                    node::poll_once(&self.state, chain.as_ref(), &link),
+                )
+                .await;
+                Some(sync::spawn(
+                    self.state.clone(),
+                    chain.clone(),
+                    cache.clone(),
+                    link,
+                ))
+            }
+            _ => None,
+        };
+
         tracing::info!(
             network = %self.network,
             socket = %socket.display(),
@@ -229,11 +282,22 @@ impl Daemon {
             .context("gRPC server failed");
 
         sweeper.abort();
+        // Cancel at the next batch boundary: `scan_cached_blocks` commits per
+        // batch, so no partial batch is ever visible (SYNC.md §8 step 1).
+        if let Some(s) = scheduler {
+            s.abort();
+        }
         // Zeroize every decrypted key before the process goes away
         // (CLI_SPEC.md §2.1 `daemon stop`).
         let locked = self.state.vault.lock_all();
         if !locked.is_empty() {
             tracing::info!(keys = locked.len(), "keys zeroized on stop");
+        }
+        // SYNC.md §8 step 3: leave the cache without a WAL to replay.
+        if let Some(cache) = &self.state.block_cache
+            && let Err(e) = cache.checkpoint()
+        {
+            tracing::warn!(error = %e, "block cache checkpoint failed");
         }
         if let Err(e) = std::fs::remove_file(&socket)
             && e.kind() != std::io::ErrorKind::NotFound

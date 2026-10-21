@@ -5,7 +5,9 @@
 //!   `WalletDb` per key, validates permissions at startup (Q-S7);
 //! * [`vault::manager::VaultManager`] – `seed.age` encryption, connection- and
 //!   daemon-scoped unlocks with idle TTL, per-key back-off (Q-S1…S3, Q-S5);
-//! * `SyncScheduler` – per-key state machine over `gyges_chain` (SYNC.md);
+//! * [`sync`] – the per-key state machine's types and the scan, transparent
+//!   indexing and rewind steps over `gyges_chain` (SYNC.md); the scheduler
+//!   that drives them lives in `gygesd`;
 //! * `TxEngine` – proposal → PCZT roles → broadcast (Q-K3, Q-K4, Q-K7);
 //! * `TexQueue` – durable two-step ZIP 320 broadcaster (Q-T1…T3).
 
@@ -18,6 +20,7 @@ pub mod paths;
 pub mod perms;
 pub mod profile;
 pub mod registry;
+pub mod sync;
 pub mod vault;
 
 pub use birthday::{BirthdayError, ResolvedBirthday};
@@ -26,6 +29,7 @@ pub use network::{ConsensusParams, Network};
 pub use paths::Home;
 pub use profile::{KeyProfile, ProfileError};
 pub use registry::{KeyEntry, KeyRegistry, NewLocalSeedKey, RegistryError};
+pub use sync::{KeyProgress, StallReason, SyncError, SyncState};
 pub use vault::manager::VaultManager;
 
 /// How a key profile signs (DATA_MODEL.md `profile.json`).
