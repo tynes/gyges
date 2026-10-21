@@ -3,3 +3,6 @@
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Worktrees the Claude desktop app creates for side sessions
+.claude/worktrees/
