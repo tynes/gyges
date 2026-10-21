@@ -28,6 +28,24 @@ pub struct Link(AtomicU8);
 const UP: u8 = 1;
 const DOWN: u8 = 2;
 
+/// Whether `url` points at this machine: `localhost` or a loopback address.
+/// Anything else is a remote node, which THREAT_MODEL.md §3 row 6 says
+/// moves the node operator into the trusted base; the first successful poll
+/// warns once.
+pub fn is_local_host(url: &str) -> bool {
+    let Ok(uri) = url.parse::<http::Uri>() else {
+        return false;
+    };
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// One poll. Returns whether the node answered.
 pub async fn poll_once(state: &DaemonState, chain: &dyn ChainBackend, link: &Link) -> bool {
     let before = link.0.load(Ordering::Relaxed);
@@ -45,6 +63,14 @@ pub async fn poll_once(state: &DaemonState, chain: &dyn ChainBackend, link: &Lin
                     url = %url,
                     "node connected"
                 );
+                if !is_local_host(url) {
+                    tracing::warn!(
+                        url = %url,
+                        "zakura_rpc.url is not this machine: the node's operator sees every \
+                         block the wallet fetches, every transaction it broadcasts and when \
+                         (THREAT_MODEL.md §3 row 6)"
+                    );
+                }
                 let window = tip.saturating_sub(retained_from);
                 let min = state.config.zakura_rpc.min_retention_blocks;
                 if status.pruned && window < min {
@@ -92,6 +118,31 @@ pub fn spawn_poller(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_and_localhost_are_local_and_nothing_else_is() {
+        for url in [
+            "http://127.0.0.1:8232",
+            "http://127.1.2.3:18232/",
+            "http://localhost:8232",
+            "http://LocalHost",
+            "http://[::1]:8232",
+            "http://user:pw@127.0.0.1:8232",
+        ] {
+            assert!(is_local_host(url), "{url}");
+        }
+        for url in [
+            "http://192.168.1.5:8232",
+            "http://10.0.0.1",
+            "http://node.example:8232",
+            "http://[2001:db8::1]:8232",
+            "http://localhost.example",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_local_host(url), "{url}");
+        }
+    }
 
     #[test]
     fn link_starts_unknown() {

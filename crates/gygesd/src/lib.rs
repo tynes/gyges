@@ -342,6 +342,14 @@ fn bind(socket: &Path, socket_group: &str) -> anyhow::Result<UnixListener> {
     Ok(listener)
 }
 
+/// Refuse to write core dumps: a core of a process that holds decrypted
+/// entropy or a spending key is a plaintext copy of the vault on disk
+/// (THREAT_MODEL.md §6 item 10). Both limits go to zero, so nothing later in
+/// the process can raise them again.
+pub fn disable_core_dumps() -> nix::Result<()> {
+    nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0)
+}
+
 /// `daemon.socket_group` is a group name or a numeric gid.
 fn resolve_group(name: &str) -> anyhow::Result<u32> {
     if let Ok(gid) = name.parse::<u32>() {
@@ -382,5 +390,39 @@ mod tests {
     fn numeric_group_needs_no_lookup() {
         assert_eq!(resolve_group("20").unwrap(), 20);
         assert!(resolve_group("no-such-group-gyges-test").is_err());
+    }
+
+    #[test]
+    fn core_dumps_are_disabled_for_good() {
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+        disable_core_dumps().unwrap();
+        assert_eq!(getrlimit(Resource::RLIMIT_CORE).unwrap(), (0, 0));
+        // The hard limit is zero too, so it cannot be raised again.
+        assert!(setrlimit(Resource::RLIMIT_CORE, 1, 1).is_err());
+    }
+
+    /// The hardened deployment (THREAT_MODEL.md §3 row 1): with
+    /// `daemon.socket_group` set the socket is `0660` and owned by that
+    /// group; without it, `0600`. The test uses the process's own gid, the
+    /// one group it can always chgrp to.
+    #[tokio::test]
+    async fn socket_group_makes_the_socket_0660_and_group_owned() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("gygesd.sock");
+        let gid = nix::unistd::getgid().as_raw();
+
+        let listener = bind(&sock, &gid.to_string()).unwrap();
+        let meta = std::fs::metadata(&sock).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o660, "{:o}", meta.mode());
+        assert_eq!(meta.gid(), gid);
+        drop(listener);
+
+        // Rebinding replaces the stale file and goes back to owner-only.
+        let _listener = bind(&sock, "").unwrap();
+        let meta = std::fs::metadata(&sock).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o600, "{:o}", meta.mode());
+
+        assert!(bind(&sock, "no-such-group-gyges-test").is_err());
     }
 }

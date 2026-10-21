@@ -260,6 +260,72 @@ mod tests {
         assert!(allowed_when_airgapped("/grpc.health.v1.Health/Check"));
     }
 
+    /// THREAT_MODEL.md §5, first row: the tower layer refuses a request
+    /// whose connection carries a foreign uid, or none, before it reaches a
+    /// handler, and applies the air-gapped allow-list to the rest. Stands in
+    /// for the accept-loop check that CI cannot run as a second user.
+    #[tokio::test]
+    async fn the_layer_refuses_foreign_uids_and_airgapped_methods_before_routing() {
+        use gyges_core::vault::manager::ConnId;
+        use tower::ServiceExt as _;
+
+        async fn call(airgapped: bool, uid: Option<u32>, method: &str) -> Response<Body> {
+            let inner = tower::service_fn(|_req: Request<()>| async {
+                Ok::<_, std::convert::Infallible>(Response::new(Body::empty()))
+            });
+            let mut svc = PolicyLayer::new(PeerPolicy::new(501, [1000]), airgapped).layer(inner);
+            let mut req = Request::builder()
+                .uri(format!("/gyges.v1.Gyges/{method}"))
+                .body(())
+                .unwrap();
+            req.extensions_mut().insert(ConnInfo { id: ConnId(1), uid });
+            svc.ready().await.unwrap().call(req).await.unwrap()
+        }
+        fn grpc_status(resp: &Response<Body>) -> Option<i32> {
+            resp.headers()
+                .get("grpc-status")
+                .map(|v| v.to_str().unwrap().parse().unwrap())
+        }
+        let denied = tonic::Code::PermissionDenied as i32;
+        let airgapped = GygesError::new(ErrorReason::Airgapped, "")
+            .into_status()
+            .code() as i32;
+
+        // Own and listed uids reach the handler (no grpc-status header: the
+        // inner service answered).
+        assert_eq!(
+            grpc_status(&call(false, Some(501), "GetBalance").await),
+            None
+        );
+        assert_eq!(
+            grpc_status(&call(false, Some(1000), "GetBalance").await),
+            None
+        );
+        // A foreign uid, or no credentials, never does.
+        assert_eq!(
+            grpc_status(&call(false, Some(502), "GetInfo").await),
+            Some(denied)
+        );
+        assert_eq!(
+            grpc_status(&call(false, Some(0), "GetInfo").await),
+            Some(denied)
+        );
+        assert_eq!(
+            grpc_status(&call(false, None, "GetInfo").await),
+            Some(denied)
+        );
+        // Air-gapped: the allow-list applies after the uid check.
+        assert_eq!(grpc_status(&call(true, Some(501), "GetInfo").await), None);
+        assert_eq!(
+            grpc_status(&call(true, Some(501), "GetBalance").await),
+            Some(airgapped)
+        );
+        assert_eq!(
+            grpc_status(&call(true, Some(502), "GetInfo").await),
+            Some(denied)
+        );
+    }
+
     #[test]
     fn every_allow_listed_method_exists_in_the_proto() {
         let proto = include_str!("../../../proto/gyges.proto");
