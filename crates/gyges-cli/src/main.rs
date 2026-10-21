@@ -18,6 +18,7 @@ mod daemon;
 mod exit;
 mod key;
 mod output;
+mod pczt;
 mod prompt;
 mod sync;
 mod tx;
@@ -92,7 +93,8 @@ enum Command {
     #[command(subcommand)]
     Tx(tx::TxCmd),
     /// PCZT role pipeline for Unix pipes and air-gapped signing.
-    Pczt(Unimplemented),
+    #[command(subcommand)]
+    Pczt(pczt::PcztCmd),
 }
 
 /// Accepts any arguments so that `gyges key list` is "not implemented"
@@ -130,7 +132,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Balance(args) => balance::run(&ctx, args).await,
         Command::Notes(_) => Err(CliError::NotImplemented("notes")),
         Command::Tx(cmd) => tx::run(&ctx, cmd).await,
-        Command::Pczt(_) => Err(CliError::NotImplemented("pczt")),
+        Command::Pczt(cmd) => pczt::run(&ctx, cmd).await,
     }
 }
 
@@ -199,6 +201,56 @@ mod tests {
         let cli = Cli::try_parse_from(["gyges", "balance", "--min-conf", "3"]).unwrap();
         assert!(matches!(cli.command, Command::Balance(ref a) if a.min_conf == Some(3)));
         Cli::try_parse_from(["gyges", "tx", "abort", "abcd"]).unwrap();
+    }
+
+    #[test]
+    fn pczt_commands_parse_per_spec() {
+        let cli = Cli::try_parse_from([
+            "gyges", "pczt", "create", "--to", "u1x", "--amount", "2.5", "-o", "tx.pczt",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pczt(pczt::PcztCmd::Create(ref a))
+                if a.to == "u1x"
+                    && a.amount == crate::amount::ParsedAmount::Zatoshis(250_000_000)
+                    && a.out.as_deref() == Some(std::path::Path::new("tx.pczt"))
+        ));
+        let cli = Cli::try_parse_from(["gyges", "pczt", "prove", "-", "-o", "out.pczt"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pczt(pczt::PcztCmd::Prove(ref a))
+                if a.file.as_deref() == Some(std::path::Path::new("-"))
+        ));
+        let cli = Cli::try_parse_from(["gyges", "pczt", "sign"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pczt(pczt::PcztCmd::Sign(ref a)) if a.io.file.is_none() && a.qr_out.is_none()
+        ));
+        let cli = Cli::try_parse_from(["gyges", "pczt", "combine", "a.pczt", "b.pczt"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pczt(pczt::PcztCmd::Combine(ref a)) if a.files.len() == 2
+        ));
+        assert!(
+            Cli::try_parse_from(["gyges", "pczt", "combine", "a.pczt"]).is_err(),
+            "combine needs two files"
+        );
+        let cli =
+            Cli::try_parse_from(["gyges", "pczt", "broadcast", "c.pczt", "--via-tor"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pczt(pczt::PcztCmd::Broadcast(ref a)) if a.via_tor
+        ));
+        Cli::try_parse_from([
+            "gyges",
+            "pczt",
+            "qr-import",
+            "--session",
+            "x",
+            "ur:zcash-pczt/1",
+        ])
+        .unwrap();
     }
 
     #[test]

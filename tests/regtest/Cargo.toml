@@ -28,6 +28,10 @@ path = "scenarios/sync.rs"
 name = "tx"
 path = "scenarios/tx.rs"
 
+[[test]]
+name = "pczt"
+path = "scenarios/pczt.rs"
+
 # Against the pinned real zakurad (TESTING.md §3 rows 1–4); skips itself
 # where no node binary is available.
 [[test]]

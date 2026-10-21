@@ -333,8 +333,10 @@ impl KeyRegistry {
         })?;
         // Upstream's schema plus Gyges' own `ext_gyges_*` tables, migrated
         // together (DATA_MODEL.md §5).
-        let migrator = WalletMigrator::new()
-            .with_external_migrations(vec![Box::new(crate::tex::TexQueueMigration)]);
+        let migrator = WalletMigrator::new().with_external_migrations(vec![
+            Box::new(crate::tex::TexQueueMigration),
+            Box::new(crate::sessions::SigningSessionsMigration),
+        ]);
         match migrator.init_or_migrate(&mut wallet) {
             Ok(()) => Ok(wallet),
             Err(schemerz::MigratorError::Migration {

@@ -2694,3 +2694,427 @@ async fn zip320_sends_through_the_fake_node() {
     task.abort();
     drop(dir);
 }
+
+// ---------------------------------------------------------------------------
+// The PCZT pipeline (ROADMAP.md M4, first item)
+// ---------------------------------------------------------------------------
+
+/// Postcard's unsigned varint (LEB128: seven bits per byte, low bits
+/// first, high bit set on every byte but the last).
+fn varint(mut v: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return out;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// A PCZT with the one occurrence of the value `old` replaced by `new`
+/// (same encoded length), which is what a tampered file looks like
+/// (TESTING.md §3 row 13): the bytes still parse, only an output value
+/// differs from the approved proposal.
+fn tamper_value(bytes: &[u8], old: u64, new: u64) -> Vec<u8> {
+    let from = varint(old);
+    let to = varint(new);
+    assert_eq!(from.len(), to.len(), "pick values of equal varint length");
+    let hits: Vec<usize> = (0..=bytes.len() - from.len())
+        .filter(|&i| bytes[i..i + from.len()] == from[..])
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected the value once in the file: {hits:?}"
+    );
+    let mut out = bytes.to_vec();
+    out[hits[0]..hits[0] + to.len()].copy_from_slice(&to);
+    out
+}
+
+/// Drive `SignPczt` to its signed bytes, answering `SignatureRequired`
+/// with `passphrase` through `UnlockKey { session_id }`.
+async fn sign_pczt_with_session(
+    c: &mut GygesClient<Channel>,
+    pczt: Vec<u8>,
+    passphrase: &str,
+) -> Result<(Vec<u8>, usize), tonic::Status> {
+    use gyges_proto::v1::{SignPcztRequest, sign_pczt_event};
+    let mut s = c
+        .sign_pczt(SignPcztRequest {
+            pczt,
+            session_token: Vec::new(),
+            key_id: String::new(),
+        })
+        .await?
+        .into_inner();
+    let mut prompts = 0;
+    let mut signed = None;
+    while let Some(item) = s.next().await {
+        match item?.event {
+            Some(sign_pczt_event::Event::SignatureRequired(r)) => {
+                prompts += 1;
+                assert_eq!(r.kind(), SignatureKind::Passphrase);
+                assert_eq!(r.session_id.len(), 32);
+                assert!(r.summary.is_some());
+                c.unlock_key(UnlockKeyRequest {
+                    key_id: r.key_id.clone(),
+                    passphrase: passphrase.into(),
+                    session_id: r.session_id.clone(),
+                    ..Default::default()
+                })
+                .await?;
+            }
+            Some(sign_pczt_event::Event::Signed(bytes)) => signed = Some(bytes),
+            None => {}
+        }
+    }
+    Ok((signed.expect("a Signed event"), prompts))
+}
+
+/// `create → inspect → prove → sign → combine → broadcast` over the RPCs
+/// with the bytes handed back and forth like files; the balance moves; the
+/// tags are read from the file and `key_id` is only an assertion; a
+/// tampered file is refused by the Verifier with `INVALID_ARGUMENT`; the
+/// documented refusals (unproven, unsigned, already broadcast, mixed keys,
+/// a tex1 recipient, garbage).
+#[tokio::test]
+async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
+    use gyges_proto::v1::{
+        BroadcastPcztRequest, CombinePcztRequest, CreatePcztRequest, InspectPcztRequest, PcztRole,
+        Pool, ProvePcztRequest,
+    };
+    let _ = test_hub();
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(10);
+    let url = node.url().to_string();
+    let (dir, home) = fresh_home_with(
+        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n",
+    );
+    let mut opts = Options::new(home.clone(), Network::Regtest);
+    opts.zakura_rpc = Some(url);
+    opts.log_hub = Some(test_hub());
+    let daemon = Daemon::prepare(opts).expect("prepare");
+    let socket = daemon.socket_path();
+    let state = daemon.state.clone();
+    let task = tokio::spawn(daemon.serve(std::future::pending()));
+    for _ in 0..400 {
+        if uds::probe(&socket).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut c = client(&socket).await;
+    let params = Network::Regtest.consensus_params();
+    let amount = |z: i64| {
+        Some(gyges_proto::v1::Amount {
+            value: Some(gyges_proto::v1::amount::Value::Zatoshis(z)),
+        })
+    };
+    let t_recipient = zcash_keys::address::Address::Transparent(
+        transparent::address::TransparentAddress::PublicKeyHash([0x42; 20]),
+    )
+    .encode(&params);
+
+    // Two funded keys: `main` for the pipeline, `second` for the mixed-key
+    // combine.
+    for id in ["main", "second"] {
+        c.init_key(InitKeyRequest {
+            key_id: id.into(),
+            passphrase: "pw".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_spendable(&mut c, id).await;
+        let receiver = {
+            let key = state.registry.resolve(id).unwrap();
+            let w = key.wallet().unwrap();
+            let account = w.get_account_ids().unwrap()[0];
+            *w.get_transparent_receivers(account, false, false)
+                .unwrap()
+                .keys()
+                .next()
+                .expect("a transparent receiver")
+        };
+        node.mine_with_payments(&[(receiver, 100_000_000)]);
+    }
+    node.mine(1);
+    wait_spendable(&mut c, "main").await;
+    wait_spendable(&mut c, "second").await;
+    let create = |key_id: &str, to: &str, z: i64| CreatePcztRequest {
+        key_id: key_id.into(),
+        to: to.into(),
+        amount: amount(z),
+        memo: Vec::new(),
+        min_confirmations: 0,
+    };
+
+    // Create: one PCZT, the proposal, the session id; the expiry is the
+    // file's long one.
+    let created = c
+        .create_pczt(create("main", &t_recipient, 50_000_000))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(created.pczts.len(), 1);
+    assert_eq!(created.session_id.len(), 32);
+    let proposal = created.proposal.clone().unwrap();
+    assert_eq!(proposal.steps.len(), 1);
+    let fee = proposal.total_fee;
+    assert!(fee > 0);
+    assert_eq!(proposal.total_debit, 50_000_000 + fee);
+    // The target height is a few blocks above the anchor; the file's
+    // expiry is the long one, not `target + 40`.
+    assert!(
+        proposal.expiry_height >= proposal.anchor_height + gygesd::roles::PCZT_EXPIRY_BLOCKS
+            && proposal.expiry_height
+                < proposal.anchor_height + gygesd::roles::PCZT_EXPIRY_BLOCKS + 20,
+        "{proposal:?}"
+    );
+    let unsigned = created.pczts[0].clone();
+    assert!(!unsigned.is_empty());
+
+    // Inspect reads the tags and the proposal from the file alone.
+    let inspect = |c: &mut GygesClient<Channel>, pczt: Vec<u8>, key_id: &str| {
+        let req = InspectPcztRequest {
+            pczt,
+            key_id: key_id.into(),
+        };
+        let mut c = c.clone();
+        async move { c.inspect_pczt(req).await.map(|r| r.into_inner()) }
+    };
+    let insp = inspect(&mut c, unsigned.clone(), "").await.unwrap();
+    assert_eq!(insp.key_id, "main");
+    assert_eq!(insp.network(), gyges_proto::v1::Network::Regtest);
+    assert_eq!(insp.session_id, created.session_id);
+    let s = insp.summary.clone().unwrap();
+    assert_eq!(s.expiry_height, proposal.expiry_height);
+    assert_eq!(s.total_fee, fee, "{s:?}");
+    assert_eq!(s.total_debit, proposal.total_debit, "{s:?}");
+    let step = &s.steps[0];
+    assert_eq!(step.inputs.len(), 1);
+    assert_eq!(step.inputs[0].pool(), Pool::Transparent);
+    assert_eq!(step.inputs[0].value, 100_000_000);
+    let payment = step
+        .outputs
+        .iter()
+        .find(|o| o.address == t_recipient)
+        .expect("the payment");
+    assert_eq!(payment.value, 50_000_000);
+    assert!(!payment.is_change);
+    let change: i64 = step
+        .outputs
+        .iter()
+        .filter(|o| o.is_change && o.pool() == Pool::Ironwood)
+        .map(|o| o.value)
+        .sum();
+    assert_eq!(change, 100_000_000 - 50_000_000 - fee, "{step:?}");
+    assert_eq!(
+        insp.completed_roles().collect::<Vec<_>>(),
+        [
+            PcztRole::Creator,
+            PcztRole::Constructor,
+            PcztRole::IoFinalizer,
+            PcztRole::Updater
+        ],
+        "{insp:?}"
+    );
+    let pool = |insp: &gyges_proto::v1::InspectPcztResponse, p: Pool| {
+        insp.pools
+            .iter()
+            .find(|x| x.pool() == p)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {p:?} in {insp:?}"))
+    };
+    let t = pool(&insp, Pool::Transparent);
+    assert_eq!((t.spends, t.outputs), (1, 1));
+    assert_eq!((t.signatures_present, t.signatures_required), (0, 1));
+    let iw = pool(&insp, Pool::Ironwood);
+    assert!(!iw.proofs_present);
+    // Both Ironwood actions of a transparent-funded send are dummy spends,
+    // which the IO Finalizer signs with their dummy keys: already
+    // "signed" by count, while the transparent input still waits.
+    assert!(iw.signatures_required >= 2, "{iw:?}");
+    assert!(iw.signatures_present <= iw.signatures_required, "{iw:?}");
+
+    // `--key` is an assertion only.
+    let err = inspect(&mut c, unsigned.clone(), "second")
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::KeyMismatch, "{err:?}");
+    assert_eq!(GygesError::from_status(&err).unwrap().key_id, "main");
+    assert!(inspect(&mut c, unsigned.clone(), "main").await.is_ok());
+    let err = inspect(&mut c, b"not a pczt".to_vec(), "")
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+
+    // Prove (no key), and broadcasting before signing is refused by name.
+    let proven = c
+        .prove_pczt(ProvePcztRequest {
+            pczt: unsigned.clone(),
+            session_token: Vec::new(),
+            key_id: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .pczt;
+    let insp = inspect(&mut c, proven.clone(), "").await.unwrap();
+    assert!(insp.completed_roles().any(|r| r == PcztRole::Prover));
+    assert!(pool(&insp, Pool::Ironwood).proofs_present);
+    let broadcast = |c: &mut GygesClient<Channel>, pczt: Vec<u8>| {
+        let req = BroadcastPcztRequest {
+            pczt,
+            via_tor: false,
+            key_id: String::new(),
+        };
+        let mut c = c.clone();
+        async move { c.broadcast_pczt(req).await.map(|r| r.into_inner()) }
+    };
+    let err = broadcast(&mut c, proven.clone()).await.unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("not fully signed"), "{err:?}");
+    let err = broadcast(&mut c, unsigned.clone()).await.unwrap_err();
+    assert!(err.message().contains("not proven"), "{err:?}");
+
+    // Sign through the passphrase session (the key is locked).
+    let (signed, prompts) = sign_pczt_with_session(&mut c, proven.clone(), "pw")
+        .await
+        .unwrap();
+    assert_eq!(prompts, 1);
+    let insp = inspect(&mut c, signed.clone(), "").await.unwrap();
+    assert!(
+        insp.completed_roles().any(|r| r == PcztRole::Signer),
+        "{insp:?}"
+    );
+    let t = pool(&insp, Pool::Transparent);
+    assert_eq!((t.signatures_present, t.signatures_required), (1, 1));
+    let iw = pool(&insp, Pool::Ironwood);
+    assert_eq!(iw.signatures_present, iw.signatures_required);
+
+    // Combine: proven ⊕ signed is the signed one; one file is refused; a
+    // file of another key is refused before upstream sees it.
+    let combined = c
+        .combine_pczt(CombinePcztRequest {
+            pczts: vec![proven.clone(), signed.clone()],
+            key_id: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .pczt;
+    let insp = inspect(&mut c, combined.clone(), "").await.unwrap();
+    assert!(insp.completed_roles().any(|r| r == PcztRole::Signer));
+    let err = c
+        .combine_pczt(CombinePcztRequest {
+            pczts: vec![signed.clone()],
+            key_id: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument);
+    let other = c
+        .create_pczt(create("second", &t_recipient, 10_000_000))
+        .await
+        .unwrap()
+        .into_inner();
+    let err = c
+        .combine_pczt(CombinePcztRequest {
+            pczts: vec![signed.clone(), other.pczts[0].clone()],
+            key_id: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::KeyMismatch, "{err:?}");
+
+    // A tampered file: one output value changed on the way, which inspect
+    // shows and the Verifier refuses (exit 6), nothing broadcast.
+    let tampered = tamper_value(&unsigned, 50_000_000, 50_000_001);
+    let insp = inspect(&mut c, tampered.clone(), "").await.unwrap();
+    assert!(
+        insp.summary.as_ref().unwrap().steps[0]
+            .outputs
+            .iter()
+            .any(|o| o.value == 50_000_001),
+        "{insp:?}"
+    );
+    let tampered_proven = c
+        .prove_pczt(ProvePcztRequest {
+            pczt: tampered,
+            session_token: Vec::new(),
+            key_id: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .pczt;
+    let (tampered_signed, _) = sign_pczt_with_session(&mut c, tampered_proven, "pw")
+        .await
+        .unwrap();
+    let err = broadcast(&mut c, tampered_signed).await.unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    assert!(
+        err.message().contains("differs from the approved proposal"),
+        "{err:?}"
+    );
+    assert!(node.mempool().is_empty());
+
+    // The genuine one: broadcast, mined, the balance moves; twice is
+    // refused.
+    let txid = broadcast(&mut c, combined.clone()).await.unwrap().txid;
+    assert_eq!(txid.len(), 64);
+    wait_in_mempool(&node, &txid).await;
+    let err = broadcast(&mut c, combined).await.unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("already broadcast"), "{err:?}");
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    let b = c
+        .get_balance(GetBalanceRequest {
+            key_id: "main".into(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(balance_of(&b, Pool::Transparent), (0, 0), "{b:?}");
+    assert_eq!(
+        balance_of(&b, Pool::Ironwood).0,
+        100_000_000 - 50_000_000 - fee,
+        "{b:?}"
+    );
+
+    // A ZIP 320 recipient is refused at create (single-step PCZTs only).
+    let err = c
+        .create_pczt(create(
+            "main",
+            &zcash_keys::address::Address::Tex([9; 20]).encode(&params),
+            1_000,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("tx send"), "{err:?}");
+
+    // The audit trail names the file session, the signature and the
+    // broadcast.
+    let events: Vec<String> = state
+        .logs
+        .recent(true, 1000)
+        .iter()
+        .filter(|e| e.fields.get("key_id").map(String::as_str) == Some("main"))
+        .filter_map(|e| e.fields.get("event").cloned())
+        .collect();
+    assert!(events.iter().any(|e| e == "session_created"), "{events:?}");
+    assert!(events.iter().any(|e| e == "sign"), "{events:?}");
+    assert!(events.iter().any(|e| e == "broadcast"), "{events:?}");
+
+    drop(state);
+    task.abort();
+    drop(dir);
+}

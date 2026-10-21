@@ -474,7 +474,14 @@ pub async fn resume_tex_transfer(
     conn: Option<ConnInfo>,
     req: ResumeTexTransferRequest,
 ) -> Result<TexQueueEntry, Status> {
-    let prepared = tx::prepare(&state, conn, &req.key_id, &req.session_token, 0)?;
+    let prepared = tx::prepare(
+        &state,
+        conn,
+        &req.key_id,
+        &req.session_token,
+        0,
+        tx::Purpose::Spend,
+    )?;
     let key = prepared.key.clone();
     let key_id = key.key_id().to_string();
     let id = parse_txid(&req.step1_txid)?;

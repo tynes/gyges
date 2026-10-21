@@ -74,6 +74,8 @@ fn build_binaries() -> &'static Path {
 pub struct Run {
     pub status: ExitStatus,
     pub stdout: String,
+    /// Standard output as bytes, for commands that write a `.pczt`.
+    pub stdout_bytes: Vec<u8>,
     pub stderr: String,
 }
 
@@ -92,6 +94,7 @@ impl Run {
         Self {
             status: output.status,
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stdout_bytes: output.stdout,
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }
     }
@@ -336,6 +339,41 @@ impl Drop for Fixture {
             eprintln!("GYGES_TEST_KEEP: left {}", path.display());
         }
     }
+}
+
+/// Postcard's unsigned varint (LEB128: seven bits per byte, low bits
+/// first, high bit set on every byte but the last).
+pub fn varint(mut v: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return out;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// A PCZT with the one occurrence of the value `old` replaced by `new`
+/// (same encoded length): a file tampered with on the way (TESTING.md §3
+/// row 13), which still parses and only differs in that one output value.
+pub fn tamper_value(bytes: &[u8], old: u64, new: u64) -> Vec<u8> {
+    let from = varint(old);
+    let to = varint(new);
+    assert_eq!(from.len(), to.len(), "pick values of equal varint length");
+    let hits: Vec<usize> = (0..=bytes.len() - from.len())
+        .filter(|&i| bytes[i..i + from.len()] == from[..])
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected the value once in the file: {hits:?}"
+    );
+    let mut out = bytes.to_vec();
+    out[hits[0]..hits[0] + to.len()].copy_from_slice(&to);
+    out
 }
 
 fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {

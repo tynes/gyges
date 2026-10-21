@@ -215,6 +215,15 @@ types: zero or one `SignatureRequired`, then `signed` (the final PCZT bytes).
 For Keystone profiles the returned PCZT has already been through Combiner and
 Verifier in the daemon (§6.4); the client never sees a half-signed PCZT.
 
+*Landed (ROADMAP.md M4, first item):* the key is the PCZT's `gyges.key_id`
+(`key_id` in the request is an assertion, §7.1); `local-seed` and
+`signer-only` profiles sign, the others are refused as in §4.1. The
+`SignatureRequired.summary` is what `InspectPczt` derives from the file.
+The stream needs no node: a passphrase session that expires is replaced by
+a fresh one without the "can still be mined" check of §4.1, since an
+air-gapped daemon cannot know the tip; the file's expiry height is the
+client's to watch.
+
 ### 4.3 Non-interactive clients
 
 When stdin is not a TTY, or `--non-interactive` / `GYGES_NON_INTERACTIVE=1`
@@ -468,7 +477,7 @@ Every command maps to exactly one RPC, or to none when it is purely local.
 | `tx abort SESSION_ID` | `AbortSigningSession` | 32-hex argument |
 | `tx abort TXID` | `AbortTexTransfer` | 64-hex argument; allowed only in `BUILT` |
 | `tx resume TXID` | `ResumeTexTransfer` | On `SIGNATURE_REQUIRED` the CLI satisfies the session, then polls `ListSigningSessions` for the rebuilt step 2 |
-| `pczt create` | `CreatePczt` | Writes one `.pczt` per step |
+| `pczt create` | `CreatePczt` | One `.pczt`; a `tex1` recipient is refused (§9) |
 | `pczt inspect` | `InspectPczt` | |
 | `pczt prove` | `ProvePczt` | |
 | `pczt sign` | `SignPczt` | |
@@ -492,6 +501,22 @@ into the PCZT's global proprietary map. `InspectPczt`, `ProvePczt`,
 `KEY_MISMATCH` (exit 6) if it differs. `CombinePczt` refuses inputs whose key
 ids differ. The Redactor strips the proprietary map before a PCZT leaves the
 host for a Keystone (Q-C6).
+
+*Landed (ROADMAP.md M4, first item):* the five reading requests carry the
+assertion as a `key_id` field (empty asserts nothing), checked after the
+tags are read and before anything else, so the error names the file's key.
+A file without the three tags, or with a malformed one, is
+`INVALID_ARGUMENT`; one tagged for another network is `NETWORK_MISMATCH`.
+`CreatePczt` returns the `session_id` it wrote and stores the approved
+proposal under it in the key's `ext_gyges_signing_sessions` row
+(DATA_MODEL.md §5.2); `BroadcastPczt` refuses with `SESSION_NOT_FOUND` when
+this daemon holds no such row (the file was created elsewhere, or the
+wallet was restored since), with `INVALID_ARGUMENT` when the file is not
+proven, not fully signed, already broadcast, or when the Verifier finds it
+differs from the stored proposal (nothing is broadcast). `CombinePczt`
+needs two or more files and maps the Combiner's `DataMismatch` to
+`INVALID_ARGUMENT`. A `tex1` recipient is refused by `CreatePczt` with
+`INVALID_ARGUMENT` naming `tx send` (§9).
 
 ---
 

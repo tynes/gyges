@@ -10,21 +10,24 @@ use gyges_chain::{BlockDb, ChainBackend};
 use gyges_core::{Config, KeyRegistry, Network, Provers, VaultManager};
 use gyges_proto::v1::gyges_server::Gyges;
 use gyges_proto::v1::{
-    self, AbortSigningSessionRequest, AbortTexTransferRequest, ApiVersion, ExportSeedRequest,
-    ExportSeedResponse, ExportUfvkRequest, ExportUfvkResponse, FallbackStatus, FallbackTrust,
-    GetBalanceRequest, GetBalanceResponse, GetInfoRequest, GetInfoResponse, GetSyncStatusRequest,
-    GetSyncStatusResponse, InitKeyRequest, InitKeyResponse, ListKeysRequest, ListKeysResponse,
+    self, AbortSigningSessionRequest, AbortTexTransferRequest, ApiVersion, BroadcastPcztRequest,
+    BroadcastPcztResponse, CombinePcztRequest, CombinePcztResponse, CreatePcztRequest,
+    CreatePcztResponse, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest,
+    ExportUfvkResponse, FallbackStatus, FallbackTrust, GetBalanceRequest, GetBalanceResponse,
+    GetInfoRequest, GetInfoResponse, GetSyncStatusRequest, GetSyncStatusResponse, InitKeyRequest,
+    InitKeyResponse, InspectPcztRequest, InspectPcztResponse, ListKeysRequest, ListKeysResponse,
     ListSigningSessionsRequest, ListSigningSessionsResponse, LockKeyRequest, LockKeyResponse,
-    NodeStatus, RestoreKeyRequest, RestoreKeyResponse, ResumeTexTransferRequest, RunSyncRequest,
-    SendTransactionRequest, ShieldFundsRequest, ShutdownRequest, ShutdownResponse, SigningSession,
-    StreamLogsRequest, TexQueueEntry, TorState, TorStatus, UnlockKeyRequest, UnlockKeyResponse,
-    WaitSyncRequest,
+    NodeStatus, ProvePcztRequest, ProvePcztResponse, RestoreKeyRequest, RestoreKeyResponse,
+    ResumeTexTransferRequest, RunSyncRequest, SendTransactionRequest, ShieldFundsRequest,
+    ShutdownRequest, ShutdownResponse, SignPcztRequest, SigningSession, StreamLogsRequest,
+    TexQueueEntry, TorState, TorStatus, UnlockKeyRequest, UnlockKeyResponse, WaitSyncRequest,
 };
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
 use crate::keys;
 use crate::logs::{LogHub, LogStream};
+use crate::roles::{self, SignStream};
 use crate::sync::{self, ProgressStream, SyncHub};
 use crate::tex::{self, TexHub};
 use crate::tx::{self, SendStream, SessionHub};
@@ -361,6 +364,56 @@ impl Gyges for GygesService {
         request: Request<ExportSeedRequest>,
     ) -> Result<Response<ExportSeedResponse>, Status> {
         keys::export_seed(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn create_pczt(
+        &self,
+        request: Request<CreatePcztRequest>,
+    ) -> Result<Response<CreatePcztResponse>, Status> {
+        let conn = crate::conn::of_request(&request);
+        roles::create_pczt(self.state.clone(), conn, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn inspect_pczt(
+        &self,
+        request: Request<InspectPcztRequest>,
+    ) -> Result<Response<InspectPcztResponse>, Status> {
+        roles::inspect_pczt(&self.state, request.into_inner()).map(Response::new)
+    }
+
+    async fn prove_pczt(
+        &self,
+        request: Request<ProvePcztRequest>,
+    ) -> Result<Response<ProvePcztResponse>, Status> {
+        roles::prove_pczt(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn sign_pczt(
+        &self,
+        request: Request<SignPcztRequest>,
+    ) -> Result<Response<SignStream>, Status> {
+        let conn = crate::conn::of_request(&request);
+        roles::sign_pczt(self.state.clone(), conn, request.into_inner()).map(Response::new)
+    }
+
+    async fn combine_pczt(
+        &self,
+        request: Request<CombinePcztRequest>,
+    ) -> Result<Response<CombinePcztResponse>, Status> {
+        roles::combine_pczt(&self.state, request.into_inner()).map(Response::new)
+    }
+
+    async fn broadcast_pczt(
+        &self,
+        request: Request<BroadcastPcztRequest>,
+    ) -> Result<Response<BroadcastPcztResponse>, Status> {
+        roles::broadcast_pczt(self.state.clone(), request.into_inner())
             .await
             .map(Response::new)
     }
