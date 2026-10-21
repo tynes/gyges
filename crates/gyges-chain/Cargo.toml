@@ -1,6 +1,6 @@
 [package]
 name = "gyges-chain"
-description = "ChainBackend: Zakura JSON-RPC (Case A) and Tor lightwalletd (Case B) CompactBlock sources"
+description = "ChainBackend: Zakura JSON-RPC (Case A) and Tor lightwalletd (Case B) CompactBlock sources, plus the shared block cache"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,10 +8,23 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = []
+# An in-process fake `zakurad` JSON-RPC server and a synthetic block builder,
+# for tests of everything above `ChainBackend` (gygesd, the regtest harness).
+test-util = ["dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:base64"]
+
 [dependencies]
 zcash_client_backend = { workspace = true }
 zcash_protocol = { workspace = true }
 zcash_primitives = { workspace = true }
+zcash_address = { workspace = true }
+transparent = { workspace = true }
+orchard = { workspace = true }
+prost = { workspace = true }
+rusqlite = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -19,6 +32,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+
+[dev-dependencies]
+gyges-chain = { path = ".", features = ["test-util"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

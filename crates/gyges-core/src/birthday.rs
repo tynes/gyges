@@ -11,6 +11,7 @@
 use gyges_chain::{ChainBackend, ChainError};
 use zcash_client_backend::data_api::AccountBirthday;
 use zcash_client_backend::data_api::chain::ChainState;
+use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::BlockHeight;
 
@@ -68,9 +69,18 @@ pub async fn resolve(
     let prior = height - 1;
 
     if prior < sapling {
-        // Empty trees by definition; the hash is informational here and the
-        // scanner only checks continuity between blocks it has scanned.
-        let state = ChainState::empty(BlockHeight::from_u32(prior), BlockHash([0; 32]));
+        // Empty trees by definition. The scanner only checks continuity
+        // between blocks it has scanned itself, so the hash is informational;
+        // take the real one when a node is at hand and zeros otherwise.
+        let hash = match chain {
+            Some(c) => c
+                .block_hash(BlockHeight::from_u32(prior))
+                .await
+                .map(BlockHash)
+                .unwrap_or(BlockHash([0; 32])),
+            None => BlockHash([0; 32]),
+        };
+        let state = ChainState::empty(BlockHeight::from_u32(prior), hash);
         return Ok(ResolvedBirthday {
             height,
             birthday: AccountBirthday::from_parts(state, None),
@@ -107,16 +117,72 @@ pub struct FixedChain {
     pub retained_from: u32,
 }
 
+impl FixedChain {
+    fn bounds(&self) -> gyges_chain::NodeBounds {
+        gyges_chain::NodeBounds {
+            tip_height: BlockHeight::from_u32(self.tip),
+            tip_hash: [0xaa; 32],
+            retained_from: BlockHeight::from_u32(self.retained_from),
+        }
+    }
+}
+
 impl ChainBackend for FixedChain {
     fn node_bounds(
         &self,
     ) -> gyges_chain::BoxFuture<'_, Result<gyges_chain::NodeBounds, ChainError>> {
+        Box::pin(async move { Ok(self.bounds()) })
+    }
+
+    fn status(&self) -> gyges_chain::NodeStatus {
+        gyges_chain::NodeStatus {
+            connected: true,
+            bounds: Some(self.bounds()),
+            pruned: self.retained_from > 0,
+            last_error: String::new(),
+            last_polled: Some(std::time::SystemTime::now()),
+        }
+    }
+
+    fn block_hash(
+        &self,
+        height: BlockHeight,
+    ) -> gyges_chain::BoxFuture<'_, Result<[u8; 32], ChainError>> {
         Box::pin(async move {
-            Ok(gyges_chain::NodeBounds {
-                tip_height: BlockHeight::from_u32(self.tip),
-                tip_hash: [0xaa; 32],
-                retained_from: BlockHeight::from_u32(self.retained_from),
-            })
+            if u32::from(height) > self.tip {
+                return Err(ChainError::BlockUnavailable { height });
+            }
+            let mut hash = [0xaa; 32];
+            hash[..4].copy_from_slice(&u32::from(height).to_le_bytes());
+            Ok(hash)
+        })
+    }
+
+    fn compact_blocks(
+        &self,
+        range: std::ops::Range<BlockHeight>,
+    ) -> gyges_chain::BoxFuture<'_, Result<Vec<CompactBlock>, ChainError>> {
+        Box::pin(async move {
+            let mut out = Vec::new();
+            for h in u32::from(range.start)..u32::from(range.end) {
+                if h < self.retained_from || h > self.tip {
+                    return Err(ChainError::BlockUnavailable {
+                        height: BlockHeight::from_u32(h),
+                    });
+                }
+                let hash = |x: u32| {
+                    let mut b = [0xaa; 32];
+                    b[..4].copy_from_slice(&x.to_le_bytes());
+                    b.to_vec()
+                };
+                out.push(CompactBlock {
+                    height: u64::from(h),
+                    hash: hash(h),
+                    prev_hash: hash(h.wrapping_sub(1)),
+                    ..Default::default()
+                });
+            }
+            Ok(out)
         })
     }
 

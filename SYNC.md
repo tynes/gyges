@@ -32,36 +32,43 @@ The `pruneheight` field is authoritative. As a defensive measure, a "block not a
 
 ## 2. Block Sources and the Shared Cache
 
-### 2.1 `CompactBlockSource`
+### 2.1 `ChainBackend` as the compact block source
 
-Both routes feed the same scanner through one trait:
+Both routes feed the same scanner through one trait, `gyges_chain::ChainBackend` (the design's `CompactBlockSource`, merged into the trait the key registry already used for node bounds and tree states):
 
 ```rust
-#[async_trait]
-pub trait CompactBlockSource: Send + Sync {
-    /// Height and hash of the source's current tip.
-    async fn latest_block(&self) -> Result<(BlockHeight, BlockHash), SourceError>;
-    /// Completed subtree roots for `pool`, starting at `start_index`.
-    async fn subtree_roots(&self, pool: ShieldedPool, start_index: u32)
-        -> Result<Vec<SubtreeRoot>, SourceError>;
-    /// Stream compact blocks for `range`, in ascending height order.
-    async fn block_range(&self, range: Range<BlockHeight>)
-        -> Result<BoxStream<'_, Result<CompactBlock, SourceError>>, SourceError>;
+pub trait ChainBackend: Send + Sync + Debug {
+    /// `getblockchaininfo` → NodeBounds; also refreshes `status()`.
+    fn node_bounds(&self) -> BoxFuture<'_, Result<NodeBounds, ChainError>>;
+    /// Outcome of the last poll, never touching the network (feeds GetInfo.node).
+    fn status(&self) -> NodeStatus;
+    /// `z_gettreestate(height)` as the ChainState an account born at height + 1 starts from.
+    fn chain_state(&self, height: BlockHeight) -> BoxFuture<'_, Result<ChainState, ChainError>>;
+    /// `getblockhash(height)`, internal byte order; works below retained_from too.
+    fn block_hash(&self, height: BlockHeight) -> BoxFuture<'_, Result<[u8; 32], ChainError>>;
+    /// Compact blocks for `range`, ascending, contiguous, linked by prev_hash.
+    /// The caller bounds the range to `cache.fetch_batch`.
+    fn compact_blocks(&self, range: Range<BlockHeight>)
+        -> BoxFuture<'_, Result<Vec<CompactBlock>, ChainError>>;
 }
 ```
 
+Subtree roots (`z_getsubtreesbyindex` / `GetSubtreeRoots`) are added to the trait with the scheduler. A bounded `Vec` per batch replaced the stream of the first draft: the fetcher works in `fetch_batch`-sized ranges anyway, and a `Vec` lets the backend check that the batch links end to end before anything is cached.
+
 | Implementation | Crate | Backing calls | Used for |
 |---|---|---|---|
-| `ZakuraRpcSource` | `gyges-chain` | `getblock(h, 0)` → parse with `zcash_primitives::transaction::Transaction`, keep for each tx: txid, Sapling spends' nullifiers, Sapling outputs' `(cmu, ephemeral_key, enc_ciphertext[..52])`, Orchard actions' `(nullifier, cmx, ephemeral_key, enc_ciphertext[..52])`; `z_getsubtreesbyindex`; `getbestblockhash` | Case A: `[retained_from, tip]` |
-| `TorLwdSource` | `gyges-chain` | lightwalletd `GetLatestBlock`, `GetSubtreeRoots`, `GetBlockRange` over an `arti-client` circuit (`zcash_client_backend::tor`) | Case B: `[birthday, retained_from + k)` |
+| `ZakuraRpcBackend` (landed) | `gyges-chain` | per height, concurrently and in order: `getblock(h, 0)` parsed with `zcash_primitives::block::Block::read`, plus `getblock(h, 1)` for the hash, txids and `trees` (the note commitment tree sizes the scanner needs as `ChainMetadata`); the two are cross-checked and the batch is checked for `prev_hash` links; `getblockchaininfo`; `getblockhash`; `z_gettreestate` | Case A: `[retained_from, tip]` |
+| `ArtiTorLwdBackend` (M2) | `gyges-chain` | lightwalletd `GetLatestBlock`, `GetSubtreeRoots`, `GetBlockRange` over an `arti-client` circuit (`zcash_client_backend::tor`) | Case B: `[birthday, retained_from + k)` |
 
-`ZakuraRpcSource` prefers the indexer gRPC (`[rpc] indexer_listen_addr`, `get_block_range` of raw blocks) when configured, and falls back to JSON-RPC `getblock` otherwise. The synthetic `CompactBlock` format is the lightwalletd protobuf (`zcash_client_backend::proto::compact_formats`), so `scan_cached_blocks` sees no difference between the two sources.
+Per transaction the compact form keeps: txid, Sapling spends' nullifiers, Sapling outputs' `(cmu, ephemeral_key, enc_ciphertext[..52])`, Orchard and Ironwood actions' `(nullifier, cmx, ephemeral_key, enc_ciphertext[..52])`, and, because the raw block is at hand, every transparent input (`prevout`) and output (`value`, `scriptPubKey`) in the `CompactTx.vin` / `vout` fields the lightwalletd protobuf already defines. The format is `zcash_client_backend::proto::compact_formats`, so `scan_cached_blocks` sees no difference between the two sources; it ignores `vin`/`vout`. The indexer gRPC (`[rpc] indexer_listen_addr`, `get_block_range` of raw blocks) is not used yet; when it is, it replaces the `getblock` pair, not the parser.
 
-Because Case A sees full raw blocks, `ZakuraRpcSource` also emits every transparent output paying a wallet-known address into the per-key `transparent_received_outputs` table while building compact blocks. Compact blocks carry no transparent outputs, so below `retained_from` transparent history comes only from `GetAddressUtxos` over Tor (§6).
+The cache is therefore also the transparent index for Case A: the scheduler reads `vout` from cached blocks (`gyges_chain::compact::transparent_outputs`), matches `scriptPubKey`s against the key's transparent and ephemeral receivers, stages hits in the per-key `gyges_transparent_received_outputs` table and hands them to `put_received_transparent_utxo`. Blocks from the Tor route carry no transparent outputs, so below `retained_from` transparent history comes only from `GetAddressUtxos` over Tor (§5.3).
+
+The cookie file is re-read on every request: `zakurad` rewrites `~/.cache/zakura/.cookie` at each start, so a daemon that cached it would lose the node at the first node restart. A missing or stale cookie is reported as `NODE_UNREACHABLE` with the path and the fix.
 
 ### 2.2 `BlockCache` and `BlockFetcher`
 
-One cache per network at `~/.gyges/<network>/cache/blocks.sqlite` (schema in `DATA_MODEL.md` §6) implements the upstream `zcash_client_backend::data_api::chain::BlockCache` trait, so `scan_cached_blocks` reads from it unchanged.
+One cache per network at `~/.gyges/<network>/cache/blocks.sqlite` (schema in `DATA_MODEL.md` §6) implements the upstream `zcash_client_backend::data_api::chain::BlockCache` trait, so `scan_cached_blocks` reads from it unchanged. Landed as `gyges_chain::cache::BlockDb`: `BlockSource::with_blocks` stops at the first missing height, `BlockCache::read` reports a hole inside the requested range as an error, rows are tagged `source = 'node' | 'tor-lwd'`, and `evict_below` / `evict_source_below` / `checkpoint` are what the fetcher below and the daemon's stop path call. The daemon opens it at start (refusing a file from another network or a newer schema) and checkpoints it on stop.
 
 A single `BlockFetcher` task per daemon:
 

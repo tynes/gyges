@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gyges_chain::testing::{FakeNode, regtest_params};
 use gyges_core::birthday::FixedChain;
 use gyges_core::{Home, Network, perms};
 use gyges_proto::uds;
@@ -76,6 +77,15 @@ async fn start(configure: impl FnOnce(&mut Options)) -> Running {
 
 async fn client(socket: &PathBuf) -> GygesClient<Channel> {
     GygesClient::new(uds::connect(socket).await.expect("connect"))
+}
+
+/// A loopback URL nobody listens on, so "no node" tests do not depend on
+/// whether the developer runs a zakurad on the default port.
+fn closed_port_url() -> String {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    drop(l);
+    url
 }
 
 #[tokio::test]
@@ -222,8 +232,23 @@ fn fallback_without_endpoint_refuses_start() {
 
 #[tokio::test]
 async fn init_key_needs_a_node_unless_airgapped() {
-    let running = start(|_| {}).await;
+    let url = closed_port_url();
+    let running = start(|o| o.zakura_rpc = Some(url.clone())).await;
     let mut c = client(&running.socket).await;
+
+    // The real backend was built from the configuration and polled once
+    // before the socket opened: `daemon status` says why it is down.
+    let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
+    let node = info.node.unwrap();
+    assert!(!node.connected);
+    assert!(
+        node.last_error.contains("getblockchaininfo"),
+        "{}",
+        node.last_error
+    );
+    assert!(node.last_error.contains(&url), "{}", node.last_error);
+    assert_eq!(node.tip_height, 0);
+
     let err = c
         .init_key(InitKeyRequest {
             key_id: "main".into(),
@@ -239,6 +264,7 @@ async fn init_key_needs_a_node_unless_airgapped() {
         "{}",
         detail.detail
     );
+    assert!(detail.detail.contains("unreachable"), "{}", detail.detail);
     assert!(
         c.list_keys(ListKeysRequest {})
             .await
@@ -866,4 +892,92 @@ async fn seed_export_can_be_disabled_by_config() {
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
     task.abort();
     drop(dir);
+}
+
+#[tokio::test]
+async fn real_backend_against_the_fake_node_reports_bounds_and_seeds_birthdays() {
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(42);
+    let url = node.url().to_string();
+    let running = start(|o| o.zakura_rpc = Some(url)).await;
+    let mut c = client(&running.socket).await;
+
+    // The first poll ran before the socket opened.
+    let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
+    let status = info.node.unwrap();
+    assert!(status.connected, "{}", status.last_error);
+    assert_eq!(status.tip_height, 42);
+    assert_eq!(status.tip_hash, gyges_chain::display_hash(&node.tip().1));
+    assert_eq!(status.retained_from, 0);
+    assert!(!status.pruned);
+    assert!(status.last_error.is_empty());
+
+    // The shared block cache exists, private, bound to this network.
+    let cache = running._home.path().join("regtest/cache/blocks.sqlite");
+    assert!(cache.is_file());
+    assert_eq!(std::fs::metadata(&cache).unwrap().mode() & 0o777, 0o600);
+    let db = running.state.block_cache.as_ref().expect("cache open");
+    assert!(db.is_empty().unwrap());
+
+    // `key init` takes its birthday from the live tip through the real
+    // backend: tree state at 41, account born at 42.
+    let resp = c
+        .init_key(InitKeyRequest {
+            key_id: "main".into(),
+            passphrase: "pw".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.birthday_height, 42);
+    assert!(resp.ufvk.starts_with("uviewregtest"), "{}", resp.ufvk);
+    let calls = node.calls();
+    assert!(calls.iter().any(|m| m == "z_gettreestate"), "{calls:?}");
+
+    // A restore below the (now) pruned window is refused with the window.
+    node.set_prune_height(Some(30));
+    let err = c
+        .restore_key(RestoreKeyRequest {
+            key_id: "old".into(),
+            mnemonic: known_mnemonic(),
+            passphrase: "pw".into(),
+            birthday_height: 20,
+            allow_backfill: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    let detail = GygesError::from_status(&err).unwrap();
+    assert_eq!(detail.reason(), ErrorReason::FallbackUnavailable);
+    assert!(
+        detail.detail.contains("retained from 30"),
+        "{}",
+        detail.detail
+    );
+
+    // Inside the window it works and reads the node's tree state.
+    let ok = c
+        .restore_key(RestoreKeyRequest {
+            key_id: "old".into(),
+            mnemonic: known_mnemonic(),
+            passphrase: "pw".into(),
+            birthday_height: 31,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ok.birthday_height, 31);
+
+    // Shutdown checkpoints the cache (no -wal left behind).
+    c.shutdown(ShutdownRequest { graceful: true })
+        .await
+        .unwrap();
+    running.task.await.unwrap().unwrap();
+    let wal = cache.with_extension("sqlite-wal");
+    assert!(
+        !wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0,
+        "WAL not checkpointed"
+    );
 }

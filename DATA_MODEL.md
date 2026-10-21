@@ -244,7 +244,7 @@ CREATE TABLE gyges_address_labels (
 
 ### 5.4 `gyges_transparent_received_outputs`
 
-Transparent outputs seen in full raw blocks during Case A (`SYNC.md` §2.1). Upstream already stores UTXOs it learns about through `put_received_transparent_utxo`; this table is the staging area from which that call is made, and the source of truth for "which block did we see it in" when the node's address index is unavailable.
+Transparent outputs seen in full raw blocks during Case A (`SYNC.md` §2.1). The compact blocks in the shared cache (§6) carry every transparent input and output of their blocks, so the scheduler finds a key's outputs by matching `scriptPubKey`s from the cache against the key's receivers; upstream already stores UTXOs it learns about through `put_received_transparent_utxo`, and this table is the staging area from which that call is made, and the source of truth for "which block did we see it in" when the node's address index is unavailable.
 
 ```sql
 CREATE TABLE gyges_transparent_received_outputs (
@@ -295,7 +295,7 @@ CREATE TABLE cache_meta (
 );
 ```
 
-Eviction policy and privacy trade-off are in `SYNC.md` §2.2: `source = 'tor-lwd'` rows reveal an approximate birthday, so the file is `0600` and those rows are dropped once consumed unless `cache.keep_historical = true`. The cache is disposable; deleting it costs a refetch, never wallet state.
+Eviction policy and privacy trade-off are in `SYNC.md` §2.2: `source = 'tor-lwd'` rows reveal an approximate birthday, so the file is `0600` and those rows are dropped once consumed unless `cache.keep_historical = true`. The cache is disposable; deleting it costs a refetch, never wallet state. `data` is the lightwalletd `CompactBlock` protobuf including `vin`/`vout` for every transaction (the Case A transparent index, §5.4), so a cached mainnet block is tens of kilobytes rather than a few. The daemon refuses to open a cache whose `cache_meta.network` is another network or whose `schema_version` is newer than its own, naming the file (`gyges_chain::cache::BlockDb::open`).
 
 ---
 

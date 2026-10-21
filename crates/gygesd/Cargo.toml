@@ -35,6 +35,7 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 
 [dev-dependencies]
+gyges-chain = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 
 [lints]

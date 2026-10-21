@@ -94,6 +94,8 @@ http         = "1"                                            # request paths in
 tower        = "0.5"                                          # service_fn connector for UDS clients
 hyper-util   = { version = "0.1", features = ["tokio"] }      # TokioIo adapter between tonic and UnixStream
 reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }  # zakurad JSON-RPC client
+async-trait  = "0.1"                                          # `BlockCache` is an async-trait trait upstream
+futures-util = "0.3"                                          # ordered concurrent `getblock` fetches
 
 # --- Key encryption ---
 age = { version = "0.12", features = ["armor"] }              # scrypt passphrase recipient (Q-S5); no Argon2id
@@ -124,7 +126,11 @@ tonic-prost-build = "0.14"
 pbjson-build      = "0.9"
 
 # --- Tests ---
-tempfile = "3"
+tempfile       = "3"
+hyper          = { version = "1", features = ["server", "http1"] }   # fake zakurad JSON-RPC server (gyges-chain `test-util`)
+http-body-util = "0.1"
+bytes          = "1"
+base64         = "0.22"
 
 # --- Internal crates ---
 gyges-proto = { path = "crates/gyges-proto" }

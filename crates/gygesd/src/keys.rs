@@ -192,9 +192,9 @@ pub fn birthday_error(e: BirthdayError) -> GygesError {
         BirthdayError::Chain(ChainError::Unreachable(detail) | ChainError::Rpc(detail)) => {
             GygesError::new(ErrorReason::NodeUnreachable, detail)
         }
-        BirthdayError::Chain(e @ ChainError::TreeStateUnavailable { .. }) => {
-            GygesError::new(ErrorReason::FallbackUnavailable, e.to_string())
-        }
+        BirthdayError::Chain(
+            e @ (ChainError::TreeStateUnavailable { .. } | ChainError::BlockUnavailable { .. }),
+        ) => GygesError::new(ErrorReason::FallbackUnavailable, e.to_string()),
     }
 }
 
@@ -268,6 +268,13 @@ pub async fn init_key(
                     ErrorReason::NodeUnreachable,
                     "key init takes the birthday from the node's tip, and no node is connected; \
                      use `key restore --birthday` for a known seed, or `--airgapped` for a signer-only key",
+                ),
+                BirthdayError::Chain(ChainError::Unreachable(detail)) => GygesError::new(
+                    ErrorReason::NodeUnreachable,
+                    format!(
+                        "key init takes the birthday from the node's tip, and the node is unreachable ({detail}); \
+                         use `key restore --birthday` for a known seed, or `--airgapped` for a signer-only key"
+                    ),
                 ),
                 other => birthday_error(other),
             }
