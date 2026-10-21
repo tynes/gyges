@@ -10,12 +10,15 @@
 //!   that drives them lives in `gygesd`;
 //! * [`tx`] – the `TxEngine`: proposal → PCZT roles → raw transaction
 //!   (Q-K3, Q-K4, Q-K7); the daemon streams the steps and broadcasts;
-//! * `TexQueue` – durable two-step ZIP 320 broadcaster (Q-T1…T3).
+//! * `TexQueue` – durable two-step ZIP 320 broadcaster (Q-T1…T3);
+//! * [`log::Sensitive`] – the redaction wrapper every address, amount, memo,
+//!   txid and secret goes through before it can reach a log line (Q-O1).
 
 #![forbid(unsafe_code)]
 
 pub mod birthday;
 pub mod config;
+pub mod log;
 pub mod network;
 pub mod paths;
 pub mod perms;
@@ -27,6 +30,7 @@ pub mod vault;
 
 pub use birthday::{BirthdayError, ResolvedBirthday};
 pub use config::{Config, ConfigError};
+pub use log::Sensitive;
 pub use network::{ConsensusParams, Network};
 pub use paths::Home;
 pub use profile::{KeyProfile, ProfileError};

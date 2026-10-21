@@ -6,15 +6,13 @@
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::Parser;
-use gyges_core::{Home, Network, perms};
-use gygesd::{Daemon, Options};
-use tracing_subscriber::layer::SubscriberExt as _;
-use tracing_subscriber::util::SubscriberInitExt as _;
-use tracing_subscriber::{EnvFilter, fmt};
+use gyges_core::{Home, Network};
+use gygesd::{Daemon, LogHub, Options};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -96,7 +94,10 @@ fn main() -> ExitCode {
         };
     }
 
-    let daemon = match Daemon::prepare(args.options()) {
+    let hub = Arc::new(LogHub::default());
+    let mut opts = args.options();
+    opts.log_hub = Some(hub.clone());
+    let daemon = match Daemon::prepare(opts) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("gygesd: {e:#}");
@@ -104,7 +105,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let _log_guard = match init_logging(&daemon, !daemonized) {
+    let _log_guard = match init_logging(&hub, &daemon, !daemonized) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("gygesd: cannot initialise logging: {e:#}");
@@ -151,36 +152,18 @@ fn signals() -> anyhow::Result<impl std::future::Future<Output = ()> + Send> {
     })
 }
 
-/// `logs/gygesd.<date>.log`, daily rotation, seven files kept
-/// (DATA_MODEL.md §1); plus stderr when running in the foreground of a
+/// `logs/gygesd.<date>.log` (daily rotation, seven files kept),
+/// `logs/audit.log` and the `StreamLogs` tail (DATA_MODEL.md §1,
+/// `gygesd::logs`); plus stderr when running in the foreground of a
 /// terminal. `RUST_LOG` overrides `daemon.log_level`.
 fn init_logging(
+    hub: &Arc<LogHub>,
     daemon: &Daemon,
     to_stderr: bool,
-) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
-    let level = &daemon.config().daemon.log_level;
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(level))
-        .with_context(|| format!("daemon.log_level = \"{level}\" is not a valid filter"))?;
-
+) -> anyhow::Result<gygesd::logs::Guards> {
+    let filter = gygesd::logs::filter_spec(&daemon.config().daemon.log_level);
     let logs = daemon.home.logs_dir(daemon.network);
-    perms::ensure_private_dir(&logs)?;
-    let appender = tracing_appender::rolling::Builder::new()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("gygesd")
-        .filename_suffix("log")
-        .max_log_files(7)
-        .build(&logs)
-        .with_context(|| format!("cannot open log directory {}", logs.display()))?;
-    let (file_writer, guard) = tracing_appender::non_blocking(appender);
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().with_ansi(false).with_writer(file_writer))
-        .with(to_stderr.then(|| fmt::layer().with_writer(std::io::stderr)))
-        .try_init()
-        .context("a global tracing subscriber is already installed")?;
-    Ok(guard)
+    gygesd::logs::init(hub, &logs, &filter, to_stderr)
 }
 
 /// Validate the configuration here, where stderr is visible, then re-run

@@ -257,13 +257,44 @@ fn unimplemented_commands_exit_1_not_2() {
     assert_eq!(run.code(), 2, "{run:?}");
 }
 
+/// `gyges daemon logs` replays the in-memory tail through `StreamLogs`
+/// (API.md §4.5): the startup line is there, `--lines` bounds the replay,
+/// `--json` prints `LogEntry` messages, and an empty audit log is an empty
+/// replay, not an error.
 #[test]
-fn logs_command_reports_unimplemented_rpc_as_exit_1() {
+fn logs_command_streams_the_daemon_log() {
     let mut fx = Fixture::new("regtest");
     fx.start_daemon(&[]).unwrap();
-    let run = fx.gyges(&["daemon", "logs", "--lines", "5"]).run();
-    assert_eq!(run.code(), 1, "{run:?}");
-    assert!(run.stderr.contains("Unimplemented"), "{}", run.stderr);
+    let run = fx.gyges(&["daemon", "logs", "--lines", "100"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert!(run.stdout.contains("gygesd listening"), "{}", run.stdout);
+    assert!(run.stdout.contains(" INFO "), "{}", run.stdout);
+    let all = run.stdout.lines().count();
+    assert!(all >= 2, "{}", run.stdout);
+
+    let run = fx
+        .gyges(&["daemon", "logs", "--lines", "1", "--json"])
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert_eq!(run.stdout.lines().count(), 1, "{}", run.stdout);
+    let entry = run.json();
+    // The last line is the node poll (no node here: a warning).
+    assert!(
+        entry["level"].as_str().unwrap().starts_with("LOG_LEVEL_"),
+        "{entry}"
+    );
+    assert!(
+        entry["target"].as_str().unwrap().starts_with("gygesd"),
+        "{entry}"
+    );
+    assert!(entry["message"].is_string(), "{entry}");
+
+    let run = fx
+        .gyges(&["daemon", "logs", "--audit", "--lines", "100"])
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert_eq!(run.stdout, "", "{run:?}");
+    assert!(fx.network_dir().join("logs/audit.log").is_file());
 }
 
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {

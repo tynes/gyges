@@ -247,12 +247,21 @@ survive and are re-evaluated against their expiry.
 
 ### 4.5 `StreamLogs`
 
-Replays the last `lines` entries, then (with `follow`) delivers new entries
-until the client disconnects. Entries come from the in-process `tracing`
-subscriber, not from tailing the file, so the CLI stays socket-only (Q-O1).
-`audit = true` streams `audit.log` instead. Log entries are redacted at
-source; `fields` never contain addresses, amounts, memos or key material at
-any level.
+Replays the last `lines` entries (at most 1,000: the daemon keeps that many
+of each log in memory), then (with `follow`) delivers new entries until the
+client disconnects; a follower that joins during a replay sees every entry
+exactly once. Entries come from the in-process `tracing` subscriber, not
+from tailing the file, so the CLI stays socket-only (Q-O1). `min_level`
+drops entries less severe than the given level; `UNSPECIFIED` delivers
+whatever the daemon's own filter (`daemon.log_level`, or `RUST_LOG`) let
+through, which for the audit log is everything. `audit = true` streams the
+audit log instead: the events `unlock` (field `scope`), `lock`,
+`export_seed`, `session_created`, `session_completed`, `session_aborted`,
+`sign` (field `via`: `unlock` or `session`), `broadcast` and `rewind` (field
+`from`), each with `key_id`, under the target `gyges::audit`. Log entries
+are redacted at source (`gyges_core::Sensitive`); `fields` never contain
+addresses, amounts, memos, passphrases or key material at any level, and
+upstream error texts are logged at `debug` only.
 
 ### 4.6 `InitKey` / `RestoreKey`
 

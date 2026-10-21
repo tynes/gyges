@@ -2387,6 +2387,7 @@ dependencies = [
  "http",
  "nix",
  "rand 0.10.3",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -5861,6 +5862,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

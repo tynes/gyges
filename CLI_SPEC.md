@@ -83,8 +83,8 @@ Finishes the current scan batch, checkpoints SQLite WAL, aborts in-progress prov
 #### `gyges daemon status`
 Daemon version and API version, network, airgapped flag, `zakurad` connection state, node bounds (`tip_height`, `retained_from`, the node's `tx_retention`), Tor bootstrap state, fallback endpoint trust state, and a per-key line with signing mode, lock state, `scanned_tip` and sync state.
 
-#### `gyges daemon logs [--follow] [--lines <N>]`
-Streams structured daemon logs through the `StreamLogs` RPC (the CLI never tails the file).
+#### `gyges daemon logs [--follow] [--lines <N>] [--audit]`
+Streams structured daemon logs through the `StreamLogs` RPC (the CLI never tails the file). Replays the last `N` entries (default 100, at most the 1,000 the daemon keeps), then with `--follow` keeps printing until Ctrl-C. `--audit` streams the audit log instead (`API.md` §4.5). `--json` prints one `LogEntry` per line.
 
 ---
 
