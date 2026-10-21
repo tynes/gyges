@@ -229,7 +229,10 @@ pub fn tx_error(e: TxError, key_id: &str) -> GygesError {
         TxError::InvalidArgument(detail) => GygesError::new(ErrorReason::InvalidArgument, detail),
         TxError::UnsupportedPool(detail) => GygesError::new(ErrorReason::UnsupportedPool, detail),
         TxError::Internal(detail) => {
-            tracing::error!(key_id, error = %detail, "transaction engine failure");
+            // Upstream error texts can quote addresses or values, so the
+            // detail goes to the client and to `debug` only (API.md §4.5).
+            tracing::error!(key_id, "transaction engine failure");
+            tracing::debug!(key_id, error = %detail, "transaction engine failure detail");
             GygesError::new(ErrorReason::Internal, detail)
         }
     };

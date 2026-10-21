@@ -24,6 +24,7 @@
 pub mod conn;
 pub mod keys;
 pub mod lifecycle;
+pub mod logs;
 pub mod node;
 pub mod policy;
 pub mod service;
@@ -45,6 +46,7 @@ use tonic::transport::Server;
 
 pub use conn::{Conn, ConnInfo};
 pub use lifecycle::{PidLock, PidLockError};
+pub use logs::LogHub;
 pub use policy::{PeerPolicy, PolicyLayer};
 pub use service::{DaemonState, GygesService};
 
@@ -66,6 +68,10 @@ pub struct Options {
     /// The node backend. `None` means "build a `ZakuraRpcBackend` from the
     /// configuration" (or nothing, when air-gapped); tests inject a fake.
     pub chain: Option<Arc<dyn ChainBackend>>,
+    /// The in-memory log tail `StreamLogs` serves. `main` creates it before
+    /// installing the subscriber; `None` means an empty hub that nothing
+    /// feeds (tests that install no capture layer).
+    pub log_hub: Option<Arc<LogHub>>,
 }
 
 impl Options {
@@ -79,6 +85,7 @@ impl Options {
             fallback_lwd: None,
             no_tor: false,
             chain: None,
+            log_hub: None,
         }
     }
 
@@ -174,6 +181,7 @@ impl Daemon {
             vault,
             chain,
             block_cache,
+            opts.log_hub.unwrap_or_default(),
         ));
         Ok(Self {
             home,

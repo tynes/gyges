@@ -17,10 +17,11 @@ use gyges_proto::v1::{
     GetBalanceRequest, GetBalanceResponse, GetInfoRequest, GetSyncStatusRequest, GygesError,
     InitKeyRequest, ListKeysRequest, ListNotesRequest, ListSigningSessionsRequest, LockKeyRequest,
     Proposal, RestoreKeyRequest, RunSyncRequest, SendEvent, SendTransactionRequest, SessionStatus,
-    ShieldFundsRequest, ShutdownRequest, SignatureKind, SigningMode, SyncProgress, SyncState,
-    SyncTarget, UnlockKeyRequest, UnlockScope, WaitSyncRequest, send_event,
+    ShieldFundsRequest, ShutdownRequest, SignatureKind, SigningMode, StreamLogsRequest,
+    SyncProgress, SyncState, SyncTarget, UnlockKeyRequest, UnlockScope, WaitSyncRequest,
+    send_event,
 };
-use gygesd::{Daemon, DaemonState, Options};
+use gygesd::{Daemon, DaemonState, LogHub, Options};
 use tokio_stream::StreamExt as _;
 use tonic::transport::Channel;
 use zcash_client_backend::data_api::WalletRead as _;
@@ -62,14 +63,42 @@ fn known_mnemonic() -> String {
     "abandon ".repeat(23) + "art"
 }
 
+/// One log hub for the whole test binary, fed by the production capture
+/// layer (`info` and every audit event, like a default daemon); every daemon
+/// started here shares it, so tests filter by their own key ids.
+/// `RUST_LOG=debug cargo test -- --nocapture` shows the daemon's tracing.
+fn test_hub() -> Arc<LogHub> {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::filter::FilterExt as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    static HUB: std::sync::OnceLock<Arc<LogHub>> = std::sync::OnceLock::new();
+    HUB.get_or_init(|| {
+        let hub = Arc::new(LogHub::default());
+        let _ = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_test_writer()
+                    .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
+            )
+            .with(
+                hub.layer().with_filter(
+                    tracing_subscriber::filter::filter_fn(|m| {
+                        m.target() == gygesd::keys::AUDIT_TARGET
+                    })
+                    .or(tracing_subscriber::filter::LevelFilter::INFO),
+                ),
+            )
+            .try_init();
+        hub
+    })
+    .clone()
+}
+
 async fn start(configure: impl FnOnce(&mut Options)) -> Running {
-    // `RUST_LOG=debug cargo test -- --nocapture` shows the daemon's tracing.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_test_writer()
-        .try_init();
     let (dir, home) = fresh_home();
     let mut opts = Options::new(home.clone(), Network::Regtest);
+    opts.log_hub = Some(test_hub());
     configure(&mut opts);
     let daemon = Daemon::prepare(opts).expect("prepare");
     let socket = daemon.socket_path();
@@ -829,6 +858,115 @@ async fn wrong_passphrases_are_rate_limited_per_key() {
     running.task.abort();
 }
 
+/// `StreamLogs` (API.md §4.5): the audit tail replays the events of an
+/// unlock with key id, event and scope only; a follower sees the lock that
+/// comes next; the main tail carries no passphrase. Air-gapped, so the key
+/// is `signer-only` and nothing else writes to the logs meanwhile.
+#[tokio::test]
+async fn stream_logs_replays_the_audit_trail_and_follows() {
+    let running = start(|o| o.airgapped = true).await;
+    let mut c = client(&running.socket).await;
+    let key_id = format!("logs-{}", std::process::id());
+    let passphrase = "correct-horse-battery-staple-7731";
+    c.init_key(InitKeyRequest {
+        key_id: key_id.clone(),
+        passphrase: passphrase.into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    c.unlock_key(UnlockKeyRequest {
+        key_id: key_id.clone(),
+        passphrase: passphrase.into(),
+        scope: UnlockScope::Daemon as i32,
+        ttl_secs: 60,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    // Replay of the audit log: exactly one `unlock` for this key, with the
+    // documented fields and nothing else.
+    let mut s = c
+        .stream_logs(StreamLogsRequest {
+            lines: 1000,
+            audit: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut mine = Vec::new();
+    while let Some(e) = s.message().await.unwrap() {
+        assert_eq!(e.target, gygesd::keys::AUDIT_TARGET);
+        assert_eq!(e.level(), gyges_proto::v1::LogLevel::Info);
+        if e.fields.get("key_id") == Some(&key_id) {
+            mine.push(e);
+        }
+    }
+    assert_eq!(mine.len(), 1, "{mine:?}");
+    assert_eq!(mine[0].fields["event"], "unlock");
+    assert!(mine[0].fields["scope"].contains("Daemon"), "{:?}", mine[0]);
+    let mut keys: Vec<&str> = mine[0].fields.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["event", "key_id", "scope"]);
+    assert!(mine[0].timestamp_unix_ms >= running.state.started_at * 1000);
+
+    // A follower started now sees the lock, and only new entries.
+    let mut follow = c
+        .stream_logs(StreamLogsRequest {
+            lines: 0,
+            follow: true,
+            audit: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    c.lock_key(LockKeyRequest {
+        key_id: key_id.clone(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let locked = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let e = follow.message().await.unwrap().expect("stream open");
+            if e.fields.get("key_id") == Some(&key_id) {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("lock event followed");
+    assert_eq!(locked.fields["event"], "lock");
+    drop(follow);
+
+    // The main log has the daemon's lines for this key and no secret.
+    let mut s = c
+        .stream_logs(StreamLogsRequest {
+            lines: 1000,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut main = Vec::new();
+    while let Some(e) = s.message().await.unwrap() {
+        let text = format!("{e:?}");
+        assert!(!text.contains(passphrase), "{text}");
+        if e.fields.get("key_id") == Some(&key_id) {
+            main.push(e.message);
+        }
+    }
+    assert!(
+        main.iter().any(|m| m == "key created") && main.iter().any(|m| m == "key locked"),
+        "{main:?}"
+    );
+
+    running.task.abort();
+}
+
 #[tokio::test]
 async fn export_seed_round_trips_with_its_guards() {
     let running = start(|o| o.airgapped = true).await;
@@ -1472,10 +1610,7 @@ fn unified_address(state: &DaemonState, key_id: &str) -> String {
 #[tokio::test]
 async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_node() {
     use gyges_proto::v1::Pool;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_test_writer()
-        .try_init();
+    let _ = test_hub();
     let node = FakeNode::start(regtest_params()).await;
     node.mine(10);
     let url = node.url().to_string();

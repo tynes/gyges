@@ -9,6 +9,7 @@
 //! the exit-6 memo-to-transparent refusal, a non-interactive shield with
 //! `GYGES_PASSPHRASE_FILE`, and the Orchard balance after mining.
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::time::{Duration, Instant};
 
 use gyges_chain::testing::{FakeNode, regtest_params};
@@ -70,7 +71,8 @@ fn balance_send_and_shield_through_the_binaries() {
         "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n",
     );
     fx.start_daemon(&["--zakura-rpc", n.node.url()]).unwrap();
-    let pw = fx.passphrase_file("pw");
+    const PASSPHRASE: &str = "correct-horse-battery-staple-7731";
+    let pw = fx.passphrase_file(PASSPHRASE);
 
     let run = fx
         .gyges(&["key", "init", "--id", "main", "--json"])
@@ -267,17 +269,124 @@ fn balance_send_and_shield_through_the_binaries() {
     let run = fx.gyges(&["-k", "main", "balance"]).run();
     assert!(run.stdout.contains("ironwood"), "{}", run.stdout);
 
-    // The log never shows the address, the txid or the amount (TESTING.md §5).
+    // TESTING.md §5, system level: neither log shows the address, the txid,
+    // an amount (as zatoshis or decimal) or the passphrase.
     let log_dir = fx.network_dir().join("logs");
-    if let Ok(entries) = std::fs::read_dir(&log_dir) {
-        for entry in entries.flatten() {
-            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
-            assert!(
-                !text.contains(&t_addr),
-                "address in {}",
-                entry.path().display()
-            );
-            assert!(!text.contains(&txid), "txid in {}", entry.path().display());
+    let secrets = [
+        t_addr.as_str(),
+        txid.as_str(),
+        "100000000",
+        "50000000",
+        "0.50000000",
+        PASSPHRASE,
+    ];
+    let mut main_log = String::new();
+    let mut audit_log = None;
+    for entry in std::fs::read_dir(&log_dir).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(entry.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(entry.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "{name}"
+        );
+        for secret in secrets {
+            assert!(!text.contains(secret), "{secret:?} in {name}");
         }
+        if name == "audit.log" {
+            audit_log = Some(text);
+        } else {
+            assert!(
+                name.starts_with("gygesd.") && name.ends_with(".log"),
+                "{name}"
+            );
+            main_log.push_str(&text);
+        }
+    }
+    assert!(main_log.contains("transaction broadcast"), "{main_log}");
+
+    // `audit.log`: one JSON object per line, key id and event only, and the
+    // events of this scenario in order.
+    let audit_log = audit_log.expect("audit.log written");
+    let lines: Vec<serde_json::Value> = audit_log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}")))
+        .collect();
+    let allowed = [
+        "timestamp",
+        "level",
+        "event",
+        "key_id",
+        "scope",
+        "via",
+        "from",
+    ];
+    for line in &lines {
+        for (k, v) in line.as_object().unwrap() {
+            assert!(
+                allowed.contains(&k.as_str()),
+                "unexpected key {k} in {line}"
+            );
+            assert!(v.is_string(), "{line}");
+        }
+        assert_eq!(line["key_id"], "main", "{line}");
+        assert_eq!(line["level"], "INFO", "{line}");
+    }
+    let events: Vec<&str> = lines.iter().map(|l| l["event"].as_str().unwrap()).collect();
+    // The locked `tx send --yes --json` above created and aborted a session;
+    // the shield's session was completed by the passphrase, then signed
+    // through it and broadcast.
+    let aborted = events.iter().position(|e| *e == "session_aborted").unwrap();
+    let broadcast = events.iter().position(|e| *e == "broadcast").unwrap();
+    assert!(aborted < broadcast, "{events:?}");
+    assert_eq!(
+        &events[broadcast - 3..=broadcast],
+        ["session_created", "session_completed", "sign", "broadcast"],
+        "{events:?}"
+    );
+    assert_eq!(lines[broadcast - 1]["via"], "session", "{events:?}");
+
+    // `gyges daemon logs` serves both logs through `StreamLogs` (API.md
+    // §4.5), as JSON `LogEntry` messages or rendered lines.
+    let run = fx
+        .gyges(&["daemon", "logs", "--audit", "--lines", "200", "--json"])
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let streamed: Vec<serde_json::Value> = run
+        .stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(streamed.len(), lines.len(), "{}", run.stdout);
+    let last = streamed.last().unwrap();
+    assert_eq!(last["target"], "gyges::audit");
+    assert_eq!(last["level"], "LOG_LEVEL_INFO");
+    assert_eq!(last["fields"]["event"], "broadcast");
+    assert_eq!(last["fields"]["key_id"], "main");
+    assert!(
+        last["timestamp_unix_ms"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            > 0
+    );
+    for secret in secrets {
+        assert!(!run.stdout.contains(secret), "{secret:?} streamed");
+    }
+    let run = fx.gyges(&["daemon", "logs", "--lines", "500"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert!(
+        run.stdout.contains("transaction broadcast"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("gygesd listening"), "{}", run.stdout);
+    for secret in secrets {
+        assert!(!run.stdout.contains(secret), "{secret:?} streamed");
     }
 }

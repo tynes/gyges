@@ -16,13 +16,14 @@ use gyges_proto::v1::{
     GetSyncStatusResponse, InitKeyRequest, InitKeyResponse, ListKeysRequest, ListKeysResponse,
     ListSigningSessionsRequest, ListSigningSessionsResponse, LockKeyRequest, LockKeyResponse,
     NodeStatus, RestoreKeyRequest, RestoreKeyResponse, RunSyncRequest, SendTransactionRequest,
-    ShieldFundsRequest, ShutdownRequest, ShutdownResponse, SigningSession, TorState, TorStatus,
-    UnlockKeyRequest, UnlockKeyResponse, WaitSyncRequest,
+    ShieldFundsRequest, ShutdownRequest, ShutdownResponse, SigningSession, StreamLogsRequest,
+    TorState, TorStatus, UnlockKeyRequest, UnlockKeyResponse, WaitSyncRequest,
 };
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
 use crate::keys;
+use crate::logs::{LogHub, LogStream};
 use crate::sync::{self, ProgressStream, SyncHub};
 use crate::tx::{self, SendStream, SessionHub};
 
@@ -46,6 +47,8 @@ pub struct DaemonState {
     pub sessions: SessionHub,
     /// Proving and verifying keys, built on first use.
     pub provers: Arc<Provers>,
+    /// The in-memory tail of the main and audit logs (`StreamLogs`).
+    pub logs: Arc<LogHub>,
     /// Unix seconds the daemon started.
     pub started_at: i64,
     /// Signalled by `Shutdown` (and by the signal handlers in `main`).
@@ -60,6 +63,7 @@ impl DaemonState {
         vault: VaultManager,
         chain: Option<Arc<dyn ChainBackend>>,
         block_cache: Option<Arc<BlockDb>>,
+        logs: Arc<LogHub>,
     ) -> Self {
         Self {
             config,
@@ -71,6 +75,7 @@ impl DaemonState {
             sync: SyncHub::default(),
             sessions: SessionHub::default(),
             provers: Arc::new(Provers::new()),
+            logs,
             started_at: unix_now(),
             shutdown: Notify::new(),
         }
@@ -249,6 +254,13 @@ impl Gyges for GygesService {
         Ok(Response::new(self.state.info()))
     }
 
+    async fn stream_logs(
+        &self,
+        request: Request<StreamLogsRequest>,
+    ) -> Result<Response<LogStream>, Status> {
+        Ok(Response::new(self.state.logs.stream(request.get_ref())))
+    }
+
     async fn shutdown(
         &self,
         request: Request<ShutdownRequest>,
@@ -343,7 +355,15 @@ mod tests {
         };
         let registry = KeyRegistry::open(Home::new(dir.path()), Network::Regtest, &cfg).unwrap();
         let vault = VaultManager::new(&cfg.vault);
-        let state = DaemonState::new(cfg, Network::Regtest, registry, vault, None, None);
+        let state = DaemonState::new(
+            cfg,
+            Network::Regtest,
+            registry,
+            vault,
+            None,
+            None,
+            Arc::default(),
+        );
         let info = state.info();
         assert_eq!(info.network, v1::Network::Regtest as i32);
         assert_eq!(info.api_version.unwrap().major, gyges_proto::API_MAJOR);

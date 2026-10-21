@@ -108,9 +108,9 @@ The `CompleteKeystoneSign` path is tested in-process by feeding `batch_result.ur
 
 Scenario 18 is the enforcement; the mechanism is tested at three levels:
 
-1. **Type level:** `Sensitive<T>` `Debug`/`Display` print `[redacted]`; a compile-fail test (`trybuild`) shows that `UnifiedSpendingKey`, `Mnemonic` and `SecretBox` cannot be formatted with `{:?}` under the workspace clippy configuration (`disallowed_methods` / `missing_debug_implementations` denied for key types).
-2. **Subscriber level:** a unit test installs the production `tracing` layer stack, emits events with every sensitive field type, and asserts the rendered lines.
-3. **System level:** after scenarios 1–13 the harness greps `gygesd.log` and `audit.log` for every address, memo, amount (as decimal and zatoshi) and txid the scenarios used. `audit.log` may contain key ids and session ids only.
+1. **Type level:** `gyges_core::log::Sensitive<T>` `Debug`/`Display` print `[redacted]` (`log::tests`, including a derived `Debug` on a container and width/padding specifiers). *Not done:* the planned `trybuild` compile-fail test that `UnifiedSpendingKey`, `Mnemonic` and `SecretBox` cannot be formatted; those types derive `Debug` upstream and no clippy configuration can deny a derive in another crate, so this is enforced by review.
+2. **Subscriber level:** `gygesd::logs::tests` install the production layer stack (`gygesd::logs::layers`, the same function `main` uses) over in-memory writers, emit events with `%Sensitive` and `?Sensitive` fields and assert the rendered main-log lines, the `audit.log` JSON lines (keys, independence from the configured level) and the `StreamLogs` entries (replay, `min_level`, a follower joining during a replay).
+3. **System level:** `scenarios/tx.rs` runs the fake-node send and then sweeps every file in `logs/` and both `gyges daemon logs` streams for the recipient address, the txid, the amounts (as zatoshis and decimal) and the passphrase, parses `audit.log` line by line (allowed keys: `timestamp`, `level`, `event`, `key_id`, `scope`, `via`, `from`) and checks the event order of a passphrase-session send; `scenarios/keys.rs` greps for the passphrase and every mnemonic word. The real-node version over scenarios 1–13 waits for the harness item.
 
 ---
 

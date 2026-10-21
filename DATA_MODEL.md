@@ -19,7 +19,7 @@ One home per network (Q-C2). `GYGES_HOME` (default `~/.gyges`) is the root.
     │   └── blocks.sqlite        # Shared CompactBlock cache (§6)
     ├── logs/
     │   ├── gygesd.YYYY-MM-DD.log  # tracing-appender, daily rotation, 7 kept
-    │   └── audit.log            # Security-relevant events, key id + time only
+    │   └── audit.log            # Security-relevant events as JSON lines, key id + time only; never rotated
     └── keys/
         └── <key_id>/
             ├── profile.json     # KeyProfile metadata (§3)
