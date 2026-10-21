@@ -18,7 +18,7 @@ How Gyges is tested, from unit tests to a nightly run through a real Tor network
 
 ## 2. Regtest Harness (`tests/regtest/`)
 
-**Status:** the crate exists. `harness/lib.rs` runs `gygesd` and `gyges` against a temporary `GYGES_HOME` (building both binaries once per test process so they are never stale) and `scenarios/daemon.rs` covers the daemon lifecycle, the handshake and the permission and single-instance refusals. The node and archival processes below are not wired in yet.
+**Status:** the crate exists. `harness/lib.rs` runs `gygesd` and `gyges` against a temporary `GYGES_HOME` (building both binaries once per test process so they are never stale); `scenarios/daemon.rs` covers the daemon lifecycle, the handshake and the permission and single-instance refusals; `scenarios/keys.rs` covers `key list / init / restore` without a node (scripted `--json` init on an air-gapped daemon, restore from stdin at the default birthday, the exit-4 and exit-7 refusals, the permission re-check on restart, and a log grep for the passphrase and mnemonic). The node and archival processes below are not wired in yet.
 
 ### 2.1 Components
 
@@ -42,7 +42,8 @@ tests/regtest/
 ```rust
 let fx = Fixture::start(RegtestOpts { tx_retention: 200, indexer: true }).await?;
 fx.mine(10).await?;
-let key = fx.gyges(["key", "init", "--id", "main"]).passphrase("test").run_json().await?;
+let pw = fx.passphrase_file("test");                                   // today: GYGES_PASSPHRASE_FILE
+let key = fx.gyges(&["key", "init", "--id", "main", "--json"]).env("GYGES_PASSPHRASE_FILE", &pw).run().json();
 fx.fund_shielded(&key.address, Zatoshis::from_u64(1_000_000_000)).await?;   // coinbase -> shield -> mine
 fx.gyges(["sync", "wait", "--until", "spendable"]).run().await?;
 ```

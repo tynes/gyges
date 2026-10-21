@@ -11,10 +11,13 @@
 //!    (DATA_MODEL.md §1, Q-S7);
 //! 2. load `config.toml`, apply the command-line overrides, validate;
 //! 3. take the advisory lock on `gygesd.pid`;
-//! 4. bind `gygesd.sock`, set its mode, serve until a shutdown signal.
+//! 4. load every `keys/<id>/` profile and open its wallet database
+//!    (`KeyRegistry`), refusing on a broken or too-wide key directory;
+//! 5. bind `gygesd.sock`, set its mode, serve until a shutdown signal.
 
 #![forbid(unsafe_code)]
 
+pub mod keys;
 pub mod lifecycle;
 pub mod policy;
 pub mod service;
@@ -24,7 +27,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use gyges_core::{Config, Home, Network, perms};
+use gyges_chain::ChainBackend;
+use gyges_core::{Config, Home, KeyRegistry, Network, perms};
 use gyges_proto::v1::gyges_server::GygesServer;
 use tokio::net::UnixListener;
 use tokio_stream::StreamExt as _;
@@ -50,6 +54,10 @@ pub struct Options {
     pub fallback_lwd: Option<String>,
     /// `--no-tor`.
     pub no_tor: bool,
+    /// The node backend. `None` until `ZakuraRpcBackend` lands (ROADMAP.md
+    /// M1); tests inject a fake. Anything needing the node answers
+    /// `NODE_UNREACHABLE` meanwhile.
+    pub chain: Option<Arc<dyn ChainBackend>>,
 }
 
 impl Options {
@@ -62,6 +70,7 @@ impl Options {
             zakura_cookie: None,
             fallback_lwd: None,
             no_tor: false,
+            chain: None,
         }
     }
 
@@ -124,7 +133,11 @@ impl Daemon {
             .with_context(|| format!("invalid configuration in {}", config_path.display()))?;
 
         let pid = PidLock::acquire(&home.pid_path(network))?;
-        let state = Arc::new(DaemonState::new(config, network));
+        // Only after the lock: opening the wallet databases runs their
+        // migrations, which must not race a running daemon.
+        let registry = KeyRegistry::open(home.clone(), network, &config)
+            .context("refusing to start: a key directory is unusable")?;
+        let state = Arc::new(DaemonState::new(config, network, registry, opts.chain));
         Ok(Self {
             home,
             network,
@@ -141,7 +154,7 @@ impl Daemon {
         self.home.socket_path(self.network)
     }
 
-    /// Step 4: bind the socket and serve until `shutdown` resolves or the
+    /// Step 5: bind the socket and serve until `shutdown` resolves or the
     /// `Shutdown` RPC is called. Removes the socket file afterwards; the pid
     /// file goes when `self` is dropped.
     pub async fn serve(self, shutdown: impl Future<Output = ()> + Send) -> anyhow::Result<()> {

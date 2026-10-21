@@ -28,7 +28,7 @@ gyges/
 ├── crates/
 │   ├── gyges-proto/             # tonic-prost-build output, proto3 JSON impls, GygesError <-> Status, UDS connector, API version constants
 │   ├── gyges-qr/                # UTF-8 half-block QR renderer, BC-UR codec, registry tags 49201-49207
-│   ├── gyges-chain/             # CompactBlockSource: ZakuraRpcBackend (Case A) + ArtiTorLwdBackend (Case B)
+│   ├── gyges-chain/             # ChainBackend (node bounds, tree state) + CompactBlockSource: ZakuraRpcBackend (Case A), ArtiTorLwdBackend (Case B)
 │   ├── gyges-core/              # config.toml, paths, permission sweep; KeyRegistry, VaultManager, SyncScheduler, TxEngine, TexQueue
 │   ├── gygesd/                  # daemon: library (startup checks, pid lock, UDS server, policy layer, service) + thin binary
 │   └── gyges-cli/               # `gyges` binary: command router, handshake, exit codes, prompts, QR TUI

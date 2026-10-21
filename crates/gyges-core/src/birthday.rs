@@ -1,0 +1,204 @@
+//! Turning a birthday height into the `AccountBirthday` the wallet database
+//! needs (SYNC.md §"New or restored key", DATA_MODEL.md §3 defaults).
+//!
+//! An account born at height `h` needs the note commitment tree state as of
+//! the end of block `h - 1`. Below Sapling activation both trees are empty,
+//! so no node is needed; above it the local node's `z_gettreestate` is the
+//! only source in this milestone, and a pruned node can answer only for
+//! `h - 1 >= retained_from`. Restores below that need the Tor backfill
+//! (ROADMAP.md M2).
+
+use gyges_chain::{ChainBackend, ChainError};
+use zcash_client_backend::data_api::AccountBirthday;
+use zcash_client_backend::data_api::chain::ChainState;
+use zcash_primitives::block::BlockHash;
+use zcash_protocol::consensus::BlockHeight;
+
+use crate::network::Network;
+
+/// A birthday height together with the chain state the wallet is seeded with.
+#[derive(Clone, Debug)]
+pub struct ResolvedBirthday {
+    pub height: u32,
+    pub birthday: AccountBirthday,
+}
+
+/// Why a birthday could not be resolved.
+#[derive(Debug, thiserror::Error)]
+pub enum BirthdayError {
+    /// The requested height needs the node's tree state and no node backend
+    /// is connected.
+    #[error("a connected node is required to {0}")]
+    NodeRequired(&'static str),
+    #[error("birthday {height} is above the node's tip {tip}")]
+    AboveTip { height: u32, tip: u32 },
+    /// `height - 1 < retained_from`: the node has pruned the tree state the
+    /// account would start from.
+    #[error(
+        "birthday {height} is below the node's retention window (retained from {retained_from}); \
+         a historical restore over Tor is needed"
+    )]
+    BelowRetention { height: u32, retained_from: u32 },
+    #[error(transparent)]
+    Chain(#[from] ChainError),
+}
+
+/// Resolve `requested` (or, when `None`, the node's current tip) into a
+/// birthday. The result is never below Sapling activation, because nothing
+/// shielded can exist before it.
+pub async fn resolve(
+    network: Network,
+    chain: Option<&dyn ChainBackend>,
+    requested: Option<u32>,
+) -> Result<ResolvedBirthday, BirthdayError> {
+    let sapling = network.sapling_activation_height();
+    let height = match requested {
+        Some(h) => h,
+        None => {
+            let bounds = chain
+                .ok_or(BirthdayError::NodeRequired(
+                    "use the chain tip as the birthday; pass --birthday",
+                ))?
+                .node_bounds()
+                .await?;
+            u32::from(bounds.tip_height)
+        }
+    }
+    .max(sapling);
+    let prior = height - 1;
+
+    if prior < sapling {
+        // Empty trees by definition; the hash is informational here and the
+        // scanner only checks continuity between blocks it has scanned.
+        let state = ChainState::empty(BlockHeight::from_u32(prior), BlockHash([0; 32]));
+        return Ok(ResolvedBirthday {
+            height,
+            birthday: AccountBirthday::from_parts(state, None),
+        });
+    }
+
+    let chain = chain.ok_or(BirthdayError::NodeRequired(
+        "fetch the tree state at the birthday",
+    ))?;
+    let bounds = chain.node_bounds().await?;
+    let tip = u32::from(bounds.tip_height);
+    if height > tip + 1 {
+        return Err(BirthdayError::AboveTip { height, tip });
+    }
+    let retained_from = u32::from(bounds.retained_from);
+    if prior < retained_from {
+        return Err(BirthdayError::BelowRetention {
+            height,
+            retained_from,
+        });
+    }
+    let state = chain.chain_state(BlockHeight::from_u32(prior)).await?;
+    Ok(ResolvedBirthday {
+        height,
+        birthday: AccountBirthday::from_parts(state, None),
+    })
+}
+
+/// A node that answers from a fixed tip and empty trees, for tests of the
+/// code above `ChainBackend`.
+#[derive(Clone, Debug)]
+pub struct FixedChain {
+    pub tip: u32,
+    pub retained_from: u32,
+}
+
+impl ChainBackend for FixedChain {
+    fn node_bounds(
+        &self,
+    ) -> gyges_chain::BoxFuture<'_, Result<gyges_chain::NodeBounds, ChainError>> {
+        Box::pin(async move {
+            Ok(gyges_chain::NodeBounds {
+                tip_height: BlockHeight::from_u32(self.tip),
+                tip_hash: [0xaa; 32],
+                retained_from: BlockHeight::from_u32(self.retained_from),
+            })
+        })
+    }
+
+    fn chain_state(
+        &self,
+        height: BlockHeight,
+    ) -> gyges_chain::BoxFuture<'_, Result<ChainState, ChainError>> {
+        Box::pin(async move {
+            if u32::from(height) < self.retained_from {
+                return Err(ChainError::TreeStateUnavailable {
+                    height,
+                    retained_from: BlockHeight::from_u32(self.retained_from),
+                });
+            }
+            Ok(ChainState::empty(height, BlockHash([0xbb; 32])))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pre_sapling_birthdays_need_no_node() {
+        let r = resolve(Network::Mainnet, None, Some(419_200))
+            .await
+            .unwrap();
+        assert_eq!(r.height, 419_200);
+        assert_eq!(u32::from(r.birthday.height()), 419_200);
+        // Anything lower is clamped up to Sapling activation.
+        let r = resolve(Network::Mainnet, None, Some(5)).await.unwrap();
+        assert_eq!(r.height, 419_200);
+        // Regtest: Sapling at 1, prior state at 0.
+        let r = resolve(Network::Regtest, None, Some(1)).await.unwrap();
+        assert_eq!(r.height, 1);
+    }
+
+    #[tokio::test]
+    async fn later_birthdays_need_the_node() {
+        let err = resolve(Network::Mainnet, None, Some(2_000_000))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BirthdayError::NodeRequired(_)), "{err}");
+        let err = resolve(Network::Regtest, None, None).await.unwrap_err();
+        assert!(matches!(err, BirthdayError::NodeRequired(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn node_backed_resolution_respects_tip_and_retention() {
+        let chain = FixedChain {
+            tip: 1000,
+            retained_from: 800,
+        };
+        let r = resolve(Network::Regtest, Some(&chain), None).await.unwrap();
+        assert_eq!(r.height, 1000);
+        assert_eq!(u32::from(r.birthday.height()), 1000);
+
+        let r = resolve(Network::Regtest, Some(&chain), Some(801))
+            .await
+            .unwrap();
+        assert_eq!(r.height, 801);
+        let err = resolve(Network::Regtest, Some(&chain), Some(800))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BirthdayError::BelowRetention {
+                    height: 800,
+                    retained_from: 800
+                }
+            ),
+            "{err}"
+        );
+        let err = resolve(Network::Regtest, Some(&chain), Some(1002))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BirthdayError::AboveTip { .. }), "{err}");
+        // tip + 1 is allowed: the account starts with the next block.
+        resolve(Network::Regtest, Some(&chain), Some(1001))
+            .await
+            .unwrap();
+    }
+}

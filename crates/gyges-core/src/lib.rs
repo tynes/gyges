@@ -1,24 +1,31 @@
 //! Daemon-side wallet logic (ARCHITECTURE.md §2, DATA_MODEL.md).
 //!
-//! Components, each with its own module once implemented:
-//! * `KeyRegistry` – enumerates `keys/<id>/profile.json`, owns one `WalletDb`
-//!   per key, validates permissions at startup (Q-S7);
-//! * `VaultManager` – `seed.age` encryption, connection-scoped signing
-//!   sessions and TTL eviction (Q-S1, Q-S3, Q-S5);
+//! Components, each with its own module:
+//! * [`registry::KeyRegistry`] – enumerates `keys/<id>/profile.json`, owns one
+//!   `WalletDb` per key, validates permissions at startup (Q-S7);
+//! * `VaultManager` – `seed.age` encryption ([`vault`], done), connection-scoped
+//!   signing sessions and TTL eviction (Q-S1, Q-S3, Q-S5; next);
 //! * `SyncScheduler` – per-key state machine over `gyges_chain` (SYNC.md);
 //! * `TxEngine` – proposal → PCZT roles → broadcast (Q-K3, Q-K4, Q-K7);
 //! * `TexQueue` – durable two-step ZIP 320 broadcaster (Q-T1…T3).
 
 #![forbid(unsafe_code)]
 
+pub mod birthday;
 pub mod config;
 pub mod network;
 pub mod paths;
 pub mod perms;
+pub mod profile;
+pub mod registry;
+pub mod vault;
 
+pub use birthday::{BirthdayError, ResolvedBirthday};
 pub use config::{Config, ConfigError};
-pub use network::Network;
+pub use network::{ConsensusParams, Network};
 pub use paths::Home;
+pub use profile::{KeyProfile, ProfileError};
+pub use registry::{KeyEntry, KeyRegistry, NewLocalSeedKey, RegistryError};
 
 /// How a key profile signs (DATA_MODEL.md `profile.json`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

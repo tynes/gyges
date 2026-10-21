@@ -2260,11 +2260,14 @@ dependencies = [
  "gyges-proto",
  "gyges-qr",
  "humantime",
+ "rand 0.10.3",
  "rpassword",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tonic",
+ "zeroize",
 ]
 
 [[package]]
@@ -2275,9 +2278,11 @@ dependencies = [
  "bip0039",
  "gyges-chain",
  "hex",
+ "humantime",
  "humantime-serde",
  "rand 0.10.3",
  "rusqlite",
+ "schemerz",
  "secrecy 0.8.0",
  "serde",
  "serde_json",
@@ -2301,6 +2306,7 @@ dependencies = [
  "zakura-sapling-crypto",
  "zakura-transparent",
  "zeroize",
+ "zip32",
 ]
 
 [[package]]
@@ -2344,6 +2350,7 @@ dependencies = [
 name = "gygesd"
 version = "0.1.0"
 dependencies = [
+ "age",
  "anyhow",
  "clap",
  "gyges-chain",
@@ -2360,6 +2367,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

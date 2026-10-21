@@ -245,7 +245,7 @@ fn config_errors_refuse_start_and_cli_start_relays_them() {
 #[test]
 fn unimplemented_commands_exit_1_not_2() {
     let fx = Fixture::new("regtest");
-    let run = fx.gyges(&["key", "list"]).run();
+    let run = fx.gyges(&["key", "export-seed"]).run();
     assert_eq!(run.code(), 1, "{run:?}");
     assert!(run.stderr.contains("not implemented yet"), "{}", run.stderr);
     // Usage errors are still exit 2.

@@ -9,6 +9,7 @@ use tonic::transport::Channel;
 
 use crate::Global;
 use crate::exit::CliError;
+use crate::prompt::Prompter;
 
 /// The global options, resolved.
 #[derive(Clone, Debug)]
@@ -16,8 +17,14 @@ pub struct Ctx {
     pub socket: PathBuf,
     /// Given explicitly (flag or `GYGES_NETWORK`); checked against the daemon.
     pub network: Option<Network>,
+    /// `--key` / `GYGES_KEY`, passed through verbatim; empty means the
+    /// daemon's default (API.md §1.4). Consumed by the per-key commands
+    /// (`balance`, `sync`, `tx`) as they land.
+    #[allow(dead_code)]
+    pub key: String,
     pub json: bool,
     pub quiet: bool,
+    pub prompter: Prompter,
 }
 
 /// A connected, handshaken client.
@@ -33,13 +40,16 @@ impl Ctx {
             Some(p) => p,
             None => default_socket(g.network.unwrap_or(Network::Mainnet))?,
         };
-        // `--key`, `--non-interactive` and `--passphrase-fd` are parsed but
-        // only the key and transaction commands (ROADMAP.md M1) consume them.
         Ok(Self {
             socket,
             network: g.network,
+            key: g.key.unwrap_or_default(),
             json: g.json,
             quiet: g.quiet,
+            prompter: Prompter {
+                non_interactive: g.non_interactive,
+                passphrase_fd: g.passphrase_fd,
+            },
         })
     }
 

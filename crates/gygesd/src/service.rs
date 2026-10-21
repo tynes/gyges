@@ -6,20 +6,27 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gyges_core::{Config, Network};
+use gyges_chain::ChainBackend;
+use gyges_core::{Config, KeyRegistry, Network};
 use gyges_proto::v1::gyges_server::Gyges;
 use gyges_proto::v1::{
-    self, ApiVersion, FallbackStatus, FallbackTrust, GetInfoRequest, GetInfoResponse, NodeStatus,
-    ShutdownRequest, ShutdownResponse, TorState, TorStatus,
+    self, ApiVersion, FallbackStatus, FallbackTrust, GetInfoRequest, GetInfoResponse,
+    InitKeyRequest, InitKeyResponse, ListKeysRequest, ListKeysResponse, NodeStatus,
+    RestoreKeyRequest, RestoreKeyResponse, ShutdownRequest, ShutdownResponse, TorState, TorStatus,
 };
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
+
+use crate::keys;
 
 /// Everything the RPC handlers share.
 #[derive(Debug)]
 pub struct DaemonState {
     pub config: Config,
     pub network: Network,
+    pub registry: KeyRegistry,
+    /// `None` until the node backend exists (ROADMAP.md M1).
+    pub chain: Option<Arc<dyn ChainBackend>>,
     /// Unix seconds the daemon started.
     pub started_at: i64,
     /// Signalled by `Shutdown` (and by the signal handlers in `main`).
@@ -27,10 +34,17 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
-    pub fn new(config: Config, network: Network) -> Self {
+    pub fn new(
+        config: Config,
+        network: Network,
+        registry: KeyRegistry,
+        chain: Option<Arc<dyn ChainBackend>>,
+    ) -> Self {
         Self {
             config,
             network,
+            registry,
+            chain,
             started_at: unix_now(),
             shutdown: Notify::new(),
         }
@@ -68,8 +82,8 @@ impl DaemonState {
                     FallbackTrust::Unspecified as i32
                 },
             }),
-            keys: Vec::new(),
-            default_key: self.config.default_key.clone(),
+            keys: keys::summaries(self),
+            default_key: self.registry.default_key(),
             started_at: self.started_at,
             unlock_ttl_secs: self
                 .config
@@ -133,26 +147,58 @@ impl Gyges for GygesService {
         self.state.shutdown.notify_one();
         Ok(Response::new(ShutdownResponse {}))
     }
+
+    async fn list_keys(
+        &self,
+        _request: Request<ListKeysRequest>,
+    ) -> Result<Response<ListKeysResponse>, Status> {
+        Ok(Response::new(ListKeysResponse {
+            keys: keys::summaries(&self.state),
+        }))
+    }
+
+    async fn init_key(
+        &self,
+        request: Request<InitKeyRequest>,
+    ) -> Result<Response<InitKeyResponse>, Status> {
+        keys::init_key(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn restore_key(
+        &self,
+        request: Request<RestoreKeyRequest>,
+    ) -> Result<Response<RestoreKeyResponse>, Status> {
+        keys::restore_key(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gyges_core::{Home, perms};
 
     #[test]
     fn info_reports_version_network_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        perms::set_mode(dir.path(), 0o700).unwrap();
         let cfg = Config {
             default_key: "main".into(),
             airgapped: true,
             ..Config::default()
         };
-        let state = DaemonState::new(cfg, Network::Regtest);
+        let registry = KeyRegistry::open(Home::new(dir.path()), Network::Regtest, &cfg).unwrap();
+        let state = DaemonState::new(cfg, Network::Regtest, registry, None);
         let info = state.info();
         assert_eq!(info.network, v1::Network::Regtest as i32);
         assert_eq!(info.api_version.unwrap().major, gyges_proto::API_MAJOR);
         assert_eq!(info.daemon_version, env!("CARGO_PKG_VERSION"));
         assert!(info.airgapped);
         assert_eq!(info.default_key, "main");
+        assert!(info.keys.is_empty());
         assert_eq!(info.unlock_ttl_secs, 300);
         assert_eq!(info.default_min_confirmations, 10);
         assert!(!info.node.unwrap().connected);

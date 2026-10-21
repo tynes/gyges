@@ -14,7 +14,9 @@
 mod client;
 mod daemon;
 mod exit;
+mod key;
 mod output;
+mod prompt;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -71,7 +73,8 @@ enum Command {
     #[command(subcommand)]
     Daemon(daemon::DaemonCmd),
     /// Key profiles and vault unlock/lock.
-    Key(Unimplemented),
+    #[command(subcommand)]
+    Key(key::KeyCmd),
     /// Synchronisation status and control.
     Sync(Unimplemented),
     /// Addresses and terminal QR codes.
@@ -115,7 +118,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
     let ctx = Ctx::new(cli.global)?;
     match cli.command {
         Command::Daemon(cmd) => daemon::run(&ctx, cmd).await,
-        Command::Key(_) => Err(CliError::NotImplemented("key")),
+        Command::Key(cmd) => key::run(&ctx, cmd).await,
         Command::Sync(_) => Err(CliError::NotImplemented("sync")),
         Command::Address(_) => Err(CliError::NotImplemented("address")),
         Command::Balance(_) => Err(CliError::NotImplemented("balance")),
@@ -146,7 +149,38 @@ mod tests {
 
     #[test]
     fn unimplemented_groups_accept_any_arguments() {
-        Cli::try_parse_from(["gyges", "key", "list", "--all"]).unwrap();
+        Cli::try_parse_from(["gyges", "key", "unlock", "--timeout", "5m"]).unwrap();
         Cli::try_parse_from(["gyges", "tx", "send", "--to", "u1x", "--amount", "1"]).unwrap();
+    }
+
+    #[test]
+    fn key_commands_parse_per_spec() {
+        let cli =
+            Cli::try_parse_from(["gyges", "key", "init", "--id", "main", "--set-default"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Key(key::KeyCmd::Init(ref a)) if a.id == "main" && a.set_default)
+        );
+        let cli = Cli::try_parse_from([
+            "gyges",
+            "key",
+            "restore",
+            "--id",
+            "r",
+            "--birthday",
+            "100",
+            "--stdin",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Key(key::KeyCmd::Restore(ref a)) if a.birthday == Some(100) && a.stdin && a.yes
+        ));
+        assert!(
+            Cli::try_parse_from(["gyges", "key", "init"]).is_err(),
+            "--id is required"
+        );
+        let cli = Cli::try_parse_from(["gyges", "--passphrase-fd", "3", "key", "list"]).unwrap();
+        assert_eq!(cli.global.passphrase_fd, Some(3));
     }
 }

@@ -91,13 +91,17 @@ Streams structured daemon logs through the `StreamLogs` RPC (the CLI never tails
 ### 2.2 Keys and vault (`gyges key`)
 
 #### `gyges key list`
-Lists key profiles with `SigningMode` (`local-seed`, `keystone-qr`, `watch-only`, `signer-only`), `LOCKED`/`UNLOCKED`, `birthday_height`, `scanned_tip` and sync state.
+Lists key profiles with `SigningMode` (`local-seed`, `keystone-qr`, `watch-only`, `signer-only`), `locked`/`UNLOCKED`, `birthday_height`, `scanned_tip` and sync state (sync state arrives with `SyncScheduler`; `signer-only` profiles show `-` for birthday and scanned tip).
 
 #### `gyges key init --id <KEY_ID> [--set-default]`
 Generates 24-word BIP 39 entropy, sets `birthday_height` to the node's current tip, initialises `wallet.sqlite`, encrypts `seed.age` with a passphrase (prompted twice), displays the mnemonic once and requires three randomly chosen words to be typed back before continuing. TTY required (exit 4 otherwise).
 
-#### `gyges key restore --id <KEY_ID> [--birthday <HEIGHT>] [--stdin]`
-Restores a 24-word mnemonic. `--birthday` is strongly recommended; when omitted the CLI warns and uses the Sapling activation height (419,200 on mainnet), which implies a full backfill over Tor. If the birthday is below the node's `retained_from`, the daemon backfills over the configured fallback endpoint first; the first such restore asks `N blocks below the node's retention height must be fetched over Tor from <url>; continue? [y/N]` (`--yes` for scripts).
+- **Scripted form.** With `--json` *and* a passphrase source (`--passphrase-fd` or `GYGES_PASSPHRASE_FILE`) no terminal is needed: the `InitKeyResponse` (mnemonic included) is printed as JSON and nothing is typed back. This is the form the regtest suite uses. `--json` without a passphrase source is still refused (exit 4, `CONFIRMATION_REQUIRED`).
+- **Air-gapped daemon.** Against `gygesd --airgapped` the command creates a `signer-only` profile (seed and profile, no wallet, no birthday), the only mode an air-gapped box needs.
+- `--set-default` applies until the daemon restarts; the daemon never rewrites `config.toml`, so the CLI prints the `default_key = "<id>"` line to add. The same holds for `key restore --set-default`.
+
+#### `gyges key restore --id <KEY_ID> [--birthday <HEIGHT>] [--stdin] [--yes] [--set-default]`
+Restores a 24-word mnemonic, read from a hidden prompt or, with `--stdin`, from standard input. `--birthday` is strongly recommended; when omitted the CLI warns and uses the Sapling activation height (419,200 on mainnet), which implies a full backfill over Tor. If the birthday is below the node's `retained_from`, the daemon backfills over the configured fallback endpoint first; the first such restore asks `N blocks below the node's retention height must be fetched over Tor from <url>; continue? [y/N]` (`--yes` for scripts). Until the Tor backfill lands (ROADMAP.md M2) such a restore is refused with exit 7 (`FALLBACK_UNAVAILABLE`) after the consent step; any birthday above Sapling activation needs the node's tree state and exits 7 (`NODE_UNREACHABLE`) when no node is connected.
 
 #### `gyges key import-keystone --id <KEY_ID> --birthday <HEIGHT> [--ur <UR_STRING>]`
 Registers a Keystone 3 Pro profile from `ur:zcash-accounts` (tag 49201), `ur:zcash-unified-full-viewing-key` (49203) or a bare `uview1…` string. The accounts payload carries **no birthday**, so `--birthday` is required or prompted; the prompt defaults to the NU5 activation height (1,687,104 on mainnet). Records `device_version` and refuses firmware below the minimum.
