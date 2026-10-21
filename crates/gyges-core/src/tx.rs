@@ -45,14 +45,16 @@ use zcash_client_backend::data_api::wallet::input_selection::{
     CoinbasePolicy, GreedyInputSelector, SpendPolicy, TransparentSpendPolicy,
 };
 use zcash_client_backend::data_api::wallet::{
-    ConfirmationsPolicy, create_pczt_from_proposal, extract_and_store_transaction_from_pczt,
-    propose_shielding, propose_transfer,
+    ConfirmationsPolicy, SpendingKeys, create_pczt_from_proposal, create_proposed_transactions,
+    extract_and_store_transaction_from_pczt, propose_shielding, propose_transfer,
 };
-use zcash_client_backend::data_api::{CoinbaseFilter, WalletRead as _};
+use zcash_client_backend::data_api::{CoinbaseFilter, InputSource as _, WalletRead as _};
 use zcash_client_backend::fees::standard::SingleOutputChangeStrategy;
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule};
-use zcash_client_backend::proposal::{Proposal, Step};
-use zcash_client_backend::wallet::{Note, OvkPolicy, TransparentAddressSource};
+use zcash_client_backend::proposal::{Proposal, Step, StepOutputIndex};
+use zcash_client_backend::wallet::{
+    Note, OvkPolicy, TransparentAddressSource, WalletTransparentOutput,
+};
 use zcash_client_backend::zip321::{Payment, TransactionRequest};
 use zcash_client_sqlite::{AccountUuid, ReceivedNoteId};
 use zcash_keys::address::Address;
@@ -114,21 +116,16 @@ pub type SendProposal = Proposal<StandardFeeRule, ReceivedNoteId>;
 /// A shielding proposal: transparent inputs only, so no note references.
 pub type ShieldProposal = Proposal<StandardFeeRule, Infallible>;
 
-/// Parse a recipient for the network. TEX addresses parse but are refused
-/// until the ZIP 320 queue exists (ROADMAP.md M3).
+/// Parse a recipient for the network. A ZIP 320 (`tex1`) recipient parses
+/// like any other; `propose_send` then yields the two-step proposal of
+/// ARCHITECTURE.md §3.3.
 pub fn parse_recipient(params: &ConsensusParams, s: &str) -> Result<Address, TxError> {
     let s = s.trim();
-    let addr = Address::decode(params, s).ok_or_else(|| {
+    Address::decode(params, s).ok_or_else(|| {
         TxError::InvalidArgument(
             "the recipient is not a valid address for this network".to_string(),
         )
-    })?;
-    if matches!(addr, Address::Tex(_)) {
-        return Err(TxError::UnsupportedPool(
-            "ZIP 320 (tex1) recipients arrive with the TexQueue (ROADMAP.md M3)".to_string(),
-        ));
-    }
-    Ok(addr)
+    })
 }
 
 /// CLI_SPEC.md §1.5: a memo goes only to a recipient with a shielded
@@ -428,7 +425,11 @@ pub fn default_expiry(params: &ConsensusParams, target: BlockHeight) -> BlockHei
     target + delta
 }
 
-fn summarize_step<N>(params: &ConsensusParams, step: &Step<N>) -> StepSummary {
+fn summarize_step<N>(
+    params: &ConsensusParams,
+    proposal: &Proposal<StandardFeeRule, N>,
+    step: &Step<N>,
+) -> StepSummary {
     let mut inputs: Vec<InputSummary> = Vec::new();
     let mut add_input = |pool: Pool, value: u64| match inputs.iter_mut().find(|i| i.pool == pool) {
         Some(i) => {
@@ -443,6 +444,27 @@ fn summarize_step<N>(params: &ConsensusParams, step: &Step<N>) -> StepSummary {
     };
     for utxo in step.transparent_inputs() {
         add_input(Pool::Transparent, utxo.value().into_u64());
+    }
+    // ZIP 320 step 2 spends an output of step 1 (the ephemeral one): shown
+    // as the transparent input it will be.
+    for prior in step.prior_step_inputs() {
+        let Some(prior_step) = proposal.steps().get(prior.step_index()) else {
+            continue;
+        };
+        let value = match prior.output_index() {
+            StepOutputIndex::Change(i) => prior_step
+                .balance()
+                .proposed_change()
+                .get(i)
+                .map_or(0, |c| c.value().into_u64()),
+            StepOutputIndex::Payment(i) => prior_step
+                .transaction_request()
+                .payments()
+                .get(&i)
+                .and_then(|p| p.amount())
+                .map_or(0, Zatoshis::into_u64),
+        };
+        add_input(Pool::Transparent, value);
     }
     if let Some(shielded) = step.shielded_inputs() {
         for note in shielded.notes() {
@@ -512,7 +534,7 @@ pub fn summarize<N>(
     let steps: Vec<StepSummary> = proposal
         .steps()
         .iter()
-        .map(|s| summarize_step(params, s))
+        .map(|s| summarize_step(params, proposal, s))
         .collect();
     let total_fee = steps.iter().map(|s| s.fee).sum::<u64>();
     let total_debit = steps
@@ -1041,6 +1063,291 @@ pub fn extract_and_store(
     Ok((txid, raw))
 }
 
+// ---------------------------------------------------------------------------
+// ZIP 320 (ARCHITECTURE.md §3.3)
+// ---------------------------------------------------------------------------
+
+/// Whether a proposal is the two-step shape a `tex1` recipient produces.
+pub fn is_two_step<N>(proposal: &Proposal<StandardFeeRule, N>) -> bool {
+    proposal.steps().len() == 2
+}
+
+/// Both transactions of a ZIP 320 transfer, signed, as the queue stores
+/// them (`gyges_core::tex::TexRow` minus the bookkeeping).
+#[derive(Clone, Debug)]
+pub struct TexBuilt {
+    pub step1_txid: TxId,
+    pub step1_raw: Vec<u8>,
+    pub step2_txid: TxId,
+    pub step2_raw: Vec<u8>,
+    /// The ephemeral `t1…` step 1 pays, as the wallet encodes it.
+    pub ephemeral_addr: String,
+    /// The `tex1…` recipient, as the wallet encodes it.
+    pub recipient: String,
+    /// Step 2's single output, in zatoshis.
+    pub amount: u64,
+    pub expiry_height: u32,
+}
+
+/// The raw bytes and the parsed form of a transaction the wallet stored.
+fn stored_transaction(
+    wallet: &Wallet,
+    txid: TxId,
+) -> Result<(zcash_primitives::transaction::Transaction, Vec<u8>), TxError> {
+    let tx = wallet
+        .get_transaction(txid)
+        .map_err(|e| internal("reading the stored transaction", e))?
+        .ok_or_else(|| TxError::Internal("a created transaction was not stored".into()))?;
+    let mut raw = Vec::new();
+    tx.write(&mut raw)
+        .map_err(|e| internal("serialising the transaction", e))?;
+    Ok((tx, raw))
+}
+
+/// Build, prove, sign and store both steps of a two-step proposal with
+/// `create_proposed_transactions` (the upstream PCZT path takes
+/// single-step proposals only, so for ZIP 320 the roles run inside the
+/// builder with the key present: `SignatureRequired` precedes `Proving`
+/// for these sends, API.md §9). Both steps share `expiry_height`.
+pub fn create_tex_transactions(
+    wallet: &mut Wallet,
+    params: &ConsensusParams,
+    account: AccountUuid,
+    proposal: &SendProposal,
+    usk: UnifiedSpendingKey,
+    provers: &Provers,
+) -> Result<TexBuilt, TxError> {
+    if !is_two_step(proposal) {
+        return Err(TxError::Internal(format!(
+            "expected a two-step proposal, got {} step(s)",
+            proposal.steps().len()
+        )));
+    }
+    let target = BlockHeight::from(proposal.min_target_height());
+    let expiry = default_expiry(params, target);
+    let txids = run_create_proposed(wallet, params, usk, provers, proposal, expiry)?;
+    let (step1_txid, step2_txid) = match txids.as_slice() {
+        [a, b] => (*a, *b),
+        other => {
+            return Err(TxError::Internal(format!(
+                "the builder returned {} transaction(s) for two steps",
+                other.len()
+            )));
+        }
+    };
+    let (step1, step1_raw) = stored_transaction(wallet, step1_txid)?;
+    let (_, step2_raw) = stored_transaction(wallet, step2_txid)?;
+
+    // The ephemeral address is chosen at build time; it is the step-1
+    // output whose address the wallet knows under the ephemeral key scope.
+    let mut ephemeral = None;
+    for out in step1
+        .transparent_bundle()
+        .into_iter()
+        .flat_map(|b| b.vout.iter())
+    {
+        let Some(addr) = out.recipient_address() else {
+            continue;
+        };
+        let meta = wallet
+            .get_transparent_address_metadata(account, &addr)
+            .map_err(|e| internal("reading address metadata", e))?;
+        if meta.and_then(|m| m.scope()) == Some(transparent::keys::TransparentKeyScope::EPHEMERAL) {
+            ephemeral = Some(addr);
+            break;
+        }
+    }
+    let ephemeral = ephemeral.ok_or_else(|| {
+        TxError::Internal("step 1 has no output at a known ephemeral address".into())
+    })?;
+    let step2 = &proposal.steps()[1];
+    let (recipient, amount) = step2
+        .transaction_request()
+        .payments()
+        .values()
+        .next()
+        .map(|p| {
+            (
+                p.recipient_address().encode(),
+                p.amount().map_or(0, Zatoshis::into_u64),
+            )
+        })
+        .ok_or_else(|| TxError::Internal("step 2 has no payment".into()))?;
+    Ok(TexBuilt {
+        step1_txid,
+        step1_raw,
+        step2_txid,
+        step2_raw,
+        ephemeral_addr: gyges_chain::compact::encode_transparent_address(
+            params.network_type(),
+            &ephemeral,
+        ),
+        recipient,
+        amount,
+        expiry_height: u32::from(expiry),
+    })
+}
+
+fn run_create_proposed<N: fmt::Display>(
+    wallet: &mut Wallet,
+    params: &ConsensusParams,
+    usk: UnifiedSpendingKey,
+    provers: &Provers,
+    proposal: &Proposal<StandardFeeRule, N>,
+    expiry: BlockHeight,
+) -> Result<Vec<TxId>, TxError> {
+    let keys = SpendingKeys::from_unified_spending_key(usk);
+    // The Sapling prover is only consulted for Sapling spends or outputs,
+    // of which a ZIP 320 transfer from an Orchard/Ironwood wallet has none;
+    // the builder still wants one, and the bundled parameters load once per
+    // daemon.
+    let sapling = provers.sapling();
+    let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, N>(
+        wallet,
+        params,
+        sapling,
+        sapling,
+        &keys,
+        OvkPolicy::Sender,
+        proposal,
+        Some(expiry),
+    )
+    .map_err(|e| match e {
+        WalletApiError::InsufficientFunds {
+            available,
+            required,
+        } => TxError::InsufficientFunds {
+            available: available.into_u64(),
+            required: required.into_u64(),
+        },
+        WalletApiError::ScanRequired => TxError::NotSynced("no anchor available".into()),
+        other => TxError::Internal(format!("building the transactions failed: {other}")),
+    })?;
+    Ok(txids.into_iter().collect())
+}
+
+/// `tx resume` after step 1 was mined and step 2 expired (ARCHITECTURE.md
+/// §3.3, TESTING.md §3 row 11): a fresh single transparent transaction
+/// spending the ephemeral output of `step1_txid` to the recipient for
+/// `amount`, paying whatever the ephemeral output holds above it as the
+/// fee (step 2's ZIP 317 fee was fixed at proposal time). Returns the new
+/// txid, its bytes and its expiry.
+///
+/// The wallet treats an ephemeral output as spent until it is told
+/// otherwise (ZIP 320 wallets must not reuse one): `verified_unspent_at`
+/// is the chain height through which the caller confirmed with the node
+/// that nothing spent it, which must be past the old step 2's expiry.
+#[allow(clippy::too_many_arguments)]
+pub fn build_tex_step2(
+    wallet: &mut Wallet,
+    params: &ConsensusParams,
+    usk: UnifiedSpendingKey,
+    provers: &Provers,
+    step1_txid: [u8; 32],
+    ephemeral_addr: &str,
+    recipient: &str,
+    amount: u64,
+    min_confirmations: u32,
+    verified_unspent_at: BlockHeight,
+) -> Result<(TxId, Vec<u8>, u32), TxError> {
+    use std::collections::BTreeMap;
+    use transparent::bundle::OutPoint;
+    use zcash_client_backend::data_api::WalletWrite as _;
+    use zcash_client_backend::fees::TransactionBalance;
+
+    let ephemeral = Address::decode(params, ephemeral_addr)
+        .and_then(|a| a.to_transparent_address())
+        .ok_or_else(|| TxError::Internal("the stored ephemeral address does not decode".into()))?;
+    let recipient_addr = parse_recipient(params, recipient)?;
+    if !matches!(recipient_addr, Address::Tex(_)) {
+        return Err(TxError::Internal(
+            "the stored recipient is not a ZIP 320 address".into(),
+        ));
+    }
+    let (step1, _) = stored_transaction(wallet, TxId::from_bytes(step1_txid))?;
+    let index = step1
+        .transparent_bundle()
+        .into_iter()
+        .flat_map(|b| b.vout.iter().enumerate())
+        .find(|(_, o)| o.recipient_address() == Some(ephemeral))
+        .map(|(i, _)| i as u32)
+        .ok_or_else(|| TxError::Internal("step 1 has no output at the ephemeral address".into()))?;
+    let outpoint = OutPoint::new(step1_txid, index);
+    let policy = confirmations_policy(min_confirmations);
+    let (target, anchor) = wallet
+        .get_target_and_anchor_heights(
+            std::num::NonZeroU32::new(min_confirmations.max(1)).expect("non-zero"),
+        )
+        .map_err(|e| internal("target height", e))?
+        .ok_or_else(|| TxError::NotSynced("no scanned blocks to build on".into()))?;
+    // Spendable at the target height: step 1 mined, and the expired step 2
+    // no longer counts as a pending spend of it (which the wallet accepts
+    // only once the output was seen unspent past that expiry).
+    wallet
+        .notify_output_verified_unspent(outpoint.clone(), verified_unspent_at)
+        .map_err(|e| internal("recording the unspent ephemeral output", e))?;
+    let utxo = wallet
+        .get_unspent_transparent_output(&outpoint, target)
+        .map_err(|e| internal("reading the ephemeral output", e))?
+        .ok_or_else(|| {
+            TxError::Internal(
+                "the ephemeral output is not spendable yet (step 1 unmined, or step 2 not expired)"
+                    .into(),
+            )
+        })?;
+    let value = utxo.txout().value();
+    let amount = Zatoshis::from_u64(amount).map_err(|e| internal("amount", e))?;
+    let fee = (value - amount).ok_or_else(|| TxError::InsufficientFunds {
+        available: value.into_u64(),
+        required: amount.into_u64(),
+    })?;
+    let input = WalletTransparentOutput::<()>::from_parts(
+        outpoint,
+        utxo.txout().clone(),
+        utxo.mined_height(),
+        None,
+        None,
+        None,
+    )
+    .ok_or_else(|| TxError::Internal("the ephemeral output has no recognised script".into()))?;
+
+    let payment = Payment::new(
+        recipient_addr.to_zcash_address(params),
+        Some(amount),
+        None,
+        None,
+        None,
+        vec![],
+    )
+    .map_err(|e| TxError::InvalidArgument(format!("invalid payment: {e}")))?;
+    let request = TransactionRequest::new(vec![payment])
+        .map_err(|e| TxError::InvalidArgument(format!("invalid payment request: {e}")))?;
+    let balance = TransactionBalance::new(Vec::new(), fee)
+        .map_err(|e| TxError::Internal(format!("balance: {e:?}")))?;
+    let ironwood_active = params.is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from(target));
+    let proposal: Proposal<StandardFeeRule, Infallible> = Proposal::single_step(
+        request,
+        BTreeMap::from([(0usize, PoolType::Transparent)]),
+        vec![input],
+        None,
+        anchor,
+        balance,
+        StandardFeeRule::Zip317,
+        target,
+        policy,
+        false,
+        ironwood_active,
+    )
+    .map_err(|e| TxError::Internal(format!("step 2 proposal: {e:?}")))?;
+    let expiry = default_expiry(params, BlockHeight::from(target));
+    let txids = run_create_proposed(wallet, params, usk, provers, &proposal, expiry)?;
+    let txid = *txids
+        .first()
+        .ok_or_else(|| TxError::Internal("no transaction built".into()))?;
+    let (_, raw) = stored_transaction(wallet, txid)?;
+    Ok((txid, raw, u32::from(expiry)))
+}
+
 /// One pool's balance (`PoolBalance` on the wire).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PoolBalance {
@@ -1122,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn recipients_parse_per_network_and_tex_is_refused() {
+    fn recipients_parse_per_network_including_tex() {
         let p = params();
         // A regtest transparent address and a mainnet one.
         let t = Address::Transparent(transparent::address::TransparentAddress::PublicKeyHash(
@@ -1139,10 +1446,8 @@ mod tests {
             Err(TxError::InvalidArgument(_))
         ));
         let tex = Address::Tex([9; 20]).encode(&p);
-        assert!(matches!(
-            parse_recipient(&p, &tex),
-            Err(TxError::UnsupportedPool(_))
-        ));
+        assert!(matches!(parse_recipient(&p, &tex), Ok(Address::Tex(_))));
+        assert!(memo_for(&Address::Tex([9; 20]), b"hi").is_err());
         assert!(matches!(
             parse_recipient(&p, "nonsense"),
             Err(TxError::InvalidArgument(_))

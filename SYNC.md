@@ -256,7 +256,7 @@ On `daemon stop` or `SIGTERM`:
 2. Close Tor streams; the Arti cache under `tor_cache/` is kept.
 3. Run `PRAGMA wal_checkpoint(TRUNCATE)` on every `wallet.sqlite` and on `blocks.sqlite`.
 4. Zeroize unlocked keys and destroy signing sessions held in memory (persisted sessions in `signing_sessions` survive).
-5. Leave `tex_queue` rows as they are; the queue resumes on next start.
+5. Leave `ext_gyges_tex_queue` rows as they are; the queue resumes on next start (it re-checks every active row against the node, so a step the node lost while the daemon was down is simply rebroadcast).
 
 On restart every key begins in `Initializing`, which re-derives its state from `block_fully_scanned` and `NodeBounds`, so an interrupted scan simply continues.
 

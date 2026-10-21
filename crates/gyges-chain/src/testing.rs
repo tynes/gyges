@@ -293,6 +293,11 @@ struct State {
     mempool: Vec<([u8; 32], Vec<u8>)>,
     /// When set, `sendrawtransaction` refuses everything with this text.
     reject_broadcasts: Option<String>,
+    /// When set, `sendrawtransaction` refuses transactions without any
+    /// shielded bundle with this text: a stand-in for a node that does not
+    /// chain mempool transactions (ZIP 320 step 2 before step 1 is mined,
+    /// TESTING.md §3 rows 10 and 11).
+    reject_transparent_only: Option<String>,
 }
 
 impl State {
@@ -452,6 +457,7 @@ impl FakeNode {
             forks: 0,
             mempool: Vec::new(),
             reject_broadcasts: None,
+            reject_transparent_only: None,
         }));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -540,6 +546,13 @@ impl FakeNode {
     /// accepts again), to exercise `NODE_REJECTED`.
     pub fn set_reject_broadcasts(&self, message: Option<String>) {
         self.lock().reject_broadcasts = message;
+    }
+
+    /// Make `sendrawtransaction` refuse fully transparent transactions with
+    /// `message` (`None` accepts again): a node that will not chain a
+    /// ZIP 320 step 2 on an unmined step 1.
+    pub fn set_reject_transparent_only(&self, message: Option<String>) {
+        self.lock().reject_transparent_only = message;
     }
 
     /// Txids (internal byte order) waiting to be mined, in arrival order.
@@ -809,6 +822,13 @@ fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
                 .map_err(|e| (-22, format!("TX decode failed: {e}")))?;
             if let Some(reason) = &st.reject_broadcasts {
                 return Err((-26, reason.clone()));
+            }
+            if let Some(reason) = &st.reject_transparent_only
+                && tx.sapling_bundle().is_none()
+                && tx.orchard_bundle().is_none()
+                && tx.ironwood_bundle().is_none()
+            {
+                return Err((-25, reason.clone()));
             }
             let txid = *tx.txid().as_ref();
             if st.mempool.iter().any(|(id, _)| *id == txid) {

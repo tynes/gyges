@@ -13,7 +13,17 @@ jobs:
   check:
     name: check, clippy, test
     runs-on: ubuntu-latest
+    env:
+      # The debug artifacts of build + clippy --all-targets + test for this
+      # dependency tree fill the runner's disk; `ld` then dies with SIGBUS
+      # while writing the test binaries. Line tables are enough for test
+      # backtraces, and the preinstalled toolchains below are not used.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:

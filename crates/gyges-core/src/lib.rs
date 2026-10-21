@@ -25,6 +25,7 @@ pub mod perms;
 pub mod profile;
 pub mod registry;
 pub mod sync;
+pub mod tex;
 pub mod tx;
 pub mod vault;
 
@@ -64,7 +65,7 @@ pub enum Pool {
     Ironwood,
 }
 
-/// States of a `tex_queue` row (Q-T1, Q-T2).
+/// States of a `tex_queue` row (Q-T1, Q-T2; DATA_MODEL.md §5.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TexState {
@@ -76,6 +77,49 @@ pub enum TexState {
     Step2Failed,
     Expired,
     Failed,
+    Aborted,
+}
+
+impl TexState {
+    pub const ALL: [TexState; 9] = [
+        TexState::Built,
+        TexState::Step1Broadcast,
+        TexState::Step2Broadcast,
+        TexState::Step1Mined,
+        TexState::Step2Mined,
+        TexState::Step2Failed,
+        TexState::Expired,
+        TexState::Failed,
+        TexState::Aborted,
+    ];
+
+    /// The `state` column value and the CLI spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TexState::Built => "built",
+            TexState::Step1Broadcast => "step1_broadcast",
+            TexState::Step2Broadcast => "step2_broadcast",
+            TexState::Step1Mined => "step1_mined",
+            TexState::Step2Mined => "step2_mined",
+            TexState::Step2Failed => "step2_failed",
+            TexState::Expired => "expired",
+            TexState::Failed => "failed",
+            TexState::Aborted => "aborted",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.as_str() == s)
+    }
+
+    /// Nothing the queue can do with the row any more. `Step2Failed` is
+    /// not terminal: `tx resume` rebuilds its second step.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TexState::Step2Mined | TexState::Expired | TexState::Failed | TexState::Aborted
+        )
+    }
 }
 
 /// Compile-time proof that the upstream APIs the design relies on exist under

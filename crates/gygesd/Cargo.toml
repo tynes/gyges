@@ -19,6 +19,7 @@ path = "src/main.rs"
 gyges-proto = { workspace = true }
 gyges-core = { workspace = true }
 gyges-chain = { workspace = true }
+prost = { workspace = true }
 zcash_client_backend = { workspace = true }
 zcash_protocol = { workspace = true }
 zcash_keys = { workspace = true }
@@ -46,6 +47,7 @@ tower = { workspace = true, features = ["util"] }  # service_fn in the policy-la
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 transparent = { workspace = true }
+zcash_primitives = { workspace = true }  # decoding the mined ZIP 320 transactions in the tests
 
 [lints]
 workspace = true

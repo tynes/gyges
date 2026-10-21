@@ -390,3 +390,225 @@ fn balance_send_and_shield_through_the_binaries() {
         assert!(!run.stdout.contains(secret), "{secret:?} streamed");
     }
 }
+
+/// Poll `tx sessions --include-finished --json` until the ZIP 320 row for
+/// `step1` is in `state` (a `TEX_STATE_*` name).
+fn wait_tex_state(fx: &Fixture, step1: &str, state: &str) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last = serde_json::Value::Null;
+    loop {
+        let run = fx
+            .gyges(&[
+                "-k",
+                "main",
+                "tx",
+                "sessions",
+                "--include-finished",
+                "--json",
+            ])
+            .run();
+        assert_eq!(run.code(), 0, "{run:?}");
+        let v = run.json();
+        if let Some(row) = v["tex_transfers"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["step1_txid"] == step1))
+        {
+            if row["state"] == state {
+                return row.clone();
+            }
+            last = row.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "row never reached {state}; last {last}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// A ZIP 320 send through the binaries (CLI_SPEC.md §2.5 `tex1`), against a
+/// node that will not chain mempool transactions, then a daemon crash
+/// (SIGKILL) with the row pending (TESTING.md §3 row 12): the restarted
+/// daemon finishes the transfer from the stored bytes, without a passphrase,
+/// and step 2 keeps its txid. Also `--dry-run` with both steps, `tx
+/// sessions`, and the `tx abort` / `tx resume` refusals.
+#[test]
+fn zip320_send_survives_a_daemon_crash() {
+    let n = fake_node(10);
+    let mut fx = Fixture::new("regtest");
+    fx.write_config(
+        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n\
+         [policy]\nmin_confirmations = 1\n[tex]\nrebroadcast_interval = \"1s\"\n",
+    );
+    let node_url = n.node.url().to_string();
+    fx.start_daemon(&["--zakura-rpc", &node_url]).unwrap();
+    const PASSPHRASE: &str = "correct-horse-battery-staple-7731";
+    let pw = fx.passphrase_file(PASSPHRASE);
+    let run = fx
+        .gyges(&["key", "init", "--id", "main", "--json"])
+        .env("GYGES_PASSPHRASE_FILE", &pw)
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    wait_spendable(&fx);
+    let receiver = first_transparent_receiver(&fx, "main");
+    n.node.mine_with_payments(&[(receiver, 200_000_000)]);
+    n.node.mine(1);
+    wait_spendable(&fx);
+    let run = fx
+        .gyges(&["-k", "main", "tx", "shield", "--yes"])
+        .env("GYGES_PASSPHRASE_FILE", &pw)
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    n.node.mine(2);
+    wait_spendable(&fx);
+
+    let params = gyges_core::Network::Regtest.consensus_params();
+    let tex_addr = zcash_keys::address::Address::Tex([0x42; 20]).encode(&params);
+
+    // The dry run shows both steps and both fees.
+    let run = fx
+        .gyges(&[
+            "-k",
+            "main",
+            "tx",
+            "send",
+            "--to",
+            &tex_addr,
+            "--amount",
+            "0.5",
+            "--dry-run",
+        ])
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert!(
+        run.stderr.contains("Step 1 of 2") && run.stderr.contains("Step 2 of 2"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stderr.contains("ephemeral"), "{}", run.stderr);
+    assert!(run.stderr.contains(&tex_addr), "{}", run.stderr);
+    let run = fx
+        .gyges(&[
+            "-k",
+            "main",
+            "tx",
+            "send",
+            "--to",
+            &tex_addr,
+            "--amount",
+            "0.5",
+            "--dry-run",
+            "--json",
+        ])
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let proposed = &run.json()["proposed"];
+    assert_eq!(proposed["steps"].as_array().unwrap().len(), 2, "{proposed}");
+    assert_eq!(proposed["steps"][1]["transparent_only"], true, "{proposed}");
+
+    // The node refuses step 2 until step 1 is mined: the send ends with
+    // `tex pending` and one txid on stdout.
+    n.node
+        .set_reject_transparent_only(Some("bad-txns-inputs-missingorspent".into()));
+    let run = fx
+        .gyges(&[
+            "-k", "main", "tx", "send", "--to", &tex_addr, "--amount", "0.5", "--yes",
+        ])
+        .env("GYGES_PASSPHRASE_FILE", &pw)
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let txids: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(txids.len(), 1, "only step 1 reached the node: {run:?}");
+    let s1 = txids[0].to_string();
+    assert_eq!(s1.len(), 64);
+    let pending = run
+        .stderr
+        .lines()
+        .find(|l| l.starts_with("tex pending (step 2 of 2)"))
+        .unwrap_or_else(|| panic!("no tex pending line: {}", run.stderr));
+    let s2 = pending.rsplit(' ').next().unwrap().to_string();
+    assert_eq!(s2.len(), 64, "{pending}");
+    assert_eq!(
+        n.node.mempool(),
+        vec![gyges_chain::parse_display_hash(&s1).unwrap()]
+    );
+    let row = wait_tex_state(&fx, &s1, "TEX_STATE_STEP1_BROADCAST");
+    assert_eq!(row["step2_txid"], s2, "{row}");
+    assert!(
+        row["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("missingorspent"),
+        "{row}"
+    );
+    let run = fx.gyges(&["-k", "main", "tx", "sessions"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert!(
+        run.stdout.contains(&s1) && run.stdout.contains("step1_broadcast"),
+        "{}",
+        run.stdout
+    );
+    // Too late to abort (exit 6), and the argument shapes are checked.
+    let run = fx.gyges(&["-k", "main", "tx", "abort", &s1]).run();
+    assert_eq!(run.code(), 6, "{run:?}");
+    assert!(run.stderr.contains("built"), "{}", run.stderr);
+    let run = fx.gyges(&["-k", "main", "tx", "resume", "nonsense"]).run();
+    assert_eq!(run.code(), 6, "{run:?}");
+
+    // Crash with the row pending; mine step 1 while the daemon is down.
+    fx.kill_daemon();
+    n.node.mine(1);
+    n.node.set_reject_transparent_only(None);
+    fx.start_daemon(&["--zakura-rpc", &node_url]).unwrap();
+    // The restarted queue rebroadcasts step 2 from its stored bytes: same
+    // txid, no passphrase asked.
+    let want = gyges_chain::parse_display_hash(&s2).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !n.node.mempool().contains(&want) {
+        assert!(Instant::now() < deadline, "step 2 never rebroadcast");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    n.node.mine(1);
+    let row = wait_tex_state(&fx, &s1, "TEX_STATE_STEP2_MINED");
+    assert_eq!(row["step2_txid"], s2, "{row}");
+    assert_eq!(row["amount"], "50000000", "{row}");
+    assert_eq!(row["recipient"], tex_addr, "{row}");
+    let run = fx.gyges(&["-k", "main", "tx", "resume", &s1]).run();
+    assert_eq!(run.code(), 6, "{run:?}");
+    assert!(run.stderr.contains("nothing to resume"), "{}", run.stderr);
+    wait_spendable(&fx);
+    let run = fx.gyges(&["-k", "main", "balance", "--json"]).run();
+    let b = run.json();
+    let ironwood: u64 = b["pools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["pool"] == "POOL_IRONWOOD")
+        .and_then(|p| p["spendable"].as_str())
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        ironwood < 150_000_000 && ironwood > 149_900_000,
+        "amount and both fees left: {b}"
+    );
+
+    // Nothing identifying in the logs, across both daemon runs.
+    let log_dir = fx.network_dir().join("logs");
+    for entry in std::fs::read_dir(&log_dir).unwrap().flatten() {
+        let text = std::fs::read_to_string(entry.path()).unwrap();
+        for secret in [
+            tex_addr.as_str(),
+            s1.as_str(),
+            s2.as_str(),
+            "50000000",
+            PASSPHRASE,
+        ] {
+            assert!(
+                !text.contains(secret),
+                "{secret:?} in {}",
+                entry.file_name().to_string_lossy()
+            );
+        }
+    }
+}

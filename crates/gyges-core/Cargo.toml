@@ -35,6 +35,8 @@ rusqlite = { workspace = true }
 shardtree = { workspace = true }
 zip32 = { workspace = true }
 schemerz = { workspace = true }
+schemerz-rusqlite = { workspace = true }
+uuid = { workspace = true }
 rand = { workspace = true }
 secrecy = { workspace = true }
 zeroize = { workspace = true }

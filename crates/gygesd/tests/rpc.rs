@@ -1746,9 +1746,10 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
             ErrorReason::InvalidArgument,
         ),
         (
+            // A memo cannot go to a ZIP 320 recipient either.
             zcash_keys::address::Address::Tex([9; 20]).encode(&params),
-            vec![],
-            ErrorReason::UnsupportedPool,
+            b"hi".to_vec(),
+            ErrorReason::InvalidArgument,
         ),
     ] {
         let Err(err) = c
@@ -2167,6 +2168,527 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
         .into_inner();
     assert_eq!(b.total_spendable, 0, "{b:?}");
     assert_eq!(b.total_pending, 0, "{b:?}");
+
+    drop(state);
+    task.abort();
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// ZIP 320 (ROADMAP.md M3)
+// ---------------------------------------------------------------------------
+
+/// The ZIP 320 row for `step1_txid`, once it reaches `want` (polling
+/// `ListSigningSessions`, whose `tex_transfers` carry the queue's rows).
+async fn wait_tex_state(
+    c: &mut GygesClient<Channel>,
+    step1_txid: &str,
+    want: gyges_proto::v1::TexState,
+) -> gyges_proto::v1::TexQueueEntry {
+    wait_tex(c, step1_txid, &format!("{want:?}"), |r| r.state() == want).await
+}
+
+/// The ZIP 320 row for `step1_txid`, once `ok` holds for it.
+async fn wait_tex(
+    c: &mut GygesClient<Channel>,
+    step1_txid: &str,
+    what: &str,
+    ok: impl Fn(&gyges_proto::v1::TexQueueEntry) -> bool,
+) -> gyges_proto::v1::TexQueueEntry {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut last = None;
+    loop {
+        let resp = c
+            .list_signing_sessions(ListSigningSessionsRequest {
+                key_id: String::new(),
+                include_finished: true,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        if let Some(row) = resp
+            .tex_transfers
+            .iter()
+            .find(|r| r.step1_txid == step1_txid)
+        {
+            if ok(row) {
+                return row.clone();
+            }
+            last = Some(row.clone());
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "tex row never reached {what}; last seen {last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Wait until the fake node's mempool holds `txid`.
+async fn wait_in_mempool(node: &FakeNode, txid: &str) {
+    let want = gyges_chain::parse_display_hash(txid).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !node.mempool().contains(&want) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{txid} never reached the mempool: {:?}",
+            node.mempool()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The mined transaction `txid` from the fake node's block at `height`.
+fn mined_tx(
+    node: &FakeNode,
+    height: u32,
+    txid: &str,
+) -> zcash_primitives::transaction::Transaction {
+    let want = gyges_chain::parse_display_hash(txid).unwrap();
+    let block = node.block(height).expect("block exists");
+    let i = block
+        .txids
+        .iter()
+        .position(|t| *t == want)
+        .unwrap_or_else(|| panic!("{txid} not in block {height}"));
+    let branch = zcash_protocol::consensus::BranchId::for_height(
+        &regtest_params(),
+        BlockHeight::from_u32(height),
+    );
+    zcash_primitives::transaction::Transaction::read(&block.tx_raw[i][..], branch).unwrap()
+}
+
+fn tex_queued(events: &[SendEvent]) -> (String, String) {
+    events
+        .iter()
+        .find_map(|e| match &e.event {
+            Some(send_event::Event::TexQueued(t)) => {
+                Some((t.step1_txid.clone(), t.step2_txid.clone()))
+            }
+            _ => None,
+        })
+        .expect("a TexQueued event")
+}
+
+/// Pay a ZIP 320 address three times through the fake node (TESTING.md §3
+/// rows 9–11 in miniature): chained in the mempool and mined together;
+/// against a node that refuses step 2 until step 1 is mined (the queue
+/// finishes it); and with step 2 left to expire after step 1 was mined, so
+/// that `ResumeTexTransfer` rebuilds it through a signing session. Every
+/// step 2 is checked on the chain: one input (step 1's ephemeral output),
+/// one output of exactly the amount to the TEX pubkey hash.
+#[tokio::test]
+async fn zip320_sends_through_the_fake_node() {
+    use gyges_proto::v1::{AbortTexTransferRequest, Pool, ResumeTexTransferRequest, TexState};
+    let _ = test_hub();
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(10);
+    let url = node.url().to_string();
+    let (dir, home) = fresh_home_with(
+        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n\
+         [policy]\nmin_confirmations = 1\n[tex]\nrebroadcast_interval = \"1s\"\n",
+    );
+    let mut opts = Options::new(home.clone(), Network::Regtest);
+    opts.zakura_rpc = Some(url);
+    opts.log_hub = Some(test_hub());
+    let daemon = Daemon::prepare(opts).expect("prepare");
+    let socket = daemon.socket_path();
+    let state = daemon.state.clone();
+    let task = tokio::spawn(daemon.serve(std::future::pending()));
+    for _ in 0..400 {
+        if uds::probe(&socket).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut c = client(&socket).await;
+    let params = Network::Regtest.consensus_params();
+    let amount = |z: i64| {
+        Some(gyges_proto::v1::Amount {
+            value: Some(gyges_proto::v1::amount::Value::Zatoshis(z)),
+        })
+    };
+
+    // A funded, shielded wallet: 3 ZEC in Ironwood.
+    c.init_key(InitKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    wait_spendable(&mut c, "main").await;
+    let key = state.registry.resolve("main").unwrap();
+    let receiver = {
+        let w = key.wallet().unwrap();
+        let account = w.get_account_ids().unwrap()[0];
+        *w.get_transparent_receivers(account, false, false)
+            .unwrap()
+            .keys()
+            .next()
+            .expect("a transparent receiver")
+    };
+    node.mine_with_payments(&[(receiver, 300_000_000)]);
+    node.mine(1);
+    wait_spendable(&mut c, "main").await;
+    c.unlock_key(UnlockKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        scope: UnlockScope::Daemon as i32,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let events = collect_events(
+        c.shield_funds(ShieldFundsRequest {
+            key_id: "main".into(),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    let _ = broadcast_txid(&events);
+    c.lock_key(LockKeyRequest {
+        key_id: "main".into(),
+        all: false,
+    })
+    .await
+    .unwrap();
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    let balance = |c: &mut GygesClient<Channel>| {
+        let mut c = c.clone();
+        async move {
+            let b = c
+                .get_balance(GetBalanceRequest {
+                    key_id: "main".into(),
+                    min_confirmations: 0,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            balance_of(&b, Pool::Ironwood).0
+        }
+    };
+    let funded = balance(&mut c).await;
+    assert!(funded > 299_000_000 && funded < 300_000_000, "{funded}");
+
+    let tex_pkh = [0x42u8; 20];
+    let tex_addr = zcash_keys::address::Address::Tex(tex_pkh).encode(&params);
+    assert!(tex_addr.starts_with("texregtest1"), "{tex_addr}");
+
+    // --dry-run: both steps, every fee (ARCHITECTURE.md §3.3 step 4).
+    let dry = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to: tex_addr.clone(),
+            amount: amount(50_000_000),
+            dry_run: true,
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(event_names(&dry), ["proposed"]);
+    let p = proposal_of(&dry);
+    assert_eq!(p.steps.len(), 2, "{p:?}");
+    assert!(
+        !p.steps[0].transparent_only && p.steps[1].transparent_only,
+        "{p:?}"
+    );
+    let step2_fee = p.steps[1].fee;
+    assert!(step2_fee > 0, "{p:?}");
+    let ephemeral = p.steps[0]
+        .outputs
+        .iter()
+        .find(|o| o.is_ephemeral)
+        .expect("an ephemeral output");
+    assert_eq!(ephemeral.pool(), Pool::Transparent);
+    assert_eq!(ephemeral.value, 50_000_000 + step2_fee, "{p:?}");
+    assert_eq!(p.steps[1].inputs.len(), 1);
+    assert_eq!(p.steps[1].inputs[0].pool(), Pool::Transparent);
+    assert_eq!(p.steps[1].inputs[0].value, 50_000_000 + step2_fee);
+    assert_eq!(p.steps[1].outputs.len(), 1);
+    assert_eq!(p.steps[1].outputs[0].address, tex_addr);
+    assert_eq!(p.steps[1].outputs[0].value, 50_000_000);
+    assert_eq!(p.total_fee, p.steps[0].fee + step2_fee);
+    assert_eq!(p.total_debit, 50_000_000 + p.total_fee);
+    let fee_a = p.total_fee;
+
+    // 1. Mempool chaining (row 9): one session signs both steps, both are
+    //    offered at once and mined in the same block.
+    let events = send_with_session(
+        &mut c,
+        SendTransactionRequest {
+            key_id: "main".into(),
+            to: tex_addr.clone(),
+            amount: amount(50_000_000),
+            ..Default::default()
+        },
+        "pw",
+    )
+    .await
+    .unwrap();
+    let names = event_names(&events);
+    assert_eq!(&names[..2], ["proposed", "signature_required"], "{names:?}");
+    let tail: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| !matches!(*n, "proposed" | "signature_required" | "proving"))
+        .collect();
+    assert_eq!(
+        tail,
+        ["signed", "signed", "broadcast", "tex_queued", "broadcast"],
+        "{names:?}"
+    );
+    let (s1, s2) = tex_queued(&events);
+    assert_eq!(
+        node.mempool(),
+        vec![
+            gyges_chain::parse_display_hash(&s1).unwrap(),
+            gyges_chain::parse_display_hash(&s2).unwrap()
+        ]
+    );
+    let row = wait_tex_state(&mut c, &s1, TexState::Step2Broadcast).await;
+    assert_eq!(row.step2_txid, s2);
+    assert_eq!(row.amount, 50_000_000);
+    assert_eq!(row.recipient, tex_addr);
+    assert_eq!(row.key_id, "main");
+    assert_eq!(row.expiry_height, p.expiry_height, "{row:?}");
+    // Too late to abort: both are with the node.
+    let err = c
+        .abort_tex_transfer(AbortTexTransferRequest {
+            key_id: "main".into(),
+            step1_txid: s1.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    node.mine(1);
+    let (mined_at, _) = node.tip();
+    let row = wait_tex_state(&mut c, &s1, TexState::Step2Mined).await;
+    assert!(row.last_error.is_empty(), "{row:?}");
+    let tx2 = mined_tx(&node, mined_at, &s2);
+    let _ = mined_tx(&node, mined_at, &s1);
+    let bundle = tx2.transparent_bundle().expect("transparent");
+    assert_eq!(bundle.vin.len(), 1);
+    assert_eq!(
+        bundle.vin[0].prevout().txid().to_string(),
+        s1,
+        "step 2 spends step 1"
+    );
+    assert_eq!(bundle.vout.len(), 1, "no change on the ephemeral address");
+    assert_eq!(bundle.vout[0].value().into_u64(), 50_000_000);
+    assert_eq!(
+        bundle.vout[0].recipient_address(),
+        Some(transparent::address::TransparentAddress::PublicKeyHash(
+            tex_pkh
+        ))
+    );
+    // Nothing to resume on a finished transfer.
+    let err = c
+        .resume_tex_transfer(ResumeTexTransferRequest {
+            key_id: "main".into(),
+            step1_txid: s1.clone(),
+            session_token: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    wait_spendable(&mut c, "main").await;
+    let after_a = balance(&mut c).await;
+    assert_eq!(
+        after_a,
+        funded - 50_000_000 - fee_a,
+        "both fees left the pool"
+    );
+
+    // 2. A node that will not chain mempool transactions (row 10): step 2
+    //    is refused until step 1 is mined, then the queue gets it in.
+    node.set_reject_transparent_only(Some("bad-txns-inputs-missingorspent".into()));
+    let events = send_with_session(
+        &mut c,
+        SendTransactionRequest {
+            key_id: "main".into(),
+            to: tex_addr.clone(),
+            amount: amount(20_000_000),
+            ..Default::default()
+        },
+        "pw",
+    )
+    .await
+    .unwrap();
+    let names = event_names(&events);
+    assert_eq!(
+        names.iter().filter(|n| **n == "broadcast").count(),
+        1,
+        "{names:?}"
+    );
+    assert!(names.contains(&"tex_queued"), "{names:?}");
+    let (s1, s2) = tex_queued(&events);
+    let row = wait_tex_state(&mut c, &s1, TexState::Step1Broadcast).await;
+    assert!(row.last_error.contains("missingorspent"), "{row:?}");
+    assert_eq!(row.attempts, 2, "{row:?}");
+    node.mine(1);
+    let row = wait_tex_state(&mut c, &s1, TexState::Step1Mined).await;
+    assert_eq!(row.step2_txid, s2);
+    node.set_reject_transparent_only(None);
+    wait_in_mempool(&node, &s2).await;
+    node.mine(1);
+    let (mined_at, _) = node.tip();
+    wait_tex_state(&mut c, &s1, TexState::Step2Mined).await;
+    let tx2 = mined_tx(&node, mined_at, &s2);
+    let bundle = tx2.transparent_bundle().expect("transparent");
+    assert_eq!(bundle.vout[0].value().into_u64(), 20_000_000);
+    assert_eq!(bundle.vin[0].prevout().txid().to_string(), s1);
+
+    // 3. Step 1 mined, step 2 expired (row 11): `step2_failed`, then
+    //    `ResumeTexTransfer` through a session builds a new step 2.
+    node.set_reject_transparent_only(Some("bad-txns-inputs-missingorspent".into()));
+    let events = send_with_session(
+        &mut c,
+        SendTransactionRequest {
+            key_id: "main".into(),
+            to: tex_addr.clone(),
+            amount: amount(10_000_000),
+            ..Default::default()
+        },
+        "pw",
+    )
+    .await
+    .unwrap();
+    let (s1, old_s2) = tex_queued(&events);
+    let row = wait_tex_state(&mut c, &s1, TexState::Step1Broadcast).await;
+    let expiry = row.expiry_height;
+    node.mine(1);
+    wait_tex_state(&mut c, &s1, TexState::Step1Mined).await;
+    let (tip, _) = node.tip();
+    node.mine(expiry - tip + 1);
+    let row = wait_tex_state(&mut c, &s1, TexState::Step2Failed).await;
+    assert!(row.last_error.contains("tx resume"), "{row:?}");
+    wait_spendable(&mut c, "main").await;
+    node.set_reject_transparent_only(None);
+    // Without a key: a session, answered with the passphrase.
+    let err = c
+        .resume_tex_transfer(ResumeTexTransferRequest {
+            key_id: "main".into(),
+            step1_txid: s1.clone(),
+            session_token: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::SignatureRequired, "{err:?}");
+    let session_id = GygesError::from_status(&err).unwrap().session_id;
+    assert_eq!(session_id.len(), 32);
+    let sessions = c
+        .list_signing_sessions(ListSigningSessionsRequest {
+            key_id: "main".into(),
+            include_finished: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let s = sessions
+        .sessions
+        .iter()
+        .find(|s| s.session_id == session_id)
+        .expect("the resume session is listed");
+    assert_eq!(s.step, 2);
+    assert_eq!(s.status(), SessionStatus::AwaitingSignature);
+    // A second resume while the session is pending does not open another.
+    let row = c
+        .resume_tex_transfer(ResumeTexTransferRequest {
+            key_id: "main".into(),
+            step1_txid: s1.clone(),
+            session_token: Vec::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(row.state(), TexState::Step2Failed);
+    c.unlock_key(UnlockKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        session_id: session_id.clone(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    // The row keeps `step1_mined` (the furthest state) while the queue
+    // offers the fresh step 2.
+    let row = wait_tex(&mut c, &s1, "a new step 2", |r| r.step2_txid != old_s2).await;
+    assert_eq!(row.state(), TexState::Step1Mined, "{row:?}");
+    assert!(row.expiry_height > expiry, "{row:?}");
+    assert!(row.last_error.is_empty(), "{row:?}");
+    let new_s2 = row.step2_txid.clone();
+    wait_in_mempool(&node, &new_s2).await;
+    node.mine(1);
+    let (mined_at, _) = node.tip();
+    wait_tex_state(&mut c, &s1, TexState::Step2Mined).await;
+    let tx2 = mined_tx(&node, mined_at, &new_s2);
+    let bundle = tx2.transparent_bundle().expect("transparent");
+    assert_eq!(bundle.vin.len(), 1);
+    assert_eq!(bundle.vin[0].prevout().txid().to_string(), s1);
+    assert_eq!(bundle.vout.len(), 1);
+    assert_eq!(bundle.vout[0].value().into_u64(), 10_000_000);
+    assert_eq!(
+        bundle.vout[0].recipient_address(),
+        Some(transparent::address::TransparentAddress::PublicKeyHash(
+            tex_pkh
+        ))
+    );
+    let sessions = c
+        .list_signing_sessions(ListSigningSessionsRequest {
+            key_id: "main".into(),
+            include_finished: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        sessions.tex_transfers.len(),
+        3,
+        "every transfer is listed with --include-finished"
+    );
+    assert!(
+        sessions
+            .tex_transfers
+            .iter()
+            .all(|r| r.state() == TexState::Step2Mined),
+        "{:?}",
+        sessions.tex_transfers
+    );
+    wait_spendable(&mut c, "main").await;
+    let final_balance = balance(&mut c).await;
+    assert!(
+        final_balance < after_a - 30_000_000 && final_balance > after_a - 30_200_000,
+        "{final_balance} after {after_a}"
+    );
+
+    // The audit trail: a `tex_queued` per send, broadcasts, the resume.
+    let events: Vec<String> = state
+        .logs
+        .recent(true, 1000)
+        .iter()
+        .filter(|e| e.fields.get("key_id").map(String::as_str) == Some("main"))
+        .filter_map(|e| e.fields.get("event").cloned())
+        .collect();
+    assert_eq!(
+        events.iter().filter(|e| *e == "tex_queued").count(),
+        3,
+        "{events:?}"
+    );
+    assert_eq!(
+        events.iter().filter(|e| *e == "tex_resumed").count(),
+        1,
+        "{events:?}"
+    );
+    assert!(
+        events.iter().filter(|e| *e == "broadcast").count() >= 7,
+        "{events:?}"
+    );
 
     drop(state);
     task.abort();

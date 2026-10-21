@@ -37,7 +37,8 @@ use zcash_protocol::consensus::{BlockHeight, NetworkType, NetworkUpgrade, Parame
 
 use crate::compact::{self, TreeSizes};
 use crate::{
-    BoxFuture, ChainBackend, ChainError, NodeBounds, NodeStatus, display_hash, parse_display_hash,
+    BoxFuture, ChainBackend, ChainError, NodeBounds, NodeStatus, TxStatus, display_hash,
+    parse_display_hash,
 };
 
 /// TCP connect bound; the node is local, so anything slower is "down".
@@ -52,6 +53,8 @@ pub const DEFAULT_CONCURRENCY: usize = 8;
 
 /// JSON-RPC error code zcashd and Zebra use for "no such block".
 const RPC_INVALID_PARAMETER: i64 = -8;
+/// JSON-RPC error code for "no such mempool or main chain transaction".
+const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
 
 /// The node backend. Cheap to share behind an `Arc`.
 pub struct ZakuraRpcBackend<P> {
@@ -522,6 +525,37 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
         parse_display_hash(&txid)
     }
 
+    /// `getrawtransaction(txid, 1)`. The node answers `height = -1` (or no
+    /// height) for a mempool transaction, the block height for a mined one,
+    /// and the "no such mempool or main chain transaction" error (code -5)
+    /// otherwise.
+    pub async fn transaction_status(&self, txid: [u8; 32]) -> Result<TxStatus, ChainError> {
+        #[derive(Deserialize)]
+        struct Verbose {
+            #[serde(default)]
+            height: Option<i64>,
+        }
+        match self
+            .call::<Verbose>(
+                "getrawtransaction",
+                vec![json!(display_hash(&txid)), json!(1)],
+            )
+            .await
+        {
+            Ok(v) => Ok(match v.height {
+                Some(h) if h >= 0 => TxStatus::Mined(BlockHeight::from_u32(
+                    u32::try_from(h).map_err(|_| ChainError::Rpc("height out of range".into()))?,
+                )),
+                _ => TxStatus::InMempool,
+            }),
+            Err(RpcFailure::Json {
+                code: RPC_INVALID_ADDRESS_OR_KEY,
+                ..
+            }) => Ok(TxStatus::Unknown),
+            Err(other) => Err(self.chain_error("getrawtransaction", other)),
+        }
+    }
+
     /// `z_gettreestate(height)` as the `ChainState` an account born at
     /// `height + 1` starts from.
     pub async fn get_tree_state(&self, height: BlockHeight) -> Result<ChainState, ChainError> {
@@ -669,6 +703,10 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
 
     fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<[u8; 32], ChainError>> {
         Box::pin(async move { self.send_raw_transaction(&raw).await })
+    }
+
+    fn transaction_status(&self, txid: [u8; 32]) -> BoxFuture<'_, Result<TxStatus, ChainError>> {
+        Box::pin(self.transaction_status(txid))
     }
 
     fn compact_blocks(

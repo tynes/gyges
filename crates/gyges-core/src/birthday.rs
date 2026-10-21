@@ -186,6 +186,13 @@ impl ChainBackend for FixedChain {
         })
     }
 
+    fn transaction_status(
+        &self,
+        _txid: [u8; 32],
+    ) -> gyges_chain::BoxFuture<'_, Result<gyges_chain::TxStatus, ChainError>> {
+        Box::pin(async move { Ok(gyges_chain::TxStatus::Unknown) })
+    }
+
     fn send_raw_transaction(
         &self,
         _raw: Vec<u8>,

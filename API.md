@@ -159,7 +159,9 @@ Rules:
   emitted as late as possible (Q-S3). The exception is a step with Sapling
   spends from a `LOCAL_SEED` or `SIGNER_ONLY` profile: its `SignatureRequired`
   precedes its `Proving` events because the proof generation key must be
-  inserted first (Q-K3).
+  inserted first (Q-K3). A ZIP 320 send (`n = 2`) is the other exception
+  (§9): one `SignatureRequired { step: 1 }` comes right after `Proposed`,
+  then the `Proving` events of step 1, then `Signed { 1 }`, `Signed { 2 }`.
 - **One signature prompt per send.** Both ZIP 320 steps are signed in the
   same session: for `PASSPHRASE` kinds the daemon keeps the USK across both
   steps and drops it after the second `Signed`; for Keystone kinds the batch
@@ -462,10 +464,10 @@ Every command maps to exactly one RPC, or to none when it is purely local.
 | `tx shield` | `ShieldFunds` | |
 | `tx list` | `ListTransactions` | |
 | `tx status` | `GetTransactionStatus` | `--pir` sets `via_pir` |
-| `tx sessions` | `ListSigningSessions` | |
+| `tx sessions` | `ListSigningSessions` | The response also carries the ZIP 320 rows (`tex_transfers`) |
 | `tx abort SESSION_ID` | `AbortSigningSession` | 32-hex argument |
 | `tx abort TXID` | `AbortTexTransfer` | 64-hex argument; allowed only in `BUILT` |
-| `tx resume TXID` | `ResumeTexTransfer` | |
+| `tx resume TXID` | `ResumeTexTransfer` | On `SIGNATURE_REQUIRED` the CLI satisfies the session, then polls `ListSigningSessions` for the rebuilt step 2 |
 | `pczt create` | `CreatePczt` | Writes one `.pczt` per step |
 | `pczt inspect` | `InspectPczt` | |
 | `pczt prove` | `ProvePczt` | |
@@ -529,6 +531,22 @@ carries every anchor and witness the Prover and Signer need (Q-K5).
   the daemon never blocks on a user.
 - **`ResumeTexTransfer` is unary** and may return `SIGNATURE_REQUIRED` with a
   `session_id` instead of streaming, because the resumed step is a single
-  transparent transaction and the session machinery already covers it.
+  transparent transaction and the session machinery already covers it. As
+  landed: the rebuild runs in the background once the session is satisfied,
+  a second call while it is pending returns the row unchanged rather than
+  opening another session, a call on any other live row is a nudge (the
+  queue re-checks the node now), and a failed rebuild shows as a `FAILED`
+  session with the reason in `last_error`.
+- **ZIP 320 sends sign before they prove.** Upstream's `create_pczt_from_proposal`
+  takes single-step proposals only, so the two steps are built with
+  `create_proposed_transactions`, which proves and signs inside the builder
+  with the key present. The stream therefore emits `SignatureRequired` for
+  step 1 right after `Proposed`, before any `Proving` event, and the PCZT
+  Verifier (§6.4) does not run for these sends: the builder is the daemon's
+  own, and the node-facing checks are the proposal the user approved.
+  Keystone profiles cannot send to `tex1` until M5 revisits this.
+- **`ListSigningSessionsResponse.tex_transfers`** carries the ZIP 320 rows,
+  so that `gyges tx sessions` lists both without a `ListTransactions`
+  implementation; `TexQueueEntry` gained `expiry_height` and `key_id`.
 - **`Shutdown.graceful`** adds the in-flight handling the review asked for
   under `daemon stop` (§2.2) with a bounded grace period.

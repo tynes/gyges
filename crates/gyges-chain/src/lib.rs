@@ -112,6 +112,18 @@ pub enum ChainError {
     Rejected(String),
 }
 
+/// What the node knows about a transaction (`getrawtransaction(txid, 1)`),
+/// for the ZIP 320 queue (ARCHITECTURE.md §3.3) and `tx status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxStatus {
+    /// Neither in the mempool nor in the main chain (never seen, evicted,
+    /// expired, or reorged out without re-admission).
+    Unknown,
+    InMempool,
+    /// In the main chain at this height.
+    Mined(BlockHeight),
+}
+
 /// A boxed future, for the object-safe async methods below.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -155,6 +167,10 @@ pub trait ChainBackend: Send + Sync + fmt::Debug {
     /// [`ChainError::Rejected`] with its own text, which `tx send` shows
     /// verbatim as `NODE_REJECTED`.
     fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<[u8; 32], ChainError>>;
+
+    /// `getrawtransaction(txid, 1)`: whether the node has the transaction in
+    /// its mempool or its main chain. `txid` is in internal byte order.
+    fn transaction_status(&self, txid: [u8; 32]) -> BoxFuture<'_, Result<TxStatus, ChainError>>;
 }
 
 /// Block and transaction hashes as the JSON-RPC and explorers print them:
