@@ -1,0 +1,1119 @@
+//! `ArtiTorLwdBackend`: [`ChainBackend`] over a lightwalletd / zaino
+//! `CompactTxStreamer` endpoint, for the historical backfill below the
+//! node's retention window (ARCHITECTURE.md §3.1 step 2, SYNC.md §5,
+//! THREAT_MODEL.md §3 rows 7 and 10, OVERVIEW.md Q-D5 / Q-Y5).
+//!
+//! Two transports, chosen by `fallback_lightwalletd.use_tor`:
+//!
+//! * [`Transport::Tor`]: the embedded arti client of
+//!   `zcash_client_backend::tor` (its persistent state under
+//!   `tor_cache/`), bootstrapped lazily on the first request, `.onion`
+//!   endpoints reached as onion services; `https://` endpoints get TLS from
+//!   rustls with the webpki roots and the URI host as SNI (OVERVIEW.md §4.4);
+//! * [`Transport::Direct`]: plain tonic over TCP, for regtest and CI
+//!   (`use_tor = false`), with the same TLS rule for `https://`.
+//!
+//! The endpoint is untrusted (THREAT_MODEL.md B3): every block batch must
+//! carry the heights asked for and link by `prev_hash`, and the handoff
+//! validation of SYNC.md §5.2 (a later ROADMAP.md M2 item) checks the result
+//! against the local node before the wallet relies on it. What this module
+//! guarantees is only that a batch is internally consistent and that a
+//! stalled or short stream is reported rather than waited on forever.
+//!
+//! Nothing is contacted at construction. The connection (and the Tor
+//! client) is made on first use and dropped on any transport failure, so the
+//! next call reconnects.
+
+use std::error::Error as _;
+use std::fmt;
+use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::RwLock;
+use std::time::{Duration, SystemTime};
+
+use futures_util::StreamExt as _;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint, Uri};
+use tonic::{Code, Status};
+use zcash_client_backend::data_api::chain::ChainState;
+use zcash_client_backend::proto::compact_formats::CompactBlock;
+use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
+use zcash_client_backend::proto::service::{
+    BlockId, BlockRange, ChainSpec, Empty, GetSubtreeRootsArg, RawTransaction, ShieldedProtocol,
+    TxFilter,
+};
+use zcash_client_backend::tor;
+use zcash_primitives::transaction::Transaction;
+use zcash_protocol::ShieldedPool;
+use zcash_protocol::consensus::{BlockHeight, BranchId, NetworkType, Parameters};
+
+use crate::{
+    BoxFuture, ChainBackend, ChainError, NodeBounds, NodeStatus, Route, SubtreeRoot, TxStatus,
+    display_hash, parse_display_hash,
+};
+
+/// How the endpoint is reached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Transport {
+    /// `use_tor = false`: plain gRPC over TCP (regtest, CI).
+    Direct,
+    /// `use_tor = true`: through the embedded arti client, whose state
+    /// lives in `tor_dir` (`~/.gyges/<network>/tor_cache/`, created `0700`
+    /// if missing).
+    Tor { tor_dir: PathBuf },
+}
+
+/// Deadlines. Tor circuits are slow and can half-close silently, so every
+/// wait is bounded (the upstream `tor::Timeouts` are set from the same
+/// values).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LwdTimeouts {
+    /// Opening the connection (Tor stream and TLS handshake included).
+    pub connect: Duration,
+    /// Sending a request and receiving its response headers.
+    pub request: Duration,
+    /// Longest silence tolerated inside a streaming response
+    /// (`GetBlockRange`, `GetSubtreeRoots`) before the stream is declared
+    /// stalled and the connection dropped.
+    pub stream_idle: Duration,
+}
+
+impl Default for LwdTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(30),
+            request: Duration::from_secs(60),
+            stream_idle: Duration::from_secs(60),
+        }
+    }
+}
+
+/// The embedded Tor client's state, for `GetInfo.tor` (API.md).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TorState {
+    /// `use_tor = false`.
+    Disabled,
+    /// Nothing has needed Tor yet.
+    NotStarted,
+    Bootstrapping,
+    Ready,
+    Failed(String),
+}
+
+/// The endpoint backend. Cheap to share behind an `Arc`.
+pub struct ArtiTorLwdBackend<P> {
+    endpoint: Uri,
+    transport: Transport,
+    params: P,
+    timeouts: LwdTimeouts,
+    status: RwLock<NodeStatus>,
+    tor_state: RwLock<TorState>,
+    conn: tokio::sync::Mutex<Connection>,
+}
+
+#[derive(Default)]
+struct Connection {
+    tor: Option<tor::Client>,
+    client: Option<CompactTxStreamerClient<Channel>>,
+}
+
+impl<P> fmt::Debug for ArtiTorLwdBackend<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArtiTorLwdBackend")
+            .field("endpoint", &self.endpoint.to_string())
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
+    /// A backend for `endpoint` (`fallback_lightwalletd.grpc_url`: an
+    /// `http://` or `https://` URL with a host; `Config::validate` has
+    /// already applied the scheme rules of DATA_MODEL.md §2). Nothing is
+    /// contacted here.
+    pub fn new(endpoint: &str, transport: Transport, params: P) -> Result<Self, ChainError> {
+        let uri: Uri = endpoint.trim().parse().map_err(|e| {
+            ChainError::Rpc(format!("fallback endpoint `{endpoint}` is not a URL: {e}"))
+        })?;
+        match uri.scheme_str() {
+            Some("http") | Some("https") => {}
+            other => {
+                return Err(ChainError::Rpc(format!(
+                    "fallback endpoint `{endpoint}` must be http:// or https://, not {}",
+                    other.unwrap_or("a bare host")
+                )));
+            }
+        }
+        if uri.host().is_none_or(str::is_empty) {
+            return Err(ChainError::Rpc(format!(
+                "fallback endpoint `{endpoint}` has no host"
+            )));
+        }
+        let tor_state = match transport {
+            Transport::Direct => TorState::Disabled,
+            Transport::Tor { .. } => TorState::NotStarted,
+        };
+        Ok(Self {
+            endpoint: uri,
+            transport,
+            params,
+            timeouts: LwdTimeouts::default(),
+            status: RwLock::new(NodeStatus::default()),
+            tor_state: RwLock::new(tor_state),
+            conn: tokio::sync::Mutex::new(Connection::default()),
+        })
+    }
+
+    /// Replace the default [`LwdTimeouts`].
+    pub fn with_timeouts(mut self, timeouts: LwdTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    pub fn endpoint(&self) -> String {
+        self.endpoint.to_string()
+    }
+
+    pub fn transport(&self) -> &Transport {
+        &self.transport
+    }
+
+    /// Whether the endpoint host is a Tor onion service (`.onion`), which
+    /// needs no exit node and no TLS to be private (Q-D5).
+    pub fn is_onion(&self) -> bool {
+        self.endpoint
+            .host()
+            .is_some_and(|h| h.to_ascii_lowercase().ends_with(".onion"))
+    }
+
+    pub fn tor_state(&self) -> TorState {
+        self.tor_state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_tor_state(&self, state: TorState) {
+        *self.tor_state.write().unwrap_or_else(|e| e.into_inner()) = state;
+    }
+
+    /// Drop the connection (and keep the Tor client); the next call
+    /// reconnects.
+    pub async fn disconnect(&self) {
+        self.conn.lock().await.client = None;
+    }
+
+    /// The connected client, connecting (and bootstrapping Tor) on first
+    /// use. `GetLightdInfo` is checked once per connection so that an
+    /// endpoint for another chain is refused before any block is taken
+    /// from it.
+    async fn client(&self) -> Result<CompactTxStreamerClient<Channel>, ChainError> {
+        let mut conn = self.conn.lock().await;
+        if let Some(client) = &conn.client {
+            return Ok(client.clone());
+        }
+        let channel = match &self.transport {
+            Transport::Direct => self.connect_direct().await?,
+            Transport::Tor { tor_dir } => {
+                if conn.tor.is_none() {
+                    conn.tor = Some(self.bootstrap_tor(tor_dir).await?);
+                }
+                let tor = conn.tor.as_ref().expect("set above");
+                match tor
+                    .connect_lightwalletd_channel(self.endpoint.clone(), self.is_onion())
+                    .await
+                {
+                    Ok(channel) => channel,
+                    Err(e) => {
+                        // A failed circuit is the common case; a client that
+                        // lost its directory is re-bootstrapped by the next
+                        // attempt (`ensure_bootstrapped`), so keep it.
+                        return Err(ChainError::Unreachable(format!(
+                            "{} over Tor: {e}",
+                            self.endpoint
+                        )));
+                    }
+                }
+            }
+        };
+        let mut client = CompactTxStreamerClient::new(channel);
+        self.check_endpoint(&mut client).await?;
+        conn.client = Some(client.clone());
+        Ok(client)
+    }
+
+    async fn connect_direct(&self) -> Result<Channel, ChainError> {
+        let mut endpoint = Endpoint::from(self.endpoint.clone())
+            .connect_timeout(self.timeouts.connect)
+            .timeout(self.timeouts.request)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(20))
+            .keep_alive_while_idle(false);
+        if self.endpoint.scheme_str() == Some("https") {
+            // The same policy as the Tor path (OVERVIEW.md §4.4): webpki
+            // roots, SNI and hostname verification from the URI host.
+            endpoint = endpoint
+                .tls_config(ClientTlsConfig::new().with_webpki_roots())
+                .map_err(|e| ChainError::Rpc(format!("TLS configuration: {e}")))?;
+        }
+        endpoint.connect().await.map_err(|e| {
+            ChainError::Unreachable(format!("{}: {}", self.endpoint, transport_error_text(&e)))
+        })
+    }
+
+    async fn bootstrap_tor(&self, tor_dir: &PathBuf) -> Result<tor::Client, ChainError> {
+        if let Err(e) = std::fs::create_dir_all(tor_dir) {
+            let msg = format!("cannot create {}: {e}", tor_dir.display());
+            self.set_tor_state(TorState::Failed(msg.clone()));
+            return Err(ChainError::Unreachable(msg));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(tor_dir, std::fs::Permissions::from_mode(0o700));
+        }
+        self.set_tor_state(TorState::Bootstrapping);
+        tracing::info!(dir = %tor_dir.display(), "bootstrapping the embedded Tor client");
+        let timeouts = tor::Timeouts::default()
+            .with_connect(self.timeouts.connect)
+            .with_request(self.timeouts.request);
+        // `|_| {}` keeps arti's own permission checks (the directory must
+        // not be group or world writable), which is what DATA_MODEL.md §1
+        // demands anyway.
+        match tor::Client::create_with_timeouts(tor_dir, |_| {}, timeouts).await {
+            Ok(client) => {
+                self.set_tor_state(TorState::Ready);
+                tracing::info!("Tor bootstrapped");
+                Ok(client)
+            }
+            Err(e) => {
+                let msg = format!("Tor bootstrap failed: {e}");
+                self.set_tor_state(TorState::Failed(msg.clone()));
+                Err(ChainError::Unreachable(msg))
+            }
+        }
+    }
+
+    /// `GetLightdInfo`: refuse an endpoint for another chain. lightwalletd
+    /// reports `"main"` or `"test"`; zaino on regtest reports `"regtest"`.
+    async fn check_endpoint(
+        &self,
+        client: &mut CompactTxStreamerClient<Channel>,
+    ) -> Result<(), ChainError> {
+        let info = client
+            .get_lightd_info(Empty {})
+            .await
+            .map_err(|s| self.status_error("GetLightdInfo", s))?
+            .into_inner();
+        let (network, accepted): (&str, &[&str]) = match self.params.network_type() {
+            NetworkType::Main => ("mainnet", &["main"]),
+            NetworkType::Test => ("testnet", &["test"]),
+            NetworkType::Regtest => ("regtest", &["test", "regtest"]),
+        };
+        if !accepted.contains(&info.chain_name.as_str()) {
+            return Err(ChainError::Rpc(format!(
+                "the fallback endpoint {} serves chain \"{}\", this daemon is for {network}",
+                self.endpoint, info.chain_name
+            )));
+        }
+        tracing::info!(
+            endpoint = %self.endpoint,
+            vendor = %info.vendor,
+            version = %info.version,
+            tip = info.block_height,
+            "fallback endpoint connected"
+        );
+        Ok(())
+    }
+
+    /// Map a gRPC status onto [`ChainError`]; transport-level failures drop
+    /// the connection so the next call reconnects.
+    fn status_error(&self, method: &str, status: Status) -> ChainError {
+        match status.code() {
+            Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::Aborted => {
+                ChainError::Unreachable(format!(
+                    "{method} at {}: {} ({:?})",
+                    self.endpoint,
+                    status.message(),
+                    status.code()
+                ))
+            }
+            Code::Unknown if status.source().is_some() => {
+                // tonic reports a dead connection as Unknown with the
+                // transport error as its source.
+                ChainError::Unreachable(format!(
+                    "{method} at {}: {}",
+                    self.endpoint,
+                    status
+                        .source()
+                        .map_or_else(|| status.message().to_string(), ToString::to_string)
+                ))
+            }
+            code => ChainError::Rpc(format!(
+                "{method} at {}: {} ({code:?})",
+                self.endpoint,
+                status.message()
+            )),
+        }
+    }
+
+    /// Run `f` against the client, dropping the connection when the result
+    /// is a transport failure.
+    async fn call<T, F, Fut>(&self, f: F) -> Result<T, ChainError>
+    where
+        F: FnOnce(CompactTxStreamerClient<Channel>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, ChainError>>,
+    {
+        let client = self.client().await?;
+        let result = f(client).await;
+        if matches!(result, Err(ChainError::Unreachable(_))) {
+            self.disconnect().await;
+        }
+        result
+    }
+
+    fn record(&self, outcome: &Result<NodeBounds, ChainError>) {
+        let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
+        status.last_polled = Some(SystemTime::now());
+        match outcome {
+            Ok(bounds) => {
+                status.connected = true;
+                status.bounds = Some(bounds.clone());
+                status.pruned = false;
+                status.last_error.clear();
+            }
+            Err(e) => {
+                status.connected = false;
+                status.last_error = e.to_string();
+            }
+        }
+    }
+
+    /// `GetLatestBlock`: the endpoint's tip. An archival endpoint retains
+    /// everything, so `retained_from` is 0.
+    pub async fn latest_block(&self) -> Result<NodeBounds, ChainError> {
+        self.call(|mut client| async move {
+            let id = client
+                .get_latest_block(ChainSpec {})
+                .await
+                .map_err(|s| self.status_error("GetLatestBlock", s))?
+                .into_inner();
+            Ok(NodeBounds {
+                tip_height: height_of(id.height, "GetLatestBlock")?,
+                tip_hash: hash_of(&id.hash, "GetLatestBlock")?,
+                retained_from: BlockHeight::from_u32(0),
+            })
+        })
+        .await
+    }
+
+    /// `GetBlock(height)`: one compact block; [`ChainError::BlockUnavailable`]
+    /// when the endpoint has none at that height.
+    pub async fn compact_block(&self, height: BlockHeight) -> Result<CompactBlock, ChainError> {
+        self.call(|mut client| async move {
+            let block = client
+                .get_block(BlockId {
+                    height: u64::from(u32::from(height)),
+                    hash: vec![],
+                })
+                .await
+                .map_err(|s| match s.code() {
+                    Code::NotFound | Code::InvalidArgument | Code::OutOfRange => {
+                        ChainError::BlockUnavailable { height }
+                    }
+                    _ => self.status_error("GetBlock", s),
+                })?
+                .into_inner();
+            if block.height != u64::from(u32::from(height)) {
+                return Err(ChainError::Rpc(format!(
+                    "GetBlock({height}) at {} answered height {}",
+                    self.endpoint, block.height
+                )));
+            }
+            hash_of(&block.hash, "GetBlock")?;
+            Ok(block)
+        })
+        .await
+    }
+
+    /// `GetTreeState(height)` as the `ChainState` an account born at
+    /// `height + 1` starts from. Untrusted until the handoff validation of
+    /// SYNC.md §5.2 has covered it (SYNC.md §9).
+    pub async fn tree_state(&self, height: BlockHeight) -> Result<ChainState, ChainError> {
+        self.call(|mut client| async move {
+            let state = client
+                .get_tree_state(BlockId {
+                    height: u64::from(u32::from(height)),
+                    hash: vec![],
+                })
+                .await
+                .map_err(|s| match s.code() {
+                    Code::NotFound | Code::InvalidArgument | Code::OutOfRange => {
+                        ChainError::BlockUnavailable { height }
+                    }
+                    _ => self.status_error("GetTreeState", s),
+                })?
+                .into_inner();
+            if state.height != u64::from(u32::from(height)) {
+                return Err(ChainError::Rpc(format!(
+                    "GetTreeState({height}) at {} answered height {}",
+                    self.endpoint, state.height
+                )));
+            }
+            state.to_chain_state().map_err(|e| {
+                ChainError::Rpc(format!(
+                    "GetTreeState({height}) at {} does not parse: {e}",
+                    self.endpoint
+                ))
+            })
+        })
+        .await
+    }
+
+    /// `GetBlockRange(start, end - 1)`, collected with the idle timeout and
+    /// checked: the heights are exactly the requested ones in order, every
+    /// hash is 32 bytes, and consecutive blocks link by `prev_hash`. A
+    /// stream that ends early is [`ChainError::BlockUnavailable`] for the
+    /// first missing height; one that skips, repeats or forks is
+    /// [`ChainError::Rpc`] naming the heights; one that goes silent for
+    /// [`LwdTimeouts::stream_idle`] is [`ChainError::Unreachable`] and drops
+    /// the connection.
+    pub async fn block_range(
+        &self,
+        range: Range<BlockHeight>,
+    ) -> Result<Vec<CompactBlock>, ChainError> {
+        if range.end <= range.start {
+            return Ok(Vec::new());
+        }
+        let (start, end) = (u32::from(range.start), u32::from(range.end));
+        let wanted = usize::try_from(end - start).unwrap_or(usize::MAX);
+        self.call(|mut client| async move {
+            let request = BlockRange {
+                start: Some(BlockId {
+                    height: u64::from(start),
+                    hash: vec![],
+                }),
+                end: Some(BlockId {
+                    height: u64::from(end - 1),
+                    hash: vec![],
+                }),
+                // Legacy behaviour: shielded data only. Transparent outputs
+                // below `retained_from` come from `GetAddressUtxos`
+                // (SYNC.md §5.3).
+                pool_types: vec![],
+            };
+            let mut stream = client
+                .get_block_range(request)
+                .await
+                .map_err(|s| self.status_error("GetBlockRange", s))?
+                .into_inner();
+            let mut blocks: Vec<CompactBlock> = Vec::with_capacity(wanted);
+            loop {
+                let next = tokio::time::timeout(self.timeouts.stream_idle, stream.next()).await;
+                let block = match next {
+                    Err(_elapsed) => {
+                        return Err(ChainError::Unreachable(format!(
+                            "GetBlockRange({start}..{end}) at {} stalled: no block for {:?} after {} of {wanted}",
+                            self.endpoint,
+                            self.timeouts.stream_idle,
+                            blocks.len()
+                        )));
+                    }
+                    Ok(None) => break,
+                    Ok(Some(Err(s))) => return Err(self.status_error("GetBlockRange", s)),
+                    Ok(Some(Ok(block))) => block,
+                };
+                let expected = start + blocks.len() as u32;
+                if block.height != u64::from(expected) {
+                    return Err(ChainError::Rpc(format!(
+                        "GetBlockRange({start}..{end}) at {} answered height {} where {expected} was due",
+                        self.endpoint, block.height
+                    )));
+                }
+                hash_of(&block.hash, "GetBlockRange")?;
+                if let Some(prev) = blocks.last()
+                    && block.prev_hash != prev.hash
+                {
+                    return Err(ChainError::Rpc(format!(
+                        "GetBlockRange({start}..{end}) at {}: block {} (prev {}) does not link to block {} ({})",
+                        self.endpoint,
+                        block.height,
+                        display_hash(&block.prev_hash),
+                        prev.height,
+                        display_hash(&prev.hash)
+                    )));
+                }
+                blocks.push(block);
+                if blocks.len() > wanted {
+                    return Err(ChainError::Rpc(format!(
+                        "GetBlockRange({start}..{end}) at {} streamed more than {wanted} blocks",
+                        self.endpoint
+                    )));
+                }
+            }
+            if blocks.len() < wanted {
+                return Err(ChainError::BlockUnavailable {
+                    height: BlockHeight::from_u32(start + blocks.len() as u32),
+                });
+            }
+            Ok(blocks)
+        })
+        .await
+    }
+
+    /// `GetSubtreeRoots`, collected with the idle timeout.
+    pub async fn get_subtree_roots(
+        &self,
+        pool: ShieldedPool,
+        start_index: u32,
+        max_entries: u32,
+    ) -> Result<Vec<SubtreeRoot>, ChainError> {
+        let protocol = match pool {
+            ShieldedPool::Sapling => ShieldedProtocol::Sapling,
+            ShieldedPool::Orchard => ShieldedProtocol::Orchard,
+            ShieldedPool::Ironwood => ShieldedProtocol::Ironwood,
+        };
+        self.call(|mut client| async move {
+            let mut request = GetSubtreeRootsArg {
+                start_index,
+                shielded_protocol: 0,
+                max_entries,
+            };
+            request.set_shielded_protocol(protocol);
+            let mut stream = client
+                .get_subtree_roots(request)
+                .await
+                .map_err(|s| self.status_error("GetSubtreeRoots", s))?
+                .into_inner();
+            let mut roots = Vec::new();
+            loop {
+                let next = tokio::time::timeout(self.timeouts.stream_idle, stream.next()).await;
+                let root = match next {
+                    Err(_elapsed) => {
+                        return Err(ChainError::Unreachable(format!(
+                            "GetSubtreeRoots({pool:?}, {start_index}) at {} stalled after {} roots",
+                            self.endpoint,
+                            roots.len()
+                        )));
+                    }
+                    Ok(None) => break,
+                    Ok(Some(Err(s))) => return Err(self.status_error("GetSubtreeRoots", s)),
+                    Ok(Some(Ok(root))) => root,
+                };
+                let index = start_index + roots.len() as u32;
+                let end_hash = if root.completing_block_hash.is_empty() {
+                    None
+                } else {
+                    Some(hash_of(&root.completing_block_hash, "GetSubtreeRoots")?)
+                };
+                roots.push(SubtreeRoot {
+                    pool,
+                    index,
+                    root: hash_of(&root.root_hash, "GetSubtreeRoots")?,
+                    end_height: height_of(root.completing_block_height, "GetSubtreeRoots")?,
+                    end_hash,
+                });
+            }
+            Ok(roots)
+        })
+        .await
+    }
+
+    /// `GetTransaction(txid)`: where the endpoint has the transaction.
+    /// lightwalletd reports `height` 0 for the mempool, `u64::MAX` for a
+    /// transaction mined only on a fork, else the main-chain height
+    /// (OVERVIEW.md §4.4); NOT_FOUND is [`TxStatus::Unknown`].
+    pub async fn transaction_status(&self, txid: [u8; 32]) -> Result<TxStatus, ChainError> {
+        self.call(|mut client| async move {
+            let resp = client
+                .get_transaction(TxFilter {
+                    block: None,
+                    index: 0,
+                    hash: txid.to_vec(),
+                })
+                .await;
+            let raw = match resp {
+                Ok(r) => r.into_inner(),
+                Err(s) if s.code() == Code::NotFound => return Ok(TxStatus::Unknown),
+                Err(s) => return Err(self.status_error("GetTransaction", s)),
+            };
+            Ok(match raw.height {
+                0 => TxStatus::InMempool,
+                u64::MAX => TxStatus::Unknown,
+                h => TxStatus::Mined(height_of(h, "GetTransaction")?),
+            })
+        })
+        .await
+    }
+
+    /// `SendTransaction`: broadcast through the endpoint (`tx send
+    /// --via-tor`, `broadcast_via_tor`). lightwalletd answers the node's
+    /// `sendrawtransaction` result: `error_code` 0 with the txid in
+    /// `error_message`, or the node's rejection code and text, which is
+    /// passed through as [`ChainError::Rejected`].
+    pub async fn send_transaction(&self, raw: &[u8]) -> Result<[u8; 32], ChainError> {
+        let raw = raw.to_vec();
+        self.call(|mut client| async move {
+            let resp = client
+                .send_transaction(RawTransaction {
+                    data: raw.clone(),
+                    height: 0,
+                })
+                .await
+                .map_err(|s| self.status_error("SendTransaction", s))?
+                .into_inner();
+            if resp.error_code != 0 {
+                return Err(ChainError::Rejected(format!(
+                    "{} (code {})",
+                    resp.error_message, resp.error_code
+                )));
+            }
+            if let Ok(txid) = parse_display_hash(&resp.error_message) {
+                return Ok(txid);
+            }
+            // No txid in the reply: compute it from the transaction itself,
+            // parsed under the branch id of the next block.
+            let tip = self
+                .status()
+                .bounds
+                .map_or(BlockHeight::from_u32(0), |b| b.tip_height);
+            let branch = BranchId::for_height(&self.params, tip + 1);
+            Transaction::read(&raw[..], branch)
+                .map(|tx| *tx.txid().as_ref())
+                .map_err(|e| {
+                    ChainError::Rpc(format!(
+                        "SendTransaction at {} accepted a transaction Gyges cannot parse: {e}",
+                        self.endpoint
+                    ))
+                })
+        })
+        .await
+    }
+}
+
+fn height_of(height: u64, method: &str) -> Result<BlockHeight, ChainError> {
+    u32::try_from(height)
+        .map(BlockHeight::from_u32)
+        .map_err(|_| ChainError::Rpc(format!("{method}: height {height} does not fit a u32")))
+}
+
+fn hash_of(bytes: &[u8], method: &str) -> Result<[u8; 32], ChainError> {
+    <[u8; 32]>::try_from(bytes).map_err(|_| {
+        ChainError::Rpc(format!(
+            "{method}: hash has {} bytes, expected 32",
+            bytes.len()
+        ))
+    })
+}
+
+/// tonic's transport errors hide the OS error several layers down.
+fn transport_error_text(e: &tonic::transport::Error) -> String {
+    let mut cur: &dyn std::error::Error = e;
+    let mut last = e.to_string();
+    while let Some(next) = cur.source() {
+        last = next.to_string();
+        cur = next;
+    }
+    last
+}
+
+impl<P: Parameters + Send + Sync + 'static> ChainBackend for ArtiTorLwdBackend<P> {
+    fn route(&self) -> Route {
+        Route::TorLightwalletd
+    }
+
+    fn node_bounds(&self) -> BoxFuture<'_, Result<NodeBounds, ChainError>> {
+        Box::pin(async move {
+            let outcome = self.latest_block().await;
+            self.record(&outcome);
+            outcome
+        })
+    }
+
+    fn status(&self) -> NodeStatus {
+        self.status
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn chain_state(&self, height: BlockHeight) -> BoxFuture<'_, Result<ChainState, ChainError>> {
+        Box::pin(self.tree_state(height))
+    }
+
+    fn block_hash(&self, height: BlockHeight) -> BoxFuture<'_, Result<[u8; 32], ChainError>> {
+        Box::pin(async move {
+            let block = self.compact_block(height).await?;
+            hash_of(&block.hash, "GetBlock")
+        })
+    }
+
+    fn compact_blocks(
+        &self,
+        range: Range<BlockHeight>,
+    ) -> BoxFuture<'_, Result<Vec<CompactBlock>, ChainError>> {
+        Box::pin(self.block_range(range))
+    }
+
+    fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<[u8; 32], ChainError>> {
+        Box::pin(async move { self.send_transaction(&raw).await })
+    }
+
+    fn transaction_status(&self, txid: [u8; 32]) -> BoxFuture<'_, Result<TxStatus, ChainError>> {
+        Box::pin(self.transaction_status(txid))
+    }
+
+    fn subtree_roots(
+        &self,
+        pool: ShieldedPool,
+        start_index: u32,
+        max_entries: u32,
+    ) -> BoxFuture<'_, Result<Vec<SubtreeRoot>, ChainError>> {
+        Box::pin(self.get_subtree_roots(pool, start_index, max_entries))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use transparent::address::TransparentAddress;
+    use zcash_client_backend::data_api::chain::BlockCache as _;
+    use zcash_client_backend::data_api::scanning::{ScanPriority, ScanRange};
+    use zcash_protocol::local_consensus::LocalNetwork;
+
+    use super::*;
+    use crate::testing::{FakeLightwalletd, FakeNode, FakeSubtreeRoot, h, regtest_params};
+    use crate::{BlockDb, Source, fill_cache};
+
+    fn backend(lwd: &FakeLightwalletd) -> ArtiTorLwdBackend<LocalNetwork> {
+        ArtiTorLwdBackend::new(lwd.url(), Transport::Direct, regtest_params()).unwrap()
+    }
+
+    fn scan_range(start: u32, end: u32) -> ScanRange {
+        ScanRange::from_parts(h(start)..h(end), ScanPriority::Historic)
+    }
+
+    #[test]
+    fn endpoint_urls_are_checked_up_front() {
+        let p = regtest_params();
+        for bad in ["", "127.0.0.1:9067", "ftp://x", "grpc://x:1", "https://"] {
+            let err = ArtiTorLwdBackend::new(bad, Transport::Direct, p).unwrap_err();
+            assert!(matches!(err, ChainError::Rpc(_)), "{bad}: {err}");
+        }
+        let be = ArtiTorLwdBackend::new("https://zec.rocks:443", Transport::Direct, p).unwrap();
+        assert!(!be.is_onion());
+        assert_eq!(be.tor_state(), TorState::Disabled);
+        assert_eq!(be.route(), Route::TorLightwalletd);
+        assert!(!be.status().connected, "nothing contacted yet");
+        let dir = tempfile::tempdir().unwrap();
+        let be = ArtiTorLwdBackend::new(
+            "http://abcdefghijklmnop.onion:9067",
+            Transport::Tor {
+                tor_dir: dir.path().join("tor_cache"),
+            },
+            p,
+        )
+        .unwrap();
+        assert!(be.is_onion());
+        assert_eq!(be.tor_state(), TorState::NotStarted);
+        assert!(
+            !dir.path().join("tor_cache").exists(),
+            "the Tor directory is created on first use, not at construction"
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_the_chain_into_the_cache_tagged_as_the_tor_source() {
+        let node = FakeNode::start(regtest_params()).await;
+        node.mine(5);
+        let paid = node.mine_with_payments(&[(TransparentAddress::PublicKeyHash([0x42; 20]), 7)]);
+        node.mine(14);
+        let lwd = FakeLightwalletd::from_node(&node).await;
+        let be = backend(&lwd);
+
+        // Bounds: the endpoint's tip, nothing retained-from.
+        let bounds = be.node_bounds().await.unwrap();
+        assert_eq!(bounds.tip_height, h(20));
+        assert_eq!(bounds.tip_hash, node.tip().1);
+        assert_eq!(bounds.retained_from, h(0));
+        let st = be.status();
+        assert!(st.connected && st.last_error.is_empty() && !st.pruned);
+        assert_eq!(
+            lwd.calls(),
+            vec!["GetLightdInfo", "GetLatestBlock"],
+            "the chain is checked once, on connect"
+        );
+
+        // Blocks: same as the node route minus the transparent fields,
+        // linked, in `fetch_batch`-sized chunks, tagged `tor-lwd`.
+        let cache = BlockDb::in_memory("regtest").unwrap();
+        let n = fill_cache(&be, &cache, h(1)..h(21), 7).await.unwrap();
+        assert_eq!(n, 20);
+        let fetched = cache.read(&scan_range(1, 21)).await.unwrap();
+        assert_eq!(fetched.len(), 20);
+        let from_node = node.compact_chain();
+        for b in &fetched {
+            let expected = &from_node[b.height as usize];
+            assert_eq!(b.hash, expected.hash);
+            assert_eq!(b.prev_hash, expected.prev_hash);
+            assert_eq!(b.chain_metadata, expected.chain_metadata);
+            assert_eq!(b.vtx.len(), expected.vtx.len());
+            for (ours, theirs) in b.vtx.iter().zip(&expected.vtx) {
+                assert_eq!(ours.txid, theirs.txid);
+                assert!(
+                    ours.vin.is_empty() && ours.vout.is_empty(),
+                    "no transparent data over the Tor route"
+                );
+            }
+        }
+        assert_eq!(fetched[(paid.height - 1) as usize].vtx.len(), 2);
+        let ranges = lwd
+            .calls()
+            .iter()
+            .filter(|c| c.as_str() == "GetBlockRange")
+            .count();
+        assert_eq!(ranges, 3, "20 blocks in batches of 7");
+        assert_eq!(
+            cache.evict_source_below(Source::TorLwd, h(100)).unwrap(),
+            20,
+            "every row carries the Tor source"
+        );
+
+        // Hash and tree state by height, both checked against the node.
+        assert_eq!(
+            be.block_hash(h(9)).await.unwrap(),
+            node.block(9).unwrap().hash
+        );
+        let cs = be.chain_state(h(10)).await.unwrap();
+        assert_eq!(cs.block_height(), h(10));
+        assert_eq!(cs.block_hash().0, node.block(10).unwrap().hash);
+        assert!(cs.final_orchard_tree().value().is_none());
+        assert!(matches!(
+            be.block_hash(h(21)).await,
+            Err(ChainError::BlockUnavailable { height }) if height == h(21)
+        ));
+        assert!(matches!(
+            be.chain_state(h(21)).await,
+            Err(ChainError::BlockUnavailable { height }) if height == h(21)
+        ));
+
+        // Above the tip: the first missing height, nothing cached from it.
+        let err = be.compact_blocks(h(18)..h(25)).await.unwrap_err();
+        assert!(
+            matches!(err, ChainError::BlockUnavailable { height } if height == h(21)),
+            "{err}"
+        );
+        assert!(be.compact_blocks(h(5)..h(5)).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_skipped_forked_or_overlong_stream_is_refused() {
+        let node = FakeNode::start(regtest_params()).await;
+        node.mine(12);
+        let lwd = FakeLightwalletd::from_node(&node).await;
+        let be = backend(&lwd);
+        let cache = BlockDb::in_memory("regtest").unwrap();
+        fill_cache(&be, &cache, h(1)..h(6), 100).await.unwrap();
+
+        // A hole: height 8 follows 6.
+        lwd.omit_block(7);
+        let err = be.compact_blocks(h(6)..h(10)).await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Rpc(m) if m.contains("height 8 where 7 was due")),
+            "{err}"
+        );
+
+        // A fork inside the batch: 9 does not link to 8.
+        let lwd = FakeLightwalletd::from_node(&node).await;
+        lwd.fork_from(9);
+        let be = backend(&lwd);
+        let err = be.compact_blocks(h(6)..h(12)).await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Rpc(m) if m.contains("block 9") && m.contains("does not link to block 8")),
+            "{err}"
+        );
+        // A batch that starts on the fork is internally fine but does not
+        // link to the cache: refused by the filler, nothing cached.
+        let lwd = FakeLightwalletd::from_node(&node).await;
+        lwd.fork_from(6);
+        let be = backend(&lwd);
+        let err = fill_cache(&be, &cache, h(6)..h(9), 100).await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                crate::FillError::Unlinked {
+                    route: Route::TorLightwalletd,
+                    height: 6,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            cache.len().unwrap(),
+            5,
+            "nothing of the forked batch was cached"
+        );
+
+        // Hash length is checked too.
+        let mut blocks = node.compact_chain();
+        blocks[3].hash.truncate(31);
+        lwd.set_blocks(blocks);
+        let err = be.compact_blocks(h(3)..h(4)).await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Rpc(m) if m.contains("31 bytes")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hung_stream_times_out_and_the_next_call_reconnects() {
+        let node = FakeNode::start(regtest_params()).await;
+        node.mine(10);
+        let lwd = FakeLightwalletd::from_node(&node).await;
+        let be = backend(&lwd).with_timeouts(LwdTimeouts {
+            stream_idle: Duration::from_millis(200),
+            ..LwdTimeouts::default()
+        });
+        be.node_bounds().await.unwrap();
+
+        lwd.hang_after(Some(3));
+        let started = std::time::Instant::now();
+        let err = be.compact_blocks(h(1)..h(11)).await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Unreachable(m) if m.contains("stalled") && m.contains("after 3 of 10")),
+            "{err}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // The connection was dropped; the next call reconnects (another
+        // GetLightdInfo) and succeeds once the endpoint behaves.
+        lwd.hang_after(None);
+        let blocks = be.compact_blocks(h(1)..h(11)).await.unwrap();
+        assert_eq!(blocks.len(), 10);
+        assert_eq!(
+            lwd.calls()
+                .iter()
+                .filter(|c| c.as_str() == "GetLightdInfo")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn subtree_roots_for_every_pool() {
+        let node = FakeNode::start(regtest_params()).await;
+        node.mine(3);
+        let lwd = FakeLightwalletd::from_node(&node).await;
+        let root = |i: u8| FakeSubtreeRoot {
+            root: [i; 32],
+            end_height: u32::from(i) * 1000,
+            end_hash: node.block(1).unwrap().hash,
+        };
+        lwd.set_subtree_roots(ShieldedPool::Sapling, vec![root(1), root(2), root(3)]);
+        lwd.set_subtree_roots(ShieldedPool::Orchard, vec![root(4)]);
+        let be = backend(&lwd);
+
+        let sapling = be.subtree_roots(ShieldedPool::Sapling, 0, 0).await.unwrap();
+        assert_eq!(sapling.len(), 3);
+        assert_eq!(sapling[2].index, 2);
+        assert_eq!(sapling[2].root, [3; 32]);
+        assert_eq!(sapling[2].end_height, h(3000));
+        assert_eq!(sapling[2].end_hash, Some(node.block(1).unwrap().hash));
+        assert_eq!(sapling[2].pool, ShieldedPool::Sapling);
+        let upstream = sapling[0].sapling().expect("a valid Sapling node");
+        assert_eq!(upstream.subtree_end_height(), h(1000));
+        assert!(sapling[0].orchard().is_none(), "pool is checked");
+
+        // From an index, bounded.
+        let tail = be.subtree_roots(ShieldedPool::Sapling, 1, 1).await.unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].index, 1);
+        assert_eq!(tail[0].root, [2; 32]);
+
+        let orchard = be.subtree_roots(ShieldedPool::Orchard, 0, 0).await.unwrap();
+        assert_eq!(orchard.len(), 1);
+        assert!(orchard[0].orchard().is_some());
+        assert!(
+            be.subtree_roots(ShieldedPool::Ironwood, 0, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_chain_unreachable_and_broadcasts() {
+        // Mainnet lightwalletd, regtest daemon: refused on connect.
+        let lwd = FakeLightwalletd::start("main", vec![], vec![]).await;
+        let be = backend(&lwd);
+        let err = be.node_bounds().await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Rpc(m) if m.contains("serves chain \"main\"")),
+            "{err}"
+        );
+        assert!(!be.status().connected);
+        assert!(be.status().last_error.contains("serves chain"));
+
+        // Nobody listening.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let be = ArtiTorLwdBackend::new(&url, Transport::Direct, regtest_params()).unwrap();
+        let err = be.node_bounds().await.unwrap_err();
+        assert!(matches!(&err, ChainError::Unreachable(_)), "{err}");
+        assert!(be.status().last_polled.is_some());
+
+        // Broadcast through the endpoint: accepted, then refused.
+        let node = FakeNode::start(regtest_params()).await;
+        node.mine(2);
+        let lwd = FakeLightwalletd::from_node(&node).await;
+        let be = backend(&lwd);
+        let raw = node.block(2).unwrap().tx_raw[0].clone();
+        be.send_raw_transaction(raw.clone()).await.unwrap();
+        assert_eq!(lwd.broadcasts(), vec![raw.clone()]);
+        lwd.set_reject_broadcasts(Some("tx-expired".into()));
+        let err = be.send_raw_transaction(raw).await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Rejected(m) if m.contains("tx-expired")),
+            "{err}"
+        );
+
+        // Transaction status: mined at its block, unknown otherwise.
+        let mined = node.block(2).unwrap().txids[0];
+        assert_eq!(
+            be.transaction_status(mined).await.unwrap(),
+            TxStatus::Mined(h(2))
+        );
+        assert_eq!(
+            be.transaction_status([0x55; 32]).await.unwrap(),
+            TxStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn tor_transport_needs_a_bootstrap_before_any_request() {
+        // No network here: a bootstrap attempt cannot be exercised in unit
+        // tests (TESTING.md §1, nightly tier). What can be checked is that
+        // the backend creates its directory and reports the failure through
+        // `TorState` rather than hanging: an unreachable directory makes the
+        // bootstrap fail before Tor is touched.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let be = ArtiTorLwdBackend::new(
+            "http://abcdefghijklmnop.onion:9067",
+            Transport::Tor {
+                tor_dir: file.join("tor_cache"),
+            },
+            regtest_params(),
+        )
+        .unwrap();
+        let err = be.node_bounds().await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Unreachable(m) if m.contains("cannot create")),
+            "{err}"
+        );
+        assert!(matches!(be.tor_state(), TorState::Failed(m) if m.contains("cannot create")));
+    }
+}

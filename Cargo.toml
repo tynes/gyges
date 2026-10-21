@@ -40,7 +40,8 @@ repository = "https://github.com/tynes/gyges"
 # --- Zakura wallet libraries (zakura-core/wallet-libraries) ---
 zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc9.1", features = [
     "lightwalletd-tonic",            # CompactTxStreamer client for the Tor backfill route
-    "lightwalletd-tonic-transport",  # tonic transport for direct gRPC in tests (use_tor = false)
+    "lightwalletd-tonic-transport",  # tonic transport for direct gRPC (use_tor = false: regtest and CI)
+    "lightwalletd-tonic-tls-webpki-roots",  # gates `tor::Client::connect_to_lightwalletd` (rustls + webpki roots for https endpoints; OVERVIEW.md §4.4)
     "tor",                           # embedded arti-client; pulls arti-client/tor-rtcompat at the version the backend wants
     "pczt",                          # PCZT construction via `create_pczt_from_proposal`
     "orchard",

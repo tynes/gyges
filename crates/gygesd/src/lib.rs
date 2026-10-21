@@ -14,8 +14,11 @@
 //! 4. load every `keys/<id>/` profile and open its wallet database
 //!    (`KeyRegistry`), refusing on a broken or too-wide key directory;
 //! 5. unless air-gapped, build the node backend (`ZakuraRpcBackend`, which
-//!    contacts nothing yet) and open the shared block cache
-//!    (`cache/blocks.sqlite`), refusing a cache from another network;
+//!    contacts nothing yet), the fallback endpoint backend when
+//!    `fallback_lightwalletd.enabled` (`ArtiTorLwdBackend`, which contacts
+//!    nothing and bootstraps Tor only when a backfill first needs it), and
+//!    open the shared block cache (`cache/blocks.sqlite`), refusing a cache
+//!    from another network;
 //! 6. poll the node once (bounded), bind `gygesd.sock`, set its mode, serve
 //!    until a shutdown signal; checkpoint the cache on the way out.
 
@@ -37,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use gyges_chain::{BlockDb, ChainBackend, ZakuraRpcBackend};
+use gyges_chain::{ArtiTorLwdBackend, BlockDb, ChainBackend, Transport, ZakuraRpcBackend};
 use gyges_core::{Config, Home, KeyRegistry, Network, VaultManager, perms};
 use gyges_proto::v1::gyges_server::GygesServer;
 use tokio::net::UnixListener;
@@ -166,6 +169,27 @@ impl Daemon {
                 .context("cannot set up the node backend")?,
             )),
         };
+        let fallback = if config.airgapped || !config.fallback_lightwalletd.enabled {
+            None
+        } else {
+            let fb = &config.fallback_lightwalletd;
+            let transport = if fb.use_tor {
+                Transport::Tor {
+                    tor_dir: home.tor_cache_dir(network),
+                }
+            } else {
+                tracing::warn!(
+                    endpoint = %fb.grpc_url,
+                    "fallback_lightwalletd.use_tor = false: the endpoint sees this host's address \
+                     and every block range it asks for (THREAT_MODEL.md §3 row 10)"
+                );
+                Transport::Direct
+            };
+            Some(Arc::new(
+                ArtiTorLwdBackend::new(&fb.grpc_url, transport, network.consensus_params())
+                    .context("cannot set up the fallback endpoint backend")?,
+            ))
+        };
         let block_cache = if config.airgapped {
             None
         } else {
@@ -181,6 +205,7 @@ impl Daemon {
             registry,
             vault,
             chain,
+            fallback,
             block_cache,
             opts.log_hub.unwrap_or_default(),
         ));

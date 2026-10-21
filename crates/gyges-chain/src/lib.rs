@@ -8,18 +8,27 @@
 //! * [`compact`] – the raw-block → `CompactBlock` builder, which also carries
 //!   every transparent input and output so that Case A can index transparent
 //!   history without a node-side address index;
+//! * [`lwd::ArtiTorLwdBackend`] – the same trait over a lightwalletd / zaino
+//!   `CompactTxStreamer` endpoint, reached through the embedded Tor client
+//!   (`zcash_client_backend::tor`, arti) or directly (regtest and CI), for
+//!   the historical backfill below the node's retention window (Case B);
+//! * [`fetch::fill_cache`] – streams a range from either backend into the
+//!   cache in `cache.fetch_batch`-sized, `prev_hash`-checked chunks, tagged
+//!   with where it came from;
 //! * [`cache::BlockDb`] – the shared `cache/blocks.sqlite`, implementing the
 //!   upstream `BlockSource` and `BlockCache` traits so that
 //!   `scan_cached_blocks` reads it unchanged.
 //!
-//! The Tor lightwalletd route (`ArtiTorLwdBackend`, Case B) arrives with
-//! ROADMAP.md M2. With the `test-util` feature, the `testing` module provides
-//! an in-process fake `zakurad` and a synthetic block builder.
+//! With the `test-util` feature, the `testing` module provides an in-process
+//! fake `zakurad`, an in-process fake lightwalletd and a synthetic block
+//! builder.
 
 #![forbid(unsafe_code)]
 
 pub mod cache;
 pub mod compact;
+pub mod fetch;
+pub mod lwd;
 pub mod rpc;
 #[cfg(feature = "test-util")]
 pub mod testing;
@@ -30,12 +39,15 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::time::SystemTime;
 
-use zcash_client_backend::data_api::chain::ChainState;
+use zcash_client_backend::data_api::chain::{ChainState, CommitmentTreeRoot};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
+use zcash_protocol::ShieldedPool;
 use zcash_protocol::consensus::BlockHeight;
 
 pub use cache::{BlockDb, CacheError, Source};
 pub use compact::{CompactError, TransparentOutput, TreeSizes};
+pub use fetch::{FillError, fill_cache};
+pub use lwd::{ArtiTorLwdBackend, LwdTimeouts, TorState, Transport};
 pub use rpc::ZakuraRpcBackend;
 
 /// What `getblockchaininfo` tells us about the node (OVERVIEW.md Q-D1).
@@ -84,6 +96,70 @@ pub enum Route {
     TorLightwalletd,
 }
 
+impl Route {
+    /// How blocks fetched through this route are tagged in the cache.
+    pub const fn source(self) -> Source {
+        match self {
+            Route::ZakuraRpc => Source::Node,
+            Route::TorLightwalletd => Source::TorLwd,
+        }
+    }
+}
+
+/// One completed 2^16-leaf subtree of a note commitment tree, as
+/// `z_getsubtreesbyindex` (node) and `GetSubtreeRoots` (lightwalletd) report
+/// it. The handoff validation of SYNC.md §5.2 compares the two sources index
+/// by index; the scheduler hands the roots to `put_sapling_subtree_roots` /
+/// `put_orchard_subtree_roots` through [`SubtreeRoot::sapling`] and
+/// [`SubtreeRoot::orchard`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubtreeRoot {
+    pub pool: ShieldedPool,
+    /// Position of the subtree in the tree (the first is 0).
+    pub index: u32,
+    /// The subtree's Merkle root, raw node bytes (the encoding both sources
+    /// use: the node's `to_bytes()` as hex, lightwalletd's `root_hash` as
+    /// bytes, neither reversed).
+    pub root: [u8; 32],
+    /// Height of the block whose commitment completed the subtree.
+    pub end_height: BlockHeight,
+    /// Hash of that block, internal byte order; lightwalletd reports it,
+    /// `z_getsubtreesbyindex` does not.
+    pub end_hash: Option<[u8; 32]>,
+}
+
+impl SubtreeRoot {
+    /// The upstream form for `put_sapling_subtree_roots`; `None` if the pool
+    /// is not Sapling or the bytes are not a Sapling node.
+    pub fn sapling(&self) -> Option<CommitmentTreeRoot<sapling::Node>> {
+        if self.pool != ShieldedPool::Sapling {
+            return None;
+        }
+        let node = sapling::Node::from_bytes(self.root).into_option()?;
+        Some(CommitmentTreeRoot::from_parts(self.end_height, node))
+    }
+
+    /// The upstream form for `put_orchard_subtree_roots` and
+    /// `put_ironwood_subtree_roots` (both pools use Orchard's hash);
+    /// `None` for Sapling or bytes that are not a valid node.
+    pub fn orchard(&self) -> Option<CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>> {
+        if self.pool == ShieldedPool::Sapling {
+            return None;
+        }
+        let node = orchard::tree::MerkleHashOrchard::from_bytes(&self.root).into_option()?;
+        Some(CommitmentTreeRoot::from_parts(self.end_height, node))
+    }
+}
+
+/// The pool name both `z_getsubtreesbyindex` and `z_gettreestate` use.
+pub const fn pool_name(pool: ShieldedPool) -> &'static str {
+    match pool {
+        ShieldedPool::Sapling => "sapling",
+        ShieldedPool::Orchard => "orchard",
+        ShieldedPool::Ironwood => "ironwood",
+    }
+}
+
 /// Why the node could not answer.
 #[derive(Debug, thiserror::Error)]
 pub enum ChainError {
@@ -129,10 +205,15 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The node-facing operations `gygesd` needs.
 ///
-/// Implemented by [`ZakuraRpcBackend`] and by test fakes. Scanning itself
-/// goes through `zcash_client_backend`'s `BlockSource` / `BlockCache` over
-/// the shared [`BlockDb`]; this trait is how the cache gets filled.
+/// Implemented by [`ZakuraRpcBackend`] (Case A), [`ArtiTorLwdBackend`]
+/// (Case B) and by test fakes. Scanning itself goes through
+/// `zcash_client_backend`'s `BlockSource` / `BlockCache` over the shared
+/// [`BlockDb`]; this trait is how the cache gets filled ([`fill_cache`]).
 pub trait ChainBackend: Send + Sync + fmt::Debug {
+    /// Which route this backend is, hence how its blocks are tagged in the
+    /// cache ([`Route::source`]).
+    fn route(&self) -> Route;
+
     /// `getblockchaininfo`, reduced to what the scheduler needs. Also
     /// refreshes [`ChainBackend::status`].
     fn node_bounds(&self) -> BoxFuture<'_, Result<NodeBounds, ChainError>>;
@@ -171,6 +252,18 @@ pub trait ChainBackend: Send + Sync + fmt::Debug {
     /// `getrawtransaction(txid, 1)`: whether the node has the transaction in
     /// its mempool or its main chain. `txid` is in internal byte order.
     fn transaction_status(&self, txid: [u8; 32]) -> BoxFuture<'_, Result<TxStatus, ChainError>>;
+
+    /// Completed subtree roots of `pool`'s note commitment tree from
+    /// `start_index` on, at most `max_entries` of them (0 for all):
+    /// `z_getsubtreesbyindex` on the node, `GetSubtreeRoots` on lightwalletd.
+    /// Ascending, contiguous indices; an index the source has not completed
+    /// (or, on a node still rebuilding its index, not rebuilt) ends the list.
+    fn subtree_roots(
+        &self,
+        pool: ShieldedPool,
+        start_index: u32,
+        max_entries: u32,
+    ) -> BoxFuture<'_, Result<Vec<SubtreeRoot>, ChainError>>;
 }
 
 /// Block and transaction hashes as the JSON-RPC and explorers print them:
@@ -202,11 +295,13 @@ pub fn parse_display_hash(hex_str: &str) -> Result<[u8; 32], ChainError> {
 /// documents exist under the `package =` renames in `Cargo.toml`.
 #[allow(unused_imports)]
 mod paths_compile {
-    use zcash_client_backend::data_api::chain::{BlockCache, BlockSource, scan_cached_blocks};
-    use zcash_client_backend::data_api::{WalletRead, WalletWrite};
+    use zcash_client_backend::data_api::chain::{
+        BlockCache, BlockSource, CommitmentTreeRoot, scan_cached_blocks,
+    };
+    use zcash_client_backend::data_api::{WalletCommitmentTrees, WalletRead, WalletWrite};
     use zcash_client_backend::proto::compact_formats::CompactBlock;
     use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
-    use zcash_client_backend::tor;
+    use zcash_client_backend::tor::{self, Client, Timeouts};
 }
 
 #[cfg(test)]
@@ -221,6 +316,28 @@ mod tests {
         assert_eq!(parse_display_hash(&shown).unwrap(), internal);
         assert!(parse_display_hash("abcd").is_err());
         assert!(parse_display_hash("zz").is_err());
+    }
+
+    #[test]
+    fn subtree_roots_convert_to_the_upstream_types_only_for_valid_nodes() {
+        let root = |pool, bytes| SubtreeRoot {
+            pool,
+            index: 0,
+            root: bytes,
+            end_height: BlockHeight::from_u32(10),
+            end_hash: None,
+        };
+        // Zero is a valid field element in both curves; all-ones is not.
+        assert!(root(ShieldedPool::Sapling, [0; 32]).sapling().is_some());
+        assert!(root(ShieldedPool::Sapling, [0xff; 32]).sapling().is_none());
+        assert!(root(ShieldedPool::Sapling, [0; 32]).orchard().is_none());
+        assert!(root(ShieldedPool::Orchard, [0; 32]).orchard().is_some());
+        assert!(root(ShieldedPool::Ironwood, [0; 32]).orchard().is_some());
+        assert!(root(ShieldedPool::Orchard, [0xff; 32]).orchard().is_none());
+        assert!(root(ShieldedPool::Orchard, [0; 32]).sapling().is_none());
+        assert_eq!(Route::TorLightwalletd.source(), Source::TorLwd);
+        assert_eq!(Route::ZakuraRpc.source(), Source::Node);
+        assert_eq!(pool_name(ShieldedPool::Ironwood), "ironwood");
     }
 
     #[test]

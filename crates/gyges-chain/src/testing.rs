@@ -12,6 +12,8 @@
 //! stay consistent with what it served, which is what a wallet needs to scan
 //! and spend its own shielded outputs.
 
+pub mod lwd;
+
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::net::SocketAddr;
@@ -30,17 +32,22 @@ use orchard::tree::MerkleHashOrchard;
 use serde_json::{Value, json};
 use transparent::address::{Script, TransparentAddress};
 use transparent::bundle::{Authorized, Bundle, OutPoint, TxIn, TxOut};
+use zcash_client_backend::proto::compact_formats::CompactBlock;
+use zcash_client_backend::proto::service::TreeState;
 use zcash_primitives::block::{BlockHash, BlockHeaderData};
 use zcash_primitives::merkle_tree::write_commitment_tree;
 use zcash_primitives::transaction::{
     Authorized as TxAuthorized, Transaction, TransactionData, TxVersion,
 };
+use zcash_protocol::ShieldedPool;
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 use zcash_protocol::local_consensus::LocalNetwork;
 use zcash_protocol::value::Zatoshis;
 
-use crate::compact::TreeSizes;
-use crate::display_hash;
+use crate::compact::{self, TreeSizes};
+use crate::{display_hash, pool_name};
+
+pub use lwd::{FakeLightwalletd, FakeSubtreeRoot, h};
 
 /// Regtest parameters with every network upgrade active from height 1, the
 /// same table `gyges_core::network::ConsensusParams::Regtest` uses.
@@ -298,6 +305,9 @@ struct State {
     /// chain mempool transactions (ZIP 320 step 2 before step 1 is mined,
     /// TESTING.md §3 rows 10 and 11).
     reject_transparent_only: Option<String>,
+    /// `z_getsubtreesbyindex` answers, per pool, index order (a real node
+    /// computes them from 2^16 commitments, which no test mines).
+    subtree_roots: BTreeMap<ShieldedPool, Vec<([u8; 32], u32)>>,
 }
 
 impl State {
@@ -458,6 +468,7 @@ impl FakeNode {
             mempool: Vec::new(),
             reject_broadcasts: None,
             reject_transparent_only: None,
+            subtree_roots: BTreeMap::new(),
         }));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -553,6 +564,48 @@ impl FakeNode {
     /// ZIP 320 step 2 on an unmined step 1.
     pub fn set_reject_transparent_only(&self, message: Option<String>) {
         self.lock().reject_transparent_only = message;
+    }
+
+    /// What `z_getsubtreesbyindex(pool, …)` answers: `(root, end_height)`
+    /// per completed subtree, index order.
+    pub fn set_subtree_roots(&self, pool: ShieldedPool, roots: Vec<([u8; 32], u32)>) {
+        self.lock().subtree_roots.insert(pool, roots);
+    }
+
+    /// `z_gettreestate(height)` as lightwalletd's `TreeState` carries it
+    /// (the same hex frontiers, the hash as display hex).
+    pub fn tree_state(&self, height: u32) -> TreeState {
+        let st = self.lock();
+        let block = st.blocks.get(&height).expect("height exists");
+        let (sapling, orchard, ironwood) = st.frontiers_at(height);
+        TreeState {
+            network: st.chain_name.to_string(),
+            height: u64::from(height),
+            hash: display_hash(&block.hash),
+            time: block.time,
+            sapling_tree: sapling,
+            orchard_tree: orchard,
+            ironwood_tree: ironwood,
+        }
+    }
+
+    /// Every block in compact form, genesis to tip, as
+    /// [`crate::ZakuraRpcBackend`] would build them (transparent fields
+    /// included).
+    pub fn compact_chain(&self) -> Vec<CompactBlock> {
+        let st = self.lock();
+        st.blocks
+            .iter()
+            .map(|(h, b)| {
+                compact::from_raw(
+                    &st.params,
+                    BlockHeight::from_u32(*h),
+                    &b.raw,
+                    st.tree_sizes_at(*h),
+                )
+                .expect("the fake's own blocks parse")
+            })
+            .collect()
     }
 
     /// Txids (internal byte order) waiting to be mined, in arrival order.
@@ -836,6 +889,37 @@ fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
             }
             // `dispatch` takes `&State`; the caller applies the mutation.
             Ok(json!({ "__accept__": hex::encode(txid), "txid": display_hash(&txid) }))
+        }
+        "z_getsubtreesbyindex" => {
+            let pool = params
+                .first()
+                .and_then(Value::as_str)
+                .ok_or((-32602, "missing pool".to_string()))?;
+            let pool = [
+                ShieldedPool::Sapling,
+                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood,
+            ]
+            .into_iter()
+            .find(|p| pool_name(*p) == pool)
+            .ok_or((
+                -1,
+                "invalid pool name, must be one of: [\"sapling\", \"orchard\", \"ironwood\"]"
+                    .to_string(),
+            ))?;
+            let start = params
+                .get(1)
+                .and_then(Value::as_u64)
+                .ok_or((-32602, "missing start_index".to_string()))?;
+            let limit = params.get(2).and_then(Value::as_u64);
+            let roots = st.subtree_roots.get(&pool).cloned().unwrap_or_default();
+            let subtrees: Vec<Value> = roots
+                .iter()
+                .skip(start as usize)
+                .take(limit.map_or(usize::MAX, |l| l as usize))
+                .map(|(root, end_height)| json!({ "root": hex::encode(root), "end_height": end_height }))
+                .collect();
+            Ok(json!({ "pool": pool_name(pool), "start_index": start, "subtrees": subtrees }))
         }
         "getrawtransaction" => {
             let txid = params
