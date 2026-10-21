@@ -28,10 +28,21 @@ path = "scenarios/sync.rs"
 name = "tx"
 path = "scenarios/tx.rs"
 
+# Against the pinned real zakurad (TESTING.md §3 rows 1–4); skips itself
+# where no node binary is available.
+[[test]]
+name = "node"
+path = "scenarios/node.rs"
+
 [dependencies]
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }  # JSON-RPC to zakurad from the sync harness
 
 [dev-dependencies]
 gyges-chain = { workspace = true, features = ["test-util"] }
@@ -39,7 +50,10 @@ gyges-core = { workspace = true }
 zcash_client_backend = { workspace = true }
 zcash_client_sqlite = { workspace = true }
 zcash_protocol = { workspace = true }
+zcash_keys = { workspace = true }
 transparent = { workspace = true }
+bip0039 = { workspace = true }
+zip32 = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 

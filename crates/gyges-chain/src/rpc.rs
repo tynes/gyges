@@ -112,6 +112,39 @@ pub struct BlockchainInfo {
     /// Present only when `pruned`.
     #[serde(default)]
     pub pruneheight: Option<u32>,
+    /// Network upgrades keyed by consensus branch id (eight hex digits),
+    /// pending ones included.
+    #[serde(default)]
+    pub upgrades: std::collections::HashMap<String, UpgradeInfo>,
+}
+
+/// One entry of `getblockchaininfo.upgrades`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpgradeInfo {
+    pub activationheight: u32,
+    #[serde(default)]
+    pub status: String,
+}
+
+/// The network upgrades whose activation heights are compared with the
+/// node's: every one `zcash_protocol` knows.
+pub const UPGRADES: [NetworkUpgrade; 11] = [
+    NetworkUpgrade::Overwinter,
+    NetworkUpgrade::Sapling,
+    NetworkUpgrade::Blossom,
+    NetworkUpgrade::Heartwood,
+    NetworkUpgrade::Canopy,
+    NetworkUpgrade::Nu5,
+    NetworkUpgrade::Nu6,
+    NetworkUpgrade::Nu6_1,
+    NetworkUpgrade::Nu6_2,
+    NetworkUpgrade::Nu6_3,
+    NetworkUpgrade::Nu7,
+];
+
+/// `getblockchaininfo.upgrades` key for an upgrade.
+pub fn branch_key(nu: NetworkUpgrade) -> String {
+    format!("{:08x}", u32::from(nu.branch_id()))
 }
 
 impl BlockchainInfo {
@@ -371,18 +404,57 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
             .call("getblockchaininfo", vec![])
             .await
             .map_err(|e| self.chain_error("getblockchaininfo", e))?;
-        let expected = match self.params.network_type() {
-            NetworkType::Main => "main",
-            NetworkType::Test => "test",
-            NetworkType::Regtest => "regtest",
+        // Zakura reports "test" for regtest as well as testnet (verified
+        // against v1.6.0), so the name only separates mainnet from the rest;
+        // the activation heights below tell testnet and regtest apart.
+        let (network, accepted): (&str, &[&str]) = match self.params.network_type() {
+            NetworkType::Main => ("mainnet", &["main"]),
+            NetworkType::Test => ("testnet", &["test"]),
+            NetworkType::Regtest => ("regtest", &["test", "regtest"]),
         };
-        if info.chain != expected {
+        if !accepted.contains(&info.chain.as_str()) {
             return Err(ChainError::Rpc(format!(
-                "the node at {} serves chain \"{}\", this daemon is for {expected}",
+                "the node at {} serves chain \"{}\", this daemon is for {network}",
                 self.url, info.chain
             )));
         }
+        self.check_upgrades(&info, network)?;
         Ok(info)
+    }
+
+    /// Refuse a node whose activated upgrades disagree with this daemon's
+    /// consensus parameters: a mismatched height, an upgrade the daemon
+    /// expects by the node's tip that the node never activated (a regtest
+    /// without `[network.testnet_parameters.activation_heights]`), or rules
+    /// in force on the node that this daemon does not know. Pending upgrades
+    /// above the tip on either side are not an error.
+    fn check_upgrades(&self, info: &BlockchainInfo, network: &str) -> Result<(), ChainError> {
+        for nu in UPGRADES {
+            let expected = self.params.activation_height(nu).map(u32::from);
+            let node = info
+                .upgrades
+                .get(&branch_key(nu))
+                .map(|u| u.activationheight);
+            let problem = match (expected, node) {
+                (Some(e), Some(n)) if e != n => format!(
+                    "activates {nu:?} at height {n}, this daemon's {network} parameters expect {e}"
+                ),
+                (Some(e), None) if e <= info.blocks => format!(
+                    "has not activated {nu:?}, which this daemon's {network} parameters expect at \
+                     height {e} (a regtest node needs it under \
+                     [network.testnet_parameters.activation_heights] in zakura.toml)"
+                ),
+                (None, Some(n)) if n <= info.blocks => format!(
+                    "has activated {nu:?} at height {n}, which this daemon does not support"
+                ),
+                _ => continue,
+            };
+            return Err(ChainError::Rpc(format!(
+                "the node at {} {problem}",
+                self.url
+            )));
+        }
+        Ok(())
     }
 
     /// `getblockhash(height)`, internal byte order.
@@ -657,11 +729,14 @@ mod tests {
     #[test]
     fn blockchain_info_reduces_to_bounds() {
         let info: BlockchainInfo = serde_json::from_value(json!({
-            "chain": "regtest", "blocks": 120, "headers": 120,
+            "chain": "test", "blocks": 120, "headers": 120,
             "bestblockhash": "00".repeat(31) + "ab", "pruned": true, "pruneheight": 100,
-            "estimatedheight": 120, "upgrades": {}, "valuePools": []
+            "estimatedheight": 120, "valuePools": [],
+            "upgrades": { "c2d6d0b4": { "name": "NU5", "activationheight": 1, "status": "active" } }
         }))
         .unwrap();
+        assert_eq!(info.upgrades["c2d6d0b4"].activationheight, 1);
+        assert_eq!(branch_key(NetworkUpgrade::Nu5), "c2d6d0b4");
         let b = info.bounds().unwrap();
         assert_eq!(b.tip_height, h(120));
         assert_eq!(b.retained_from, h(100));
@@ -862,13 +937,46 @@ mod tests {
         let st = be.status();
         assert!(!st.connected && st.bounds.is_none() && st.last_polled.is_some());
 
-        // Mainnet daemon pointed at a regtest node.
+        // Mainnet daemon pointed at a regtest node: the chain name says so.
         let node = FakeNode::start(regtest_params()).await;
         let be = ZakuraRpcBackend::new(node.url(), None, zcash_protocol::consensus::MAIN_NETWORK)
             .unwrap();
         let err = be.node_bounds().await.unwrap_err();
         assert!(
-            matches!(&err, ChainError::Rpc(m) if m.contains("serves chain \"regtest\"")),
+            matches!(&err, ChainError::Rpc(m) if m.contains("serves chain \"test\"")),
+            "{err}"
+        );
+
+        // Testnet daemon pointed at a regtest node: the name matches ("test"
+        // for both), the activation heights do not.
+        let be = ZakuraRpcBackend::new(node.url(), None, zcash_protocol::consensus::TEST_NETWORK)
+            .unwrap();
+        let err = be.node_bounds().await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Rpc(m) if m.contains("activates Overwinter at height 1")
+                && m.contains("testnet parameters expect")),
+            "{err}"
+        );
+
+        // A regtest node that never activated NU5 (no activation_heights in
+        // its zakura.toml) is refused once it has a block; at genesis the
+        // expectation is still pending.
+        let canopy_only = zcash_protocol::local_consensus::LocalNetwork {
+            nu5: None,
+            nu6: None,
+            nu6_1: None,
+            nu6_2: None,
+            nu6_3: None,
+            ..regtest_params()
+        };
+        let node = FakeNode::start(canopy_only).await;
+        let be = backend(&node);
+        assert!(be.node_bounds().await.is_ok(), "nothing active yet");
+        node.mine(1);
+        let err = be.node_bounds().await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Rpc(m) if m.contains("has not activated Nu5")
+                && m.contains("activation_heights")),
             "{err}"
         );
     }

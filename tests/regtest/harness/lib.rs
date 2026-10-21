@@ -1,14 +1,18 @@
 //! Test harness for the end-to-end scenarios (TESTING.md §2).
 //!
-//! Today the fixture knows how to run `gygesd` and `gyges` against a
-//! temporary `GYGES_HOME`; the node (`zakurad`) and archival (`zaino`)
-//! processes arrive with ROADMAP.md M1/M2. Binaries are taken from
-//! `GYGES_DAEMON_BIN` / `GYGES_CLI_BIN` when set; otherwise they are built
-//! (once per test process, a no-op when fresh) into the same target directory
-//! as the test executable, so a `cargo test -p gyges-regtest` never runs
-//! against stale binaries.
+//! [`Fixture`] runs `gygesd` and `gyges` against a temporary `GYGES_HOME`;
+//! [`Node`] runs the pinned `zakurad` in regtest (`versions.toml`) and drives
+//! it over JSON-RPC. The archival `zaino` arrives with ROADMAP.md M2. Gyges
+//! binaries are taken from `GYGES_DAEMON_BIN` / `GYGES_CLI_BIN` when set;
+//! otherwise they are built (once per test process, a no-op when fresh)
+//! into the same target directory as the test executable, so a `cargo test
+//! -p gyges-regtest` never runs against stale binaries.
 
 #![forbid(unsafe_code)]
+
+mod node;
+
+pub use node::{BURN_MINER_ADDRESS, MIN_TX_RETENTION, Node, NodeOpts, pinned_tag, zakurad_binary};
 
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt as _;

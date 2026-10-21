@@ -430,10 +430,11 @@ impl Drop for FakeNode {
 impl FakeNode {
     /// Start listening on a loopback port with a genesis block (height 0).
     pub async fn start<P: Parameters + Clone + Send + Sync + 'static>(params: P) -> Self {
+        // Like zakurad v1.6.0: regtest also reports "test".
         let chain_name = match params.network_type() {
             zcash_protocol::consensus::NetworkType::Main => "main",
-            zcash_protocol::consensus::NetworkType::Test => "test",
-            zcash_protocol::consensus::NetworkType::Regtest => "regtest",
+            zcash_protocol::consensus::NetworkType::Test
+            | zcash_protocol::consensus::NetworkType::Regtest => "test",
         };
         let params = DynParams::new(params);
         let genesis =
@@ -662,6 +663,27 @@ fn height_param(st: &State, v: Option<&Value>) -> Result<u32, (i64, String)> {
     Err((-8, "Block not found".into()))
 }
 
+/// `getblockchaininfo.upgrades` as zakurad renders it: every upgrade the
+/// parameters activate, keyed by branch id, pending ones included.
+fn upgrades(st: &State, tip: u32) -> Value {
+    let mut map = serde_json::Map::new();
+    for nu in crate::rpc::UPGRADES {
+        if let Some(h) = st.params.activation_height(nu) {
+            let h = u32::from(h);
+            map.insert(
+                crate::rpc::branch_key(nu),
+                json!({
+                    "name": format!("{nu:?}"),
+                    "activationheight": h,
+                    "status": if h <= tip { "active" } else { "pending" },
+                    "info": "",
+                }),
+            );
+        }
+    }
+    Value::Object(map)
+}
+
 fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
     let (tip, tip_hash) = st.tip();
     match method {
@@ -679,7 +701,7 @@ fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
                 "verificationprogress": 1.0,
                 "pruned": st.prune_height.is_some(),
                 "valuePools": [],
-                "upgrades": {},
+                "upgrades": upgrades(st, tip),
                 "consensus": { "chaintip": "c8e71055", "nextblock": "c8e71055" },
             });
             if let Some(p) = st.prune_height {
