@@ -118,7 +118,7 @@ pub async fn run(ctx: &Ctx, cmd: TxCmd) -> Result<(), CliError> {
 }
 
 /// The key name shown in prompts: `--key`, else the daemon's default.
-fn shown_key(ctx: &Ctx, conn: &Conn) -> String {
+pub(crate) fn shown_key(ctx: &Ctx, conn: &Conn) -> String {
     if ctx.key.is_empty() {
         conn.info.default_key.clone()
     } else {
@@ -296,8 +296,8 @@ async fn follow(
 /// How many wrong passphrases a terminal user may enter per session.
 const PASSPHRASE_ATTEMPTS: u32 = 3;
 
-/// Answer one `SignatureRequired`.
-async fn satisfy(
+/// Answer one `SignatureRequired` (shared with `pczt sign`).
+pub(crate) async fn satisfy(
     ctx: &Ctx,
     conn: &mut Conn,
     key: &str,
@@ -397,8 +397,21 @@ async fn abort_session(conn: &mut Conn, session_id: &str) {
 }
 
 /// CLI_SPEC.md §2.5: inputs per pool, outputs, the ZIP 317 fee per step,
-/// the total debit.
+/// the total debit, then the anchor, expiry and confirmations line.
 pub fn render_proposal(p: &Proposal) -> String {
+    use std::fmt::Write as _;
+    let mut s = render_steps(p);
+    let _ = writeln!(
+        s,
+        "Anchor height {}, expires at height {}, {} confirmations",
+        p.anchor_height, p.expiry_height, p.min_confirmations
+    );
+    s
+}
+
+/// The steps and the total debit (shared with `pczt inspect`, whose file
+/// knows no anchor height).
+pub fn render_steps(p: &Proposal) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     let n = p.steps.len();
@@ -439,11 +452,6 @@ pub fn render_proposal(p: &Proposal) -> String {
         let _ = writeln!(s, "  {:<9} {} ZEC (ZIP 317)", "fee:", format_zec(step.fee));
     }
     let _ = writeln!(s, "Total debit: {} ZEC", format_zec(p.total_debit));
-    let _ = writeln!(
-        s,
-        "Anchor height {}, expires at height {}, {} confirmations",
-        p.anchor_height, p.expiry_height, p.min_confirmations
-    );
     s
 }
 

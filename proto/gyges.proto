@@ -1117,13 +1117,21 @@ message CreatePcztRequest {
 message CreatePcztResponse {
   // Postcard-serialized PCZT after Creator, Constructor, IO Finalizer and
   // Updater, with `gyges.key_id`, `gyges.network` and `gyges.session_id` in
-  // the global proprietary map. A tex recipient yields one PCZT per step.
+  // the global proprietary map. A tex recipient would yield one PCZT per
+  // step; it is refused for now (upstream builds PCZTs from single-step
+  // proposals only), so there is exactly one.
   repeated bytes pczts = 1;
   Proposal proposal = 2;
+  // The `gyges.session_id` written into the PCZT: the stored proposal
+  // BroadcastPczt verifies against (API.md §7.1).
+  string session_id = 3;
 }
 
 message InspectPcztRequest {
   bytes pczt = 1;
+  // Assertion only (API.md §7.1): KEY_MISMATCH when it differs from the
+  // PCZT's `gyges.key_id`; empty asserts nothing.
+  string key_id = 2;
 }
 
 message InspectPcztResponse {
@@ -1151,6 +1159,8 @@ message ProvePcztRequest {
   // Required for Sapling spends in a LOCAL_SEED or SIGNER_ONLY profile (the
   // proof generation key is inserted before proving); ignored otherwise.
   bytes session_token = 2 [debug_redact = true];
+  // Assertion only (API.md §7.1).
+  string key_id = 3;
 }
 
 message ProvePcztResponse {
@@ -1161,6 +1171,8 @@ message SignPcztRequest {
   bytes pczt = 1;
   // Optional; without it a locked LOCAL_SEED key pauses on SignatureRequired.
   bytes session_token = 2 [debug_redact = true];
+  // Assertion only (API.md §7.1).
+  string key_id = 3;
 }
 
 message SignPcztEvent {
@@ -1174,6 +1186,8 @@ message SignPcztEvent {
 message CombinePcztRequest {
   // Two or more PCZTs for the same transaction and key id.
   repeated bytes pczts = 1;
+  // Assertion only (API.md §7.1).
+  string key_id = 2;
 }
 
 message CombinePcztResponse {
@@ -1183,6 +1197,8 @@ message CombinePcztResponse {
 message BroadcastPcztRequest {
   bytes pczt = 1;
   bool via_tor = 2;
+  // Assertion only (API.md §7.1).
+  string key_id = 3;
 }
 
 message BroadcastPcztResponse {

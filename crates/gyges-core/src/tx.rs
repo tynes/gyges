@@ -93,6 +93,10 @@ pub enum TxError {
     /// `UNSUPPORTED_POOL`.
     #[error("{0}")]
     UnsupportedPool(String),
+    /// `INVALID_ARGUMENT`: the Verifier found the PCZT differs from the
+    /// approved proposal (Q-K7); nothing is broadcast.
+    #[error("{0}")]
+    Verifier(String),
     /// `INTERNAL`: the wallet or the PCZT pipeline failed.
     #[error("{0}")]
     Internal(String),
@@ -565,12 +569,14 @@ pub fn summarize<N>(
 
 /// Step 3: Creator, Constructor, IO Finalizer and Updater (anchors and
 /// witnesses from the wallet). Only single-step proposals can become one
-/// PCZT, which is every proposal until ZIP 320.
+/// PCZT, which is every proposal except ZIP 320's. `expiry` overrides the
+/// default `target + 40` (`pczt create` gives a file time to travel).
 pub fn build_pczt<N: fmt::Display>(
     wallet: &mut Wallet,
     params: &ConsensusParams,
     account: AccountUuid,
     proposal: &Proposal<StandardFeeRule, N>,
+    expiry: Option<BlockHeight>,
 ) -> Result<Pczt, TxError> {
     create_pczt_from_proposal::<_, _, Infallible, _, Infallible, N>(
         wallet,
@@ -578,7 +584,7 @@ pub fn build_pczt<N: fmt::Display>(
         account,
         OvkPolicy::Sender,
         proposal,
-        None,
+        expiry,
         BundlePadding {
             bundle_required: false,
             pad_to_minimum: None,
@@ -732,14 +738,26 @@ pub fn spending_key(
 /// are not ours or are dummies answer `WrongSpendAuthorizingKey` and are
 /// skipped, as upstream does). Transparent inputs are matched to the
 /// wallet's receivers by `scriptPubKey` and signed with the key at that
-/// receiver's BIP 44 path.
-pub fn sign(wallet: &Wallet, pczt: Pczt, usk: &UnifiedSpendingKey) -> Result<Pczt, TxError> {
+/// receiver's BIP 44 path; without a wallet (a `signer-only` profile) a
+/// PCZT with transparent inputs is refused until the signer reads the
+/// paths from the PCZT itself (ROADMAP.md M4, second item).
+pub fn sign(
+    wallet: Option<&Wallet>,
+    pczt: Pczt,
+    usk: &UnifiedSpendingKey,
+) -> Result<Pczt, TxError> {
     use pczt::roles::signer::Error as SignErr;
 
     // Which key signs which transparent input, decided before the Signer
     // takes the PCZT.
     let mut transparent_keys = Vec::new();
     if !pczt.transparent().inputs().is_empty() {
+        let wallet = wallet.ok_or_else(|| {
+            TxError::UnsupportedPool(
+                "transparent inputs cannot be signed on a signer-only profile yet (ROADMAP.md M4, second item)"
+                    .into(),
+            )
+        })?;
         let account = account_of(wallet)?;
         let receivers = wallet
             .get_transparent_receivers(account, true, true)
@@ -823,20 +841,35 @@ pub struct Expected {
     pub expiry_height: u32,
 }
 
+/// `Expected` on disk (`ext_gyges_signing_sessions.expected`): the same
+/// fields with the fixed-size arrays as byte vectors, since serde has no
+/// 43-byte arrays.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExpectedWire {
+    transparent_outputs: Vec<(Vec<u8>, u64)>,
+    orchard_payments: Vec<(Vec<u8>, u64)>,
+    orchard_change: u64,
+    sapling_payments: Vec<(Vec<u8>, u64)>,
+    sapling_change: u64,
+    fee: u64,
+    min_target_height: u32,
+    expiry_height: u32,
+}
+
 impl Expected {
-    /// From a single-step proposal.
+    /// From a single-step proposal; `expiry` is what [`build_pczt`] was
+    /// given (`None` for the default).
     pub fn from_proposal<N>(
         params: &ConsensusParams,
         proposal: &Proposal<StandardFeeRule, N>,
+        expiry: Option<BlockHeight>,
     ) -> Result<Self, TxError> {
         let step = proposal.steps().first();
+        let target = BlockHeight::from(proposal.min_target_height());
         let mut exp = Expected {
             fee: step.balance().fee_required().into_u64(),
-            min_target_height: u32::from(BlockHeight::from(proposal.min_target_height())),
-            expiry_height: u32::from(default_expiry(
-                params,
-                BlockHeight::from(proposal.min_target_height()),
-            )),
+            min_target_height: u32::from(target),
+            expiry_height: u32::from(expiry.unwrap_or_else(|| default_expiry(params, target))),
             ..Default::default()
         };
         for (idx, payment) in step.transaction_request().payments() {
@@ -894,6 +927,56 @@ impl Expected {
         }
         Ok(exp)
     }
+
+    /// For the signing sessions table.
+    pub fn to_json(&self) -> Vec<u8> {
+        let wire = ExpectedWire {
+            transparent_outputs: self.transparent_outputs.clone(),
+            orchard_payments: self
+                .orchard_payments
+                .iter()
+                .map(|(a, v)| (a.to_vec(), *v))
+                .collect(),
+            orchard_change: self.orchard_change,
+            sapling_payments: self
+                .sapling_payments
+                .iter()
+                .map(|(a, v)| (a.to_vec(), *v))
+                .collect(),
+            sapling_change: self.sapling_change,
+            fee: self.fee,
+            min_target_height: self.min_target_height,
+            expiry_height: self.expiry_height,
+        };
+        serde_json::to_vec(&wire).expect("plain data serialises")
+    }
+
+    pub fn from_json(bytes: &[u8]) -> Result<Self, TxError> {
+        let wire: ExpectedWire = serde_json::from_slice(bytes)
+            .map_err(|e| TxError::Internal(format!("stored proposal is unreadable: {e}")))?;
+        let arr = |v: Vec<u8>| -> Result<[u8; 43], TxError> {
+            <[u8; 43]>::try_from(v)
+                .map_err(|_| TxError::Internal("stored proposal has a malformed address".into()))
+        };
+        Ok(Expected {
+            transparent_outputs: wire.transparent_outputs,
+            orchard_payments: wire
+                .orchard_payments
+                .into_iter()
+                .map(|(a, v)| Ok((arr(a)?, v)))
+                .collect::<Result<_, TxError>>()?,
+            orchard_change: wire.orchard_change,
+            sapling_payments: wire
+                .sapling_payments
+                .into_iter()
+                .map(|(a, v)| Ok((arr(a)?, v)))
+                .collect::<Result<_, TxError>>()?,
+            sapling_change: wire.sapling_change,
+            fee: wire.fee,
+            min_target_height: wire.min_target_height,
+            expiry_height: wire.expiry_height,
+        })
+    }
 }
 
 /// Step 6: the Verifier role (Q-K7). Every transparent output, every
@@ -903,7 +986,7 @@ impl Expected {
 /// refused and nothing is broadcast.
 pub fn verify(pczt: Pczt, expected: &Expected) -> Result<Pczt, TxError> {
     let mismatch = |what: &str| {
-        TxError::Internal(format!(
+        TxError::Verifier(format!(
             "verifier: {what} differs from the approved proposal"
         ))
     };

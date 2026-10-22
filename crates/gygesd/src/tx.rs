@@ -241,6 +241,9 @@ pub fn tx_error(e: TxError, key_id: &str) -> GygesError {
         TxError::NotSynced(detail) => GygesError::new(ErrorReason::NotSynced, detail),
         TxError::InvalidArgument(detail) => GygesError::new(ErrorReason::InvalidArgument, detail),
         TxError::UnsupportedPool(detail) => GygesError::new(ErrorReason::UnsupportedPool, detail),
+        // A tampered or stale PCZT is the client's problem (exit 6), not a
+        // daemon failure.
+        TxError::Verifier(detail) => GygesError::new(ErrorReason::InvalidArgument, detail),
         TxError::Internal(detail) => {
             // Upstream error texts can quote addresses or values, so the
             // detail goes to the client and to `debug` only (API.md §4.5).
@@ -324,9 +327,33 @@ pub fn proto_proposal(s: &ProposalSummary) -> v1::Proposal {
 /// errors arrive as the RPC's status rather than as the first stream item.
 pub(crate) struct Prepared {
     pub(crate) key: Arc<KeyEntry>,
-    pub(crate) chain: Arc<dyn gyges_chain::ChainBackend>,
+    /// `None` for `SignPczt`, which needs no node (and runs air-gapped).
+    pub(crate) chain: Option<Arc<dyn gyges_chain::ChainBackend>>,
     auth: PreAuth,
     min_confirmations: u32,
+}
+
+impl Prepared {
+    pub(crate) fn min_confirmations(&self) -> u32 {
+        self.min_confirmations
+    }
+
+    fn chain(&self) -> Result<&Arc<dyn gyges_chain::ChainBackend>, Status> {
+        self.chain
+            .as_ref()
+            .ok_or_else(|| Status::internal("this request was prepared without a node"))
+    }
+}
+
+/// What a spending RPC is for, which decides the profiles it accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Purpose {
+    /// `SendTransaction` / `ShieldFunds`: the daemon signs, so `local-seed`
+    /// only.
+    Spend,
+    /// `CreatePczt`: nothing is signed here, so a watch-only profile
+    /// qualifies too.
+    CreatePczt,
 }
 
 /// How the key may be obtained without a session.
@@ -342,6 +369,7 @@ pub(crate) fn prepare(
     key_id: &str,
     session_token: &[u8],
     min_confirmations: u32,
+    purpose: Purpose,
 ) -> Result<Prepared, Status> {
     let key = state
         .registry
@@ -351,6 +379,7 @@ pub(crate) fn prepare(
     let typed = |reason, detail: &str| GygesError::new(reason, detail).with_key(&kid).into_status();
     match key.profile().signing_mode {
         SigningMode::LocalSeed => {}
+        SigningMode::WatchOnly if purpose == Purpose::CreatePczt => {}
         SigningMode::SignerOnly => {
             return Err(typed(
                 ErrorReason::InvalidArgument,
@@ -400,21 +429,10 @@ pub(crate) fn prepare(
             ));
         }
     }
-    let auth = if session_token.is_empty() {
-        PreAuth::None
-    } else {
-        let token = Token::from_slice(session_token).ok_or_else(|| {
-            typed(
-                ErrorReason::InvalidArgument,
-                "session_token must be the 32 bytes UnlockKey returned",
-            )
-        })?;
-        let conn = conn.ok_or_else(|| Status::internal("no connection info on this request"))?;
-        PreAuth::Token { conn, token }
-    };
+    let auth = parse_auth(conn, session_token, &kid)?;
     Ok(Prepared {
         key,
-        chain,
+        chain: Some(chain),
         auth,
         min_confirmations: if min_confirmations == 0 {
             state.config.policy.min_confirmations
@@ -424,7 +442,61 @@ pub(crate) fn prepare(
     })
 }
 
-fn parse_amount(amount: Option<v1::Amount>) -> Result<AmountSpec, Status> {
+fn parse_auth(conn: Option<ConnInfo>, session_token: &[u8], kid: &str) -> Result<PreAuth, Status> {
+    if session_token.is_empty() {
+        return Ok(PreAuth::None);
+    }
+    let token = Token::from_slice(session_token).ok_or_else(|| {
+        GygesError::new(
+            ErrorReason::InvalidArgument,
+            "session_token must be the 32 bytes UnlockKey returned",
+        )
+        .with_key(kid)
+        .into_status()
+    })?;
+    let conn = conn.ok_or_else(|| Status::internal("no connection info on this request"))?;
+    Ok(PreAuth::Token { conn, token })
+}
+
+/// `SignPczt`'s checks: a profile that holds a seed (`local-seed` or
+/// `signer-only`), no node and no sync state needed.
+pub(crate) fn prepare_signer(
+    state: &DaemonState,
+    conn: Option<ConnInfo>,
+    key_id: &str,
+    session_token: &[u8],
+) -> Result<Prepared, Status> {
+    let key = state
+        .registry
+        .resolve(key_id)
+        .map_err(|e| registry_error(e).into_status())?;
+    let kid = key.key_id().to_string();
+    let typed = |reason, detail: &str| GygesError::new(reason, detail).with_key(&kid).into_status();
+    match key.profile().signing_mode {
+        SigningMode::LocalSeed | SigningMode::SignerOnly => {}
+        SigningMode::WatchOnly => {
+            return Err(typed(
+                ErrorReason::InvalidArgument,
+                "a watch-only profile holds no seed and cannot sign",
+            ));
+        }
+        SigningMode::KeystoneQr => {
+            return Err(typed(
+                ErrorReason::HardwareSigner,
+                "Keystone signing arrives with ROADMAP.md M5",
+            ));
+        }
+    }
+    let auth = parse_auth(conn, session_token, &kid)?;
+    Ok(Prepared {
+        key,
+        chain: None,
+        auth,
+        min_confirmations: 0,
+    })
+}
+
+pub(crate) fn parse_amount(amount: Option<v1::Amount>) -> Result<AmountSpec, Status> {
     let invalid = |d: &str| GygesError::new(ErrorReason::InvalidArgument, d).into_status();
     match amount.and_then(|a| a.value) {
         Some(v1::amount::Value::Zatoshis(z)) => {
@@ -470,6 +542,7 @@ pub fn send_transaction(
         &req.key_id,
         &req.session_token,
         req.min_confirmations,
+        Purpose::Spend,
     )?;
     let key_id = prepared.key.key_id().to_string();
     let params = state.registry.params();
@@ -505,8 +578,8 @@ pub fn send_transaction(
         if core_tx::is_two_step(&proposal) {
             return Ok((summary, Some(Built::Tex(Box::new(proposal)))));
         }
-        let expected = Expected::from_proposal(&params, &proposal)?;
-        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal)?;
+        let expected = Expected::from_proposal(&params, &proposal, None)?;
+        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal, None)?;
         Ok((summary, Some(Built::Pczt(expected, Box::new(pczt)))))
     };
     Ok(run(
@@ -525,7 +598,14 @@ pub fn shield_funds(
     conn: Option<ConnInfo>,
     req: ShieldFundsRequest,
 ) -> Result<SendStream, Status> {
-    let prepared = prepare(&state, conn, &req.key_id, &req.session_token, 0)?;
+    let prepared = prepare(
+        &state,
+        conn,
+        &req.key_id,
+        &req.session_token,
+        0,
+        Purpose::Spend,
+    )?;
     let params = state.registry.params();
     let threshold = u64::try_from(req.threshold).map_err(|_| {
         GygesError::new(
@@ -544,8 +624,8 @@ pub fn shield_funds(
         if dry_run {
             return Ok((summary, None));
         }
-        let expected = Expected::from_proposal(&params, &proposal)?;
-        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal)?;
+        let expected = Expected::from_proposal(&params, &proposal, None)?;
+        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal, None)?;
         Ok((summary, Some(Built::Pczt(expected, Box::new(pczt)))))
     };
     Ok(run(
@@ -605,7 +685,7 @@ pub(crate) async fn with_wallet<T: Send + 'static>(
     .map_err(|e| TxError::Internal(format!("wallet task failed: {e}")))?
 }
 
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, TxError> + Send + 'static,
 ) -> Result<T, TxError> {
     tokio::task::spawn_blocking(f)
@@ -694,14 +774,17 @@ async fn pipeline(
     );
 
     // 5. The spending key: token, daemon unlock, or a session.
-    let usk = obtain_key(state, prepared, &proto, tx, 1).await?;
+    let usk = obtain_key(state, prepared, &proto, tx, 1, |r| SendEvent {
+        event: Some(send_event::Event::SignatureRequired(r)),
+    })
+    .await?;
     let pczt = {
         let key = key.clone();
         blocking(move || {
             let wallet = key
                 .wallet()
                 .ok_or_else(|| TxError::Internal("this profile has no wallet".into()))?;
-            core_tx::sign(&wallet, pczt, &usk)
+            core_tx::sign(Some(&wallet), pczt, &usk)
         })
         .await
         .map_err(err)?
@@ -719,7 +802,7 @@ async fn pipeline(
     emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
     let txid_hex = txid.to_string();
     prepared
-        .chain
+        .chain()?
         .send_raw_transaction(raw)
         .await
         .map_err(|e| broadcast_error(e, &key_id).into_status())?;
@@ -819,13 +902,17 @@ pub(crate) fn key_from_unlock(
 /// daemon-scoped unlock, else a signing session the client satisfies with
 /// `UnlockKey { session_id }`. A session that times out is replaced by a
 /// fresh `SignatureRequired` while the proposal can still be mined
-/// (API.md §4.1), and ends the stream with `NOT_SYNCED` otherwise.
-async fn obtain_key(
+/// (API.md §4.1), and ends the stream with `NOT_SYNCED` otherwise (without
+/// a node, as in `SignPczt`, the file's expiry is the client's to watch, so
+/// a fresh session always follows). `wrap` makes the stream's event type
+/// out of the `SignatureRequired`.
+pub(crate) async fn obtain_key<E: Send + 'static>(
     state: &Arc<DaemonState>,
     prepared: &Prepared,
     summary: &v1::Proposal,
-    tx: &mpsc::Sender<Result<SendEvent, Status>>,
+    tx: &mpsc::Sender<Result<E, Status>>,
     step: u32,
+    wrap: impl Fn(SignatureRequired) -> E,
 ) -> Result<UnifiedSpendingKey, Status> {
     let key = &prepared.key;
     let key_id = key.key_id().to_string();
@@ -838,19 +925,17 @@ async fn obtain_key(
         let (session_id, expires_at, rx) =
             state.sessions.create(&key_id, step, ttl, summary.clone());
         tracing::info!(target: AUDIT_TARGET, key_id, event = "session_created");
-        emit(
-            tx,
-            send_event::Event::SignatureRequired(SignatureRequired {
-                key_id: key_id.clone(),
-                kind: SignatureKind::Passphrase as i32,
-                session_id: session_id.clone(),
-                expires_at,
-                payload: Vec::new(),
-                step,
-                summary: Some(summary.clone()),
-            }),
-        )
-        .await?;
+        tx.send(Ok(wrap(SignatureRequired {
+            key_id: key_id.clone(),
+            kind: SignatureKind::Passphrase as i32,
+            session_id: session_id.clone(),
+            expires_at,
+            payload: Vec::new(),
+            step,
+            summary: Some(summary.clone()),
+        })))
+        .await
+        .map_err(|_| Status::cancelled("client disconnected"))?;
         let guard = SessionGuard {
             hub: state.clone(),
             session_id: session_id.clone(),
@@ -878,8 +963,12 @@ async fn obtain_key(
                         .sessions
                         .finish(&session_id, SessionStatus::Expired, "no passphrase arrived in time");
                     guard.disarm();
-                    let tip = prepared.chain.status().bounds.map_or(0, |b| u32::from(b.tip_height));
-                    if tip >= summary.expiry_height {
+                    let tip = prepared
+                        .chain
+                        .as_ref()
+                        .and_then(|c| c.status().bounds)
+                        .map_or(0, |b| u32::from(b.tip_height));
+                    if summary.expiry_height > 0 && tip >= summary.expiry_height {
                         return Err(GygesError::new(
                             ErrorReason::NotSynced,
                             "the signing session expired and the proposal can no longer be mined; start over",
@@ -919,7 +1008,11 @@ async fn tex_pipeline(
 
     // One signature prompt per send: the key is obtained once and used for
     // both steps inside the builder.
-    let usk = obtain_key(state, prepared, &proto, tx, 1).await?;
+    let usk = obtain_key(state, prepared, &proto, tx, 1, |r| SendEvent {
+        event: Some(send_event::Event::SignatureRequired(r)),
+    })
+    .await?;
+    let chain = prepared.chain()?.clone();
     let pools: Vec<(v1::Pool, u32)> = proto
         .steps
         .first()
@@ -1001,7 +1094,7 @@ async fn tex_pipeline(
 
     // Step 1: a refusal fails the transfer (nothing left the shielded pool).
     let now = unix_now();
-    match prepared.chain.send_raw_transaction(built.step1_raw).await {
+    match chain.send_raw_transaction(built.step1_raw).await {
         Ok(_) => {
             with_wallet(key, move |w| {
                 core_tex::record_attempt(w, id, now, None).map_err(queue_err)?;
@@ -1048,7 +1141,7 @@ async fn tex_pipeline(
     // transactions refuses it now and takes it from the queue once step 1
     // is mined.
     let now = unix_now();
-    match prepared.chain.send_raw_transaction(built.step2_raw).await {
+    match chain.send_raw_transaction(built.step2_raw).await {
         Ok(_) => {
             with_wallet(key, move |w| {
                 core_tex::record_attempt(w, id, now, None).map_err(queue_err)?;
@@ -1085,7 +1178,7 @@ async fn tex_pipeline(
     if wait_for_mined {
         let mut step1_done = false;
         loop {
-            let s1 = prepared.chain.transaction_status(id).await;
+            let s1 = chain.transaction_status(id).await;
             if let Ok(gyges_chain::TxStatus::Mined(h)) = s1
                 && !step1_done
             {
@@ -1108,7 +1201,7 @@ async fn tex_pipeline(
             };
             match row.state {
                 TexState::Step2Mined => {
-                    let h = match prepared.chain.transaction_status(row.step2_txid).await {
+                    let h = match chain.transaction_status(row.step2_txid).await {
                         Ok(gyges_chain::TxStatus::Mined(h)) => u32::from(h),
                         _ => 0,
                     };

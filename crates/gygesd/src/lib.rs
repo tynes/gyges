@@ -30,6 +30,7 @@ pub mod lifecycle;
 pub mod logs;
 pub mod node;
 pub mod policy;
+pub mod roles;
 pub mod service;
 pub mod sync;
 pub mod tex;

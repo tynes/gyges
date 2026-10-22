@@ -215,6 +215,25 @@ State machine: `built → step1_broadcast → step2_broadcast → step1_mined �
 
 ### 5.2 `gyges_signing_sessions` (Q-K4, Q-C4)
 
+**Landed (ROADMAP.md M4, first item) as `gyges_core::sessions`, table `ext_gyges_signing_sessions`** (the `ext_` prefix, as for §5.1), with the columns the file protocol needs; the Keystone columns below join it with M5:
+
+```sql
+CREATE TABLE ext_gyges_signing_sessions (
+    session_id   TEXT NOT NULL PRIMARY KEY,   -- 16 random bytes, hex: the PCZT's gyges.session_id
+    protocol     TEXT NOT NULL CHECK (protocol IN ('passphrase', 'keystone-batch', 'keystone-pczt', 'file')),
+    status       TEXT NOT NULL CHECK (status IN ('awaiting-signature', 'signed', 'broadcast', 'aborted', 'expired')),
+    created_at   INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL,            -- created_at + vault.signing_session_ttl (informational; the file's own limit is its expiry height)
+    proposal     BLOB NOT NULL,               -- the gyges.v1.Proposal the user approved, serialised
+    expected     BLOB NOT NULL,               -- gyges_core::tx::Expected as JSON: what the Verifier checks against
+    txid         BLOB,                        -- set on broadcast, internal byte order
+    last_error   TEXT                         -- the node's refusal, when a broadcast failed (status stays `signed`)
+);
+CREATE INDEX ext_gyges_signing_sessions_status ON ext_gyges_signing_sessions (status, expires_at);
+```
+
+A row is inserted as `awaiting-signature` by `CreatePczt` (protocol `file`) and moved to `broadcast` by `BroadcastPczt`; a second broadcast of the same session is refused. Passphrase sessions of `tx send` are still memory-only (API.md §6.1). The design below is what the Keystone kinds will add.
+
 ```sql
 CREATE TABLE gyges_signing_sessions (
     session_id        BLOB NOT NULL PRIMARY KEY,  -- 16 random bytes
