@@ -272,6 +272,78 @@ fn fallback_without_endpoint_refuses_start() {
     assert!(format!("{err:#}").contains("grpc_url"), "{err:#}");
 }
 
+/// ROADMAP.md M2, first item: the fallback endpoint backend is built at
+/// start from `[fallback_lightwalletd]` and contacts nothing until a backfill
+/// needs it (no Tor directory, no connection).
+#[tokio::test]
+async fn fallback_backend_is_built_from_the_config_and_touches_nothing() {
+    let url = closed_port_url();
+    let running = start(|o| {
+        o.chain = Some(Arc::new(FixedChain {
+            tip: 10,
+            retained_from: 0,
+        }));
+        o.fallback_lwd = Some(url.clone());
+        o.no_tor = true;
+    })
+    .await;
+    let fallback = running
+        .state
+        .fallback
+        .as_ref()
+        .expect("fallback configured");
+    assert_eq!(fallback.transport(), &gyges_chain::Transport::Direct);
+    assert_eq!(fallback.tor_state(), gyges_chain::TorState::Disabled);
+    assert!(fallback.endpoint().starts_with(&url));
+    assert!(
+        !gyges_chain::ChainBackend::status(fallback.as_ref()).connected,
+        "nothing contacted at start"
+    );
+    let info = client(&running.socket)
+        .await
+        .get_info(GetInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let fb = info.fallback.unwrap();
+    assert!(fb.enabled && !fb.use_tor);
+    assert_eq!(fb.grpc_url, url);
+
+    // Over Tor (the default): the arti state goes under tor_cache/, which
+    // is created only when Tor is first bootstrapped.
+    let running = start(|o| {
+        o.chain = Some(Arc::new(FixedChain {
+            tip: 10,
+            retained_from: 0,
+        }));
+        o.fallback_lwd = Some("http://abcdefghijklmnop.onion:9067".into());
+    })
+    .await;
+    let fallback = running
+        .state
+        .fallback
+        .as_ref()
+        .expect("fallback configured");
+    let tor_dir = running._home.path().join("regtest").join("tor_cache");
+    assert_eq!(
+        fallback.transport(),
+        &gyges_chain::Transport::Tor {
+            tor_dir: tor_dir.clone()
+        }
+    );
+    assert!(fallback.is_onion());
+    assert_eq!(fallback.tor_state(), gyges_chain::TorState::NotStarted);
+    assert!(!tor_dir.exists());
+
+    // Air-gapped: no fallback whatever the config says.
+    let running = start(|o| {
+        o.airgapped = true;
+        o.fallback_lwd = Some("http://127.0.0.1:1".into());
+    })
+    .await;
+    assert!(running.state.fallback.is_none());
+}
+
 #[tokio::test]
 async fn init_key_needs_a_node_unless_airgapped() {
     let url = closed_port_url();

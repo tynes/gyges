@@ -6,7 +6,8 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gyges_chain::{BlockDb, ChainBackend};
+use gyges_chain::{ArtiTorLwdBackend, BlockDb, ChainBackend};
+use gyges_core::network::ConsensusParams;
 use gyges_core::{Config, KeyRegistry, Network, Provers, VaultManager};
 use gyges_proto::v1::gyges_server::Gyges;
 use gyges_proto::v1::{
@@ -39,6 +40,10 @@ pub struct DaemonState {
     pub vault: Arc<VaultManager>,
     /// `None` only when air-gapped.
     pub chain: Option<Arc<dyn ChainBackend>>,
+    /// The archival endpoint for Case B (`fallback_lightwalletd`), `None`
+    /// when disabled or air-gapped. Built at start, connected (and Tor
+    /// bootstrapped) by the first backfill that needs it (SYNC.md §5).
+    pub fallback: Option<Arc<ArtiTorLwdBackend<ConsensusParams>>>,
     /// The shared compact block cache (`cache/blocks.sqlite`); `None` only
     /// when air-gapped.
     pub block_cache: Option<Arc<BlockDb>>,
@@ -60,12 +65,16 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
+    /// One argument per optional interface; a builder would only hide that
+    /// the two backends and the cache are decided together at start.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
         network: Network,
         registry: KeyRegistry,
         vault: VaultManager,
         chain: Option<Arc<dyn ChainBackend>>,
+        fallback: Option<Arc<ArtiTorLwdBackend<ConsensusParams>>>,
         block_cache: Option<Arc<BlockDb>>,
         logs: Arc<LogHub>,
     ) -> Self {
@@ -75,6 +84,7 @@ impl DaemonState {
             registry,
             vault: Arc::new(vault),
             chain,
+            fallback,
             block_cache,
             sync: SyncHub::default(),
             sessions: SessionHub::default(),
@@ -387,6 +397,7 @@ mod tests {
             Network::Regtest,
             registry,
             vault,
+            None,
             None,
             None,
             Arc::default(),

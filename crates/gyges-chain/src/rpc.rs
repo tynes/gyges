@@ -33,12 +33,13 @@ use serde_json::{Value, json};
 use zcash_client_backend::data_api::chain::ChainState;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
+use zcash_protocol::ShieldedPool;
 use zcash_protocol::consensus::{BlockHeight, NetworkType, NetworkUpgrade, Parameters};
 
 use crate::compact::{self, TreeSizes};
 use crate::{
-    BoxFuture, ChainBackend, ChainError, NodeBounds, NodeStatus, TxStatus, display_hash,
-    parse_display_hash,
+    BoxFuture, ChainBackend, ChainError, NodeBounds, NodeStatus, Route, SubtreeRoot, TxStatus,
+    display_hash, parse_display_hash, pool_name,
 };
 
 /// TCP connect bound; the node is local, so anything slower is "down".
@@ -249,6 +250,24 @@ struct PoolTree {
 struct Commitments {
     #[serde(default, rename = "finalState")]
     final_state: Option<String>,
+}
+
+/// `z_getsubtreesbyindex`, as Zakura serialises it (OVERVIEW.md §4.4):
+/// the pool and start index echoed, then `{root, end_height}` per subtree.
+#[derive(Deserialize)]
+struct SubtreesObject {
+    #[serde(default)]
+    pool: String,
+    #[serde(default)]
+    start_index: u32,
+    #[serde(default)]
+    subtrees: Vec<SubtreeObject>,
+}
+
+#[derive(Deserialize)]
+struct SubtreeObject {
+    root: String,
+    end_height: u32,
 }
 
 impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
@@ -626,6 +645,62 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
             .map_err(|e| ChainError::Rpc(format!("z_gettreestate({height}) does not parse: {e}")))
     }
 
+    /// `z_getsubtreesbyindex(pool, start_index, limit)`: completed 2^16-leaf
+    /// subtree roots, raw node bytes as hex. The node answers for every
+    /// index it has built, pruned bodies or not, because the commitment
+    /// tree is consensus state (SYNC.md §5.2, **needs verification** on a
+    /// pruned node). `limit` 0 means all.
+    pub async fn get_subtrees_by_index(
+        &self,
+        pool: ShieldedPool,
+        start_index: u32,
+        limit: u32,
+    ) -> Result<Vec<SubtreeRoot>, ChainError> {
+        let name = pool_name(pool);
+        let mut params = vec![json!(name), json!(start_index)];
+        if limit > 0 {
+            params.push(json!(limit));
+        }
+        let obj: SubtreesObject = self
+            .call("z_getsubtreesbyindex", params)
+            .await
+            .map_err(|e| self.chain_error("z_getsubtreesbyindex", e))?;
+        if !obj.pool.is_empty() && obj.pool != name {
+            return Err(ChainError::Rpc(format!(
+                "z_getsubtreesbyindex({name}) answered for pool {}",
+                obj.pool
+            )));
+        }
+        if !obj.subtrees.is_empty() && obj.start_index != start_index {
+            return Err(ChainError::Rpc(format!(
+                "z_getsubtreesbyindex({name}, {start_index}) answered from index {}",
+                obj.start_index
+            )));
+        }
+        obj.subtrees
+            .into_iter()
+            .enumerate()
+            .map(|(i, st)| {
+                let bytes = hex::decode(st.root.trim()).map_err(|e| {
+                    ChainError::Rpc(format!("z_getsubtreesbyindex: root is not hex: {e}"))
+                })?;
+                let root = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                    ChainError::Rpc(format!(
+                        "z_getsubtreesbyindex: root has {} bytes, expected 32",
+                        bytes.len()
+                    ))
+                })?;
+                Ok(SubtreeRoot {
+                    pool,
+                    index: start_index + i as u32,
+                    root,
+                    end_height: BlockHeight::from_u32(st.end_height),
+                    end_hash: None,
+                })
+            })
+            .collect()
+    }
+
     /// One compact block: `getblock(h, 0)` parsed with `zcash_primitives`,
     /// cross-checked against `getblock(h, 1)`'s hash and txids, carrying
     /// that object's tree sizes.
@@ -675,6 +750,10 @@ fn connect_error_text(e: &reqwest::Error) -> String {
 }
 
 impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P> {
+    fn route(&self) -> Route {
+        Route::ZakuraRpc
+    }
+
     fn node_bounds(&self) -> BoxFuture<'_, Result<NodeBounds, ChainError>> {
         Box::pin(async move {
             let outcome = match self.get_blockchain_info().await {
@@ -731,6 +810,15 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
             }
             Ok(blocks)
         })
+    }
+
+    fn subtree_roots(
+        &self,
+        pool: ShieldedPool,
+        start_index: u32,
+        max_entries: u32,
+    ) -> BoxFuture<'_, Result<Vec<SubtreeRoot>, ChainError>> {
+        Box::pin(self.get_subtrees_by_index(pool, start_index, max_entries))
     }
 }
 
@@ -916,6 +1004,59 @@ mod tests {
             Err(ChainError::BlockUnavailable { height }) if height == h(2) || height == h(3)
         ));
         be.compact_blocks(h(4)..h(7)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subtree_roots_come_from_z_getsubtreesbyindex() {
+        use zcash_protocol::ShieldedPool;
+        let node = FakeNode::start(regtest_params()).await;
+        node.mine(1);
+        node.set_subtree_roots(
+            ShieldedPool::Sapling,
+            vec![([1; 32], 100), ([2; 32], 200), ([3; 32], 300)],
+        );
+        node.set_subtree_roots(ShieldedPool::Ironwood, vec![([9; 32], 900)]);
+        let be = backend(&node);
+
+        let all = be.subtree_roots(ShieldedPool::Sapling, 0, 0).await.unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[1].index, 1);
+        assert_eq!(all[1].root, [2; 32]);
+        assert_eq!(all[1].end_height, h(200));
+        assert_eq!(all[1].end_hash, None, "the node reports no completing hash");
+        assert!(all[1].sapling().is_some());
+
+        let some = be.subtree_roots(ShieldedPool::Sapling, 1, 1).await.unwrap();
+        assert_eq!(some.len(), 1);
+        assert_eq!(some[0].index, 1);
+        let ironwood = be
+            .subtree_roots(ShieldedPool::Ironwood, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(ironwood[0].root, [9; 32]);
+        assert!(
+            ironwood[0].orchard().is_some(),
+            "Ironwood uses Orchard's hash"
+        );
+        assert!(
+            be.subtree_roots(ShieldedPool::Orchard, 0, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            be.subtree_roots(ShieldedPool::Sapling, 7, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            node.calls()
+                .iter()
+                .filter(|c| c.as_str() == "z_getsubtreesbyindex")
+                .count(),
+            5
+        );
     }
 
     #[tokio::test]

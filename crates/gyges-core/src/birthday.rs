@@ -128,6 +128,19 @@ impl FixedChain {
 }
 
 impl ChainBackend for FixedChain {
+    fn route(&self) -> gyges_chain::Route {
+        gyges_chain::Route::ZakuraRpc
+    }
+
+    fn subtree_roots(
+        &self,
+        _pool: zcash_protocol::ShieldedPool,
+        _start_index: u32,
+        _max_entries: u32,
+    ) -> gyges_chain::BoxFuture<'_, Result<Vec<gyges_chain::SubtreeRoot>, ChainError>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
     fn node_bounds(
         &self,
     ) -> gyges_chain::BoxFuture<'_, Result<gyges_chain::NodeBounds, ChainError>> {

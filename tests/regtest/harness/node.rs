@@ -101,6 +101,13 @@ fn download_pinned() -> anyhow::Result<PathBuf> {
     if bin.is_file() {
         return Ok(bin);
     }
+    if dir.exists() {
+        // The directory without its binary: an interrupted earlier run, or a
+        // CI cache that kept the tree but trimmed the file. `rename` below
+        // cannot replace a non-empty directory, so clear it first.
+        eprintln!("removing incomplete {}", dir.display());
+        fs::remove_dir_all(&dir).with_context(|| format!("remove incomplete {}", dir.display()))?;
+    }
     fs::create_dir_all(regtest_bin_dir())?;
     let archive = format!("zakurad-{}-{platform}.tar.gz", v.tag);
     let url = format!(
@@ -147,13 +154,20 @@ fn download_pinned() -> anyhow::Result<PathBuf> {
     if !staging.join("bin/zakurad").is_file() {
         bail!("{archive} has no bin/zakurad");
     }
-    // Another test binary may have raced us to the same directory.
+    // Another test process may have raced us to the same directory: keep
+    // whichever copy is complete.
     match fs::rename(&staging, &dir) {
         Ok(()) => {}
         Err(_) if bin.is_file() => {
             let _ = fs::remove_dir_all(&staging);
         }
-        Err(e) => return Err(e).context("move the extracted node into place"),
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(e).context(format!(
+                "move the extracted node into place at {}",
+                dir.display()
+            ));
+        }
     }
     Ok(bin)
 }
@@ -369,6 +383,7 @@ use_color = false
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             if let Some(status) = self.child.as_mut().unwrap().try_wait()? {
+                self.child = None;
                 bail!(
                     "zakurad exited during startup: {status}\n{}",
                     self.log_tail()
@@ -535,7 +550,25 @@ use_color = false
         let tip = self.tip_height();
         self.stop();
         self.opts = opts;
-        self.spawn(tip)
+        // zakurad 1.6.0 sometimes dies while starting over a restored
+        // non-finalized backup: its legacy genesis bootstrap finds the sync
+        // lifecycle already past `LegacyBootstrap` and exits with
+        // "genesis apply handoff failed: illegal sync lifecycle transition"
+        // (seen on about one CI run in three, never on a fresh state). The
+        // state on disk is intact, so starting again is enough.
+        let mut attempt = 1;
+        loop {
+            match self.spawn(tip) {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < RESTART_ATTEMPTS && e.to_string().contains(HANDOFF_RACE) => {
+                    eprintln!(
+                        "zakurad restart attempt {attempt} hit the genesis handoff race; retrying"
+                    );
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Keep the directory for inspection and return its path.
@@ -546,6 +579,13 @@ use_color = false
         self.dir_path.clone()
     }
 }
+
+/// How many times [`Node::restart`] starts the node before giving up on the
+/// handoff race.
+const RESTART_ATTEMPTS: u32 = 4;
+
+/// The text zakurad 1.6.0 exits with when the race in [`Node::restart`] bites.
+const HANDOFF_RACE: &str = "genesis apply handoff failed: illegal sync lifecycle transition";
 
 impl Drop for Node {
     fn drop(&mut self) {
