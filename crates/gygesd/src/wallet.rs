@@ -11,7 +11,6 @@ use gyges_chain::{ChainError, TxStatus, display_hash, parse_display_hash};
 use gyges_core::addresses::{self, AddressKind, Inspected};
 use gyges_core::history::{self, NoteRow, TxRow};
 use gyges_core::tex::{self as core_tex, TexRow};
-use gyges_core::tx::TxError;
 use gyges_core::{KeyEntry, Network, Pool, SigningMode};
 use gyges_proto::v1::{
     self, AddressInfo, ErrorReason, GetCurrentAddressRequest, GetTransactionStatusRequest,
@@ -23,8 +22,8 @@ use gyges_proto::v1::{
 use tonic::Status;
 use zcash_protocol::consensus::NetworkType;
 
-use crate::keys::{proto_pool, registry_error};
-use crate::service::DaemonState;
+use crate::keys::proto_pool;
+use crate::service::{DaemonState, invalid};
 use crate::tex;
 use crate::tx::{tx_error, with_wallet};
 
@@ -33,25 +32,12 @@ pub const DEFAULT_TX_LIMIT: usize = 50;
 /// The most one page returns.
 pub const MAX_TX_LIMIT: usize = 1000;
 
-fn invalid(detail: impl Into<String>) -> Status {
-    GygesError::new(ErrorReason::InvalidArgument, detail).into_status()
-}
-
 /// Resolve `key_id` to a profile with a wallet.
 fn wallet_key(state: &DaemonState, key_id: &str) -> Result<Arc<KeyEntry>, Status> {
-    let key = state
-        .registry
-        .resolve(key_id)
-        .map_err(|e| registry_error(e).into_status())?;
-    if !key.profile().has_wallet() {
-        return Err(GygesError::new(
-            ErrorReason::InvalidArgument,
-            "a signer-only profile has no wallet: no addresses, notes or history",
-        )
-        .with_key(key.key_id())
-        .into_status());
-    }
-    Ok(key)
+    state.wallet_key(
+        key_id,
+        "a signer-only profile has no wallet: no addresses, notes or history",
+    )
 }
 
 fn core_pool(p: i32) -> Result<Pool, Status> {
@@ -335,10 +321,6 @@ fn parse_txid(s: &str, field: &str) -> Result<[u8; 32], Status> {
     parse_display_hash(s).map_err(|_| invalid(format!("{field} must be a 64-hex txid")))
 }
 
-fn queue_error(e: core_tex::TexQueueError) -> TxError {
-    TxError::Internal(e.to_string())
-}
-
 /// `ListTransactions`: newest first, `limit` (0 = 50) per page, paged by
 /// `before_txid`; each ZIP 320 step carries its queue row.
 pub async fn list_transactions(
@@ -358,7 +340,7 @@ pub async fn list_transactions(
     let key_id = key.key_id().to_string();
     let (rows, tex_rows) = with_wallet(&key, move |w| {
         let rows = history::transactions(w, limit, before)?;
-        let tex_rows = core_tex::list(w, true).map_err(queue_error)?;
+        let tex_rows = core_tex::list(w, true).map_err(tex::queue_error)?;
         Ok((rows, tex_rows))
     })
     .await
@@ -394,7 +376,7 @@ pub async fn get_transaction_status(
     let key_id = key.key_id().to_string();
     let (row, tex_row) = with_wallet(&key, move |w| {
         let row = history::transaction(w, txid)?;
-        let tex_rows = core_tex::list(w, true).map_err(queue_error)?;
+        let tex_rows = core_tex::list(w, true).map_err(tex::queue_error)?;
         Ok((row, tex_row_of(&tex_rows, &txid).cloned()))
     })
     .await

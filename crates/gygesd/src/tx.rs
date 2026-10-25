@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use age::secrecy::SecretString;
-use gyges_chain::ChainError;
+use gyges_chain::{ChainBackend, ChainError};
 use gyges_core::tx::{self as core_tx, AmountSpec, Expected, ProposalSummary, TxError};
 use gyges_core::vault::manager::{Auth, Token};
 use gyges_core::{KeyEntry, SigningMode};
@@ -42,8 +42,9 @@ use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::value::Zatoshis;
 
 use crate::conn::ConnInfo;
-use crate::keys::{AUDIT_TARGET, proto_pool, registry_error, vault_error};
-use crate::service::{DaemonState, unix_now};
+use crate::keys::{AUDIT_TARGET, proto_pool, vault_error};
+use crate::service::{DaemonState, invalid, unix_now};
+use crate::tex::queue_error;
 
 /// The server-streaming response type for `SendTransaction` / `ShieldFunds`.
 pub type SendStream = tonic::codegen::BoxStream<SendEvent>;
@@ -466,10 +467,7 @@ pub(crate) fn prepare(
     min_confirmations: u32,
     purpose: Purpose,
 ) -> Result<Prepared, Status> {
-    let key = state
-        .registry
-        .resolve(key_id)
-        .map_err(|e| registry_error(e).into_status())?;
+    let key = state.resolve_key(key_id)?;
     let kid = key.key_id().to_string();
     let typed = |reason, detail: &str| GygesError::new(reason, detail).with_key(&kid).into_status();
     match key.profile().signing_mode {
@@ -494,18 +492,7 @@ pub(crate) fn prepare(
             ));
         }
     }
-    let Some(chain) = state.chain.clone() else {
-        return Err(typed(
-            ErrorReason::Airgapped,
-            "an air-gapped daemon cannot broadcast",
-        ));
-    };
-    if !chain.status().connected {
-        return Err(typed(
-            ErrorReason::NodeUnreachable,
-            "the node is not connected; the transaction could not be broadcast",
-        ));
-    }
+    let chain = connected_chain(state, &kid)?;
     match state.sync.get(&kid) {
         Some(p) if p.spendable => {}
         Some(p) => {
@@ -561,10 +548,7 @@ pub(crate) fn prepare_signer(
     key_id: &str,
     session_token: &[u8],
 ) -> Result<Prepared, Status> {
-    let key = state
-        .registry
-        .resolve(key_id)
-        .map_err(|e| registry_error(e).into_status())?;
+    let key = state.resolve_key(key_id)?;
     let kid = key.key_id().to_string();
     let typed = |reason, detail: &str| GygesError::new(reason, detail).with_key(&kid).into_status();
     match key.profile().signing_mode {
@@ -592,7 +576,6 @@ pub(crate) fn prepare_signer(
 }
 
 pub(crate) fn parse_amount(amount: Option<v1::Amount>) -> Result<AmountSpec, Status> {
-    let invalid = |d: &str| GygesError::new(ErrorReason::InvalidArgument, d).into_status();
     match amount.and_then(|a| a.value) {
         Some(v1::amount::Value::Zatoshis(z)) => {
             let z = u64::try_from(z).map_err(|_| invalid("the amount must be positive"))?;
@@ -775,6 +758,25 @@ fn run(
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
+/// Step 1's `Proving` event for each pool, before (`done = false`) or
+/// after proving.
+async fn emit_proving(
+    tx: &mpsc::Sender<Result<SendEvent, Status>>,
+    pools: &[(v1::Pool, u32)],
+    done: bool,
+) -> Result<(), Status> {
+    for &(pool, total) in pools {
+        let progress = v1::ProvingProgress {
+            step: 1,
+            pool: pool as i32,
+            actions_done: if done { total } else { 0 },
+            actions_total: total,
+        };
+        emit(tx, send_event::Event::Proving(progress)).await?;
+    }
+    Ok(())
+}
+
 async fn emit(
     tx: &mpsc::Sender<Result<SendEvent, Status>>,
     event: send_event::Event,
@@ -782,6 +784,28 @@ async fn emit(
     tx.send(Ok(SendEvent { event: Some(event) }))
         .await
         .map_err(|_| Status::cancelled("client disconnected"))
+}
+
+/// The node backend for a broadcast, refused when air-gapped or offline.
+pub(crate) fn connected_chain(
+    state: &DaemonState,
+    key_id: &str,
+) -> Result<Arc<dyn ChainBackend>, Status> {
+    let refuse = |reason, detail: &str| GygesError::new(reason, detail).with_key(key_id);
+    let chain = state.chain.clone().ok_or_else(|| {
+        refuse(
+            ErrorReason::Airgapped,
+            "an air-gapped daemon cannot broadcast",
+        )
+    })?;
+    if !chain.status().connected {
+        return Err(refuse(
+            ErrorReason::NodeUnreachable,
+            "the node is not connected; the transaction could not be broadcast",
+        )
+        .into());
+    }
+    Ok(chain)
 }
 
 /// Run `f` with the key's wallet on a blocking thread.
@@ -851,35 +875,13 @@ async fn pipeline(
     .into_iter()
     .filter(|(_, n)| *n > 0)
     .collect();
-    for (pool, total) in &pools {
-        emit(
-            tx,
-            send_event::Event::Proving(v1::ProvingProgress {
-                step: 1,
-                pool: *pool as i32,
-                actions_done: 0,
-                actions_total: *total,
-            }),
-        )
-        .await?;
-    }
+    emit_proving(tx, &pools, false).await?;
     let provers = state.provers.clone();
     let t0 = std::time::Instant::now();
     let pczt = blocking(move || core_tx::prove(pczt, &provers))
         .await
         .map_err(err)?;
-    for (pool, total) in &pools {
-        emit(
-            tx,
-            send_event::Event::Proving(v1::ProvingProgress {
-                step: 1,
-                pool: *pool as i32,
-                actions_done: *total,
-                actions_total: *total,
-            }),
-        )
-        .await?;
-    }
+    emit_proving(tx, &pools, true).await?;
     tracing::info!(
         key_id,
         orchard_actions = work.orchard_actions,
@@ -922,10 +924,7 @@ async fn pipeline(
         .map_err(err)?;
     emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
     let txid_hex = txid.to_string();
-    route
-        .send(prepared.chain()?, raw, &key_id)
-        .await
-        .map_err(GygesError::into_status)?;
+    route.send(prepared.chain()?, raw, &key_id).await?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());
     tracing::info!(key_id, via = route.name(), "transaction broadcast");
     state.sync.wake();
@@ -1144,18 +1143,7 @@ async fn tex_pipeline(
                 .collect()
         })
         .unwrap_or_default();
-    for (pool, total) in &pools {
-        emit(
-            tx,
-            send_event::Event::Proving(v1::ProvingProgress {
-                step: 1,
-                pool: *pool as i32,
-                actions_done: 0,
-                actions_total: *total,
-            }),
-        )
-        .await?;
-    }
+    emit_proving(tx, &pools, false).await?;
     let params = state.registry.params();
     let provers = state.provers.clone();
     let t0 = std::time::Instant::now();
@@ -1165,18 +1153,7 @@ async fn tex_pipeline(
     })
     .await
     .map_err(err)?;
-    for (pool, total) in &pools {
-        emit(
-            tx,
-            send_event::Event::Proving(v1::ProvingProgress {
-                step: 1,
-                pool: *pool as i32,
-                actions_done: *total,
-                actions_total: *total,
-            }),
-        )
-        .await?;
-    }
+    emit_proving(tx, &pools, true).await?;
     tracing::info!(
         key_id,
         ms = t0.elapsed().as_millis(),
@@ -1204,8 +1181,7 @@ async fn tex_pipeline(
         attempts: 0,
         last_error: None,
     };
-    let queue_err = |e: core_tex::TexQueueError| TxError::Internal(e.to_string());
-    with_wallet(key, move |w| core_tex::insert(w, &row).map_err(queue_err))
+    with_wallet(key, move |w| core_tex::insert(w, &row).map_err(queue_error))
         .await
         .map_err(err)?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "tex_queued");
@@ -1217,8 +1193,8 @@ async fn tex_pipeline(
     match chain.send_raw_transaction(built.step1_raw).await {
         Ok(_) => {
             with_wallet(key, move |w| {
-                core_tex::record_attempt(w, id, now, None).map_err(queue_err)?;
-                core_tex::set_state(w, id, TexState::Step1Broadcast, None).map_err(queue_err)
+                core_tex::record_attempt(w, id, now, None).map_err(queue_error)?;
+                core_tex::set_state(w, id, TexState::Step1Broadcast, None).map_err(queue_error)
             })
             .await
             .map_err(err)?;
@@ -1229,9 +1205,10 @@ async fn tex_pipeline(
             let text = e.to_string();
             let rejected = matches!(e, ChainError::Rejected(_));
             let _ = with_wallet(key, move |w| {
-                core_tex::record_attempt(w, id, now, Some(&text)).map_err(queue_err)?;
+                core_tex::record_attempt(w, id, now, Some(&text)).map_err(queue_error)?;
                 if rejected {
-                    core_tex::set_state(w, id, TexState::Failed, Some(&text)).map_err(queue_err)?;
+                    core_tex::set_state(w, id, TexState::Failed, Some(&text))
+                        .map_err(queue_error)?;
                 }
                 Ok(())
             })
@@ -1264,8 +1241,8 @@ async fn tex_pipeline(
     match chain.send_raw_transaction(built.step2_raw).await {
         Ok(_) => {
             with_wallet(key, move |w| {
-                core_tex::record_attempt(w, id, now, None).map_err(queue_err)?;
-                core_tex::set_state(w, id, TexState::Step2Broadcast, None).map_err(queue_err)
+                core_tex::record_attempt(w, id, now, None).map_err(queue_error)?;
+                core_tex::set_state(w, id, TexState::Step2Broadcast, None).map_err(queue_error)
             })
             .await
             .map_err(err)?;
@@ -1283,7 +1260,7 @@ async fn tex_pipeline(
         Err(e) => {
             let text = e.to_string();
             let _ = with_wallet(key, move |w| {
-                core_tex::record_attempt(w, id, now, Some(&text)).map_err(queue_err)
+                core_tex::record_attempt(w, id, now, Some(&text)).map_err(queue_error)
             })
             .await;
             tracing::warn!(
@@ -1313,7 +1290,7 @@ async fn tex_pipeline(
                 )
                 .await?;
             }
-            let row = with_wallet(key, move |w| core_tex::get(w, id).map_err(queue_err))
+            let row = with_wallet(key, move |w| core_tex::get(w, id).map_err(queue_error))
                 .await
                 .map_err(err)?;
             let Some(row) = row else {
@@ -1410,10 +1387,7 @@ pub async fn satisfy_session(
         .into_status()
     };
     let key_id = state.sessions.key_of(&session_id).ok_or_else(not_found)?;
-    let key = state
-        .registry
-        .resolve(&key_id)
-        .map_err(|e| registry_error(e).into_status())?;
+    let key = state.resolve_key(&key_id)?;
     let params = state.registry.params();
     let account_index = key.profile().account_index;
     let st = state.clone();
@@ -1479,18 +1453,10 @@ pub async fn get_balance(
     state: Arc<DaemonState>,
     req: GetBalanceRequest,
 ) -> Result<GetBalanceResponse, Status> {
-    let key = state
-        .registry
-        .resolve(&req.key_id)
-        .map_err(|e| registry_error(e).into_status())?;
-    if !key.profile().has_wallet() {
-        return Err(GygesError::new(
-            ErrorReason::InvalidArgument,
-            "a signer-only profile has no wallet and no balance",
-        )
-        .with_key(key.key_id())
-        .into_status());
-    }
+    let key = state.wallet_key(
+        &req.key_id,
+        "a signer-only profile has no wallet and no balance",
+    )?;
     let min_confirmations = if req.min_confirmations == 0 {
         state.config.policy.min_confirmations
     } else {

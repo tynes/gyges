@@ -14,7 +14,9 @@ use gyges_chain::ChainError;
 use gyges_core::registry::NewLocalSeedKey;
 use gyges_core::vault::VaultError;
 use gyges_core::vault::manager::{Auth, Scope, UnlockState};
-use gyges_core::{BirthdayError, KeyEntry, RegistryError, SigningMode, birthday, vault};
+use gyges_core::{
+    BirthdayError, KeyEntry, RegistryError, ResolvedBirthday, SigningMode, birthday, vault,
+};
 use gyges_proto::v1::{
     self, ErrorReason, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest,
     ExportUfvkResponse, GygesError, InitKeyRequest, InitKeyResponse, KeySummary, LockKeyRequest,
@@ -25,7 +27,7 @@ use tonic::Status;
 use zeroize::Zeroizing;
 
 use crate::conn::ConnInfo;
-use crate::service::DaemonState;
+use crate::service::{DaemonState, invalid};
 
 /// Security-relevant events, key id and time only (OVERVIEW.md Q-O1). The
 /// target lets the audit appender (ROADMAP.md M1, last item) pick them out.
@@ -210,10 +212,6 @@ pub fn birthday_error(e: BirthdayError) -> GygesError {
     }
 }
 
-fn invalid(detail: &str) -> Status {
-    GygesError::new(ErrorReason::InvalidArgument, detail).into_status()
-}
-
 /// Move the passphrase out of the request into a zeroizing wrapper.
 fn take_passphrase(passphrase: &mut String) -> Result<SecretString, Status> {
     let p = std::mem::take(passphrase);
@@ -228,6 +226,32 @@ fn require_key_id(key_id: &str) -> Result<(), Status> {
         return Err(invalid("--id is required"));
     }
     Ok(())
+}
+
+/// Create a `local-seed` profile on a blocking thread.
+async fn create_local_seed(
+    state: &Arc<DaemonState>,
+    key_id: &str,
+    entropy: vault::Entropy,
+    passphrase: SecretString,
+    birthday: ResolvedBirthday,
+) -> Result<Arc<KeyEntry>, Status> {
+    let st = state.clone();
+    let id = key_id.to_string();
+    let entry = tokio::task::spawn_blocking(move || {
+        st.registry.create_local_seed(NewLocalSeedKey {
+            key_id: &id,
+            entropy: &entropy,
+            passphrase,
+            birthday: &birthday,
+            account_index: 0,
+            label: None,
+        })
+    })
+    .await
+    .map_err(|e| Status::internal(e.to_string()))?
+    .map_err(registry_error)?;
+    Ok(entry)
 }
 
 /// Apply `set_default`, which lasts for this daemon's lifetime (the daemon
@@ -270,7 +294,7 @@ pub async fn init_key(
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e| registry_error(e).into_status())?;
+        .map_err(registry_error)?;
         (entry, 0)
     } else {
         let birthday = birthday::resolve(state.network, state.chain.as_deref(), None)
@@ -292,21 +316,7 @@ pub async fn init_key(
             }
             .into_status())?;
         let height = birthday.height;
-        let st = state.clone();
-        let id = key_id.clone();
-        let entry = tokio::task::spawn_blocking(move || {
-            st.registry.create_local_seed(NewLocalSeedKey {
-                key_id: &id,
-                entropy: &entropy,
-                passphrase,
-                birthday: &birthday,
-                account_index: 0,
-                label: None,
-            })
-        })
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e| registry_error(e).into_status())?;
+        let entry = create_local_seed(&state, &key_id, entropy, passphrase, birthday).await?;
         (entry, height)
     };
     maybe_set_default(&state, &key_id, req.set_default);
@@ -334,7 +344,7 @@ pub async fn restore_key(
     let passphrase = take_passphrase(&mut req.passphrase)?;
     let phrase = Zeroizing::new(std::mem::take(&mut req.mnemonic));
     let entropy = vault::entropy_from_phrase(&phrase)
-        .map_err(|e| invalid(&format!("invalid mnemonic: {e}")))?;
+        .map_err(|e| invalid(format!("invalid mnemonic: {e}")))?;
     drop(phrase);
 
     let requested = if req.birthday_height == 0 {
@@ -344,44 +354,29 @@ pub async fn restore_key(
     };
     let mut backfill_blocks = 0;
     let mut warnings = Vec::new();
-    let birthday =
-        match birthday::resolve(state.network, state.chain.as_deref(), Some(requested)).await {
-            Ok(b) => b,
-            Err(BirthdayError::BelowRetention {
-                height,
-                retained_from,
-            }) => {
-                let (b, n) = below_retention(&state, height, retained_from, req.allow_backfill)
-                    .await
-                    .map_err(GygesError::into_status)?;
-                backfill_blocks = n;
-                warnings.push(format!(
-                    "transparent history below height {} comes from the fallback endpoint and is \
+    let birthday = match birthday::resolve(state.network, state.chain.as_deref(), Some(requested))
+        .await
+    {
+        Ok(b) => b,
+        Err(BirthdayError::BelowRetention {
+            height,
+            retained_from,
+        }) => {
+            let (b, n) = below_retention(&state, height, retained_from, req.allow_backfill).await?;
+            backfill_blocks = n;
+            warnings.push(format!(
+                "transparent history below height {} comes from the fallback endpoint and is \
                      best-effort: an output it leaves out cannot be detected (SYNC.md §5.3)",
-                    retained_from
-                ));
-                b
-            }
-            Err(other) => return Err(birthday_error(other).into_status()),
-        };
+                retained_from
+            ));
+            b
+        }
+        Err(other) => return Err(birthday_error(other).into_status()),
+    };
 
     let key_id = req.key_id.clone();
     let height = birthday.height;
-    let st = state.clone();
-    let id = key_id.clone();
-    let entry = tokio::task::spawn_blocking(move || {
-        st.registry.create_local_seed(NewLocalSeedKey {
-            key_id: &id,
-            entropy: &entropy,
-            passphrase,
-            birthday: &birthday,
-            account_index: 0,
-            label: None,
-        })
-    })
-    .await
-    .map_err(|e| Status::internal(e.to_string()))?
-    .map_err(|e| registry_error(e).into_status())?;
+    let entry = create_local_seed(&state, &key_id, entropy, passphrase, birthday).await?;
     maybe_set_default(&state, &key_id, req.set_default);
     Ok(RestoreKeyResponse {
         key_id,
@@ -470,10 +465,7 @@ pub async fn unlock_key(
     if !req.session_id.is_empty() {
         return crate::tx::satisfy_session(state, req.session_id, passphrase).await;
     }
-    let key = state
-        .registry
-        .resolve(&req.key_id)
-        .map_err(|e| registry_error(e).into_status())?;
+    let key = state.resolve_key(&req.key_id)?;
     let scope = match req.scope() {
         UnlockScope::Daemon => Scope::Daemon,
         UnlockScope::Connection | UnlockScope::Unspecified => Scope::Connection(
@@ -509,10 +501,7 @@ pub fn lock_key(state: &DaemonState, req: LockKeyRequest) -> Result<LockKeyRespo
     let locked_key_ids = if req.all {
         state.vault.lock_all()
     } else {
-        let key = state
-            .registry
-            .resolve(&req.key_id)
-            .map_err(|e| registry_error(e).into_status())?;
+        let key = state.resolve_key(&req.key_id)?;
         if state.vault.lock(key.key_id()) {
             vec![key.key_id().to_string()]
         } else {
@@ -532,17 +521,14 @@ pub fn export_ufvk(
     _conn: Option<ConnInfo>,
     req: ExportUfvkRequest,
 ) -> Result<ExportUfvkResponse, Status> {
-    let key = state
-        .registry
-        .resolve(&req.key_id)
-        .map_err(|e| registry_error(e).into_status())?;
+    let key = state.resolve_key(&req.key_id)?;
     let ufvk = match key.ufvk() {
         Some(u) => u,
         None => state
             .vault
             .with_entropy(key.key_id(), Auth::Daemon, |e| key.derive_ufvk(e))
             .map_err(|e| vault_error(e, key.key_id()).into_status())?
-            .map_err(|e| registry_error(e).into_status())?,
+            .map_err(registry_error)?,
     };
     Ok(ExportUfvkResponse {
         ufvk,
@@ -571,10 +557,7 @@ pub async fn export_seed(
         )
         .into_status());
     }
-    let key = state
-        .registry
-        .resolve(&req.key_id)
-        .map_err(|e| registry_error(e).into_status())?;
+    let key = state.resolve_key(&req.key_id)?;
     let key_id = key.key_id().to_string();
     let st = state.clone();
     let k = key.clone();

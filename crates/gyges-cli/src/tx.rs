@@ -143,8 +143,7 @@ async fn send(ctx: &Ctx, args: SendArgs) -> Result<(), CliError> {
     let stream = conn
         .client
         .send_transaction(request(args.dry_run))
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     let key = shown_key(ctx, &conn);
     follow(ctx, &mut conn, &key, stream, shown).await
@@ -168,8 +167,7 @@ async fn shield(ctx: &Ctx, args: ShieldArgs) -> Result<(), CliError> {
     let stream = conn
         .client
         .shield_funds(request(args.dry_run))
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     let key = shown_key(ctx, &conn);
     follow(ctx, &mut conn, &key, stream, shown).await
@@ -185,11 +183,10 @@ async fn dry_run(conn: &mut Conn, req: SendOrShield) -> Result<Proposal, CliErro
     let mut stream = match req {
         SendOrShield::Send(r) => conn.client.send_transaction(r).await,
         SendOrShield::Shield(r) => conn.client.shield_funds(r).await,
-    }
-    .map_err(CliError::from_status)?
+    }?
     .into_inner();
     while let Some(item) = stream.next().await {
-        let ev = item.map_err(CliError::from_status)?;
+        let ev = item?;
         if let Some(send_event::Event::Proposed(p)) = ev.event {
             return Ok(p);
         }
@@ -229,7 +226,7 @@ async fn follow(
         let Some(item) = next else {
             return Ok(());
         };
-        let ev = item.map_err(CliError::from_status)?;
+        let ev = item?;
         if ctx.json {
             println!("{}", to_json(&ev)?);
         }
@@ -459,8 +456,7 @@ async fn sessions(ctx: &Ctx, args: SessionsArgs) -> Result<(), CliError> {
             },
             include_finished: args.include_finished,
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if ctx.json {
         println!("{}", to_json(&resp)?);
@@ -602,8 +598,7 @@ async fn resume(ctx: &Ctx, txid: String) -> Result<(), CliError> {
                 key_id: ctx.key.clone(),
                 include_finished: true,
             })
-            .await
-            .map_err(CliError::from_status)?
+            .await?
             .into_inner();
         if let Some(s) = sessions
             .sessions
@@ -690,8 +685,7 @@ async fn abort(ctx: &Ctx, id: String) -> Result<(), CliError> {
                     key_id: ctx.key.clone(),
                     step1_txid: id,
                 })
-                .await
-                .map_err(CliError::from_status)?
+                .await?
                 .into_inner();
             if ctx.json {
                 println!("{}", to_json(&entry)?);
@@ -711,8 +705,7 @@ async fn abort(ctx: &Ctx, id: String) -> Result<(), CliError> {
     let resp = conn
         .client
         .abort_signing_session(AbortSigningSessionRequest { session_id: id })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if ctx.json {
         println!("{}", to_json(&resp)?);
