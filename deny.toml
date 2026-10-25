@@ -24,6 +24,11 @@ ignore = [
     # paste unmaintained. Proc-macro used by arti-client (fs-mistrust -> pwd-grp)
     # and others. Not linked into the binaries.
     { id = "RUSTSEC-2024-0436", reason = "proc-macro build dependency via arti-client; not in the binaries" },
+    # crypto-bigint 0.5.5: non-constant-time arithmetic (fixed in 0.7.6). Pulled in
+    # by age 0.12 -> p256 / hpke -> elliptic-curve 0.13, unconditionally; no age
+    # release moves to crypto-bigint 0.7. Gyges uses only age's scrypt recipient
+    # (seed.age), so no P-256 operation ever runs.
+    { id = "RUSTSEC-2026-0387", reason = "age 0.12 transitive via p256; Gyges uses only the scrypt recipient, no P-256 operations" },
 ]
 
 [licenses]

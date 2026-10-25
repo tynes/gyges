@@ -2569,6 +2569,37 @@ async fn zip320_sends_through_the_fake_node() {
         .await
         .unwrap_err();
     assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    // That answer depends on neither the scan nor the node: with the node
+    // unreachable (it now wants a cookie the daemon does not send), a
+    // finished transfer still has nothing to resume, not NODE_UNREACHABLE.
+    let chain = state.chain.clone().expect("networked daemon");
+    let wait_connected = |want: bool| {
+        let chain = chain.clone();
+        async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while gyges_chain::ChainBackend::status(chain.as_ref()).connected != want {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "node never connected={want}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    node.set_cookie(Some("rotated".into()));
+    wait_connected(false).await;
+    let err = c
+        .resume_tex_transfer(ResumeTexTransferRequest {
+            key_id: "main".into(),
+            step1_txid: s1.clone(),
+            session_token: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("nothing to resume"), "{err:?}");
+    node.set_cookie(None);
+    wait_connected(true).await;
     wait_spendable(&mut c, "main").await;
     let after_a = balance(&mut c).await;
     assert_eq!(
