@@ -237,6 +237,21 @@ a fresh one without the "can still be mined" check of §4.1, since an
 air-gapped daemon cannot know the tip; the file's expiry height is the
 client's to watch.
 
+*Change ownership (ROADMAP.md M4, third item):* once the key is unlocked
+and before anything is signed, every shielded output must match its note
+and value commitments (a missing `recipient`, `value` or `rseed` fails), every
+`user_address` must name the receiver its output pays, and every output without a `user_address`
+(upstream sets one on each payment to an external address, and
+`InspectPczt` lists those as payments) and with a non-zero value must belong
+to the key: an Orchard or Ironwood recipient in either scope of the
+account's Orchard viewing key, a Sapling recipient the Sapling viewing key
+decrypts, a transparent script among the wallet's receivers or, on a
+`signer-only` profile, at an external or internal index below 1,000.
+Otherwise the stream fails with `INVALID_ARGUMENT` (exit 6). `BroadcastPczt`
+and `SendTransaction` apply the same rule in the Verifier: change is
+matched to the approved proposal by value and owner, not by value or total
+alone.
+
 ### 4.3 Non-interactive clients
 
 When stdin is not a TTY, or `--non-interactive` / `GYGES_NON_INTERACTIVE=1`

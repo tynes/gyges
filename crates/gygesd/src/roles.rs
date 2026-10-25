@@ -429,7 +429,11 @@ pub async fn broadcast_pczt(
     let expected = Expected::from_json(&row.expected).map_err(err)?;
 
     // Verifier (Q-K7), then extract and record.
-    let pczt = core_tx::verify(pczt, &expected).map_err(err)?;
+    let owner_params = state.registry.params();
+    let owner = with_wallet(&key, move |w| core_tx::Owner::of_wallet(&owner_params, w))
+        .await
+        .map_err(err)?;
+    let pczt = core_tx::verify(pczt, &expected, &owner).map_err(err)?;
     let provers = state.provers.clone();
     let (txid, raw) = with_wallet(&key, move |w| core_tx::extract_and_store(w, pczt, &provers))
         .await

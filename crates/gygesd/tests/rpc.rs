@@ -4386,3 +4386,390 @@ async fn an_airgapped_signer_only_daemon_signs_transparent_inputs() {
     offline.task.abort();
     online.task.abort();
 }
+
+/// Replace every occurrence of `old` in `bytes` with `new` (equal lengths):
+/// a value or address an attacker changes everywhere the file carries it.
+fn replace_all(bytes: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
+    assert_eq!(old.len(), new.len());
+    let mut out = bytes.to_vec();
+    let mut hits = 0;
+    let mut i = 0;
+    while i + old.len() <= out.len() {
+        if out[i..i + old.len()] == *old {
+            out[i..i + old.len()].copy_from_slice(new);
+            hits += 1;
+            i += old.len();
+        } else {
+            i += 1;
+        }
+    }
+    assert!(hits > 0, "the bytes do not occur");
+    out
+}
+
+/// Replace the one occurrence of `old` in `bytes` with `new`.
+fn replace_once(bytes: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
+    let hits: Vec<usize> = bytes
+        .windows(old.len())
+        .enumerate()
+        .filter(|(_, w)| *w == old)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(hits.len(), 1, "expected the bytes exactly once");
+    let mut out = bytes.to_vec();
+    out[hits[0]..hits[0] + old.len()].copy_from_slice(new);
+    out
+}
+
+/// THREAT_MODEL.md §6 item 8 (ROADMAP.md M4, third item): a PCZT whose
+/// change output is redirected to another key's address is refused by
+/// `pczt sign` before anything is signed, and a signed file with its change
+/// redirected afterwards is refused by the Verifier at `pczt broadcast`,
+/// although the value, the fee and every payment are unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
+    use gyges_proto::v1::{BroadcastPcztRequest, CreatePcztRequest, ProvePcztRequest};
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(10);
+    let params = Network::Regtest.consensus_params();
+    let config = "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n";
+    let url = node.url().to_string();
+    let running = start_with(config, |o| o.zakura_rpc = Some(url)).await;
+    let mut c = client(&running.socket).await;
+    for id in ["main", "thief"] {
+        c.init_key(InitKeyRequest {
+            key_id: id.into(),
+            passphrase: "pw".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_spendable(&mut c, id).await;
+    }
+    let internal = |id: &str| {
+        let encoded = running.state.registry.resolve(id).unwrap().ufvk().unwrap();
+        let ufvk = zcash_keys::keys::UnifiedFullViewingKey::decode(&params, &encoded).unwrap();
+        ufvk.orchard()
+            .unwrap()
+            .address_at(0u32, orchard::keys::Scope::Internal)
+            .to_raw_address_bytes()
+    };
+    let (ours, theirs) = (internal("main"), internal("thief"));
+    let receiver = {
+        let key = running.state.registry.resolve("main").unwrap();
+        let w = key.wallet().unwrap();
+        let account = w.get_account_ids().unwrap()[0];
+        *w.get_transparent_receivers(account, false, false)
+            .unwrap()
+            .keys()
+            .next()
+            .expect("a transparent receiver")
+    };
+    node.mine_with_payments(&[(receiver, 100_000_000)]);
+    node.mine(1);
+    wait_spendable(&mut c, "main").await;
+
+    let t_recipient = zcash_keys::address::Address::Transparent(
+        transparent::address::TransparentAddress::PublicKeyHash([0x42; 20]),
+    )
+    .encode(&params);
+    let created = c
+        .create_pczt(CreatePcztRequest {
+            key_id: "main".into(),
+            to: t_recipient,
+            amount: Some(gyges_proto::v1::Amount {
+                value: Some(gyges_proto::v1::amount::Value::Zatoshis(10_000_000)),
+            }),
+            memo: Vec::new(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let prove = |pczt: Vec<u8>| {
+        let mut c = c.clone();
+        async move {
+            c.prove_pczt(ProvePcztRequest {
+                pczt,
+                session_token: Vec::new(),
+                key_id: String::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .pczt
+        }
+    };
+    let proven = prove(created.pczts[0].clone()).await;
+
+    // The recipient field alone rewritten to another key's address: it no
+    // longer matches the note commitment, so the signer refuses the file.
+    // (This moves no funds by itself; the commitment and the proof still
+    // pay us. It is the consistency check.)
+    let redirected = replace_once(&proven, &ours, &theirs);
+    let err = sign_pczt_with_session(&mut c, redirected, "pw")
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("note commitment"), "{err:?}");
+
+    // The case that moves funds: the change output still names our
+    // internal address, but its note commitment (what the transaction
+    // pays) is another note's. A check that reads only the recipient field
+    // signs this; the note commitment check refuses it.
+    let parsed = pczt::Pczt::parse(&proven).unwrap();
+    let actions = parsed.ironwood().actions();
+    let change = actions
+        .iter()
+        .position(|a| *a.output().recipient() == Some(ours))
+        .expect("the change action names our internal address");
+    let other = (0..actions.len()).find(|&i| i != change).unwrap();
+    let change_cmx = actions[change]
+        .output()
+        .cmx()
+        .expect("the file carries cmx");
+    let other_cmx = actions[other].output().cmx().expect("the file carries cmx");
+    let recommitted = replace_once(&proven, &change_cmx, &other_cmx);
+    let err = sign_pczt_with_session(&mut c, recommitted, "pw")
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("note commitment"), "{err:?}");
+
+    // A payment whose script is changed under its address label: the label
+    // the user is shown no longer names what the output pays.
+    let relabelled = replace_once(&proven, &[0x42; 20], &[0x43; 20]);
+    let err = sign_pczt_with_session(&mut c, relabelled, "pw")
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("label does not match"), "{err:?}");
+
+    // Property, at sign time: a random rewrite of the change's recipient or
+    // value, or of the payment's script under its label, is refused before
+    // anything is signed. A daemon-scoped unlock spares each case a
+    // session.
+    {
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, TestRunner};
+        let fee = u64::try_from(created.proposal.as_ref().unwrap().total_fee).unwrap();
+        let change_value = 100_000_000 - 10_000_000 - fee;
+        let thief = {
+            let encoded = running
+                .state
+                .registry
+                .resolve("thief")
+                .unwrap()
+                .ufvk()
+                .unwrap();
+            zcash_keys::keys::UnifiedFullViewingKey::decode(&params, &encoded).unwrap()
+        };
+        c.unlock_key(UnlockKeyRequest {
+            key_id: "main".into(),
+            passphrase: "pw".into(),
+            scope: UnlockScope::Daemon as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let strategy = prop_oneof![
+            (0u32..1_000, any::<bool>()).prop_map(|(j, ext)| (0u8, j, ext, [0u8; 20], 0u64)),
+            ((1u64 << 21)..(1u64 << 28)).prop_map(|v| (1u8, 0, false, [0u8; 20], v)),
+            any::<[u8; 20]>().prop_map(|h| (2u8, 0, false, h, 0)),
+        ];
+        let mut runner = TestRunner::new(Config {
+            cases: 24,
+            failure_persistence: None,
+            ..Config::default()
+        });
+        let handle = tokio::runtime::Handle::current();
+        let tried = std::sync::atomic::AtomicUsize::new(0);
+        runner
+            .run(&strategy, |(kind, j, external, h, v)| {
+                let (bytes, want) = match kind {
+                    0 => {
+                        let scope = if external {
+                            orchard::keys::Scope::External
+                        } else {
+                            orchard::keys::Scope::Internal
+                        };
+                        let to = thief
+                            .orchard()
+                            .unwrap()
+                            .address_at(j, scope)
+                            .to_raw_address_bytes();
+                        (replace_all(&proven, &ours, &to), "note commitment")
+                    }
+                    1 if v != change_value => (
+                        replace_all(&proven, &varint(change_value), &varint(v)),
+                        "commitment",
+                    ),
+                    2 if h != [0x42; 20] => (
+                        replace_all(&proven, &[0x42; 20], &h),
+                        "label does not match",
+                    ),
+                    _ => return Ok(()),
+                };
+                tried.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut c = c.clone();
+                let result = tokio::task::block_in_place(|| {
+                    handle.block_on(sign_pczt_with_session(&mut c, bytes, "pw"))
+                });
+                let err = match result {
+                    Ok(_) => return Err(TestCaseError::fail("a rewritten file was signed")),
+                    Err(e) => e,
+                };
+                prop_assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{:?}", err);
+                prop_assert!(err.message().contains(want), "{:?}", err);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            tried.into_inner() >= 20,
+            "the mutations were mostly skipped"
+        );
+        c.lock_key(LockKeyRequest {
+            key_id: "main".into(),
+            all: false,
+        })
+        .await
+        .unwrap();
+    }
+
+    // Signed as created, then rewritten: the Verifier refuses each at
+    // broadcast, and the node sees nothing.
+    let (signed, _) = sign_pczt_with_session(&mut c, proven.clone(), "pw")
+        .await
+        .unwrap();
+    for (bytes, want) in [
+        (replace_once(&signed, &ours, &theirs), "note commitment"),
+        (
+            replace_once(&signed, &change_cmx, &other_cmx),
+            "note commitment",
+        ),
+        (
+            replace_once(&signed, &[0x42; 20], &[0x43; 20]),
+            "label does not match",
+        ),
+    ] {
+        let err = c
+            .broadcast_pczt(BroadcastPcztRequest {
+                pczt: bytes,
+                via_tor: false,
+                key_id: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+        assert!(err.message().contains(want), "{err:?}");
+    }
+    assert!(node.mempool().is_empty());
+
+    // Property: any one change to an output's value or recipient, or to the
+    // input's value, in the signed file is refused at broadcast, and the
+    // node sees nothing. Each case is one BroadcastPczt; a refusal leaves
+    // the session signed, so the cases are independent.
+    {
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, TestRunner};
+        #[derive(Debug, Clone)]
+        enum Mutation {
+            /// Output or input value `values[.0]` becomes `.1`.
+            Value(usize, u64),
+            /// The change goes to the thief's address at this index and scope.
+            Change(u32, bool),
+            /// The payment goes to another pubkey hash.
+            Payment([u8; 20]),
+        }
+        let fee = u64::try_from(created.proposal.as_ref().unwrap().total_fee).unwrap();
+        let values = [10_000_000u64, 100_000_000 - 10_000_000 - fee, 100_000_000];
+        let thief = {
+            let encoded = running
+                .state
+                .registry
+                .resolve("thief")
+                .unwrap()
+                .ufvk()
+                .unwrap();
+            zcash_keys::keys::UnifiedFullViewingKey::decode(&params, &encoded).unwrap()
+        };
+        let strategy = prop_oneof![
+            (0usize..3, (1u64 << 21)..(1u64 << 28)).prop_map(|(t, v)| Mutation::Value(t, v)),
+            (0u32..1_000, any::<bool>()).prop_map(|(j, ext)| Mutation::Change(j, ext)),
+            any::<[u8; 20]>().prop_map(Mutation::Payment),
+        ];
+        let mut runner = TestRunner::new(Config {
+            cases: 48,
+            failure_persistence: None,
+            ..Config::default()
+        });
+        let handle = tokio::runtime::Handle::current();
+        let signed = signed.clone();
+        let tried = std::sync::atomic::AtomicUsize::new(0);
+        runner
+            .run(&strategy, |m| {
+                let bytes = match m {
+                    Mutation::Value(t, v) if v != values[t] => {
+                        replace_all(&signed, &varint(values[t]), &varint(v))
+                    }
+                    Mutation::Change(j, external) => {
+                        let scope = if external {
+                            orchard::keys::Scope::External
+                        } else {
+                            orchard::keys::Scope::Internal
+                        };
+                        let to = thief
+                            .orchard()
+                            .unwrap()
+                            .address_at(j, scope)
+                            .to_raw_address_bytes();
+                        replace_all(&signed, &ours, &to)
+                    }
+                    Mutation::Payment(h) if h != [0x42; 20] => {
+                        replace_all(&signed, &[0x42; 20], &h)
+                    }
+                    _ => return Ok(()),
+                };
+                tried.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut c = c.clone();
+                let result = tokio::task::block_in_place(|| {
+                    handle.block_on(c.broadcast_pczt(BroadcastPcztRequest {
+                        pczt: bytes,
+                        via_tor: false,
+                        key_id: String::new(),
+                    }))
+                });
+                let err = match result {
+                    Ok(r) => {
+                        return Err(TestCaseError::fail(format!(
+                            "broadcast {:?}",
+                            r.into_inner().txid
+                        )));
+                    }
+                    Err(e) => e,
+                };
+                prop_assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{:?}", err);
+                prop_assert!(node.mempool().is_empty());
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            tried.into_inner() >= 40,
+            "the mutations were mostly skipped"
+        );
+    }
+
+    // The genuine file still goes through.
+    let txid = c
+        .broadcast_pczt(BroadcastPcztRequest {
+            pczt: signed,
+            via_tor: false,
+            key_id: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .txid;
+    wait_in_mempool(&node, &txid).await;
+    running.task.abort();
+}

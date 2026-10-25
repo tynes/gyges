@@ -44,6 +44,9 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 
 [dev-dependencies]
+orchard = { workspace = true }
+pczt = { workspace = true }
+proptest = { workspace = true }
 gyges-chain = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }  # service_fn in the policy-layer tests
 tempfile = { workspace = true }
