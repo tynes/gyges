@@ -16,8 +16,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod addresses;
 pub mod birthday;
 pub mod config;
+pub mod history;
 pub mod log;
 pub mod network;
 pub mod paths;

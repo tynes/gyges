@@ -35,6 +35,7 @@ pub mod service;
 pub mod sync;
 pub mod tex;
 pub mod tx;
+pub mod wallet;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};

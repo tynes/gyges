@@ -2,8 +2,8 @@
 //!
 //! Implemented: `send` (including ZIP 320 `tex1` recipients), `shield`,
 //! `sessions` (signing sessions and ZIP 320 transfers), `abort SESSION_ID`,
-//! `abort TXID` and `resume TXID`. `list` and `status` wait for the
-//! transaction history item.
+//! `abort TXID` and `resume TXID` here; `list` and `status` in
+//! [`crate::history`] (`status --pir` is not implemented yet).
 //!
 //! `send` runs the `SendTransaction` stream and answers its
 //! `SignatureRequired` event in place: the passphrase is prompted (or read
@@ -12,8 +12,6 @@
 //! only for the signing step. Without a terminal and without a passphrase
 //! source the session is aborted and the command exits 4 naming the fix
 //! (CLI_SPEC.md §1.2).
-
-use std::ffi::OsString;
 
 use clap::{Args, Subcommand};
 use gyges_proto::v1::{
@@ -36,22 +34,16 @@ pub enum TxCmd {
     Send(SendArgs),
     /// Sweep transparent UTXOs into the key's Orchard pool.
     Shield(ShieldArgs),
-    /// Transaction history.
-    List(Unimplemented),
-    /// Confirmation status of one transaction.
-    Status(Unimplemented),
+    /// Transaction history, newest first.
+    List(crate::history::ListArgs),
+    /// Confirmation status of one transaction, from the node.
+    Status(crate::history::StatusArgs),
     /// Pending signing sessions.
     Sessions(SessionsArgs),
     /// Abort a signing session (32 hex) or a ZIP 320 transfer still `built` (64 hex).
     Abort { id: String },
     /// Retry a ZIP 320 transfer by its step-1 txid; rebuilds step 2 when step 1 was mined and step 2 expired.
     Resume { txid: String },
-}
-
-#[derive(Debug, Args)]
-pub struct Unimplemented {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-    _rest: Vec<OsString>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -109,8 +101,8 @@ pub async fn run(ctx: &Ctx, cmd: TxCmd) -> Result<(), CliError> {
     match cmd {
         TxCmd::Send(args) => send(ctx, args).await,
         TxCmd::Shield(args) => shield(ctx, args).await,
-        TxCmd::List(_) => Err(CliError::NotImplemented("tx list")),
-        TxCmd::Status(_) => Err(CliError::NotImplemented("tx status")),
+        TxCmd::List(args) => crate::history::list(ctx, args).await,
+        TxCmd::Status(args) => crate::history::status(ctx, args).await,
         TxCmd::Sessions(args) => sessions(ctx, args).await,
         TxCmd::Abort { id } => abort(ctx, id).await,
         TxCmd::Resume { txid } => resume(ctx, txid).await,

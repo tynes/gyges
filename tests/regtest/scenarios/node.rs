@@ -61,15 +61,6 @@ fn test_key_tex_address() -> String {
     zcash_keys::address::Address::Tex(hash).encode(&regtest())
 }
 
-/// The default unified address of an exported UFVK (`key init --json`).
-fn unified_address_of(ufvk: &str) -> String {
-    let ufvk = zcash_keys::keys::UnifiedFullViewingKey::decode(&regtest(), ufvk).unwrap();
-    let (ua, _) = ufvk
-        .default_address(zcash_keys::keys::UnifiedAddressRequest::AllAvailableKeys)
-        .unwrap();
-    ua.encode(&regtest())
-}
-
 /// The transparent receivers the key's wallet watches (the gap-limit set).
 fn transparent_receivers(fx: &Fixture, key_id: &str) -> Vec<TransparentAddress> {
     let path = fx.key_dir(key_id).join("wallet.sqlite");
@@ -426,8 +417,15 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
         .run();
     assert_eq!(run.code(), 0, "{run:?}");
     assert_eq!(run.json()["birthday_height"], 103);
-    let bob_ua = unified_address_of(run.json()["ufvk"].as_str().unwrap());
+    // The receive address comes from `gyges address current`, as a user
+    // would get it (the M1 exit criterion).
+    let run = fx.gyges(&["-k", "bob", "address", "current"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let bob_ua = run.stdout.trim().to_string();
     assert!(bob_ua.starts_with("uregtest1"), "{bob_ua}");
+    let run = fx.gyges(&["address", "inspect", &bob_ua, "--json"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert_eq!(run.json()["kind"], "ADDRESS_KIND_UNIFIED");
     let run = fx
         .gyges(&[
             "-k", "main", "tx", "send", "--to", &bob_ua, "--amount", "1", "--yes",
@@ -440,7 +438,35 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
     wait_for_txid(&fx, "bob", &pay_bob_txid);
     let b = wait_balance(&fx, "bob", |b| spendable(b, "POOL_IRONWOOD") == 100_000_000);
     assert_eq!(b["total_spendable"], "100000000", "{b}");
+    // What arrived and how the payment stands, through the M1 commands.
+    let run = fx.gyges(&["-k", "bob", "notes", "--json"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let notes = run.json();
+    let notes = notes["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0]["pool"], "POOL_IRONWOOD");
+    assert_eq!(notes[0]["value"], "100000000");
+    assert_eq!(notes[0]["txid"], pay_bob_txid.as_str());
+    let run = fx
+        .gyges(&["-k", "main", "tx", "status", &pay_bob_txid, "--json"])
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let st = run.json();
+    assert_eq!(st["status"], "TRANSACTION_STATUS_MINED", "{st}");
+    assert_eq!(st["source"], "STATUS_SOURCE_NODE", "{st}");
+    assert!(st["confirmations"].as_u64().unwrap_or(0) >= 1, "{st}");
     wait_for_txid(&fx, "main", &pay_bob_txid);
+    let run = fx.gyges(&["-k", "main", "tx", "list", "--json"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let history = run.json();
+    let txids: Vec<&str> = history["transactions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["txid"].as_str().unwrap())
+        .collect();
+    assert_eq!(txids.first(), Some(&pay_bob_txid.as_str()), "{history}");
+    assert!(txids.contains(&shield_txid.as_str()), "{history}");
     let b = wait_balance(&fx, "main", |b| {
         spendable(b, "POOL_IRONWOOD") < shielded - 100_000_000
     });

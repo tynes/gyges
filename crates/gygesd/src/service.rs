@@ -23,6 +23,11 @@ use gyges_proto::v1::{
     ShutdownRequest, ShutdownResponse, SignPcztRequest, SigningSession, StreamLogsRequest,
     TexQueueEntry, TorState, TorStatus, UnlockKeyRequest, UnlockKeyResponse, WaitSyncRequest,
 };
+use gyges_proto::v1::{
+    AddressInfo, GetCurrentAddressRequest, GetTransactionStatusRequest,
+    GetTransactionStatusResponse, InspectAddressRequest, InspectAddressResponse, ListNotesRequest,
+    ListNotesResponse, ListTransactionsRequest, ListTransactionsResponse, NewAddressRequest,
+};
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
@@ -32,6 +37,7 @@ use crate::roles::{self, SignStream};
 use crate::sync::{self, ProgressStream, SyncHub};
 use crate::tex::{self, TexHub};
 use crate::tx::{self, SendStream, SessionHub};
+use crate::wallet;
 
 /// Everything the RPC handlers share.
 #[derive(Debug)]
@@ -226,6 +232,61 @@ impl Gyges for GygesService {
         request: Request<GetBalanceRequest>,
     ) -> Result<Response<GetBalanceResponse>, Status> {
         tx::get_balance(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn get_current_address(
+        &self,
+        request: Request<GetCurrentAddressRequest>,
+    ) -> Result<Response<AddressInfo>, Status> {
+        wallet::get_current_address(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn new_address(
+        &self,
+        request: Request<NewAddressRequest>,
+    ) -> Result<Response<AddressInfo>, Status> {
+        wallet::new_address(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn inspect_address(
+        &self,
+        request: Request<InspectAddressRequest>,
+    ) -> Result<Response<InspectAddressResponse>, Status> {
+        Ok(Response::new(wallet::inspect_address(
+            &self.state,
+            request.into_inner(),
+        )))
+    }
+
+    async fn list_notes(
+        &self,
+        request: Request<ListNotesRequest>,
+    ) -> Result<Response<ListNotesResponse>, Status> {
+        wallet::list_notes(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn list_transactions(
+        &self,
+        request: Request<ListTransactionsRequest>,
+    ) -> Result<Response<ListTransactionsResponse>, Status> {
+        wallet::list_transactions(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn get_transaction_status(
+        &self,
+        request: Request<GetTransactionStatusRequest>,
+    ) -> Result<Response<GetTransactionStatusResponse>, Status> {
+        wallet::get_transaction_status(self.state.clone(), request.into_inner())
             .await
             .map(Response::new)
     }

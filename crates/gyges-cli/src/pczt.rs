@@ -25,8 +25,9 @@ use crate::amount::{MemoArg, ParsedAmount, parse_amount, parse_memo};
 use crate::balance::pool_name;
 use crate::client::Ctx;
 use crate::exit::CliError;
+use crate::key::Unimplemented;
 use crate::output::to_json;
-use crate::tx::{Unimplemented, render_steps, satisfy, shown_key};
+use crate::tx::{render_steps, satisfy, shown_key};
 
 #[derive(Debug, Subcommand)]
 pub enum PcztCmd {

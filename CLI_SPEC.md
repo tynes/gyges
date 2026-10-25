@@ -155,7 +155,7 @@ Derives a fresh diversified Unified Address.
 ```text
 Flags:
       --receivers <LIST>    Comma-separated: orchard,sapling,transparent [default: orchard,sapling; keystone-qr profiles: orchard,transparent]
-      --label <TEXT>        Metadata label stored in gyges_address_labels
+      --label <TEXT>        Metadata label stored in ext_gyges_address_labels
       --qr                  Render a QR code in the terminal
 ```
 There is deliberately no `--tex` flag: `tex1` addresses exist so exchanges can force senders to pay from transparent funds, and a privacy wallet advertising one would force every counterparty to deshield. `tex1` is supported on the send side only.
@@ -169,8 +169,10 @@ Parses any Zcash address (`u1`, `utest1`, `zs1`, `t1`, `t3`, `tex1`, `textest1`)
 #### `gyges balance [--min-conf <N>]`
 **Spendable** and **Pending** balances per pool (Orchard, Ironwood, Sapling, Transparent) with totals and the height they are as of. *Spendable* means confirmed to the daemon's anchor depth (`--min-conf`, default `policy.min_confirmations` = 10, the upstream default), with witnesses available; *pending* is received but below that depth, unmined, or change awaiting confirmation.
 
-#### `gyges notes [--pool <orchard|sapling|transparent>] [--unspent | --spent]`
+#### `gyges notes [--pool <orchard|ironwood|sapling|transparent>] [--unspent | --spent | --all]`
 Decrypted notes and UTXOs with heights, values, memo previews and witness readiness.
+
+**Landed (ROADMAP.md M1 follow-up):** `address current`, `address new`, `address inspect` and `notes`. `current` and `new` print the address alone on stdout (so `$(gyges address current)` works) and its receivers, diversifier index and label on stderr (quiet with `-q`). On a fresh key `current` is the account's default address, which carries every receiver the key has (Orchard, Sapling and transparent); `address new` without `--receivers` gives a shielded-only one, and from then on `current` is the newest address handed out. `new` needs the first sync to have recorded the chain tip (exit 7 before that); `--receivers transparent` alone is exit 6 (a unified address needs a shielded receiver). `inspect` exits 6 when the address is malformed or for another network than the daemon's (with `--json`, the error object). `notes` lists oldest first; the memo preview of an incoming payment waits for transaction enhancement, while the wallet's own sends always show theirs (API.md §7.2). Not yet: `--qr` and `address qr` exit 1 until `gyges-qr` renders codes (ROADMAP.md M5).
 
 ---
 
@@ -195,11 +197,13 @@ Flags:
 #### `gyges tx shield [--threshold <AMOUNT>] [--dry-run] [--yes] [--wait]`
 Sweeps transparent UTXOs of at least the threshold (in total; default: any) into the key's shielded pool (Ironwood after NU6.3; auto-shielding, no ZIP governs this behaviour). Same confirmation, signing and output as `tx send`.
 
-#### `gyges tx list [--limit <N>]`
-History with timestamps, pool flows, ZIP 317 fees, decrypted memos, and pending states (`awaiting-signature`, `tex pending`).
+#### `gyges tx list [--limit <N>] [--before <TXID>]`
+History with timestamps, pool flows, ZIP 317 fees, decrypted memos, and pending states (`awaiting-signature`, `tex pending`). `--before` pages: pass the last txid of the previous page.
 
 #### `gyges tx status <TXID> [--pir]`
 Confirmation status from the node, or via `zakura-pir-status` with `--pir`. **Experimental:** the PIR servers queried, their operators and the privacy guarantee must be documented before this leaves experimental status.
+
+**Landed (ROADMAP.md M1 follow-up):** `tx list` prints newest first, one line per transaction (time, status, height, net value with fees, fee, txid), then its non-change outputs with pool, value, recipient and memo, and its ZIP 320 row; statuses are `pending`, `mined`, `expired`, `failed` and `tex-pending` (`awaiting-signature` never shows: a session holds no transaction until it is signed). `tx status` prints `mined at height H (N confirmations)` or the state; an unknown txid is exit 6, an unreachable node exit 7. `--json` prints `ListTransactionsResponse` / `GetTransactionStatusResponse` (API.md §7.2). Not yet: `--pir` exits 1 before contacting the daemon (ROADMAP.md M6).
 
 #### `gyges tx sessions [--all] [--include-finished]` / `gyges tx abort <SESSION_ID | TXID>` / `gyges tx resume <TXID>`
 Lists pending signing sessions (and, with `--include-finished`, completed, expired, aborted and failed ones the daemon still remembers) and ZIP 320 rows (a second table: step-1 txid, key, state, expiry, attempts, amount and the node's last refusal); `abort` cancels a signing session, or a TEX row while it is still `built`; `resume` forces a retry of a TEX row, building a new Step 2 if Step 1 was mined and Step 2 expired. `resume` prompts for the passphrase like `tx send` when the key is locked, waits for the daemon to store the new Step 2 (up to two minutes) and prints its txid on stdout; on a row the queue is still working on it only triggers an immediate re-check.

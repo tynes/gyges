@@ -15,8 +15,8 @@ use gyges_proto::v1::gyges_client::GygesClient;
 use gyges_proto::v1::{
     AbortSigningSessionRequest, ErrorReason, ExportSeedRequest, ExportUfvkRequest,
     GetBalanceRequest, GetBalanceResponse, GetInfoRequest, GetSyncStatusRequest, GygesError,
-    InitKeyRequest, ListKeysRequest, ListNotesRequest, ListSigningSessionsRequest, LockKeyRequest,
-    Proposal, RestoreKeyRequest, RunSyncRequest, SendEvent, SendTransactionRequest, SessionStatus,
+    InitKeyRequest, ListKeysRequest, ListSigningSessionsRequest, LockKeyRequest, Proposal,
+    RestoreKeyRequest, RunSyncRequest, SendEvent, SendTransactionRequest, SessionStatus,
     ShieldFundsRequest, ShutdownRequest, SignatureKind, SigningMode, StreamLogsRequest,
     SyncProgress, SyncState, SyncTarget, UnlockKeyRequest, UnlockScope, WaitSyncRequest,
     send_event,
@@ -155,7 +155,10 @@ async fn get_info_over_uds_and_socket_is_owner_only() {
     assert_eq!(info.started_at, running.state.started_at);
 
     // Unimplemented RPCs answer UNIMPLEMENTED without a GygesError detail.
-    let err = c.list_notes(ListNotesRequest::default()).await.unwrap_err();
+    let err = c
+        .scan_mempool(gyges_proto::v1::ScanMempoolRequest::default())
+        .await
+        .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unimplemented);
     assert!(GygesError::from_status(&err).is_none());
 
@@ -1709,16 +1712,15 @@ fn balance_of(resp: &GetBalanceResponse, pool: gyges_proto::v1::Pool) -> (i64, i
         .unwrap_or((0, 0))
 }
 
-/// The key's current unified address (every receiver), from its UFVK.
-fn unified_address(state: &DaemonState, key_id: &str) -> String {
-    use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
-    let params = Network::Regtest.consensus_params();
-    let key = state.registry.resolve(key_id).unwrap();
-    let ufvk = UnifiedFullViewingKey::decode(&params, &key.ufvk().unwrap()).unwrap();
-    let (ua, _) = ufvk
-        .default_address(UnifiedAddressRequest::AllAvailableKeys)
-        .unwrap();
-    ua.encode(&params)
+/// The key's current unified address, as `gyges address current` prints it.
+async fn current_address(c: &mut GygesClient<Channel>, key_id: &str) -> String {
+    c.get_current_address(gyges_proto::v1::GetCurrentAddressRequest {
+        key_id: key_id.into(),
+    })
+    .await
+    .unwrap()
+    .into_inner()
+    .address
 }
 
 /// Fund a transparent receiver, shield it, spend Orchard to the key's own
@@ -1944,7 +1946,7 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
     // An Orchard spend to our own unified address through the session
     // flow: a wrong passphrase is refused (and rate-limited) without ending
     // the stream, then the right one signs.
-    let ua = unified_address(&state, "main");
+    let ua = current_address(&mut c, "main").await;
     let mut s = c
         .send_transaction(SendTransactionRequest {
             key_id: "main".into(),
@@ -3220,4 +3222,432 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
     drop(state);
     task.abort();
     drop(dir);
+}
+
+/// `address current/new/inspect`, `notes`, `tx list` and `tx status`
+/// through the fake node: a fresh key's current address is the account's
+/// default address (before the first sync too) and stays put until
+/// `NewAddress` hands out another; labels and receiver sets; every address
+/// kind inspected; then fund → shield → a memo'd self-send, with the notes,
+/// the history pages and the node's status after each step.
+#[tokio::test]
+async fn addresses_notes_and_history_through_the_fake_node() {
+    use gyges_proto::v1::{
+        AddressKind, GetCurrentAddressRequest, GetTransactionStatusRequest, InspectAddressRequest,
+        ListNotesRequest, ListTransactionsRequest, NewAddressRequest, Pool, SpentFilter,
+        StatusSource, TransactionStatus,
+    };
+    use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
+    let _ = test_hub();
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(10);
+    let (_dir, home) = fresh_home_with(
+        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n",
+    );
+    let mut opts = Options::new(home.clone(), Network::Regtest);
+    opts.zakura_rpc = Some(node.url().to_string());
+    let daemon = Daemon::prepare(opts).expect("prepare");
+    let socket = daemon.socket_path();
+    let state = daemon.state.clone();
+    let task = tokio::spawn(daemon.serve(std::future::pending()));
+    for _ in 0..400 {
+        if uds::probe(&socket).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut c = client(&socket).await;
+    let params = Network::Regtest.consensus_params();
+
+    let err = c
+        .get_current_address(GetCurrentAddressRequest {
+            key_id: "main".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::KeyNotFound);
+
+    c.init_key(InitKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    // Current = the account's default address (upstream exposes it with
+    // every receiver when it creates the account), stable.
+    let first = c
+        .get_current_address(GetCurrentAddressRequest {
+            key_id: "main".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let ufvk = UnifiedFullViewingKey::decode(
+        &params,
+        &state.registry.resolve("main").unwrap().ufvk().unwrap(),
+    )
+    .unwrap();
+    let (expected, j) = ufvk
+        .default_address(UnifiedAddressRequest::AllAvailableKeys)
+        .unwrap();
+    assert_eq!(first.address, expected.encode(&params));
+    assert!(first.address.starts_with("uregtest1"), "{first:?}");
+    assert_eq!(
+        first.diversifier_index,
+        gyges_core::addresses::diversifier_decimal(j)
+    );
+    let pools: Vec<Pool> = first.receivers.iter().map(|r| r.pool()).collect();
+    assert_eq!(
+        pools,
+        [Pool::Orchard, Pool::Sapling, Pool::Transparent],
+        "{first:?}"
+    );
+    assert!(first.receivers[0].encoded.is_empty());
+    assert!(first.receivers[1].encoded.starts_with("zregtestsapling1"));
+    assert!(first.receivers[2].encoded.starts_with("tm"));
+    assert!(first.label.is_empty());
+    assert_eq!(current_address(&mut c, "main").await, first.address);
+
+    // NewAddress needs the chain tip, which the first scan records.
+    wait_spendable(&mut c, "main").await;
+    let labelled = c
+        .new_address(NewAddressRequest {
+            key_id: "main".into(),
+            receivers: vec![],
+            label: "shop".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(labelled.address, first.address);
+    assert_eq!(labelled.label, "shop");
+    let pools: Vec<Pool> = labelled.receivers.iter().map(|r| r.pool()).collect();
+    assert_eq!(pools, [Pool::Orchard, Pool::Sapling]);
+    let now = c
+        .get_current_address(GetCurrentAddressRequest {
+            key_id: "main".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        now, labelled,
+        "the newest address is current, label included"
+    );
+
+    let with_t = c
+        .new_address(NewAddressRequest {
+            key_id: "main".into(),
+            receivers: vec![Pool::Ironwood as i32, Pool::Transparent as i32],
+            label: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let pools: Vec<Pool> = with_t.receivers.iter().map(|r| r.pool()).collect();
+    assert_eq!(pools, [Pool::Orchard, Pool::Transparent], "{with_t:?}");
+    assert!(with_t.receivers[1].encoded.starts_with("tm"), "{with_t:?}");
+    for (receivers, label, want) in [
+        (
+            vec![Pool::Transparent as i32],
+            "",
+            ErrorReason::InvalidArgument,
+        ),
+        (
+            vec![Pool::Unspecified as i32],
+            "",
+            ErrorReason::InvalidArgument,
+        ),
+        (vec![], "two\nlines", ErrorReason::InvalidArgument),
+    ] {
+        let err = c
+            .new_address(NewAddressRequest {
+                key_id: "main".into(),
+                receivers,
+                label: label.into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&err), want, "{err:?}");
+    }
+
+    // Inspect: the same receivers as AddressInfo; other kinds; refusals.
+    let i = c
+        .inspect_address(InspectAddressRequest {
+            address: with_t.address.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(i.valid, "{i:?}");
+    assert_eq!(i.network(), gyges_proto::v1::Network::Regtest);
+    assert_eq!(i.kind(), AddressKind::Unified);
+    assert_eq!(i.receivers, with_t.receivers);
+    assert!(!i.transparent_source_only);
+    let tex = zcash_keys::address::Address::Tex([9; 20]).encode(&params);
+    let i = c
+        .inspect_address(InspectAddressRequest { address: tex })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(i.valid && i.transparent_source_only, "{i:?}");
+    assert_eq!(i.kind(), AddressKind::Tex);
+    assert_eq!(i.receivers[0].pool(), Pool::Transparent);
+    let t = with_t.receivers[1].encoded.clone();
+    let i = c
+        .inspect_address(InspectAddressRequest { address: t })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(i.valid, "{i:?}");
+    assert_eq!(i.network(), gyges_proto::v1::Network::Regtest, "{i:?}");
+    assert_eq!(i.kind(), AddressKind::TransparentP2pkh);
+    let mainnet = zcash_keys::address::Address::Transparent(
+        transparent::address::TransparentAddress::PublicKeyHash([7; 20]),
+    )
+    .encode(&Network::Mainnet.consensus_params());
+    let i = c
+        .inspect_address(InspectAddressRequest { address: mainnet })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!i.valid, "{i:?}");
+    assert_eq!(i.network(), gyges_proto::v1::Network::Mainnet);
+    assert!(i.error.contains("mainnet"), "{i:?}");
+    let i = c
+        .inspect_address(InspectAddressRequest {
+            address: "nonsense".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!i.valid && !i.error.is_empty(), "{i:?}");
+    assert_eq!(i.kind(), AddressKind::Unspecified);
+
+    // Nothing received yet.
+    let notes = |spent: SpentFilter, pool: Pool| ListNotesRequest {
+        key_id: "main".into(),
+        pool: pool as i32,
+        spent: spent as i32,
+    };
+    let list = |limit: u32, before: &str| ListTransactionsRequest {
+        key_id: "main".into(),
+        limit,
+        before_txid: before.into(),
+    };
+    let n = c
+        .list_notes(notes(SpentFilter::All, Pool::Unspecified))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(n.notes.is_empty(), "{n:?}");
+    let h = c.list_transactions(list(0, "")).await.unwrap().into_inner();
+    assert!(h.transactions.is_empty(), "{h:?}");
+
+    // 1 ZEC to a transparent receiver: one UTXO.
+    let receiver = {
+        let key = state.registry.resolve("main").unwrap();
+        let w = key.wallet().unwrap();
+        let account = w.get_account_ids().unwrap()[0];
+        *w.get_transparent_receivers(account, false, false)
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+    };
+    let fund_height = node.mine_with_payments(&[(receiver, 100_000_000)]);
+    node.mine(1);
+    wait_spendable(&mut c, "main").await;
+    let n = c
+        .list_notes(notes(SpentFilter::Unspecified, Pool::Unspecified))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(n.notes.len(), 1, "{n:?}");
+    let utxo = n.notes[0].clone();
+    assert_eq!(utxo.pool(), Pool::Transparent);
+    assert_eq!(utxo.value, 100_000_000);
+    assert_eq!(utxo.height, fund_height.height);
+    assert!(
+        utxo.witness_ready && !utxo.spent && !utxo.ephemeral,
+        "{utxo:?}"
+    );
+
+    // Shield it (daemon-scoped unlock: no session round trip).
+    c.unlock_key(UnlockKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        scope: UnlockScope::Daemon as i32,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let events = collect_events(
+        c.shield_funds(ShieldFundsRequest {
+            key_id: "main".into(),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    let shield_txid = broadcast_txid(&events);
+    let shield_fee = proposal_of(&events).total_fee;
+
+    // Unmined: the node has it in its mempool; the UTXO counts as spent.
+    let st = c
+        .get_transaction_status(GetTransactionStatusRequest {
+            key_id: "main".into(),
+            txid: shield_txid.clone(),
+            via_pir: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(st.status(), TransactionStatus::Pending, "{st:?}");
+    assert_eq!((st.height, st.confirmations), (0, 0));
+    assert_eq!(st.source(), StatusSource::Node);
+    let h = c.list_transactions(list(0, "")).await.unwrap().into_inner();
+    assert_eq!(h.transactions[0].txid, shield_txid, "{h:?}");
+    assert_eq!(h.transactions[0].status(), TransactionStatus::Pending);
+    assert_eq!(h.transactions[0].height, 0);
+
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    let shield_height = node.tip().0 - 1;
+    let n = c
+        .list_notes(notes(SpentFilter::Spent, Pool::Unspecified))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(n.notes.len(), 1, "{n:?}");
+    assert_eq!(n.notes[0].txid, utxo.txid);
+    assert!(n.notes[0].spent);
+    assert_eq!(n.notes[0].spent_txid, shield_txid);
+    let n = c
+        .list_notes(notes(SpentFilter::Unspent, Pool::Ironwood))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(n.notes.len(), 1, "{n:?}");
+    assert_eq!(n.notes[0].value, 100_000_000 - shield_fee);
+    assert_eq!(n.notes[0].txid, shield_txid);
+    assert_eq!(n.notes[0].height, shield_height);
+    assert!(n.notes[0].witness_ready, "{n:?}");
+    let n = c
+        .list_notes(notes(SpentFilter::All, Pool::Transparent))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(n.notes.len(), 1, "{n:?}");
+    let st = c
+        .get_transaction_status(GetTransactionStatusRequest {
+            key_id: "main".into(),
+            txid: shield_txid.clone(),
+            via_pir: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(st.status(), TransactionStatus::Mined, "{st:?}");
+    assert_eq!(st.height, shield_height);
+    assert_eq!(st.confirmations, 2);
+    assert_eq!(st.source(), StatusSource::Node);
+
+    // A memo'd payment to the labelled address of our own.
+    let events = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to: labelled.address.clone(),
+            amount: Some(gyges_proto::v1::Amount {
+                value: Some(gyges_proto::v1::amount::Value::Zatoshis(30_000_000)),
+            }),
+            memo: b"hello".to_vec(),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    let send_txid = broadcast_txid(&events);
+    let send_fee = proposal_of(&events).total_fee;
+    node.mine(1);
+    wait_spendable(&mut c, "main").await;
+
+    let h = c.list_transactions(list(0, "")).await.unwrap().into_inner();
+    let txids: Vec<&str> = h.transactions.iter().map(|t| t.txid.as_str()).collect();
+    assert_eq!(
+        txids,
+        [send_txid.as_str(), shield_txid.as_str(), utxo.txid.as_str()]
+    );
+    let send = &h.transactions[0];
+    assert_eq!(send.status(), TransactionStatus::Mined, "{send:?}");
+    assert_eq!(send.height, node.tip().0);
+    assert_eq!(send.fee, send_fee);
+    assert_eq!(send.net_value, -send_fee, "a self-send costs the fee");
+    assert!(send.timestamp > 0, "{send:?}");
+    assert!(send.tex.is_none());
+    let paid = send
+        .outputs
+        .iter()
+        .find(|o| o.address == labelled.address)
+        .unwrap_or_else(|| panic!("an output to the labelled address: {send:?}"));
+    assert_eq!(paid.value, 30_000_000);
+    assert_eq!(paid.memo, b"hello");
+    assert!(send.outputs.iter().any(|o| o.is_change), "{send:?}");
+    let fund = &h.transactions[2];
+    assert_eq!(fund.net_value, 100_000_000, "{fund:?}");
+    assert_eq!(fund.height, fund_height.height);
+
+    // Paging.
+    let page = c.list_transactions(list(1, "")).await.unwrap().into_inner();
+    assert_eq!(page.transactions.len(), 1);
+    assert_eq!(page.transactions[0].txid, send_txid);
+    let page = c
+        .list_transactions(list(1, &send_txid))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page.transactions[0].txid, shield_txid);
+    let err = c
+        .list_transactions(list(1, &"00".repeat(32)))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument);
+    let err = c.list_transactions(list(1, "xyz")).await.unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument);
+
+    // The received note carries the memo preview.
+    let n = c
+        .list_notes(notes(SpentFilter::Unspent, Pool::Unspecified))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        n.notes
+            .iter()
+            .any(|x| x.value == 30_000_000 && x.memo_preview == "hello" && x.txid == send_txid),
+        "{n:?}"
+    );
+
+    // tx status refusals.
+    for (txid, via_pir) in [
+        ("00".repeat(32), false),
+        ("nothex".to_string(), false),
+        (send_txid.clone(), true),
+    ] {
+        let err = c
+            .get_transaction_status(GetTransactionStatusRequest {
+                key_id: "main".into(),
+                txid,
+                via_pir,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    }
+
+    task.abort();
 }

@@ -186,7 +186,7 @@ The upstream `zcash_client_sqlite` schema is created and migrated by `zcash_clie
 
 ### 5.1 `ext_gyges_tex_queue` (Q-T1)
 
-**Landed (ROADMAP.md M3) as `gyges_core::tex`.** `zcash_client_sqlite` reserves the `ext_` prefix for application tables: they are created by an external migration (`WalletMigrator::with_external_migrations`, run with the upstream migrations when the registry opens a wallet) and written only through `WalletDb::transactionally_with_extension`, whose SQLite authorizer refuses writes to any other table, schema changes and transaction control. The table is therefore `ext_gyges_tex_queue`, not the `gyges_tex_queue` of the first draft; `gyges_signing_sessions` and `gyges_address_labels` below will follow the same rule when they land. Two consequences shape the code: the extension handle answers single rows only (`execute`, `query_row`), so listing goes through a `group_concat` of ids; and `AUTOINCREMENT` is unusable (it writes `sqlite_sequence`), which this table does not need.
+**Landed (ROADMAP.md M3) as `gyges_core::tex`.** `zcash_client_sqlite` reserves the `ext_` prefix for application tables: they are created by an external migration (`WalletMigrator::with_external_migrations`, run with the upstream migrations when the registry opens a wallet) and written only through `WalletDb::transactionally_with_extension`, whose SQLite authorizer refuses writes to any other table, schema changes and transaction control. The table is therefore `ext_gyges_tex_queue`, not the `gyges_tex_queue` of the first draft; `gyges_signing_sessions` and `gyges_address_labels` below follow the same rule (both landed as `ext_gyges_*`). Two consequences shape the code: the extension handle answers single rows only (`execute`, `query_row`), so listing goes through a `group_concat` of ids; and `AUTOINCREMENT` is unusable (it writes `sqlite_sequence`), which this table does not need.
 
 ```sql
 CREATE TABLE ext_gyges_tex_queue (
@@ -254,10 +254,12 @@ CREATE INDEX gyges_signing_sessions_status ON gyges_signing_sessions (status, ex
 
 The connection-scoped unlock token from Q-S1 is **not** stored here: it lives only in daemon memory and dies with the connection.
 
-### 5.3 `gyges_address_labels`
+### 5.3 `ext_gyges_address_labels`
+
+**Landed (ROADMAP.md M1 follow-up) as `gyges_core::addresses::AddressLabelsMigration`**, with the `ext_` prefix as for §5.1. Written by `address new --label` (an upsert keyed on the address) and read back by `GetCurrentAddress` / `NewAddress`.
 
 ```sql
-CREATE TABLE gyges_address_labels (
+CREATE TABLE ext_gyges_address_labels (
     address     TEXT NOT NULL PRIMARY KEY,        -- encoded as handed out (u1…, t1…)
     label       TEXT NOT NULL,
     created_at  INTEGER NOT NULL

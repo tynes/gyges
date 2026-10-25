@@ -518,6 +518,68 @@ needs two or more files and maps the Combiner's `DataMismatch` to
 `INVALID_ARGUMENT`. A `tex1` recipient is refused by `CreatePczt` with
 `INVALID_ARGUMENT` naming `tx send` (§9).
 
+### 7.2 Addresses, notes and history
+
+*Landed (ROADMAP.md M1 follow-up)* in `gygesd::wallet` over
+`gyges_core::{addresses, history}`; the proto is unchanged.
+
+- **`GetCurrentAddress`** returns the address most recently handed out, by
+  any receiver set (upstream's `get_last_generated_address_matching`). On a
+  fresh key that is the account's default address, which upstream exposes
+  with every receiver the key has (Orchard, Sapling, transparent) when it
+  creates the account; it needs no sync.
+- **`NewAddress`** (`get_next_available_address`) requires the listed
+  receivers and omits the others; empty means `orchard,sapling` (Keystone
+  profiles: `orchard,transparent`). `POOL_IRONWOOD` names the Orchard
+  receiver, which also takes Ironwood notes after NU6.3. A list without a
+  shielded receiver, or with `POOL_UNSPECIFIED`, is `INVALID_ARGUMENT`; a
+  pool outside the profile's `receive_pools` is `UNSUPPORTED_POOL`; before
+  the first scan has recorded the chain tip it is `NOT_SYNCED`; a used-up
+  transparent gap limit is `INVALID_ARGUMENT`. `label` (1–128 bytes, no
+  control characters) is stored in `ext_gyges_address_labels`
+  (DATA_MODEL.md §5.3) and returned by both RPCs.
+- **Receivers** are listed one per receiver in the address, in its
+  preference order; the Orchard receiver is `POOL_ORCHARD` with an empty
+  `encoded`. `AddressInfo.receivers` and `InspectAddressResponse.receivers`
+  are built by the same parse, so they agree for the same string.
+- **`InspectAddress`** never fails on its input: a malformed address is
+  `valid = false` with `error`, and so is a well-formed address for another
+  network (`network` then names the address's own). Regtest transparent
+  addresses share testnet's prefixes, so on a regtest daemon a
+  testnet-encoded `t`-address is valid and reported as `NETWORK_REGTEST`.
+  The CLI exits 6 when `valid` is false.
+- **`ListNotes`** lists received notes and UTXOs oldest first (unmined
+  last), from upstream's `v_received_outputs`. A note is `spent` when a
+  transaction spending it is mined, or unmined and not expired; a note
+  received in an unmined transaction that has expired is not listed.
+  `witness_ready` means mined at or below the fully scanned height with a
+  commitment tree position (shielded), or mined (transparent). `ephemeral`
+  marks ZIP 320 ephemeral outputs. `memo_preview` is filled when the wallet
+  holds the memo: always for its own sends, for incoming payments once
+  transaction enhancement exists (compact blocks carry no memos).
+- **`ListTransactions`** is newest first: unmined transactions, then mined
+  ones by height and position in the block. `before_txid` pages after that
+  transaction (unknown or malformed: `INVALID_ARGUMENT`); `limit` 0 is 50,
+  capped at 1,000. Accounting (`net_value`, `fee`) is upstream's
+  `transaction_history_summaries`; `outputs` come from `v_tx_outputs`,
+  change included and flagged, with `memo` as the text of a text memo and
+  the raw bytes otherwise. Both steps of a ZIP 320 transfer carry its
+  `TexQueueEntry` and are `TEX_PENDING` until the row is `step2_mined` or
+  terminal (`expired` → `EXPIRED`, `failed` / `aborted` → `FAILED` for an
+  unmined step). `AWAITING_SIGNATURE` is never reported: a signing session
+  holds no transaction until it is signed.
+- **`GetTransactionStatus`** asks the node (`getrawtransaction`), so a fully
+  transparent transaction the wallet cannot see mined is reported too;
+  `confirmations` counts from the node's current tip. When the node does not
+  know the transaction, the wallet and the ZIP 320 queue answer: `EXPIRED`,
+  `FAILED`, `PENDING`, or `MINED` at the height the wallet scanned with
+  `source = STATUS_SOURCE_UNSPECIFIED` (the node has dropped it from its
+  index). Unknown to all three is `INVALID_ARGUMENT`; an unreachable node is
+  `NODE_UNREACHABLE`; `via_pir` is `INVALID_ARGUMENT` until ROADMAP.md M6.
+- All six are outside the air-gapped allow-list (§8), `InspectAddress`
+  included, and refuse a `signer-only` profile (no wallet) with
+  `INVALID_ARGUMENT`.
+
 ---
 
 ## 8. Air-gapped mode

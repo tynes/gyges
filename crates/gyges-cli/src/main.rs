@@ -11,19 +11,21 @@
 // Printing to stdout is this binary's purpose.
 #![allow(clippy::print_stdout)]
 
+mod address;
 mod amount;
 mod balance;
 mod client;
 mod daemon;
 mod exit;
+mod history;
 mod key;
+mod notes;
 mod output;
 mod pczt;
 mod prompt;
 mod sync;
 mod tx;
 
-use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -84,25 +86,18 @@ enum Command {
     #[command(subcommand)]
     Sync(sync::SyncCmd),
     /// Addresses and terminal QR codes.
-    Address(Unimplemented),
+    #[command(subcommand)]
+    Address(address::AddressCmd),
     /// Balances per pool.
     Balance(balance::BalanceArgs),
     /// Decrypted notes and UTXOs.
-    Notes(Unimplemented),
+    Notes(notes::NotesArgs),
     /// High-level transactions.
     #[command(subcommand)]
     Tx(tx::TxCmd),
     /// PCZT role pipeline for Unix pipes and air-gapped signing.
     #[command(subcommand)]
     Pczt(pczt::PcztCmd),
-}
-
-/// Accepts any arguments so that `gyges key list` is "not implemented"
-/// (exit 1) rather than a usage error (exit 2).
-#[derive(Debug, Args)]
-struct Unimplemented {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-    _rest: Vec<OsString>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -128,9 +123,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Daemon(cmd) => daemon::run(&ctx, cmd).await,
         Command::Key(cmd) => key::run(&ctx, cmd).await,
         Command::Sync(cmd) => sync::run(&ctx, cmd).await,
-        Command::Address(_) => Err(CliError::NotImplemented("address")),
+        Command::Address(cmd) => address::run(&ctx, cmd).await,
         Command::Balance(args) => balance::run(&ctx, args).await,
-        Command::Notes(_) => Err(CliError::NotImplemented("notes")),
+        Command::Notes(args) => notes::run(&ctx, args).await,
         Command::Tx(cmd) => tx::run(&ctx, cmd).await,
         Command::Pczt(cmd) => pczt::run(&ctx, cmd).await,
     }
@@ -158,7 +153,59 @@ mod tests {
     #[test]
     fn unimplemented_groups_accept_any_arguments() {
         Cli::try_parse_from(["gyges", "key", "backup", "-o", "x.tar"]).unwrap();
-        Cli::try_parse_from(["gyges", "tx", "list", "--limit", "5"]).unwrap();
+    }
+
+    #[test]
+    fn address_notes_and_history_commands_parse_per_spec() {
+        let cli = Cli::try_parse_from(["gyges", "address", "current"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Address(address::AddressCmd::Current(ref a)) if !a.qr
+        ));
+        let cli = Cli::try_parse_from([
+            "gyges",
+            "address",
+            "new",
+            "--receivers",
+            "orchard,transparent",
+            "--label",
+            "shop",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Address(address::AddressCmd::New(ref a))
+                if a.receivers == [address::ReceiverArg::Orchard, address::ReceiverArg::Transparent]
+                    && a.label.as_deref() == Some("shop")
+        ));
+        assert!(
+            Cli::try_parse_from(["gyges", "address", "new", "--receivers", "sprout"]).is_err(),
+            "unknown receivers are a usage error"
+        );
+        Cli::try_parse_from(["gyges", "address", "qr", "u1x"]).unwrap();
+        Cli::try_parse_from(["gyges", "address", "qr"]).unwrap();
+        let cli = Cli::try_parse_from(["gyges", "address", "inspect", "t1x"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Address(address::AddressCmd::Inspect { ref address }) if address == "t1x"
+        ));
+        let cli = Cli::try_parse_from(["gyges", "notes", "--pool", "orchard", "--spent"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Notes(ref a) if a.pool == Some(notes::PoolArg::Orchard) && a.spent
+        ));
+        assert!(Cli::try_parse_from(["gyges", "notes", "--spent", "--unspent"]).is_err());
+        let cli = Cli::try_parse_from(["gyges", "tx", "list", "--limit", "5"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Tx(tx::TxCmd::List(ref a)) if a.limit == Some(5) && a.before.is_none()
+        ));
+        let cli = Cli::try_parse_from(["gyges", "tx", "status", "ab", "--pir"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Tx(tx::TxCmd::Status(ref a)) if a.txid == "ab" && a.pir
+        ));
+        assert!(Cli::try_parse_from(["gyges", "tx", "status"]).is_err());
     }
 
     #[test]
