@@ -10,8 +10,13 @@
 
 #![forbid(unsafe_code)]
 
+mod fake;
 mod node;
 
+pub use fake::{
+    FAST_CONFIG, FakeNodeHandle, PASSPHRASE, SPEND_CONFIG, TEX_CONFIG, fund_transparent,
+    pool_spendable, synced_key, transparent_receivers, wait_spendable, wait_tex_state,
+};
 pub use node::{BURN_MINER_ADDRESS, MIN_TX_RETENTION, Node, NodeOpts, pinned_tag, zakurad_binary};
 
 use std::ffi::OsStr;
@@ -241,10 +246,21 @@ impl Fixture {
     /// `gyges --network <net> <args…>` with `GYGES_HOME` set and the
     /// `gygesd` binary resolvable for `daemon start`.
     pub fn gyges(&self, args: &[&str]) -> Cmd {
+        self.cli(Some(self.network), args)
+    }
+
+    /// Like [`Fixture::gyges`] but without `--network`, so the CLI adopts
+    /// whatever the daemon reports.
+    pub fn gyges_no_network(&self, args: &[&str]) -> Cmd {
+        self.cli(None, args)
+    }
+
+    fn cli(&self, network: Option<&str>, args: &[&str]) -> Cmd {
         let mut cmd = Command::new(binary("gyges"));
-        cmd.arg("--network")
-            .arg(self.network)
-            .args(args)
+        if let Some(network) = network {
+            cmd.arg("--network").arg(network);
+        }
+        cmd.args(args)
             .env("GYGES_HOME", &self.home_path)
             .env("GYGES_DAEMON_BIN", binary("gygesd"))
             .env_remove("GYGES_SOCKET")
@@ -272,23 +288,6 @@ impl Fixture {
     /// `keys/<id>/` for this network.
     pub fn key_dir(&self, key_id: &str) -> PathBuf {
         self.network_dir().join("keys").join(key_id)
-    }
-
-    /// Like [`Fixture::gyges`] but without `--network`, so the CLI adopts
-    /// whatever the daemon reports.
-    pub fn gyges_no_network(&self, args: &[&str]) -> Cmd {
-        let mut cmd = Command::new(binary("gyges"));
-        cmd.args(args)
-            .env("GYGES_HOME", &self.home_path)
-            .env("GYGES_DAEMON_BIN", binary("gygesd"))
-            .env_remove("GYGES_SOCKET")
-            .env_remove("GYGES_NETWORK")
-            .env_remove("GYGES_KEY")
-            .env_remove("GYGES_PASSPHRASE_FILE")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        Cmd { cmd, stdin: None }
     }
 
     /// SIGKILL the daemon this fixture started (a crash, TESTING.md §3 row
@@ -330,14 +329,29 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if let Some(mut child) = self.daemon.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.kill_daemon();
         if std::env::var_os("GYGES_TEST_KEEP").is_some() {
             let path = self.keep();
             eprintln!("GYGES_TEST_KEEP: left {}", path.display());
         }
+    }
+}
+
+/// Call `f` every `every` until it returns `Ok`, panicking with `what` and
+/// the last `Err` once `timeout` has passed.
+pub fn poll_until<T>(
+    timeout: Duration,
+    every: Duration,
+    what: &str,
+    mut f: impl FnMut() -> Result<T, String>,
+) -> T {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match f() {
+            Ok(v) => return v,
+            Err(last) => assert!(Instant::now() < deadline, "{what}: {last}"),
+        }
+        std::thread::sleep(every);
     }
 }
 

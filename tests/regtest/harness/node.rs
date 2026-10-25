@@ -258,27 +258,29 @@ impl Node {
     pub fn wait_for_backup(&self) {
         let tip = self.tip_height();
         let hashes: Vec<String> = (1..=tip).map(|h| self.block_hash(h)).collect();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let present: std::collections::HashSet<String> = fs::read_dir(self.backup_dir())
-                .map(|rd| {
-                    rd.flatten()
-                        .map(|e| e.file_name().to_string_lossy().into_owned())
-                        .collect()
-                })
-                .unwrap_or_default();
-            if hashes.iter().all(|h| present.contains(h)) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "non-finalized backup never caught up: {} of {} blocks in {}",
-                hashes.iter().filter(|h| present.contains(*h)).count(),
-                hashes.len(),
-                self.backup_dir().display()
-            );
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        crate::poll_until(
+            Duration::from_secs(30),
+            Duration::from_millis(200),
+            "non-finalized backup never caught up",
+            || {
+                let present: std::collections::HashSet<String> = fs::read_dir(self.backup_dir())
+                    .map(|rd| {
+                        rd.flatten()
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if hashes.iter().all(|h| present.contains(h)) {
+                    return Ok(());
+                }
+                Err(format!(
+                    "{} of {} blocks in {}",
+                    hashes.iter().filter(|h| present.contains(*h)).count(),
+                    hashes.len(),
+                    self.backup_dir().display()
+                ))
+            },
+        );
     }
 
     fn config_path(&self) -> PathBuf {
