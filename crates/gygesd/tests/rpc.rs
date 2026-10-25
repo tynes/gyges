@@ -4773,3 +4773,158 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
     wait_in_mempool(&node, &txid).await;
     running.task.abort();
 }
+
+/// SYNC.md §5.3 (ROADMAP.md M2, fourth item): a restore below the node's
+/// window recovers the key's transparent outputs from the endpoint's
+/// `GetAddressUtxos`, one below `retained_from` (placed through the
+/// endpoint's block, whose hash is the node's) and one between
+/// `retained_from` and the handoff (checked in the node's own block; the
+/// backfilled blocks there carry no transparent outputs, so nothing else
+/// finds it). Two fabricated outputs are discarded: one whose transaction
+/// the endpoint does not have, one claiming an output index its transaction
+/// lacks. The restore warns that transparent history below the window is
+/// best-effort, and `GetInfo` repeats it for the key.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_below_the_window_recovers_transparent_outputs_and_discards_fabricated_ones() {
+    use gyges_chain::testing::FakeUtxo;
+    use gyges_proto::v1::Pool;
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(5);
+    let config = "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n\
+                  [policy]\nmin_confirmations = 1\n";
+
+    // A first daemon only to learn the seed and two of its receivers.
+    let url = node.url().to_string();
+    let first = start_with(config, |o| o.zakura_rpc = Some(url)).await;
+    let mut c = client(&first.socket).await;
+    let mnemonic = c
+        .init_key(InitKeyRequest {
+            key_id: "orig".into(),
+            passphrase: "pw".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .mnemonic;
+    let (r0, r1) = {
+        let key = first.state.registry.resolve("orig").unwrap();
+        let w = key.wallet().unwrap();
+        let account = w.get_account_ids().unwrap()[0];
+        let mut rs: Vec<_> = w
+            .get_transparent_receivers(account, false, false)
+            .unwrap()
+            .into_keys()
+            .collect();
+        rs.sort_by_key(|a| format!("{a:?}"));
+        assert!(rs.len() >= 2, "{rs:?}");
+        (rs[0], rs[1])
+    };
+    first.task.abort();
+
+    // 3 ZEC to r0 at height 6 (below the window), 2 ZEC to r1 at 35
+    // (inside the window, below the handoff at 30 + 10).
+    let low = node.mine_with_payments(&[(r0, 300_000_000)]);
+    node.mine(34 - low.height);
+    let mid = node.mine_with_payments(&[(r1, 200_000_000)]);
+    assert_eq!(mid.height, 35);
+    node.mine(15);
+    node.set_prune_height(Some(30));
+    let lwd = FakeLightwalletd::from_node(&node);
+    let lwd = lwd.await;
+    let enc = |a| {
+        gyges_chain::compact::encode_transparent_address(
+            zcash_protocol::consensus::NetworkType::Regtest,
+            &a,
+        )
+    };
+    let real = lwd
+        .utxos()
+        .into_iter()
+        .find(|u| u.height == low.height && u.address == enc(r0))
+        .expect("the endpoint reports the real output");
+    // lightwalletd lists only transactions with shielded parts in compact
+    // blocks; drop the transparent-only payment from its block, so the
+    // output below the window cannot be placed (best-effort).
+    let blocks = lwd
+        .blocks()
+        .into_iter()
+        .map(|mut b| {
+            b.vtx.retain(|tx| tx.txid[..] != real.txid[..]);
+            b
+        })
+        .collect();
+    lwd.set_blocks(blocks);
+    lwd.inject_utxo(FakeUtxo {
+        txid: [0x99; 32],
+        height: 9,
+        ..real.clone()
+    });
+    lwd.inject_utxo(FakeUtxo {
+        index: 7,
+        value_zat: 500_000_000,
+        ..real.clone()
+    });
+
+    let (node_url, lwd_url) = (node.url().to_string(), lwd.url().to_string());
+    let running = start_with(config, |o| {
+        o.zakura_rpc = Some(node_url);
+        o.fallback_lwd = Some(lwd_url);
+        o.no_tor = true;
+    })
+    .await;
+    let mut c = client(&running.socket).await;
+    let resp = c
+        .restore_key(RestoreKeyRequest {
+            key_id: "copy".into(),
+            mnemonic,
+            passphrase: "pw".into(),
+            birthday_height: 4,
+            allow_backfill: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.warnings.len(), 1, "{resp:?}");
+    assert!(resp.warnings[0].contains("best-effort"), "{resp:?}");
+    assert!(resp.warnings[0].contains("below height 30"), "{resp:?}");
+
+    wait_spendable(&mut c, "copy").await;
+    let b = c
+        .get_balance(GetBalanceRequest {
+            key_id: "copy".into(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        balance_of(&b, Pool::Transparent),
+        (500_000_000, 0),
+        "both real outputs, neither fabricated one: {b:?}"
+    );
+    assert!(lwd.calls().iter().any(|m| m == "GetAddressUtxos"));
+
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            running
+                ._home
+                .path()
+                .join("regtest/keys/copy/transparent_recovery.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["credited"], 2, "{report}");
+    assert_eq!(report["discarded"], 2, "{report}");
+    assert_eq!(
+        report["unplaced"], 1,
+        "the transparent-only payment below the window: {report}"
+    );
+    assert_eq!(report["best_effort_below"], 30, "{report}");
+    let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
+    let k = info.keys.iter().find(|k| k.key_id == "copy").unwrap();
+    assert_eq!(k.transparent_best_effort_below, 30);
+    running.task.abort();
+}

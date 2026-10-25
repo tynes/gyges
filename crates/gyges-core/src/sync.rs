@@ -345,7 +345,21 @@ pub fn index_transparent(
             ScanChainError::Scan(e) => SyncError::Scan(e.to_string()),
             _ => SyncError::Scan("reading cached blocks failed".into()),
         })?;
-    outputs.retain(|o| o.address.is_some());
+    credit_transparent(wallet, &outputs)
+}
+
+/// Credit every output of `outputs` that pays one of the key's receivers
+/// (external, change and ephemeral) through `put_received_transparent_utxo`.
+/// Finding an output can advance the gap limit and reveal new receivers, so
+/// the pass repeats until a pass finds nothing new. Used for the node's
+/// blocks ([`index_transparent`]) and for outputs recovered below the
+/// node's window (`crate::recovery`).
+pub fn credit_transparent(
+    wallet: &mut Wallet,
+    outputs: &[compact::TransparentOutput],
+) -> Result<usize, SyncError> {
+    let outputs: Vec<&compact::TransparentOutput> =
+        outputs.iter().filter(|o| o.address.is_some()).collect();
     if outputs.is_empty() {
         return Ok(0);
     }

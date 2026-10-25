@@ -80,6 +80,8 @@ pub fn summary(entry: &KeyEntry, default_key: &str, unlocks: &[UnlockState]) -> 
             .collect(),
         device_version: p.device_version.clone().unwrap_or_default(),
         seed_fingerprint: p.seed_fingerprint.clone().unwrap_or_default(),
+        transparent_best_effort_below: crate::backfill::load_report(entry)
+            .map_or(0, |r| r.best_effort_below),
     }
 }
 
@@ -341,6 +343,7 @@ pub async fn restore_key(
         req.birthday_height
     };
     let mut backfill_blocks = 0;
+    let mut warnings = Vec::new();
     let birthday =
         match birthday::resolve(state.network, state.chain.as_deref(), Some(requested)).await {
             Ok(b) => b,
@@ -352,6 +355,11 @@ pub async fn restore_key(
                     .await
                     .map_err(GygesError::into_status)?;
                 backfill_blocks = n;
+                warnings.push(format!(
+                    "transparent history below height {} comes from the fallback endpoint and is \
+                     best-effort: an output it leaves out cannot be detected (SYNC.md §5.3)",
+                    retained_from
+                ));
                 b
             }
             Err(other) => return Err(birthday_error(other).into_status()),
@@ -380,6 +388,7 @@ pub async fn restore_key(
         birthday_height: height,
         ufvk: entry.ufvk().unwrap_or_default(),
         backfill_blocks,
+        warnings,
     })
 }
 

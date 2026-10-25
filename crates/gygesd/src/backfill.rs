@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use gyges_chain::{ChainBackend, ChainError, FillError, NodeBounds, Source, TorState};
 use gyges_core::KeyEntry;
 use gyges_core::handoff::{self, Check, Mismatch};
+use gyges_core::recovery::{self, Placement, Report};
 use gyges_core::sync::{self as core_sync, ScanOutcome, StallReason, SyncError, SyncState};
 use gyges_proto::v1;
 use serde::{Deserialize, Serialize};
@@ -219,6 +220,28 @@ fn save_session(key: &KeyEntry, session: &Session) -> std::io::Result<()> {
     use std::io::Write as _;
     let bytes = serde_json::to_vec_pretty(session).map_err(std::io::Error::other)?;
     gyges_core::perms::create_private_file(&session_path(key))?.write_all(&bytes)
+}
+
+fn report_path(key: &KeyEntry) -> PathBuf {
+    key.dir().join("transparent_recovery.json")
+}
+
+/// The key's last transparent recovery (`keys/<id>/transparent_recovery.json`),
+/// if it was ever backfilled below the node's window.
+pub fn load_report(key: &KeyEntry) -> Option<Report> {
+    serde_json::from_slice(&std::fs::read(report_path(key)).ok()?).ok()
+}
+
+fn save_report(key: &KeyEntry, report: &Report) {
+    use std::io::Write as _;
+    let result = serde_json::to_vec_pretty(report)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| {
+            gyges_core::perms::create_private_file(&report_path(key))?.write_all(&bytes)
+        });
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "cannot record the transparent recovery");
+    }
 }
 
 fn clear_session(key: &KeyEntry) {
@@ -586,6 +609,21 @@ impl Scheduler {
             return Err(SyncError::Untrusted(m));
         }
 
+        // Transparent history from the endpoint, before the session closes,
+        // so an endpoint that drops out retries it on the next tick.
+        let report = self
+            .recover_transparent(key, session.from, height, bounds)
+            .await?;
+        save_report(key, &report);
+        tracing::info!(
+            key_id,
+            credited = report.credited,
+            unplaced = report.unplaced,
+            discarded = report.discarded,
+            best_effort_below = report.best_effort_below,
+            "transparent outputs below the node's window recovered from the fallback endpoint (best-effort)"
+        );
+
         self.set_session(key, None);
         self.state.fallback_trust.mark_verified();
         if !self.state.config.cache.keep_historical {
@@ -608,6 +646,153 @@ impl Scheduler {
             p.detail = format!("handoff validated at {}", u32::from(height));
         });
         Ok((true, height))
+    }
+
+    /// SYNC.md §5.3: ask the endpoint for the unspent outputs of the key's
+    /// transparent receivers mined in `[from, to]`, check each against its
+    /// raw transaction and the node's chain (`gyges_core::recovery`), and
+    /// credit the ones that pass. Crediting can reveal new receivers (the
+    /// gap limit), which are asked about in the next pass.
+    async fn recover_transparent(
+        &self,
+        key: &Arc<KeyEntry>,
+        from: u32,
+        to: BlockHeight,
+        bounds: &NodeBounds,
+    ) -> Result<Report, SyncError> {
+        let mut report = Report {
+            from,
+            to: u32::from(to),
+            best_effort_below: u32::from(bounds.retained_from),
+            ..Report::default()
+        };
+        let Some(fallback) = self.state.fallback.clone() else {
+            return Ok(report);
+        };
+        let key_id = key.key_id().to_string();
+        let params = self.state.registry.params();
+        let network = zcash_protocol::consensus::Parameters::network_type(&params);
+        let mut asked = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let receivers = with_wallet(key, move |w| recovery::receivers(w, network)).await?;
+            let new: Vec<String> = receivers
+                .into_iter()
+                .map(|(_, s)| s)
+                .filter(|s| !asked.contains(s))
+                .collect();
+            if new.is_empty() {
+                break;
+            }
+            asked.extend(new.iter().cloned());
+            let utxos = fallback
+                .address_utxos(new, BlockHeight::from_u32(from))
+                .await
+                .map_err(SyncError::Fallback)?;
+            let mut verified = Vec::new();
+            for u in utxos {
+                if u.height > to || u32::from(u.height) < from || !seen.insert((u.txid, u.index)) {
+                    continue;
+                }
+                match self.place_utxo(&fallback, &params, &u, bounds).await? {
+                    Ok((out, placement)) => {
+                        if placement == Placement::Unplaced {
+                            report.unplaced += 1;
+                        }
+                        verified.push(out);
+                    }
+                    Err(reason) => {
+                        report.discarded += 1;
+                        tracing::warn!(
+                            key_id,
+                            height = u32::from(u.height),
+                            reason,
+                            "a transparent output reported by the fallback endpoint was discarded"
+                        );
+                    }
+                }
+            }
+            if verified.is_empty() {
+                continue;
+            }
+            let n = with_wallet(key, move |w| core_sync::credit_transparent(w, &verified)).await?;
+            report.credited += u32::try_from(n).unwrap_or(u32::MAX);
+        }
+        Ok(report)
+    }
+
+    /// The checks of `gyges_core::recovery` for one reported output: the
+    /// outer error is a failure to ask (retried), the inner one the reason
+    /// to discard the output.
+    async fn place_utxo(
+        &self,
+        fallback: &gyges_chain::ArtiTorLwdBackend<gyges_core::ConsensusParams>,
+        params: &gyges_core::ConsensusParams,
+        u: &gyges_chain::AddressUtxo,
+        bounds: &NodeBounds,
+    ) -> Result<Result<(gyges_chain::compact::TransparentOutput, Placement), String>, SyncError>
+    {
+        let Some((raw, raw_height)) = fallback
+            .raw_transaction(u.txid)
+            .await
+            .map_err(SyncError::Fallback)?
+        else {
+            return Ok(Err("the endpoint does not have the transaction".into()));
+        };
+        let (out, shielded) = match recovery::check_utxo(params, u, &raw, raw_height) {
+            Ok(x) => x,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let node_hash = match self.chain.block_hash(u.height).await {
+            Ok(h) => h,
+            Err(ChainError::BlockUnavailable { .. }) => {
+                return Ok(Err("the node has no block at the reported height".into()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // Where the node still has the block, it decides.
+        if u.height >= bounds.retained_from {
+            match self.chain.compact_blocks(u.height..u.height + 1).await {
+                Ok(blocks) => {
+                    return Ok(match blocks.first() {
+                        Some(b)
+                            if b.hash[..] == node_hash[..] && recovery::block_holds(b, &out) =>
+                        {
+                            Ok((out, Placement::Node))
+                        }
+                        _ => Err(
+                            "the node's block at the reported height does not hold the output"
+                                .into(),
+                        ),
+                    });
+                }
+                Err(ChainError::BlockUnavailable { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let blocks = fallback
+            .block_range(u.height..u.height + 1)
+            .await
+            .map_err(SyncError::Fallback)?;
+        let Some(b) = blocks.first() else {
+            return Ok(Err(
+                "the endpoint has no block at the reported height".into()
+            ));
+        };
+        if b.hash[..] != node_hash[..] {
+            return Ok(Err(
+                "the endpoint's block at the reported height is not the node's".into(),
+            ));
+        }
+        if recovery::block_holds(b, &out) {
+            return Ok(Ok((out, Placement::EndpointBlock)));
+        }
+        if shielded {
+            return Ok(Err(
+                "a transaction with shielded parts is missing from the endpoint's block".into(),
+            ));
+        }
+        Ok(Ok((out, Placement::Unplaced)))
     }
 
     /// A failed check: mark the endpoint untrusted, drop what came from it

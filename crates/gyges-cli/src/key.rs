@@ -370,6 +370,9 @@ async fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<(), CliError> {
                 String::new()
             }
         );
+        for w in &resp.warnings {
+            eprintln!("warning: {w}");
+        }
         if args.set_default {
             eprintln!(
                 "note: --set-default lasts until the daemon restarts; set default_key = \"{}\" in config.toml to persist it",

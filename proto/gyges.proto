@@ -256,6 +256,10 @@ message KeySummary {
   // From `ur:zcash-accounts` for keystone-qr profiles, else empty.
   string device_version = 10;
   string seed_fingerprint = 11;
+  // Non-zero when the key was backfilled below the node's window: its
+  // transparent history below this height came from the fallback endpoint
+  // and is best-effort (SYNC.md §5.3).
+  uint32 transparent_best_effort_below = 12;
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +419,9 @@ message RestoreKeyResponse {
   string ufvk = 3;
   // Number of blocks that will be fetched over the fallback endpoint.
   uint32 backfill_blocks = 4;
+  // Human-readable warnings the CLI prints: set for every restore below the
+  // node's window (transparent history there is best-effort, SYNC.md §5.3).
+  repeated string warnings = 5;
 }
 
 message ImportKeystoneRequest {

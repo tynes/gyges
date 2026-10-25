@@ -47,7 +47,7 @@ use zcash_protocol::value::Zatoshis;
 use crate::compact::{self, TreeSizes};
 use crate::{display_hash, pool_name};
 
-pub use lwd::{FakeLightwalletd, FakeSubtreeRoot, h};
+pub use lwd::{FakeLightwalletd, FakeSubtreeRoot, FakeUtxo, h};
 
 /// Regtest parameters with every network upgrade active from height 1, the
 /// same table `gyges_core::network::ConsensusParams::Regtest` uses.

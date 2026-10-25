@@ -350,6 +350,13 @@ pub fn render_status(info: &GetInfoResponse) -> String {
                 k.scanned_tip,
                 if k.is_default { " (default)" } else { "" }
             );
+            if k.transparent_best_effort_below > 0 {
+                let _ = writeln!(
+                    s,
+                    "      transparent history below {} is best-effort (from the fallback endpoint)",
+                    k.transparent_best_effort_below
+                );
+            }
         }
     }
     s
