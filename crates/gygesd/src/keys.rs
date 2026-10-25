@@ -186,9 +186,17 @@ pub fn birthday_error(e: BirthdayError) -> GygesError {
             ErrorReason::FallbackUnavailable,
             format!(
                 "birthday {height} is below the node's retention window (retained from {retained_from}) \
-                 and historical restore over Tor is not implemented yet (ROADMAP.md M2)"
+                 and no fallback endpoint is configured; enable [fallback_lightwalletd] to backfill \
+                 the blocks below the window, or restore with a later birthday"
             ),
         ),
+        BirthdayError::Fallback(e) => GygesError::new(
+            ErrorReason::FallbackUnavailable,
+            format!("the fallback endpoint cannot serve the birthday's tree state: {e}"),
+        ),
+        e @ BirthdayError::FallbackMismatch { .. } => {
+            GygesError::new(ErrorReason::FallbackUnavailable, e.to_string())
+        }
         BirthdayError::Chain(
             ChainError::Unreachable(detail)
             | ChainError::Rpc(detail)
@@ -308,11 +316,14 @@ pub async fn init_key(
     })
 }
 
-/// `RestoreKey`: a known mnemonic with a birthday that the local node can
-/// serve a tree state for. Below the node's retention window the restore
-/// needs the Tor backfill of ROADMAP.md M2, so it is refused: with
-/// `CONFIRMATION_REQUIRED` until the client has asked the user, then with
-/// `FALLBACK_UNAVAILABLE`.
+/// `RestoreKey`: a known mnemonic and a birthday. Inside the node's
+/// retention window the node serves the birthday's tree state. Below it the
+/// blocks up to the window must come from the fallback endpoint (Case B,
+/// SYNC.md §5): refused with `CONFIRMATION_REQUIRED` until the client has
+/// asked the user (`allow_backfill`), then with `FALLBACK_UNAVAILABLE` when
+/// no endpoint is configured or it is marked untrusted; otherwise the tree
+/// state comes from the endpoint (its block hash checked against the node)
+/// and the scheduler backfills and validates at the handoff.
 pub async fn restore_key(
     state: Arc<DaemonState>,
     mut req: RestoreKeyRequest,
@@ -329,23 +340,22 @@ pub async fn restore_key(
     } else {
         req.birthday_height
     };
-    let birthday = birthday::resolve(state.network, state.chain.as_deref(), Some(requested))
-        .await
-        .map_err(|e| match e {
-            BirthdayError::BelowRetention {
+    let mut backfill_blocks = 0;
+    let birthday =
+        match birthday::resolve(state.network, state.chain.as_deref(), Some(requested)).await {
+            Ok(b) => b,
+            Err(BirthdayError::BelowRetention {
                 height,
                 retained_from,
-            } if !req.allow_backfill => GygesError::new(
-                ErrorReason::ConfirmationRequired,
-                format!(
-                    "{} blocks below the node's retention height ({retained_from}) would have to be \
-                     fetched from the fallback endpoint; confirm with --yes",
-                    retained_from - height
-                ),
-            ),
-            other => birthday_error(other),
-        }
-        .into_status())?;
+            }) => {
+                let (b, n) = below_retention(&state, height, retained_from, req.allow_backfill)
+                    .await
+                    .map_err(GygesError::into_status)?;
+                backfill_blocks = n;
+                b
+            }
+            Err(other) => return Err(birthday_error(other).into_status()),
+        };
 
     let key_id = req.key_id.clone();
     let height = birthday.height;
@@ -369,8 +379,73 @@ pub async fn restore_key(
         key_id,
         birthday_height: height,
         ufvk: entry.ufvk().unwrap_or_default(),
-        backfill_blocks: 0,
+        backfill_blocks,
     })
+}
+
+/// A restore below the node's window: consent, an endpoint that is not
+/// marked untrusted, and the birthday's tree state from it. Returns the
+/// birthday and how many blocks the backfill fetches from the endpoint
+/// (up to the handoff height, SYNC.md §5.1).
+async fn below_retention(
+    state: &DaemonState,
+    height: u32,
+    retained_from: u32,
+    allow_backfill: bool,
+) -> Result<(birthday::ResolvedBirthday, u32), GygesError> {
+    let below = retained_from - height;
+    let fallback = state.fallback.as_ref();
+    if !allow_backfill {
+        let from = fallback.map_or_else(
+            || "the fallback endpoint".to_string(),
+            |f| {
+                let how = if matches!(f.transport(), gyges_chain::Transport::Direct) {
+                    "directly"
+                } else {
+                    "over Tor"
+                };
+                format!("{} ({how})", f.endpoint())
+            },
+        );
+        return Err(GygesError::new(
+            ErrorReason::ConfirmationRequired,
+            format!(
+                "{below} blocks below the node's retention height ({retained_from}) would have to be \
+                 fetched from {from}; confirm with --yes"
+            ),
+        ));
+    }
+    let (Some(fallback), Some(chain)) = (fallback, state.chain.as_deref()) else {
+        return Err(birthday_error(BirthdayError::BelowRetention {
+            height,
+            retained_from,
+        }));
+    };
+    if let crate::backfill::Trust::Untrusted { reason } = state.fallback_trust.get() {
+        return Err(GygesError::new(
+            ErrorReason::FallbackUnavailable,
+            format!(
+                "the fallback endpoint is marked untrusted ({reason}); set another \
+                 fallback_lightwalletd.grpc_url to restore below the node's window"
+            ),
+        ));
+    }
+    let resolved = birthday::resolve_from_fallback(chain, fallback.as_ref(), height)
+        .await
+        .map_err(birthday_error)?;
+    let overlap = state.config.fallback_lightwalletd.overlap_blocks;
+    let tip = chain
+        .status()
+        .bounds
+        .map_or(retained_from + overlap, |b| u32::from(b.tip_height));
+    let handoff = (retained_from + overlap).min(tip);
+    tracing::info!(
+        height,
+        retained_from,
+        endpoint = %fallback.endpoint(),
+        "restore below the node's window; the scheduler backfills from the fallback endpoint"
+    );
+    Ok((resolved, (handoff + 1).saturating_sub(height)))
 }
 
 /// `UnlockKey` (API.md §6.3). Without `session_id`: a reusable unlock in

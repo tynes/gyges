@@ -284,7 +284,13 @@ with `birthday_height = 0` uses the network's Sapling activation height; any
 birthday at or below Sapling activation needs no node, any other needs the
 node's tree state at `birthday - 1`, and one below `node.retained_from`
 returns `CONFIRMATION_REQUIRED` until `allow_backfill` is set, then
-`FALLBACK_UNAVAILABLE` until the Tor backfill exists (ROADMAP.md M2).
+`FALLBACK_UNAVAILABLE` when no `[fallback_lightwalletd]` endpoint is
+configured or it is marked untrusted. Otherwise the tree state at
+`birthday - 1` comes from the endpoint (its block hash checked against the
+node's `getblockhash`), `backfill_blocks` is how many blocks the scheduler
+will fetch from it (up to the handoff height, SYNC.md §5.1), and the key
+syncs through `Backfilling` (`SYNC_STATE_VALIDATING_HANDOFF` with `backend`
+`SYNC_BACKEND_TOR_LWD_FALLBACK` or `_DIRECT_LWD_FALLBACK`) before Case A.
 `set_default` on either changes `GetInfo.default_key` for this daemon run
 only: the daemon never rewrites `config.toml`. Passphrases and mnemonics are
 moved into zeroizing wrappers on arrival; a mnemonic error never echoes a

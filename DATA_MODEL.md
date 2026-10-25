@@ -15,6 +15,7 @@ One home per network (Q-C2). `GYGES_HOME` (default `~/.gyges`) is the root.
     ├── gygesd.sock              # Unix Domain Socket
     ├── gygesd.pid               # PID of the running daemon, advisory-locked
     ├── tor_cache/               # Arti directory and consensus cache
+    ├── fallback_trust.json      # Only after a failed handoff: the untrusted endpoint and why (SYNC.md §5.2)
     ├── cache/
     │   └── blocks.sqlite        # Shared CompactBlock cache (§6)
     ├── logs/
@@ -24,6 +25,7 @@ One home per network (Q-C2). `GYGES_HOME` (default `~/.gyges`) is the root.
         └── <key_id>/
             ├── profile.json     # KeyProfile metadata (§3)
             ├── wallet.sqlite    # zcash_client_sqlite WalletDb + Gyges tables (§5)
+            ├── backfill.json    # Only while a Case B backfill awaits its handoff (SYNC.md §5)
             └── seed.age         # Only for local-seed and signer-only (§4)
 ```
 

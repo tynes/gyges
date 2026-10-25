@@ -5,8 +5,9 @@
 //! the end of block `h - 1`. Below Sapling activation both trees are empty,
 //! so no node is needed; above it the local node's `z_gettreestate` is the
 //! only source in this milestone, and a pruned node can answer only for
-//! `h - 1 >= retained_from`. Restores below that need the Tor backfill
-//! (ROADMAP.md M2).
+//! `h - 1 >= retained_from`. Below that, [`resolve_from_fallback`] takes the
+//! tree state from the fallback endpoint instead, and the Case B backfill
+//! validates it at the handoff (SYNC.md §5).
 
 use gyges_chain::{ChainBackend, ChainError};
 use zcash_client_backend::data_api::AccountBirthday;
@@ -42,6 +43,19 @@ pub enum BirthdayError {
     BelowRetention { height: u32, retained_from: u32 },
     #[error(transparent)]
     Chain(#[from] ChainError),
+    /// The fallback endpoint could not serve the tree state.
+    #[error("fallback endpoint: {0}")]
+    Fallback(ChainError),
+    /// The fallback endpoint's tree state is for a block the node does not
+    /// have at that height.
+    #[error(
+        "the fallback endpoint's tree state at {height} is for block {endpoint_hash}, the node has {node_hash}"
+    )]
+    FallbackMismatch {
+        height: u32,
+        endpoint_hash: String,
+        node_hash: String,
+    },
 }
 
 /// Resolve `requested` (or, when `None`, the node's current tip) into a
@@ -103,6 +117,37 @@ pub async fn resolve(
         });
     }
     let state = chain.chain_state(BlockHeight::from_u32(prior)).await?;
+    Ok(ResolvedBirthday {
+        height,
+        birthday: AccountBirthday::from_parts(state, None),
+    })
+}
+
+/// A birthday below the node's retention window (SYNC.md §9, "New or
+/// restored key"): the tree state at `height - 1` comes from the fallback
+/// endpoint's `GetTreeState`, and its block hash must equal the node's
+/// `getblockhash(height - 1)` (the node keeps headers at every height). The
+/// frontier itself cannot be checked against a pruned node here; the root
+/// check at the handoff height covers it, since the root there commits to
+/// every leaf before the birthday too (SYNC.md §5.2).
+pub async fn resolve_from_fallback(
+    chain: &dyn ChainBackend,
+    fallback: &dyn ChainBackend,
+    height: u32,
+) -> Result<ResolvedBirthday, BirthdayError> {
+    let prior = BlockHeight::from_u32(height.saturating_sub(1));
+    let state = fallback
+        .chain_state(prior)
+        .await
+        .map_err(BirthdayError::Fallback)?;
+    let node_hash = chain.block_hash(prior).await?;
+    if state.block_hash().0 != node_hash {
+        return Err(BirthdayError::FallbackMismatch {
+            height: u32::from(prior),
+            endpoint_hash: gyges_chain::display_hash(&state.block_hash().0),
+            node_hash: gyges_chain::display_hash(&node_hash),
+        });
+    }
     Ok(ResolvedBirthday {
         height,
         birthday: AccountBirthday::from_parts(state, None),

@@ -33,6 +33,7 @@ transparent = { workspace = true }
 pasta_curves = { workspace = true }
 rusqlite = { workspace = true }
 shardtree = { workspace = true }
+incrementalmerkletree = { workspace = true }
 zip32 = { workspace = true }
 schemerz = { workspace = true }
 schemerz-rusqlite = { workspace = true }

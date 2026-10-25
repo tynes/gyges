@@ -288,6 +288,9 @@ struct State {
     params: DynParams,
     blocks: BTreeMap<u32, BuiltBlock>,
     prune_height: Option<u32>,
+    /// `(n, height)`: after `n` more raw blocks (`getblock(h, 0)`) have
+    /// been served, prune below `height` (a node pruning under a scan).
+    prune_after_raw: Option<(u32, u32)>,
     cookie: Option<String>,
     /// Overrides the computed sizes in `getblock(h, 1).trees` when set.
     tree_sizes: Option<TreeSizes>,
@@ -461,6 +464,7 @@ impl FakeNode {
             params,
             blocks,
             prune_height: None,
+            prune_after_raw: None,
             cookie: None,
             tree_sizes: None,
             calls: Vec::new(),
@@ -530,6 +534,12 @@ impl FakeNode {
         st.forks += 1;
     }
 
+    /// Prune below `height` once `n` more raw blocks (`getblock(h, 0)`)
+    /// have been served: deterministically, in the middle of a scan.
+    pub fn prune_after_raw_blocks(&self, n: u32, height: u32) {
+        self.lock().prune_after_raw = Some((n, height));
+    }
+
     /// `pruneheight`: bodies below it answer `-8 Block not found`.
     pub fn set_prune_height(&self, height: Option<u32>) {
         self.lock().prune_height = height;
@@ -597,11 +607,13 @@ impl FakeNode {
         st.blocks
             .iter()
             .map(|(h, b)| {
+                // Zeros, not `None`, for empty trees: what the node backend
+                // builds and what lightwalletd and zaino send.
                 compact::from_raw(
                     &st.params,
                     BlockHeight::from_u32(*h),
                     &b.raw,
-                    st.tree_sizes_at(*h),
+                    Some(st.tree_sizes_at(*h).unwrap_or_default()),
                 )
                 .expect("the fake's own blocks parse")
             })
@@ -669,6 +681,18 @@ async fn handle(
     }
 
     let mut outcome = dispatch(&st, &method, &params);
+    if method == "getblock"
+        && params.get(1).and_then(Value::as_u64) == Some(0)
+        && outcome.is_ok()
+        && let Some((n, height)) = st.prune_after_raw
+    {
+        if n <= 1 {
+            st.prune_after_raw = None;
+            st.prune_height = Some(height);
+        } else {
+            st.prune_after_raw = Some((n - 1, height));
+        }
+    }
     if let Ok(Value::Object(obj)) = &outcome
         && let Some(Value::String(txid_hex)) = obj.get("__accept__")
     {
