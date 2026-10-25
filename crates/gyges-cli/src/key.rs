@@ -484,7 +484,7 @@ async fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<(), CliError> {
         println!("{}", to_json(&resp)?);
     } else if !ctx.quiet {
         eprintln!(
-            "key '{shown}' unlocked until {} (daemon scope: any process of this user can spend              from it until then; `gyges key lock` ends it early)",
+            "key '{shown}' unlocked until {} (daemon scope: any process of this user can spend from it until then; `gyges key lock` ends it early)",
             format_unix(resp.expires_at)
         );
     }
@@ -559,7 +559,7 @@ async fn export_seed(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
         key_id.clone()
     };
     eprintln!(
-        "This prints the 24 words that control every fund of key '{shown}'. Anyone who sees them          can spend. Make sure nobody is watching your screen."
+        "This prints the 24 words that control every fund of key '{shown}'. Anyone who sees them can spend. Make sure nobody is watching your screen."
     );
     let typed = ctx.prompter.line("Type `reveal seed` to continue")?;
     if typed != "reveal seed" {

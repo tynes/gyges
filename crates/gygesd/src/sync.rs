@@ -906,17 +906,9 @@ pub fn get_sync_status(
     state: &DaemonState,
     req: GetSyncStatusRequest,
 ) -> Result<GetSyncStatusResponse, Status> {
-    let keys = if req.key_id.is_empty() && state.registry.default_key().is_empty() {
-        state
-            .registry
-            .list()
-            .into_iter()
-            .filter(|k| k.profile().has_wallet())
-            .map(|k| to_proto(&progress_of(state, k.key_id())))
-            .collect()
-    } else if req.key_id.is_empty() {
-        // An empty key_id with a default configured still means "all keys"
-        // for status (CLI_SPEC.md §2.3 `--all`), unlike the other RPCs.
+    let keys = if req.key_id.is_empty() {
+        // An empty key_id means "all keys" for status even with a default
+        // configured (CLI_SPEC.md §2.3 `--all`), unlike the other RPCs.
         state
             .registry
             .list()

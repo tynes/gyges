@@ -3,10 +3,8 @@
 //! once when the node's retention window is shorter than
 //! `zakura_rpc.min_retention_blocks`.
 //!
-//! The sync scheduler (ROADMAP.md M1, next item) will drive its ticks from
-//! the same poll; until then the poll only feeds `GetInfo.node`.
+//! The sync scheduler (`crate::sync`) calls [`poll_once`] on every tick.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
@@ -94,25 +92,6 @@ pub async fn poll_once(state: &DaemonState, chain: &dyn ChainBackend, link: &Lin
             false
         }
     }
-}
-
-/// Poll forever at the configured interval. The caller has just polled, so
-/// the first interval tick (which fires immediately) is skipped.
-pub fn spawn_poller(
-    state: Arc<DaemonState>,
-    chain: Arc<dyn ChainBackend>,
-    link: Arc<Link>,
-) -> tokio::task::JoinHandle<()> {
-    let every = Duration::from_secs(u64::from(state.config.zakura_rpc.poll_interval_secs.max(1)));
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(every);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tick.tick().await;
-        loop {
-            tick.tick().await;
-            poll_once(&state, chain.as_ref(), &link).await;
-        }
-    })
 }
 
 #[cfg(test)]
