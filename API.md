@@ -183,6 +183,19 @@ Rules:
 - **`session_token`** supplied up front (from `gyges key unlock`) suppresses
   `SignatureRequired` for `PASSPHRASE` kinds. It is never valid for Keystone
   profiles.
+- **`via_tor`** (or `[fallback_lightwalletd] broadcast_via_tor = true`, which
+  also covers `ShieldFunds` and `BroadcastPczt`) sends the transaction to the
+  fallback endpoint's `SendTransaction` over its Tor client instead of the
+  node's `sendrawtransaction`. It never falls back to the node: without an
+  enabled endpoint, or with `use_tor = false` outside regtest, the RPC fails
+  with `FALLBACK_UNAVAILABLE` before anything is proposed, and an endpoint
+  that cannot be reached at broadcast time fails the stream with
+  `FALLBACK_UNAVAILABLE` (the transaction is already in the wallet as
+  unmined). The endpoint passes the node's rejection through as
+  `NODE_REJECTED`. A `tex1` recipient with `via_tor` is refused with
+  `INVALID_ARGUMENT`: the `tex_queue` broadcasts and rebroadcasts both steps
+  through the node. The `broadcast` audit event carries `via = "node"` or
+  `"fallback"`.
 
 `ShieldFunds` emits the same events for a one-step transparent-to-shielded
 proposal (the output pool is Ironwood after NU6.3, see `OVERVIEW.md` §4.3).

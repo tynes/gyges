@@ -71,7 +71,7 @@ min_retention_blocks = 10000     # warn at startup if the node retains fewer blo
 enabled = false
 grpc_url = ""                    # REQUIRED when enabled. No default; see the commented examples below.
 use_tor = true                   # false only for regtest/CI
-broadcast_via_tor = false        # `tx send --via-tor` default
+broadcast_via_tor = false        # `--via-tor` for every broadcast; needs enabled and use_tor
 overlap_blocks = 10              # k in SYNC.md §5
 # Public archival endpoints, operator named. Uncomment one deliberately:
 # grpc_url = "https://zec.rocks:443"                     # operated by zec.rocks

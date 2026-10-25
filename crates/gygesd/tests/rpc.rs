@@ -3173,6 +3173,19 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
     );
     assert!(node.mempool().is_empty());
 
+    // `--via-tor` without a fallback endpoint is refused, not sent to the
+    // node.
+    let err = c
+        .broadcast_pczt(BroadcastPcztRequest {
+            pczt: combined.clone(),
+            via_tor: true,
+            key_id: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::FallbackUnavailable, "{err:?}");
+    assert!(node.mempool().is_empty());
+
     // The genuine one: broadcast, mined, the balance moves; twice is
     // refused.
     let txid = broadcast(&mut c, combined.clone()).await.unwrap().txid;
@@ -4053,5 +4066,159 @@ async fn node_pruning_past_the_scan_tip_mid_scan_falls_back_and_recovers() {
     let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
     assert_eq!(info.node.unwrap().retained_from, 50);
     assert_eq!(info.fallback.unwrap().trust(), FallbackTrust::Verified);
+    running.task.abort();
+}
+
+/// `--via-tor` (ROADMAP.md M2): without a Tor endpoint the send is refused
+/// before anything is proposed, and with one the transaction goes to the
+/// endpoint's `SendTransaction`, never to the node. The endpoint is reached
+/// directly here (`use_tor = false`, accepted on regtest only); the Tor
+/// transport itself is the nightly tier.
+#[tokio::test(flavor = "multi_thread")]
+async fn via_tor_broadcasts_through_the_fallback_endpoint_and_never_falls_back_to_the_node() {
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(10);
+    let params = Network::Regtest.consensus_params();
+    let config = "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n";
+    let amount = |z: i64| {
+        Some(gyges_proto::v1::Amount {
+            value: Some(gyges_proto::v1::amount::Value::Zatoshis(z)),
+        })
+    };
+    let t_recipient = zcash_keys::address::Address::Transparent(
+        transparent::address::TransparentAddress::PublicKeyHash([0x42; 20]),
+    )
+    .encode(&params);
+
+    // No endpoint configured: FALLBACK_UNAVAILABLE before the stream.
+    let url = node.url().to_string();
+    let plain = start_with(config, |o| o.zakura_rpc = Some(url)).await;
+    let mut c = client(&plain.socket).await;
+    c.init_key(InitKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    wait_spendable(&mut c, "main").await;
+    let Err(err) = c
+        .send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to: t_recipient.clone(),
+            amount: amount(1_000),
+            via_tor: true,
+            ..Default::default()
+        })
+        .await
+    else {
+        panic!("--via-tor without an endpoint must be refused before streaming");
+    };
+    assert_eq!(reason(&err), ErrorReason::FallbackUnavailable, "{err:?}");
+    plain.task.abort();
+
+    // With an endpoint: fund, then send with --via-tor.
+    let lwd = FakeLightwalletd::from_node(&node).await;
+    let (node_url, lwd_url) = (node.url().to_string(), lwd.url().to_string());
+    let running = start_with(config, |o| {
+        o.zakura_rpc = Some(node_url);
+        o.fallback_lwd = Some(lwd_url);
+        o.no_tor = true;
+    })
+    .await;
+    let mut c = client(&running.socket).await;
+    c.init_key(InitKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    wait_spendable(&mut c, "main").await;
+    let receiver = {
+        let key = running.state.registry.resolve("main").unwrap();
+        let w = key.wallet().unwrap();
+        let account = w.get_account_ids().unwrap()[0];
+        *w.get_transparent_receivers(account, false, false)
+            .unwrap()
+            .keys()
+            .next()
+            .expect("a transparent receiver")
+    };
+    // Two coins, so the second send has one the first left unspent.
+    node.mine_with_payments(&[(receiver, 100_000_000)]);
+    node.mine_with_payments(&[(receiver, 100_000_000)]);
+    node.mine(1);
+    wait_spendable(&mut c, "main").await;
+    c.unlock_key(UnlockKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        scope: UnlockScope::Daemon as i32,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    // A tex1 recipient is refused: the ZIP 320 queue broadcasts through the
+    // node.
+    let Err(err) = c
+        .send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to: zcash_keys::address::Address::Tex([9; 20]).encode(&params),
+            amount: amount(1_000),
+            via_tor: true,
+            ..Default::default()
+        })
+        .await
+    else {
+        panic!("--via-tor to tex1 must be refused before streaming");
+    };
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("tex1"), "{err:?}");
+
+    let events = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to: t_recipient,
+            amount: amount(10_000_000),
+            via_tor: true,
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        event_names(&events).last(),
+        Some(&"broadcast"),
+        "{events:?}"
+    );
+    assert_eq!(
+        lwd.broadcasts().len(),
+        1,
+        "the endpoint got the transaction"
+    );
+    assert!(node.mempool().is_empty(), "the node did not");
+
+    // A refusal by the endpoint is the node's rejection passed through.
+    lwd.set_reject_broadcasts(Some("bad-txns-inputs-spent".into()));
+    let err = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to: zcash_keys::address::Address::Transparent(
+                transparent::address::TransparentAddress::PublicKeyHash([0x43; 20]),
+            )
+            .encode(&params),
+            amount: amount(1_000_000),
+            via_tor: true,
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::NodeRejected, "{err:?}");
+    assert_eq!(lwd.broadcasts().len(), 1);
+    assert!(node.mempool().is_empty());
     running.task.abort();
 }
