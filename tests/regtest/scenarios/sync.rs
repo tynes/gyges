@@ -185,3 +185,94 @@ fn sync_wait_times_out_with_exit_7_when_the_node_is_down() {
     assert_eq!(run.code(), 0, "{run:?}");
     assert!(run.stdout.contains("initializing"), "{}", run.stdout);
 }
+
+/// `key restore` below the node's window through the binaries (ROADMAP.md
+/// M2, fifth item): without a terminal the consent is exit 4 and asks for
+/// `--yes`; with it, the notes on what the endpoint learns, the best-effort
+/// warning, the backfill, and `daemon status` repeating the warning. A
+/// first start also leaves a commented `config.toml`.
+#[test]
+fn restore_below_the_window_asks_consent_warns_and_backfills() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let node = rt.block_on(FakeNode::start(regtest_params()));
+    node.mine(50);
+    node.set_prune_height(Some(30));
+    let lwd = rt.block_on(gyges_chain::testing::FakeLightwalletd::from_node(&node));
+
+    // A first start without a config writes the commented template.
+    let mut plain = Fixture::new("regtest");
+    plain.start_daemon(&["--airgapped"]).unwrap();
+    let template = std::fs::read_to_string(plain.network_dir().join("config.toml")).unwrap();
+    assert!(template.contains("[fallback_lightwalletd]"), "{template}");
+    assert!(
+        template.lines().all(|l| l.trim().is_empty()
+            || l.trim_start().starts_with('#')
+            || l.trim_start().starts_with('[')),
+        "every value is commented out: {template}"
+    );
+    plain.kill_daemon();
+
+    let mut fx = Fixture::new("regtest");
+    fx.write_config(&format!(
+        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n\
+         [fallback_lightwalletd]\nenabled = true\ngrpc_url = \"{}\"\nuse_tor = false\n",
+        lwd.url()
+    ));
+    fx.start_daemon(&["--zakura-rpc", node.url()]).unwrap();
+    let pw = fx.passphrase_file("restore-passphrase-0001");
+    let mnemonic = "abandon ".repeat(23) + "art";
+    let restore = |extra: &[&str]| {
+        let mut args = vec!["key", "restore", "--id", "r", "--stdin", "--birthday", "4"];
+        args.extend_from_slice(extra);
+        fx.gyges(&args)
+            .env("GYGES_PASSPHRASE_FILE", &pw)
+            .stdin(mnemonic.clone())
+            .run()
+    };
+
+    // No terminal, no --yes: exit 4, nothing created.
+    let run = restore(&[]);
+    assert_eq!(run.code(), 4, "{run:?}");
+    assert!(run.stderr.contains("--yes"), "{}", run.stderr);
+    assert!(!fx.key_dir("r").exists());
+
+    let run = restore(&["--yes"]);
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert!(
+        run.stderr
+            .contains("note: the endpoint learns the block range"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stderr.contains("use_tor = false"), "{}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("warning: transparent history below height 30"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("blocks will be backfilled"),
+        "{}",
+        run.stderr
+    );
+
+    let run = fx
+        .gyges(&["-k", "r", "sync", "wait", "--timeout", "60s"])
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let run = fx.gyges(&["daemon", "status"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert!(
+        run.stdout
+            .contains("transparent history below 30 is best-effort"),
+        "{}",
+        run.stdout
+    );
+    fx.kill_daemon();
+    drop(lwd);
+}

@@ -263,7 +263,84 @@ pub enum ConfigError {
     LogLevel(String),
 }
 
+/// The commented `config.toml` the daemon writes on first start when none
+/// exists (DATA_MODEL.md §2, OVERVIEW.md Q-D5). Every line is a comment, so
+/// it parses to [`Config::default`]: the file names the knobs and the
+/// public archival endpoints without choosing any of them for the user.
+pub fn template(network: Network) -> String {
+    let endpoints = match network {
+        Network::Mainnet => {
+            "# Public archival endpoints, operator named. Uncomment one deliberately.\n\
+             # Prefer an operator's .onion address when it publishes one: with\n\
+             # use_tor = true a clearnet endpoint is reached through a Tor exit relay,\n\
+             # an .onion endpoint without one.\n\
+             # grpc_url = \"https://zec.rocks:443\"                   # operated by zec.rocks\n\
+             # grpc_url = \"https://mainnet.lightwalletd.com:9067\"   # operated by Electric Coin Co.\n"
+        }
+        Network::Testnet => {
+            "# A testnet lightwalletd or zaino you choose; prefer an .onion address.\n\
+             # grpc_url = \"https://<endpoint>:443\"\n"
+        }
+        Network::Regtest => {
+            "# A local zaino or lightwalletd; http:// is accepted on regtest only.\n\
+             # grpc_url = \"http://127.0.0.1:9067\"\n\
+             # use_tor = false\n"
+        }
+    };
+    format!(
+        "# Gyges daemon configuration for {network}. Every key is optional; the\n\
+         # values shown are the defaults. See DATA_MODEL.md §2 for each one.\n\
+         #\n\
+         # default_key = \"main\"\n\
+         # airgapped = false\n\
+         \n\
+         [daemon]\n\
+         # socket_group = \"\"\n\
+         # allowed_uids = []\n\
+         # log_level = \"info\"\n\
+         # offline_grace = \"2m\"\n\
+         # shutdown_grace = \"30s\"\n\
+         \n\
+         [zakura_rpc]\n\
+         # url = \"http://127.0.0.1:8232\"\n\
+         # cookie_path = \"~/.cache/zakura/.cookie\"\n\
+         # poll_interval_secs = 15\n\
+         # min_retention_blocks = 10000\n\
+         \n\
+         # The archival endpoint for history below the node's retention window\n\
+         # (SYNC.md §5). It learns the block ranges you fetch (about a restored\n\
+         # key's birthday) and, for transparent recovery, the key's transparent\n\
+         # addresses. There is no default endpoint.\n\
+         [fallback_lightwalletd]\n\
+         # enabled = false\n\
+         # use_tor = true\n\
+         # broadcast_via_tor = false\n\
+         # overlap_blocks = 10\n\
+         {endpoints}\
+         \n\
+         [vault]\n\
+         # unlock_ttl = \"5m\"\n\
+         # allow_seed_export = true\n\
+         # unlock_backoff_max = \"30s\"\n\
+         # scrypt_work_factor = 20\n\
+         \n\
+         [policy]\n\
+         # min_confirmations = 10\n"
+    )
+}
+
 impl Config {
+    /// Write [`template`] to `path` (0600) unless a file is already there.
+    /// Returns whether it wrote one.
+    pub fn write_template(path: &Path, network: Network) -> std::io::Result<bool> {
+        use std::io::Write as _;
+        if path.exists() {
+            return Ok(false);
+        }
+        crate::perms::create_private_file(path)?.write_all(template(network).as_bytes())?;
+        Ok(true)
+    }
+
     /// Parse a TOML document.
     pub fn parse(text: &str) -> Result<Self, Box<toml::de::Error>> {
         toml::from_str(text).map_err(Box::new)
@@ -449,6 +526,29 @@ mod tests {
             Err(ConfigError::FallbackUrlInsecure)
         ));
         cfg.validate(Network::Regtest).unwrap();
+    }
+
+    #[test]
+    fn the_template_parses_to_the_defaults_and_names_no_endpoint() {
+        for net in [Network::Mainnet, Network::Testnet, Network::Regtest] {
+            let text = template(net);
+            assert_eq!(Config::parse(&text).unwrap(), Config::default(), "{net}");
+            assert!(
+                text.lines()
+                    .filter(|l| l.contains("grpc_url"))
+                    .all(|l| l.trim_start().starts_with('#')),
+                "no endpoint is chosen for the user ({net})"
+            );
+        }
+        assert!(template(Network::Mainnet).contains(".onion"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(Config::write_template(&path, Network::Regtest).unwrap());
+        assert!(
+            !Config::write_template(&path, Network::Regtest).unwrap(),
+            "kept"
+        );
+        assert_eq!(Config::load(&path).unwrap(), Config::default());
     }
 
     #[test]
