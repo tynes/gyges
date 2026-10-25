@@ -267,6 +267,29 @@ Read from `zakura-client-backend` 0.1.0-rc9.1 (`src/tor.rs`, `src/tor/grpc.rs`, 
 - `GetLightdInfo.chain_name` is `"main"` or `"test"` from lightwalletd; zaino may answer `"regtest"` on regtest, so the backend accepts either for a regtest daemon, like `ZakuraRpcBackend` does for the node. `tonic` reports a dead connection as `Code::Unknown` with the transport error as `source()`; Gyges maps that, `Unavailable`, `DeadlineExceeded`, `Cancelled` and `Aborted` to `ChainError::Unreachable` and drops the connection.
 - `tonic-prost-build`'s `extern_path` maps every proto message onto an existing Rust type, including the request and response types of generated services, so `gyges-chain`'s `build.rs` can generate only the *server* side of `CompactTxStreamer` for the fake over `zcash_client_backend::proto::{compact_formats, service}` types (`generate_default_stubs` makes the unimplemented methods answer UNIMPLEMENTED, server-streaming methods take `BoxStream`). The upstream crate ships no `.proto` files, only the generated modules, so the proto subset in `crates/gyges-chain/proto/` was written from them. (Q-O2)
 
+
+### 4.5 Facts about an archival endpoint for the regtest harness (2026-10-25, research only)
+
+Gathered for ROADMAP.md M2's sixth item. Nothing below has been run against a node yet.
+
+- **zakura-core publishes no indexer.** The organisation has `common`, `zakura`, `wallet-libraries` and forks of rocksdb, iroh, iroh-quinn and librustzcash. There is no zaino or lightwalletd fork. Zakura's docs send wallet features to Zaino (`docs/contributing.md`, `docs/zcashd-compat.md`). Zakura's own tests use `electriccoinco/lightwalletd` (`docker/docker-compose.lwd.yml`, `crates/zakurad/tests/common/lightwalletd/`). `zakurad` serves the Zebra indexer gRPC (zakura PR #612), and its `getblockchaininfo` reports `pruned` / `pruneheight` (PR #470).
+- **Upstream zaino against `zakurad` v1.6.0: plausible, untested.**
+  - zaino 0.10.1/0.10.2 links zebra-chain 12 (zebra v6.3.0).
+  - NU6.3 (Ironwood) has the same branch id in both (`0x37a5165b`), and zaino already handles the Ironwood pool.
+  - NU7 differs (zebra's placeholder `0xfffffffe` against Zakura's `0x77190ad9`, plus Zakura's 25 s spacing). The harness activates only through NU6.3, so this does not matter yet.
+  - Only zaino's `backend = "rpc"` (JSON-RPC) can work: the `direct` backend reads the node's database, whose format has diverged (Zakura format 29).
+- **No release binaries.** zaino's GitHub releases carry only `CHANGELOG.md`, and so do lightwalletd's. Pinnable instead:
+  - the crates.io `zainod` 0.10.2 `.crate` (sha256 `501b24362ae267a9c64a2236c7089208a3db63e7b09f38f93c5658c6c8edf76e`), built with `cargo install --locked`;
+  - the `zingodevops/zaino:0.10.1` image (linux/amd64 only, digest `sha256:f2fda4a8ef06d5b41d914de6575b980d27c5392170578001c5127bbb5eb6c6d9`).
+- **Regtest config.** `network = "Regtest"` adopts the node's activation heights. Keys:
+  - `backend = "rpc"`;
+  - `[validator_settings] validator_jsonrpc_listen_address`, `validator_cookie_path`;
+  - `[grpc_settings] listen_address`;
+  - `[storage.database] path`.
+
+  It serves plaintext gRPC on loopback; TLS is enforced only for non-private binds.
+- **zaino cannot sit in front of the wallet's pruned node.** Compact blocks and tree states are served from its own LMDB store once indexed. But mined transactions (`GetTransaction`) and subtree roots are fetched from the node every time, which fails below a pruned node's window. So the harness needs a **second, archive-mode `zakurad`** peered with the wallet's pruned one, with zaino in front of the archive node.
+
 ---
 
 ## 5. Missing Documents
