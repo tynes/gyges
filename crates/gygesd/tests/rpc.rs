@@ -4222,3 +4222,167 @@ async fn via_tor_broadcasts_through_the_fallback_endpoint_and_never_falls_back_t
     assert!(node.mempool().is_empty());
     running.task.abort();
 }
+
+/// TESTING.md §3 row 13, air-gapped half (ROADMAP.md M4): the online daemon
+/// creates and proves a transparent-funded PCZT, an `--airgapped` daemon
+/// holding the same seed as a `signer-only` profile (no `wallet.sqlite`)
+/// signs it from the inputs' BIP 44 derivations, and the online daemon
+/// verifies and broadcasts it. A PCZT whose inputs name another seed is
+/// refused by the offline signer.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_airgapped_signer_only_daemon_signs_transparent_inputs() {
+    use gyges_proto::v1::{BroadcastPcztRequest, CreatePcztRequest, Pool, ProvePcztRequest};
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(10);
+    let params = Network::Regtest.consensus_params();
+    let config = "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n";
+    let amount = |z: i64| {
+        Some(gyges_proto::v1::Amount {
+            value: Some(gyges_proto::v1::amount::Value::Zatoshis(z)),
+        })
+    };
+    let t_recipient = zcash_keys::address::Address::Transparent(
+        transparent::address::TransparentAddress::PublicKeyHash([0x42; 20]),
+    )
+    .encode(&params);
+
+    // The offline box makes the seed; the online daemon restores it.
+    let offline = start(|o| o.airgapped = true).await;
+    let mut off = client(&offline.socket).await;
+    let mnemonic = off
+        .init_key(InitKeyRequest {
+            key_id: "main".into(),
+            passphrase: "offline-pw".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .mnemonic;
+    assert!(
+        !offline
+            ._home
+            .path()
+            .join("regtest/keys/main/wallet.sqlite")
+            .exists()
+    );
+
+    let url = node.url().to_string();
+    let online = start_with(config, |o| o.zakura_rpc = Some(url)).await;
+    let mut on = client(&online.socket).await;
+    on.restore_key(RestoreKeyRequest {
+        key_id: "main".into(),
+        mnemonic,
+        passphrase: "online-pw".into(),
+        birthday_height: 5,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    // A second online key whose seed the offline box does not hold.
+    on.init_key(InitKeyRequest {
+        key_id: "other".into(),
+        passphrase: "pw".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    for id in ["main", "other"] {
+        wait_spendable(&mut on, id).await;
+        let receiver = {
+            let key = online.state.registry.resolve(id).unwrap();
+            let w = key.wallet().unwrap();
+            let account = w.get_account_ids().unwrap()[0];
+            *w.get_transparent_receivers(account, false, false)
+                .unwrap()
+                .keys()
+                .next()
+                .expect("a transparent receiver")
+        };
+        node.mine_with_payments(&[(receiver, 100_000_000)]);
+    }
+    node.mine(1);
+    wait_spendable(&mut on, "main").await;
+    wait_spendable(&mut on, "other").await;
+
+    let creator = on.clone();
+    let create_and_prove = |key_id: &'static str| {
+        let mut on = creator.clone();
+        let to = t_recipient.clone();
+        async move {
+            let created = on
+                .create_pczt(CreatePcztRequest {
+                    key_id: key_id.into(),
+                    to,
+                    amount: amount(50_000_000),
+                    memo: Vec::new(),
+                    min_confirmations: 0,
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            let p = created.proposal.unwrap();
+            assert_eq!(p.steps[0].inputs[0].pool(), Pool::Transparent, "{p:?}");
+            on.prove_pczt(ProvePcztRequest {
+                pczt: created.pczts[0].clone(),
+                session_token: Vec::new(),
+                key_id: String::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .pczt
+        }
+    };
+
+    // Signed offline through the passphrase session, broadcast online.
+    let proven = create_and_prove("main").await;
+    let (signed, prompts) = sign_pczt_with_session(&mut off, proven, "offline-pw")
+        .await
+        .unwrap();
+    assert_eq!(prompts, 1);
+    let txid = on
+        .broadcast_pczt(BroadcastPcztRequest {
+            pczt: signed,
+            via_tor: false,
+            key_id: "main".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .txid;
+    wait_in_mempool(&node, &txid).await;
+    node.mine(1);
+    wait_spendable(&mut on, "main").await;
+    let b = on
+        .get_balance(GetBalanceRequest {
+            key_id: "main".into(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(balance_of(&b, Pool::Transparent), (0, 0), "{b:?}");
+    assert!(
+        b.total_spendable > 0 && b.total_spendable < 50_000_000,
+        "{b:?}"
+    );
+
+    // A signer-only key under the same name but another seed: the inputs'
+    // derivations name a seed it does not hold.
+    off.init_key(InitKeyRequest {
+        key_id: "other".into(),
+        passphrase: "pw".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let proven = create_and_prove("other").await;
+    let err = sign_pczt_with_session(&mut off, proven, "pw")
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("BIP 44 derivation"), "{err:?}");
+    offline.task.abort();
+    online.task.abort();
+}

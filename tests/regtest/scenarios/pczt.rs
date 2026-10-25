@@ -1,8 +1,7 @@
 //! `gyges pczt create | prove | sign | broadcast` through the binaries
-//! against the in-process fake `zakurad` (TESTING.md §3 row 13 without its
-//! air-gapped half, which is the second M4 item): over files, over a pipe,
-//! across a daemon restart, and with a tampered file refused by the
-//! Verifier (exit 6).
+//! against the in-process fake `zakurad` (TESTING.md §3 row 13): over
+//! files, over a pipe, across a daemon restart, with a tampered file refused
+//! by the Verifier (exit 6), and signed on an `--airgapped` daemon.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
@@ -351,4 +350,120 @@ fn pczt_pipeline_over_files_and_pipes_through_the_binaries() {
     assert!(run.stderr.contains("stdin"), "{}", run.stderr);
 
     let _ = Path::new(&dir);
+}
+
+/// TESTING.md §3 row 13, air-gapped half: `pczt create` on the online
+/// daemon, the file carried to an `--airgapped` daemon whose `signer-only`
+/// key holds the same seed and no wallet, `pczt prove` and `sign` there,
+/// and `pczt broadcast` back online. The funds are transparent, so the
+/// offline signer derives each input's key from the BIP 44 path in the file.
+#[test]
+fn airgapped_signer_only_daemon_signs_a_transparent_funded_file() {
+    let n = fake_node(10);
+    const CONFIG: &str = "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n";
+
+    // The offline box makes the seed.
+    let mut off = Fixture::new("regtest");
+    off.write_config(CONFIG);
+    off.start_daemon(&["--airgapped"]).unwrap();
+    let off_pw = off.passphrase_file("offline-passphrase-1234");
+    let run = off
+        .gyges(&["key", "init", "--id", "main", "--json"])
+        .env("GYGES_PASSPHRASE_FILE", &off_pw)
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let mnemonic = run.json()["mnemonic"].as_str().unwrap().to_string();
+    assert!(!off.key_dir("main").join("wallet.sqlite").exists());
+
+    // The online daemon restores it with a wallet and is funded.
+    let mut fx = Fixture::new("regtest");
+    fx.write_config(CONFIG);
+    fx.start_daemon(&["--zakura-rpc", n.node.url()]).unwrap();
+    let pw = fx.passphrase_file("online-passphrase-5678");
+    let run = fx
+        .gyges(&[
+            "key",
+            "restore",
+            "--id",
+            "main",
+            "--stdin",
+            "--birthday",
+            "5",
+            "-q",
+            "--json",
+        ])
+        .env("GYGES_PASSPHRASE_FILE", &pw)
+        .stdin(mnemonic)
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    wait_spendable(&fx);
+    let receiver = first_transparent_receiver(&fx, "main");
+    n.node.mine_with_payments(&[(receiver, 200_000_000)]);
+    n.node.mine(1);
+    wait_spendable(&fx);
+    let t_addr = gyges_chain::compact::encode_transparent_address(
+        zcash_protocol::consensus::NetworkType::Regtest,
+        &TransparentAddress::PublicKeyHash([0x42; 20]),
+    );
+
+    let online = fx.home().join("pczt");
+    let media = off.home().join("media");
+    std::fs::create_dir_all(&online).unwrap();
+    std::fs::create_dir_all(&media).unwrap();
+    let on_path = |name: &str| online.join(name).to_string_lossy().into_owned();
+    let media_path = |name: &str| media.join(name).to_string_lossy().into_owned();
+
+    let run = fx
+        .gyges(&[
+            "-k",
+            "main",
+            "pczt",
+            "create",
+            "--to",
+            &t_addr,
+            "--amount",
+            "0.5",
+            "-q",
+            "-o",
+            &on_path("a.pczt"),
+        ])
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+
+    // Carried over, proven and signed offline, carried back.
+    std::fs::copy(online.join("a.pczt"), media.join("a.pczt")).unwrap();
+    let run = off
+        .gyges(&[
+            "pczt",
+            "prove",
+            &media_path("a.pczt"),
+            "-o",
+            &media_path("b.pczt"),
+        ])
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let run = off
+        .gyges(&[
+            "pczt",
+            "sign",
+            &media_path("b.pczt"),
+            "-o",
+            &media_path("c.pczt"),
+        ])
+        .env("GYGES_PASSPHRASE_FILE", &off_pw)
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    std::fs::copy(media.join("c.pczt"), online.join("c.pczt")).unwrap();
+
+    let run = fx.gyges(&["pczt", "broadcast", &on_path("c.pczt")]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let txid = run.stdout.trim().to_string();
+    assert_eq!(txid.len(), 64, "{run:?}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mempool_has(&n, &txid) {
+        assert!(Instant::now() < deadline, "{txid} never reached the node");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    off.kill_daemon();
+    fx.kill_daemon();
 }

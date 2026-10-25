@@ -894,13 +894,14 @@ async fn pipeline(
         event: Some(send_event::Event::SignatureRequired(r)),
     })
     .await?;
+    let signer = core_tx::SignerId::of(key.profile(), &state.registry.params()).map_err(err)?;
     let pczt = {
         let key = key.clone();
         blocking(move || {
             let wallet = key
                 .wallet()
                 .ok_or_else(|| TxError::Internal("this profile has no wallet".into()))?;
-            core_tx::sign(Some(&wallet), pczt, &usk)
+            core_tx::sign(Some(&wallet), pczt, &usk, &signer)
         })
         .await
         .map_err(err)?

@@ -81,6 +81,7 @@ rusqlite   = { version = "0.37", features = ["bundled", "time"] }
 shardtree  = "0.7"
 incrementalmerkletree = "0.8"                        # legacy CommitmentTree, for the fake node's z_gettreestate
 zip32      = "0.2"                                   # AccountId and SeedFingerprint, the major zcash_keys uses
+bip32      = { version = "0.6", default-features = false }  # ChildNumber, for the BIP 44 paths in transparent PCZT inputs
 schemerz   = "0.2"                                   # MigratorError, to match zcash_client_sqlite's SeedRequired
 schemerz-rusqlite = "0.370"                          # external wallet migrations (the `ext_gyges_*` tables)
 uuid       = "1"                                     # migration ids

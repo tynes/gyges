@@ -35,6 +35,7 @@ rusqlite = { workspace = true }
 shardtree = { workspace = true }
 incrementalmerkletree = { workspace = true }
 zip32 = { workspace = true }
+bip32 = { workspace = true }
 schemerz = { workspace = true }
 schemerz-rusqlite = { workspace = true }
 uuid = { workspace = true }
