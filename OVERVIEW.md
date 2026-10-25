@@ -264,13 +264,13 @@ Read from `zakura-client-backend` 0.1.0-rc9.1 (`src/tor.rs`, `src/tor/grpc.rs`, 
 - **`GetBlockRange` and `GetSubtreeRoots`:** upstream `sync::run` sends `BlockRange { start, end }` with `end` *inclusive* and `pool_types: []` (the legacy, shielded-only answer: no `vin` / `vout`), collects the whole stream and inserts it into the `BlockCache`; `GetSubtreeRootsArg { start_index, shielded_protocol, max_entries }` (0 = all) streams `SubtreeRoot { root_hash, completing_block_hash, completing_block_height }` and upstream reads `root_hash` with `HashSer::read` directly, so it is the raw node bytes with no reversal. `ShieldedProtocol` has `Ironwood = 2` and `sync::run` seeds all three pools. `TreeState.hash` is display (reversed) hex, as `to_chain_state` expects; the fake serves the same. (Q-Y5)
 - **`z_getsubtreesbyindex` on the node:** `(pool: String, start_index: u16, limit: Option<u16>)`, pool matched exactly against `"sapling"`, `"orchard"`, `"ironwood"` (any other name is a `Misc` error "invalid pool name, must be one of: …"), answering `{"pool", "start_index", "subtrees": [{"root": <hex>, "end_height": N}]}` with the root as `to_bytes()` hex (Sapling) or the node's `encode_hex` (Orchard, Ironwood), no byte reversal, and **no completing block hash** (lightwalletd's `completing_block_hash` has no counterpart). The list is empty for an index the node has not built yet (it rebuilds the index from the tip during initial sync). The handler has no pruning check; whether the state answers for pruned ranges on a pruned node is still the open item of THREAT_MODEL.md §6, for the regtest run of the handoff item. `gyges_chain::SubtreeRoot` therefore carries `end_hash: Option<_>`.
 - `GetTransaction` answers `RawTransaction.height` as 0 for a mempool transaction, `0xffffffffffffffff` for one mined only on a fork, else the main-chain height (the proto comment documents the sentinel mapping from `getrawtransaction`'s `-1`); an unknown txid is NOT_FOUND. That is `ChainBackend::transaction_status` on the lightwalletd route.
-- `GetLightdInfo.chain_name` is `"main"` or `"test"` from lightwalletd; zaino may answer `"regtest"` on regtest, so the backend accepts either for a regtest daemon, like `ZakuraRpcBackend` does for the node. `tonic` reports a dead connection as `Code::Unknown` with the transport error as `source()`; Gyges maps that, `Unavailable`, `DeadlineExceeded`, `Cancelled` and `Aborted` to `ChainError::Unreachable` and drops the connection.
+- `GetLightdInfo.chain_name` is `"main"` or `"test"` from lightwalletd. zaino 0.10.2 answered `"test"` on regtest (§4.5). The backend accepts `"test"` or `"regtest"` for a regtest daemon, like `ZakuraRpcBackend` does for the node. `tonic` reports a dead connection as `Code::Unknown` with the transport error as `source()`; Gyges maps that, `Unavailable`, `DeadlineExceeded`, `Cancelled` and `Aborted` to `ChainError::Unreachable` and drops the connection.
 - `tonic-prost-build`'s `extern_path` maps every proto message onto an existing Rust type, including the request and response types of generated services, so `gyges-chain`'s `build.rs` can generate only the *server* side of `CompactTxStreamer` for the fake over `zcash_client_backend::proto::{compact_formats, service}` types (`generate_default_stubs` makes the unimplemented methods answer UNIMPLEMENTED, server-streaming methods take `BoxStream`). The upstream crate ships no `.proto` files, only the generated modules, so the proto subset in `crates/gyges-chain/proto/` was written from them. (Q-O2)
 
 
-### 4.5 Facts about an archival endpoint for the regtest harness (2026-10-25, research only)
+### 4.5 Facts about an archival endpoint for the regtest harness (2026-10-25)
 
-Gathered for ROADMAP.md M2's sixth item. Nothing below has been run against a node yet.
+Gathered for ROADMAP.md M2's sixth item. The bullets below are research from source and release pages. The smoke test at the end of this section ran them against a real node: an archive `zakurad` v1.6.0 with `zainod` 0.10.2 in front of it.
 
 - **zakura-core publishes no indexer.** The organisation has `common`, `zakura`, `wallet-libraries` and forks of rocksdb, iroh, iroh-quinn and librustzcash. There is no zaino or lightwalletd fork. Zakura's docs send wallet features to Zaino (`docs/contributing.md`, `docs/zcashd-compat.md`). Zakura's own tests use `electriccoinco/lightwalletd` (`docker/docker-compose.lwd.yml`, `crates/zakurad/tests/common/lightwalletd/`). `zakurad` serves the Zebra indexer gRPC (zakura PR #612), and its `getblockchaininfo` reports `pruned` / `pruneheight` (PR #470).
 - **Upstream zaino against `zakurad` v1.6.0: plausible, untested.**
@@ -288,7 +288,72 @@ Gathered for ROADMAP.md M2's sixth item. Nothing below has been run against a no
   - `[storage.database] path`.
 
   It serves plaintext gRPC on loopback; TLS is enforced only for non-private binds.
-- **zaino cannot sit in front of the wallet's pruned node.** Compact blocks and tree states are served from its own LMDB store once indexed. But mined transactions (`GetTransaction`) and subtree roots are fetched from the node every time, which fails below a pruned node's window. So the harness needs a **second, archive-mode `zakurad`** peered with the wallet's pruned one, with zaino in front of the archive node.
+- **zaino cannot sit in front of the wallet's pruned node.** Compact blocks and tree states are served from its own LMDB store once indexed. But mined transactions (`GetTransaction`) and subtree roots are fetched from the node every time, which fails below a pruned node's window. So the harness needs a **second, archive-mode `zakurad`** peered with the wallet's pruned one, with zaino in front of the archive node. (Not exercised by the smoke test, which used an archive node only.)
+
+#### Smoke test: `zainod` 0.10.2 in front of an archive `zakurad` v1.6.0 (2026-10-25, macOS arm64)
+
+**Result: the pairing works.** Every `ArtiTorLwdBackend` call answered, and every answer matched the node's. There are three deviations from the lightwalletd contract that `gyges_chain::lwd` assumes. lightwalletd was therefore not needed.
+
+**Setup.** No harness change; a throwaway example (not committed) drove the backend.
+- **Node:** `zakurad` 1.6.0+gebda15e23ed0, built from the tag. The config is the one `tests/regtest/harness/node.rs` writes (every upgrade through NU6.3 at height 1, cookie auth, `checkpoint_sync = false`), minus the `storage_mode` line: `Archive` is the default. `getblockchaininfo` then reports `pruned: false`.
+- **zaino:** `cargo +1.97.1 install zainod --version 0.10.2 --locked` built in 2 min 10 s.
+- **Config used** (paths shortened):
+
+  ```toml
+  backend = "rpc"
+  network = "Regtest"
+
+  [validator_settings]
+  validator_jsonrpc_listen_address = "127.0.0.1:39232"   # the node's [rpc] listen_addr
+  validator_cookie_path = "<node dir>/cookie/.cookie"
+
+  [grpc_settings]
+  listen_address = "127.0.0.1:39237"                     # plaintext gRPC on loopback
+
+  [storage.database]
+  path = "<zaino dir>/db"
+  ```
+
+  Run as `zainod start --config <file>`.
+- **Chain:** 101 coinbases to the abandon-mnemonic key, then a node restart (miner set to the burn address) and 100 more blocks. Then, through `gygesd`:
+  - `tx shield` of 101 UTXOs into Ironwood (24,065 bytes);
+  - a 1 ZEC Ironwood payment to a second key, sent `--via-tor`;
+  - a 2 ZEC payment to that key's `tm…` receiver.
+
+  Tip 210.
+
+**What worked:**
+- **Startup and adoption.** zaino adopted the node's activation heights ("Adopted activation heights from the validator": Overwinter through NU6.3 at 1). It indexed the 101-block chain and was serving 0.7 s after start. A restart over its existing database took 1.2 s. A new block reached `GetLatestBlock` within about 1 s (zaino polls the node once a second).
+- **`GetLightdInfo`** (1–3 ms):
+  - `vendor "ZingoLabs ZainoD"`, `version "0.10.2"`, `chain_name "test"` (not `"regtest"`);
+  - `consensus_branch_id "37a5165b"`, `upgrade_name "NU6.3"`, `sapling_activation_height 1`;
+  - `zcashd_build "v1.6.0+gebda15e23ed0"`, `zcashd_subversion "/Zakura:1.6.0/"`, `lightwallet_protocol_version "v0.5.0"`.
+
+  `node_bounds` passes the chain check, and its tip height and hash equal the node's.
+- **`block_range(1..211)`**: 210 blocks in under 1 ms; heights, `hash` and `prev_hash` equal `getblockhash`. With `pool_types: []`, zaino answers like lightwalletd: no transparent-only transactions (the coinbases) and no `vin` / `vout`. After dropping those from the node route's blocks (`ZakuraRpcBackend::compact_blocks`), all 210 blocks are equal field for field, including `chain_metadata` and the two `ironwood_actions` (proto tag 9) of each shielded transaction. zaino's `compact_formats.proto` has the same tags as `zakura-client-backend`'s.
+- **`chain_state`** at heights 1, 105, 201–204 and 210: 6 ms each, and equal to `z_gettreestate` through `ZakuraRpcBackend`. That includes a non-empty Ironwood frontier: position 5 after three 2-action transactions.
+- **`raw_transaction` / `transaction_status`**: bytes equal to `getrawtransaction` for a coinbase, the shield, the Ironwood payment and the transparent payment (heights 1, 202, 203, 204). The shield showed height 0 / `InMempool` while unmined.
+- **`address_utxos`**: equal to the node's `getaddressutxos`, both with 101 coinbases and after the shield (0 at the key's address, 1 at the recipient's).
+- **`send_transaction`**: `tx send --via-tor` on regtest with `use_tor = false` reached the node's mempool through zaino. The audit log records `via="fallback"`.
+- **`subtree_roots`** for Sapling, Orchard and Ironwood: empty on both sides. No subtree completes in a few blocks, so root correctness is still untested.
+
+**Deviations** (the first two need code before ROADMAP item 6 relies on them):
+1. **Unknown txid.** `GetTransaction` answers gRPC `Internal`, `RPC error: LegacyRpcError { code: -5, message: "No such mempool or main chain transaction" }`, not `NOT_FOUND`.
+   - `transaction_status` returns `ChainError::Rpc` where it should return `TxStatus::Unknown`.
+   - `raw_transaction` returns an error where it should return `None`. So `gygesd::backfill::place_utxo` retries an output whose transaction the endpoint lacks (`SyncError::Fallback`) instead of discarding it.
+2. **Rejected broadcast.** A `SendTransaction` the node refuses comes back after about 2.5 s as gRPC `Internal`, not as a `SendResponse` with `error_code`. The error text is `InternalServerError: error receiving data from backing node: critical error in backing block source: validator unreachable: <the node's text>`.
+   - `send_transaction` maps it to `ChainError::Rpc`, so a refused `--via-tor` broadcast reaches the user as `INTERNAL` instead of `NODE_REJECTED`.
+   - zaino stays `Ready` afterwards.
+3. **Stale cookie after a node restart.** zaino reads the node's cookie once, at start. `zakurad` rotates the cookie on restart and drops connections that present the old one (an empty reply). zaino logged `validator unavailable: … error sending request` and backed off, with status `RecoverableError`. Still failing at its eighth retry (attempt 8, about a minute in), it was restarted by hand. Meanwhile it kept serving its indexed blocks over gRPC. So the harness must restart zaino after every `Node::restart`.
+
+The `chain_name` `"test"` is already accepted.
+
+**Not covered:**
+- zaino in front of a pruned node;
+- the Tor transport;
+- `pool_types` other than `[]`;
+- Sapling outputs. A Sapling payment from `tx send` failed in Gyges itself: "PCZTs require that ZIP 212 is enforced for outputs".
+- Orchard actions (the wallet sends Ironwood).
 
 ---
 
