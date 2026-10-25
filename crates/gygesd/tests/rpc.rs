@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gyges_chain::testing::{FakeNode, regtest_params};
+use gyges_chain::testing::{FakeLightwalletd, FakeNode, regtest_params};
 use gyges_core::birthday::FixedChain;
 use gyges_core::{Home, Network, perms};
 use gyges_proto::uds;
@@ -96,7 +96,11 @@ fn test_hub() -> Arc<LogHub> {
 }
 
 async fn start(configure: impl FnOnce(&mut Options)) -> Running {
-    let (dir, home) = fresh_home();
+    start_with(TEST_CONFIG, configure).await
+}
+
+async fn start_with(config: &str, configure: impl FnOnce(&mut Options)) -> Running {
+    let (dir, home) = fresh_home_with(config);
     let mut opts = Options::new(home.clone(), Network::Regtest);
     opts.log_hub = Some(test_hub());
     configure(&mut opts);
@@ -3189,4 +3193,404 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
     drop(state);
     task.abort();
     drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Case B: backfill below the node's window and the handoff (ROADMAP.md M2,
+// second and third items; SYNC.md §4.2, §5)
+// ---------------------------------------------------------------------------
+
+/// Poll `GetSyncStatus` until `done` holds for the key's row.
+async fn wait_status(
+    c: &mut GygesClient<Channel>,
+    key_id: &str,
+    what: &str,
+    done: impl Fn(&gyges_proto::v1::KeySyncStatus) -> bool,
+) -> gyges_proto::v1::KeySyncStatus {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let st = c
+            .get_sync_status(GetSyncStatusRequest {
+                key_id: key_id.into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let k = st.keys[0].clone();
+        if done(&k) {
+            return k;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never {what}: {k:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Mine a chain with one shielding transaction in it (so that the backfill
+/// carries real Ironwood commitments): a key born at the tip is funded on a
+/// transparent receiver, shields, and the shield is mined. Returns the
+/// key's mnemonic, its Ironwood balance and the shield's height.
+async fn chain_with_a_shielded_note(node: &FakeNode) -> (String, i64, u32) {
+    use gyges_proto::v1::Pool;
+    node.mine(5);
+    let url = node.url().to_string();
+    let running = start_with(
+        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n\
+         [policy]\nmin_confirmations = 1\n",
+        |o| o.zakura_rpc = Some(url),
+    )
+    .await;
+    let mut c = client(&running.socket).await;
+    let resp = c
+        .init_key(InitKeyRequest {
+            key_id: "orig".into(),
+            passphrase: "pw".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    wait_spendable(&mut c, "orig").await;
+    let receiver = {
+        let key = running.state.registry.resolve("orig").unwrap();
+        let w = key.wallet().unwrap();
+        let account = w.get_account_ids().unwrap()[0];
+        *w.get_transparent_receivers(account, false, false)
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+    };
+    node.mine_with_payments(&[(receiver, 100_000_000)]);
+    node.mine(1);
+    wait_spendable(&mut c, "orig").await;
+    c.unlock_key(UnlockKeyRequest {
+        key_id: "orig".into(),
+        passphrase: "pw".into(),
+        scope: UnlockScope::Daemon as i32,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let events = collect_events(
+        c.shield_funds(ShieldFundsRequest {
+            key_id: "orig".into(),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    assert!(event_names(&events).contains(&"broadcast"), "{events:?}");
+    node.mine(1);
+    let shield_height = node.tip().0;
+    wait_spendable(&mut c, "orig").await;
+    let b = c
+        .get_balance(GetBalanceRequest {
+            key_id: "orig".into(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let (ironwood, pending) = balance_of(&b, Pool::Ironwood);
+    assert!(ironwood > 0 && pending == 0, "{b:?}");
+    running.task.abort();
+    (resp.mnemonic, ironwood, shield_height)
+}
+
+/// Item 3 for a restore: a birthday below the node's window is accepted
+/// once a fallback endpoint is configured; the scheduler backfills from it
+/// (blocks tagged with its source), validates at `retained_from + k` and
+/// hands back to the node, and the note below the window is found. Then
+/// item 2's tree check: an endpoint serving the same chain with one
+/// commitment changed (same hashes, same sizes) is refused at the handoff,
+/// marked untrusted and the key stalls.
+#[tokio::test]
+async fn restore_below_the_window_backfills_from_the_fallback_and_a_wrong_root_is_refused() {
+    use gyges_proto::v1::{FallbackTrust, Pool};
+    let node = FakeNode::start(regtest_params()).await;
+    let (mnemonic, ironwood, shield_height) = chain_with_a_shielded_note(&node).await;
+    node.mine(40);
+    let tip = node.tip().0;
+    node.set_prune_height(Some(30));
+    let lwd = FakeLightwalletd::from_node(&node).await;
+
+    let (node_url, lwd_url) = (node.url().to_string(), lwd.url().to_string());
+    let running = start(|o| {
+        o.zakura_rpc = Some(node_url);
+        o.fallback_lwd = Some(lwd_url);
+        o.no_tor = true;
+    })
+    .await;
+    let mut c = client(&running.socket).await;
+    let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
+    assert_eq!(info.fallback.unwrap().trust(), FallbackTrust::Untested);
+    assert_eq!(
+        info.tor.unwrap().state(),
+        gyges_proto::v1::TorState::Disabled
+    );
+
+    // Consent first, then the restore is accepted with the block count.
+    let req = RestoreKeyRequest {
+        key_id: "copy".into(),
+        mnemonic: mnemonic.clone(),
+        passphrase: "pw".into(),
+        birthday_height: 4,
+        ..Default::default()
+    };
+    let err = c.restore_key(req.clone()).await.unwrap_err();
+    let typed = GygesError::from_status(&err).unwrap();
+    assert_eq!(typed.reason(), ErrorReason::ConfirmationRequired);
+    assert!(typed.detail.contains("(directly)"), "{}", typed.detail);
+    let resp = c
+        .restore_key(RestoreKeyRequest {
+            allow_backfill: true,
+            ..req
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.birthday_height, 4);
+    // Up to the handoff at 30 + 10.
+    assert_eq!(resp.backfill_blocks, 40 + 1 - 4);
+
+    let status = wait_spendable(&mut c, "copy").await;
+    assert_eq!(status.scanned_tip, tip, "{status:?}");
+    assert_eq!(
+        status.backend(),
+        gyges_proto::v1::SyncBackend::ZakuraRpc,
+        "back on the node after the handoff"
+    );
+    let b = c
+        .get_balance(GetBalanceRequest {
+            key_id: "copy".into(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        balance_of(&b, Pool::Ironwood),
+        (ironwood, 0),
+        "the note at {shield_height}, below the window, was found in the backfill: {b:?}"
+    );
+    let calls = lwd.calls();
+    assert!(calls.iter().any(|m| m == "GetBlockRange"), "{calls:?}");
+    assert!(calls.iter().any(|m| m == "GetTreeState"), "{calls:?}");
+    assert!(calls.iter().any(|m| m == "GetSubtreeRoots"), "{calls:?}");
+    let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
+    assert_eq!(info.fallback.unwrap().trust(), FallbackTrust::Verified);
+    let key = running.state.registry.resolve("copy").unwrap();
+    assert!(!key.dir().join("backfill.json").exists());
+    // The endpoint's blocks are dropped once scanned
+    // (`cache.keep_historical = false`).
+    let cache = running.state.block_cache.as_ref().unwrap();
+    assert_eq!(
+        cache
+            .evict_source_below(gyges_chain::Source::TorLwd, BlockHeight::from_u32(u32::MAX))
+            .unwrap(),
+        0
+    );
+    running.task.abort();
+
+    // The same chain with one Ironwood commitment changed in the shield's
+    // block: hashes and tree sizes still agree with the node, the root
+    // does not.
+    let mut blocks = lwd.blocks();
+    let block = blocks
+        .iter_mut()
+        .find(|b| b.height == u64::from(shield_height))
+        .unwrap();
+    let action = block
+        .vtx
+        .iter_mut()
+        .flat_map(|tx| tx.ironwood_actions.iter_mut())
+        .next()
+        .expect("the shield has an Ironwood action");
+    action.cmx = vec![0; 32];
+    let liar = FakeLightwalletd::from_node(&node).await;
+    liar.set_blocks(blocks);
+    let (node_url, liar_url) = (node.url().to_string(), liar.url().to_string());
+    let running = start(|o| {
+        o.zakura_rpc = Some(node_url);
+        o.fallback_lwd = Some(liar_url);
+        o.no_tor = true;
+    })
+    .await;
+    let mut c = client(&running.socket).await;
+    c.restore_key(RestoreKeyRequest {
+        key_id: "copy".into(),
+        mnemonic,
+        passphrase: "pw".into(),
+        birthday_height: 4,
+        allow_backfill: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let stalled = wait_status(&mut c, "copy", "stalled", |k| {
+        k.state() == SyncState::Stalled
+    })
+    .await;
+    assert_eq!(
+        stalled.stall_reason(),
+        gyges_proto::v1::StallReason::FallbackUntrusted,
+        "{stalled:?}"
+    );
+    assert!(stalled.detail.contains("tree-roots"), "{}", stalled.detail);
+    assert!(stalled.detail.contains("ironwood"), "{}", stalled.detail);
+    let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
+    assert_eq!(info.fallback.unwrap().trust(), FallbackTrust::Untrusted);
+    // Nothing the endpoint served is left in the wallet.
+    {
+        let key = running.state.registry.resolve("copy").unwrap();
+        let w = key.wallet().unwrap();
+        assert!(
+            w.block_max_scanned().unwrap().is_none(),
+            "truncated to the birthday"
+        );
+    }
+    let b = c
+        .get_balance(GetBalanceRequest {
+            key_id: "copy".into(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(b.total_spendable, 0, "{b:?}");
+    running.task.abort();
+}
+
+/// Item 2's hash-chain check: an endpoint serving a fork from the
+/// birthday up (well linked, but not the node's chain) is refused before
+/// anything from it is scanned, the endpoint is marked untrusted (and
+/// persisted), and further restores below the window are refused.
+#[tokio::test]
+async fn a_fallback_serving_a_fork_is_refused_and_marked_untrusted() {
+    use gyges_proto::v1::FallbackTrust;
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(40);
+    node.set_prune_height(Some(25));
+    let lwd = FakeLightwalletd::from_node(&node).await;
+    lwd.fork_from(5);
+    let (node_url, lwd_url) = (node.url().to_string(), lwd.url().to_string());
+    let running = start(|o| {
+        o.zakura_rpc = Some(node_url);
+        o.fallback_lwd = Some(lwd_url);
+        o.no_tor = true;
+    })
+    .await;
+    let mut c = client(&running.socket).await;
+    c.restore_key(RestoreKeyRequest {
+        key_id: "old".into(),
+        mnemonic: known_mnemonic(),
+        passphrase: "pw".into(),
+        birthday_height: 5,
+        allow_backfill: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let stalled = wait_status(&mut c, "old", "stalled", |k| {
+        k.state() == SyncState::Stalled
+    })
+    .await;
+    assert_eq!(
+        stalled.stall_reason(),
+        gyges_proto::v1::StallReason::FallbackUntrusted,
+        "{stalled:?}"
+    );
+    assert!(stalled.detail.contains("hash-chain"), "{}", stalled.detail);
+    assert!(stalled.scanned_tip < 25, "{stalled:?}");
+    // WaitSync fails fast on the stalled key.
+    let err = drain(
+        c.wait_sync(WaitSyncRequest {
+            key_id: "old".into(),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::NotSynced);
+
+    let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
+    assert_eq!(info.fallback.unwrap().trust(), FallbackTrust::Untrusted);
+    assert!(
+        running
+            ._home
+            .path()
+            .join("regtest/fallback_trust.json")
+            .exists()
+    );
+    let err = c
+        .restore_key(RestoreKeyRequest {
+            key_id: "other".into(),
+            mnemonic: known_mnemonic(),
+            passphrase: "pw".into(),
+            birthday_height: 6,
+            allow_backfill: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    let typed = GygesError::from_status(&err).unwrap();
+    assert_eq!(typed.reason(), ErrorReason::FallbackUnavailable);
+    assert!(typed.detail.contains("untrusted"), "{}", typed.detail);
+    running.task.abort();
+}
+
+/// Item 3, the pruning race: the node prunes past a key while it scans
+/// (after the first batch); the key falls back to the endpoint, validates
+/// at `retained_from + k` and finishes on the node.
+#[tokio::test]
+async fn node_pruning_past_the_scan_tip_mid_scan_falls_back_and_recovers() {
+    use gyges_proto::v1::FallbackTrust;
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(10);
+    let lwd = FakeLightwalletd::from_node(&node).await;
+    let (node_url, lwd_url) = (node.url().to_string(), lwd.url().to_string());
+    let running = start_with(
+        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n\
+         [cache]\nscan_batch = 10\nfetch_batch = 10\n",
+        |o| {
+            o.zakura_rpc = Some(node_url);
+            o.fallback_lwd = Some(lwd_url);
+            o.no_tor = true;
+        },
+    )
+    .await;
+    let mut c = client(&running.socket).await;
+    c.init_key(InitKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let status = wait_spendable(&mut c, "main").await;
+    assert_eq!(status.scanned_tip, 10);
+    assert!(lwd.calls().is_empty(), "nothing needed the endpoint yet");
+
+    // The node prunes below 50 once it has served one more batch of raw
+    // blocks: the key is then at 20 with 50 blocks to go.
+    node.prune_after_raw_blocks(10, 50);
+    node.mine(60);
+    lwd.resync(&node);
+    let status = wait_spendable(&mut c, "main").await;
+    assert_eq!(status.scanned_tip, 70, "{status:?}");
+    assert_eq!(status.backend(), gyges_proto::v1::SyncBackend::ZakuraRpc);
+    assert!(
+        lwd.calls().iter().any(|m| m == "GetBlockRange"),
+        "{:?}",
+        lwd.calls()
+    );
+    let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
+    assert_eq!(info.node.unwrap().retained_from, 50);
+    assert_eq!(info.fallback.unwrap().trust(), FallbackTrust::Verified);
+    running.task.abort();
 }

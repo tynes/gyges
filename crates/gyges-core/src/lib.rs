@@ -18,6 +18,7 @@
 
 pub mod birthday;
 pub mod config;
+pub mod handoff;
 pub mod log;
 pub mod network;
 pub mod paths;

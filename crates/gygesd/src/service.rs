@@ -14,14 +14,14 @@ use gyges_proto::v1::{
     self, AbortSigningSessionRequest, AbortTexTransferRequest, ApiVersion, BroadcastPcztRequest,
     BroadcastPcztResponse, CombinePcztRequest, CombinePcztResponse, CreatePcztRequest,
     CreatePcztResponse, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest,
-    ExportUfvkResponse, FallbackStatus, FallbackTrust, GetBalanceRequest, GetBalanceResponse,
-    GetInfoRequest, GetInfoResponse, GetSyncStatusRequest, GetSyncStatusResponse, InitKeyRequest,
-    InitKeyResponse, InspectPcztRequest, InspectPcztResponse, ListKeysRequest, ListKeysResponse,
+    ExportUfvkResponse, FallbackStatus, GetBalanceRequest, GetBalanceResponse, GetInfoRequest,
+    GetInfoResponse, GetSyncStatusRequest, GetSyncStatusResponse, InitKeyRequest, InitKeyResponse,
+    InspectPcztRequest, InspectPcztResponse, ListKeysRequest, ListKeysResponse,
     ListSigningSessionsRequest, ListSigningSessionsResponse, LockKeyRequest, LockKeyResponse,
     NodeStatus, ProvePcztRequest, ProvePcztResponse, RestoreKeyRequest, RestoreKeyResponse,
     ResumeTexTransferRequest, RunSyncRequest, SendTransactionRequest, ShieldFundsRequest,
     ShutdownRequest, ShutdownResponse, SignPcztRequest, SigningSession, StreamLogsRequest,
-    TexQueueEntry, TorState, TorStatus, UnlockKeyRequest, UnlockKeyResponse, WaitSyncRequest,
+    TexQueueEntry, UnlockKeyRequest, UnlockKeyResponse, WaitSyncRequest,
 };
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
@@ -47,6 +47,9 @@ pub struct DaemonState {
     /// when disabled or air-gapped. Built at start, connected (and Tor
     /// bootstrapped) by the first backfill that needs it (SYNC.md §5).
     pub fallback: Option<Arc<ArtiTorLwdBackend<ConsensusParams>>>,
+    /// Whether the fallback endpoint has passed (or failed) the handoff
+    /// validation (SYNC.md §5.2); loaded from `fallback_trust.json` at start.
+    pub fallback_trust: crate::backfill::TrustHub,
     /// The shared compact block cache (`cache/blocks.sqlite`); `None` only
     /// when air-gapped.
     pub block_cache: Option<Arc<BlockDb>>,
@@ -88,6 +91,7 @@ impl DaemonState {
             vault: Arc::new(vault),
             chain,
             fallback,
+            fallback_trust: crate::backfill::TrustHub::default(),
             block_cache,
             sync: SyncHub::default(),
             sessions: SessionHub::default(),
@@ -111,19 +115,12 @@ impl DaemonState {
             }),
             airgapped: self.config.airgapped,
             node: Some(self.node_status()),
-            tor: Some(TorStatus {
-                state: TorState::Disabled as i32,
-                ..Default::default()
-            }),
+            tor: Some(crate::backfill::tor_status(self)),
             fallback: Some(FallbackStatus {
                 enabled: fb.enabled && !self.config.airgapped,
                 grpc_url: fb.grpc_url.clone(),
                 use_tor: fb.use_tor,
-                trust: if fb.enabled {
-                    FallbackTrust::Untested as i32
-                } else {
-                    FallbackTrust::Unspecified as i32
-                },
+                trust: crate::backfill::proto_trust(self) as i32,
             }),
             keys: keys::summaries(self),
             default_key: self.registry.default_key(),
@@ -471,7 +468,7 @@ mod tests {
             "{}",
             node.last_error
         );
-        assert_eq!(info.tor.unwrap().state, TorState::Disabled as i32);
+        assert_eq!(info.tor.unwrap().state, v1::TorState::Disabled as i32);
         assert!(info.started_at > 0);
     }
 }

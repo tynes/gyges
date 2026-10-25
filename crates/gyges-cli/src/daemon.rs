@@ -297,7 +297,8 @@ pub fn render_status(info: &GetInfoResponse) -> String {
         s,
         "  tor:          {}",
         match tor.state() {
-            gyges_proto::v1::TorState::Unspecified => "unknown".to_string(),
+            // Tor configured but not needed yet (it bootstraps on the first backfill).
+            gyges_proto::v1::TorState::Unspecified => "not started".to_string(),
             gyges_proto::v1::TorState::Disabled => "disabled".to_string(),
             gyges_proto::v1::TorState::Bootstrapping =>
                 format!("bootstrapping {}%", tor.bootstrap_percent),

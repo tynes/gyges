@@ -24,6 +24,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backfill;
 pub mod conn;
 pub mod keys;
 pub mod lifecycle;
@@ -210,6 +211,12 @@ impl Daemon {
             block_cache,
             opts.log_hub.unwrap_or_default(),
         ));
+        if let Some(fallback) = &state.fallback {
+            state.fallback_trust.load(
+                backfill::trust_path(&home.network_dir(network)),
+                &fallback.endpoint(),
+            );
+        }
         Ok(Self {
             home,
             network,
