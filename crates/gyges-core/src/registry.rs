@@ -336,6 +336,7 @@ impl KeyRegistry {
         let migrator = WalletMigrator::new().with_external_migrations(vec![
             Box::new(crate::tex::TexQueueMigration),
             Box::new(crate::sessions::SigningSessionsMigration),
+            Box::new(crate::addresses::AddressLabelsMigration),
         ]);
         match migrator.init_or_migrate(&mut wallet) {
             Ok(()) => Ok(wallet),

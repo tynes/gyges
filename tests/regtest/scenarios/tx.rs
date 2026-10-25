@@ -612,3 +612,234 @@ fn zip320_send_survives_a_daemon_crash() {
         }
     }
 }
+
+/// Wait until `tx status TXID --json` reports `status`.
+fn wait_tx_status(fx: &Fixture, txid: &str, status: &str) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let run = fx
+            .gyges(&["-k", "main", "tx", "status", txid, "--json"])
+            .run();
+        assert_eq!(run.code(), 0, "{run:?}");
+        let v = run.json();
+        if v["status"] == status {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "never {status}: {v}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `gyges address current/new/qr/inspect`, `gyges notes`, `gyges tx list`
+/// and `gyges tx status` through the binaries against the fake node, in
+/// both renderings: the M1 commands a user needs to receive, look at what
+/// arrived and follow a transaction, plus the not-implemented `--qr` /
+/// `--pir` exits and the exit-6 inspection of a bad address.
+#[test]
+fn addresses_notes_and_history_through_the_binaries() {
+    let n = fake_node(10);
+    let mut fx = Fixture::new("regtest");
+    fx.write_config(
+        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n",
+    );
+    fx.start_daemon(&["--zakura-rpc", n.node.url()]).unwrap();
+    const PASSPHRASE: &str = "correct-horse-battery-staple-7731";
+    let pw = fx.passphrase_file(PASSPHRASE);
+    let run = fx
+        .gyges(&["key", "init", "--id", "main", "--json"])
+        .env("GYGES_PASSPHRASE_FILE", &pw)
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    wait_spendable(&fx);
+
+    // The address alone on stdout, details on stderr; JSON is AddressInfo.
+    let run = fx.gyges(&["-k", "main", "address", "current"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let current = run.stdout.trim().to_string();
+    assert!(current.starts_with("uregtest1"), "{run:?}");
+    assert_eq!(run.stdout.lines().count(), 1, "{run:?}");
+    assert!(
+        run.stderr.contains("receivers:") && run.stderr.contains("transparent"),
+        "{}",
+        run.stderr
+    );
+    let run = fx
+        .gyges(&["-k", "main", "address", "current", "--json"])
+        .run();
+    let v = run.json();
+    assert_eq!(v["address"], current.as_str());
+    assert_eq!(v["schema_version"], "0.1");
+    assert_eq!(v["receivers"][0]["pool"], "POOL_ORCHARD", "{v}");
+
+    for args in [
+        &["-k", "main", "address", "current", "--qr"][..],
+        &["-k", "main", "address", "new", "--qr"],
+        &["-k", "main", "address", "qr"],
+        &["address", "qr", "u1x"],
+    ] {
+        let run = fx.gyges(args).run();
+        assert_eq!(run.code(), 1, "{args:?}: {run:?}");
+        assert!(run.stderr.contains("not implemented"), "{}", run.stderr);
+    }
+
+    let run = fx
+        .gyges(&[
+            "-k",
+            "main",
+            "address",
+            "new",
+            "--receivers",
+            "orchard",
+            "--label",
+            "shop",
+            "--json",
+        ])
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let fresh = run.json();
+    let fresh_addr = fresh["address"].as_str().unwrap().to_string();
+    assert_ne!(fresh_addr, current);
+    assert_eq!(fresh["label"], "shop");
+    assert_eq!(fresh["receivers"].as_array().unwrap().len(), 1, "{fresh}");
+    let run = fx.gyges(&["-k", "main", "address", "current"]).run();
+    assert_eq!(run.stdout.trim(), fresh_addr);
+    assert!(run.stderr.contains("shop"), "{}", run.stderr);
+    let run = fx
+        .gyges(&["-k", "main", "address", "new", "--receivers", "transparent"])
+        .run();
+    assert_eq!(run.code(), 6, "{run:?}");
+
+    let run = fx.gyges(&["address", "inspect", &current]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert!(
+        run.stdout.contains("valid:      yes") && run.stdout.contains("unified"),
+        "{}",
+        run.stdout
+    );
+    let run = fx.gyges(&["address", "inspect", &current, "--json"]).run();
+    let v = run.json();
+    assert_eq!(v["valid"], true);
+    assert_eq!(v["network"], "NETWORK_REGTEST");
+    assert_eq!(v["kind"], "ADDRESS_KIND_UNIFIED");
+    let run = fx.gyges(&["address", "inspect", "nonsense"]).run();
+    assert_eq!(run.code(), 6, "{run:?}");
+    let run = fx
+        .gyges(&["address", "inspect", "nonsense", "--json"])
+        .run();
+    assert_eq!(run.code(), 6, "{run:?}");
+    assert_eq!(
+        run.json()["error"]["reason"],
+        "ERROR_REASON_INVALID_ARGUMENT"
+    );
+
+    // Empty history.
+    let run = fx.gyges(&["-k", "main", "notes"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert_eq!(run.stdout, "no notes\n");
+    let run = fx.gyges(&["-k", "main", "tx", "list"]).run();
+    assert_eq!(run.stdout, "no transactions\n");
+
+    // Fund, then shield.
+    let receiver = first_transparent_receiver(&fx, "main");
+    n.node.mine_with_payments(&[(receiver, 100_000_000)]);
+    n.node.mine(1);
+    wait_spendable(&fx);
+    let run = fx.gyges(&["-k", "main", "notes", "--json"]).run();
+    let v = run.json();
+    let notes = v["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 1, "{v}");
+    assert_eq!(notes[0]["pool"], "POOL_TRANSPARENT");
+    assert_eq!(notes[0]["value"], "100000000");
+    let funding_txid = notes[0]["txid"].as_str().unwrap().to_string();
+
+    let run = fx
+        .gyges(&["-k", "main", "tx", "shield", "--yes"])
+        .env("GYGES_PASSPHRASE_FILE", &pw)
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    let shield = run.stdout.trim().to_string();
+    let v = wait_tx_status(&fx, &shield, "TRANSACTION_STATUS_PENDING");
+    assert_eq!(v["source"], "STATUS_SOURCE_NODE");
+    n.node.mine(2);
+    let v = wait_tx_status(&fx, &shield, "TRANSACTION_STATUS_MINED");
+    assert_eq!(v["confirmations"], 2, "{v}");
+    let run = fx.gyges(&["-k", "main", "tx", "status", &shield]).run();
+    assert!(
+        run.stdout.contains("mined at height") && run.stdout.contains("2 confirmations"),
+        "{}",
+        run.stdout
+    );
+    let run = fx
+        .gyges(&["-k", "main", "tx", "status", &shield, "--pir"])
+        .run();
+    assert_eq!(run.code(), 1, "{run:?}");
+    assert!(run.stderr.contains("not implemented"), "{}", run.stderr);
+    let run = fx
+        .gyges(&["-k", "main", "tx", "status", &"00".repeat(32)])
+        .run();
+    assert_eq!(run.code(), 6, "{run:?}");
+
+    // The scan catches up with the shield: spent UTXO, Ironwood note.
+    wait_spendable(&fx);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let run = fx
+            .gyges(&["-k", "main", "notes", "--spent", "--json"])
+            .run();
+        let v = run.json();
+        if v["notes"].as_array().is_some_and(|a| !a.is_empty()) {
+            assert_eq!(v["notes"][0]["spent_txid"], shield.as_str(), "{v}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the UTXO never showed as spent: {v}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let run = fx
+        .gyges(&["-k", "main", "notes", "--pool", "ironwood"])
+        .run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert!(
+        run.stdout.contains("ironwood") && run.stdout.contains("unspent,witness-ready"),
+        "{}",
+        run.stdout
+    );
+
+    let run = fx.gyges(&["-k", "main", "tx", "list"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert!(
+        run.stdout.contains(&shield) && run.stdout.contains(&funding_txid),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("mined"), "{}", run.stdout);
+    let run = fx
+        .gyges(&["-k", "main", "tx", "list", "--limit", "1", "--json"])
+        .run();
+    let v = run.json();
+    let txs = v["transactions"].as_array().unwrap();
+    assert_eq!(txs.len(), 1, "{v}");
+    assert_eq!(txs[0]["txid"], shield.as_str());
+    assert_eq!(txs[0]["status"], "TRANSACTION_STATUS_MINED");
+    let run = fx
+        .gyges(&["-k", "main", "tx", "list", "--before", &shield, "--json"])
+        .run();
+    assert_eq!(run.json()["transactions"][0]["txid"], funding_txid.as_str());
+
+    // None of this reaches the logs (TESTING.md §5).
+    let log_dir = fx.network_dir().join("logs");
+    for entry in std::fs::read_dir(&log_dir).unwrap().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(entry.path()).unwrap();
+        for secret in [
+            current.as_str(),
+            fresh_addr.as_str(),
+            shield.as_str(),
+            "shop",
+        ] {
+            assert!(!text.contains(secret), "{secret:?} in {name}");
+        }
+    }
+}
