@@ -266,13 +266,7 @@ impl BlockDb {
             )
             .optional()
             .map_err(|e| self.sqlite(e))?;
-        Ok(hash.map(|h| {
-            let mut out = [0u8; 32];
-            if h.len() == 32 {
-                out.copy_from_slice(&h);
-            }
-            out
-        }))
+        Ok(hash.map(|h| crate::compact::to_array(&h)))
     }
 
     /// Lowest and highest cached heights, `None` when empty.

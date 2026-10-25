@@ -29,7 +29,7 @@ use std::fmt;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::RwLock;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use futures_util::StreamExt as _;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint, Uri};
@@ -44,11 +44,11 @@ use zcash_client_backend::proto::service::{
 use zcash_client_backend::tor;
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::ShieldedPool;
-use zcash_protocol::consensus::{BlockHeight, BranchId, NetworkType, Parameters};
+use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 
 use crate::{
-    BoxFuture, ChainBackend, ChainError, NodeBounds, NodeStatus, Route, SubtreeRoot, TxStatus,
-    display_hash, parse_display_hash,
+    BoxFuture, ChainBackend, ChainError, NodeBounds, NodeStatus, Source, StatusCell, SubtreeRoot,
+    TxStatus, bytes32, check_chain_name, display_hash, innermost_error, parse_display_hash,
 };
 
 /// One `GetAddressUtxos` entry: an output the endpoint says is unspent at
@@ -119,7 +119,7 @@ pub struct ArtiTorLwdBackend<P> {
     transport: Transport,
     params: P,
     timeouts: LwdTimeouts,
-    status: RwLock<NodeStatus>,
+    status: StatusCell,
     tor_state: RwLock<TorState>,
     conn: tokio::sync::Mutex<Connection>,
 }
@@ -171,7 +171,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
             transport,
             params,
             timeouts: LwdTimeouts::default(),
-            status: RwLock::new(NodeStatus::default()),
+            status: StatusCell::default(),
             tor_state: RwLock::new(tor_state),
             conn: tokio::sync::Mutex::new(Connection::default()),
         })
@@ -270,7 +270,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                 .map_err(|e| ChainError::Rpc(format!("TLS configuration: {e}")))?;
         }
         endpoint.connect().await.map_err(|e| {
-            ChainError::Unreachable(format!("{}: {}", self.endpoint, transport_error_text(&e)))
+            ChainError::Unreachable(format!("{}: {}", self.endpoint, innermost_error(&e)))
         })
     }
 
@@ -318,17 +318,11 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
             .await
             .map_err(|s| self.status_error("GetLightdInfo", s))?
             .into_inner();
-        let (network, accepted): (&str, &[&str]) = match self.params.network_type() {
-            NetworkType::Main => ("mainnet", &["main"]),
-            NetworkType::Test => ("testnet", &["test"]),
-            NetworkType::Regtest => ("regtest", &["test", "regtest"]),
-        };
-        if !accepted.contains(&info.chain_name.as_str()) {
-            return Err(ChainError::Rpc(format!(
-                "the fallback endpoint {} serves chain \"{}\", this daemon is for {network}",
-                self.endpoint, info.chain_name
-            )));
-        }
+        check_chain_name(
+            &self.params,
+            &info.chain_name,
+            format_args!("the fallback endpoint {}", self.endpoint),
+        )?;
         tracing::info!(
             endpoint = %self.endpoint,
             vendor = %info.vendor,
@@ -370,6 +364,35 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         }
     }
 
+    /// [`ArtiTorLwdBackend::status_error`], except that NotFound,
+    /// InvalidArgument and OutOfRange mean the endpoint has no block at
+    /// `height`.
+    fn block_error(&self, method: &str, height: BlockHeight, status: Status) -> ChainError {
+        match status.code() {
+            Code::NotFound | Code::InvalidArgument | Code::OutOfRange => {
+                ChainError::BlockUnavailable { height }
+            }
+            _ => self.status_error(method, status),
+        }
+    }
+
+    /// The next item of a streaming response, `None` at its end. A stream
+    /// silent for [`LwdTimeouts::stream_idle`] is [`ChainError::Unreachable`]
+    /// with `stalled()`'s text, which drops the connection.
+    async fn next_or_stall<T>(
+        &self,
+        stream: &mut tonic::Streaming<T>,
+        method: &str,
+        stalled: impl FnOnce() -> String,
+    ) -> Result<Option<T>, ChainError> {
+        match tokio::time::timeout(self.timeouts.stream_idle, stream.next()).await {
+            Err(_elapsed) => Err(ChainError::Unreachable(stalled())),
+            Ok(None) => Ok(None),
+            Ok(Some(Err(s))) => Err(self.status_error(method, s)),
+            Ok(Some(Ok(item))) => Ok(Some(item)),
+        }
+    }
+
     /// Run `f` against the client, dropping the connection when the result
     /// is a transport failure.
     async fn call<T, F, Fut>(&self, f: F) -> Result<T, ChainError>
@@ -385,26 +408,9 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         result
     }
 
-    fn record(&self, outcome: &Result<NodeBounds, ChainError>) {
-        let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
-        status.last_polled = Some(SystemTime::now());
-        match outcome {
-            Ok(bounds) => {
-                status.connected = true;
-                status.bounds = Some(bounds.clone());
-                status.pruned = false;
-                status.last_error.clear();
-            }
-            Err(e) => {
-                status.connected = false;
-                status.last_error = e.to_string();
-            }
-        }
-    }
-
     /// `GetLatestBlock`: the endpoint's tip. An archival endpoint retains
     /// everything, so `retained_from` is 0.
-    pub async fn latest_block(&self) -> Result<NodeBounds, ChainError> {
+    async fn latest_block(&self) -> Result<NodeBounds, ChainError> {
         self.call(|mut client| async move {
             let id = client
                 .get_latest_block(ChainSpec {})
@@ -413,7 +419,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                 .into_inner();
             Ok(NodeBounds {
                 tip_height: height_of(id.height, "GetLatestBlock")?,
-                tip_hash: hash_of(&id.hash, "GetLatestBlock")?,
+                tip_hash: bytes32(&id.hash, "GetLatestBlock: hash")?,
                 retained_from: BlockHeight::from_u32(0),
             })
         })
@@ -422,20 +428,12 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
 
     /// `GetBlock(height)`: one compact block; [`ChainError::BlockUnavailable`]
     /// when the endpoint has none at that height.
-    pub async fn compact_block(&self, height: BlockHeight) -> Result<CompactBlock, ChainError> {
+    async fn compact_block(&self, height: BlockHeight) -> Result<CompactBlock, ChainError> {
         self.call(|mut client| async move {
             let block = client
-                .get_block(BlockId {
-                    height: u64::from(u32::from(height)),
-                    hash: vec![],
-                })
+                .get_block(block_id(u32::from(height)))
                 .await
-                .map_err(|s| match s.code() {
-                    Code::NotFound | Code::InvalidArgument | Code::OutOfRange => {
-                        ChainError::BlockUnavailable { height }
-                    }
-                    _ => self.status_error("GetBlock", s),
-                })?
+                .map_err(|s| self.block_error("GetBlock", height, s))?
                 .into_inner();
             if block.height != u64::from(u32::from(height)) {
                 return Err(ChainError::Rpc(format!(
@@ -443,7 +441,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                     self.endpoint, block.height
                 )));
             }
-            hash_of(&block.hash, "GetBlock")?;
+            bytes32(&block.hash, "GetBlock: hash")?;
             Ok(block)
         })
         .await
@@ -452,20 +450,12 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
     /// `GetTreeState(height)` as the `ChainState` an account born at
     /// `height + 1` starts from. Untrusted until the handoff validation of
     /// SYNC.md §5.2 has covered it (SYNC.md §9).
-    pub async fn tree_state(&self, height: BlockHeight) -> Result<ChainState, ChainError> {
+    async fn tree_state(&self, height: BlockHeight) -> Result<ChainState, ChainError> {
         self.call(|mut client| async move {
             let state = client
-                .get_tree_state(BlockId {
-                    height: u64::from(u32::from(height)),
-                    hash: vec![],
-                })
+                .get_tree_state(block_id(u32::from(height)))
                 .await
-                .map_err(|s| match s.code() {
-                    Code::NotFound | Code::InvalidArgument | Code::OutOfRange => {
-                        ChainError::BlockUnavailable { height }
-                    }
-                    _ => self.status_error("GetTreeState", s),
-                })?
+                .map_err(|s| self.block_error("GetTreeState", height, s))?
                 .into_inner();
             if state.height != u64::from(u32::from(height)) {
                 return Err(ChainError::Rpc(format!(
@@ -502,14 +492,8 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         let wanted = usize::try_from(end - start).unwrap_or(usize::MAX);
         self.call(|mut client| async move {
             let request = BlockRange {
-                start: Some(BlockId {
-                    height: u64::from(start),
-                    hash: vec![],
-                }),
-                end: Some(BlockId {
-                    height: u64::from(end - 1),
-                    hash: vec![],
-                }),
+                start: Some(block_id(start)),
+                end: Some(block_id(end - 1)),
                 // Legacy behaviour: shielded data only. Transparent outputs
                 // below `retained_from` come from `GetAddressUtxos`
                 // (SYNC.md §5.3).
@@ -522,19 +506,19 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                 .into_inner();
             let mut blocks: Vec<CompactBlock> = Vec::with_capacity(wanted);
             loop {
-                let next = tokio::time::timeout(self.timeouts.stream_idle, stream.next()).await;
-                let block = match next {
-                    Err(_elapsed) => {
-                        return Err(ChainError::Unreachable(format!(
-                            "GetBlockRange({start}..{end}) at {} stalled: no block for {:?} after {} of {wanted}",
-                            self.endpoint,
-                            self.timeouts.stream_idle,
-                            blocks.len()
-                        )));
-                    }
-                    Ok(None) => break,
-                    Ok(Some(Err(s))) => return Err(self.status_error("GetBlockRange", s)),
-                    Ok(Some(Ok(block))) => block,
+                let stalled = || {
+                    format!(
+                        "GetBlockRange({start}..{end}) at {} stalled: no block for {:?} after {} of {wanted}",
+                        self.endpoint,
+                        self.timeouts.stream_idle,
+                        blocks.len()
+                    )
+                };
+                let Some(block) = self
+                    .next_or_stall(&mut stream, "GetBlockRange", stalled)
+                    .await?
+                else {
+                    break;
                 };
                 let expected = start + blocks.len() as u32;
                 if block.height != u64::from(expected) {
@@ -543,7 +527,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                         self.endpoint, block.height
                     )));
                 }
-                hash_of(&block.hash, "GetBlockRange")?;
+                bytes32(&block.hash, "GetBlockRange: hash")?;
                 if let Some(prev) = blocks.last()
                     && block.prev_hash != prev.hash
                 {
@@ -575,7 +559,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
     }
 
     /// `GetSubtreeRoots`, collected with the idle timeout.
-    pub async fn get_subtree_roots(
+    async fn get_subtree_roots(
         &self,
         pool: ShieldedPool,
         start_index: u32,
@@ -600,61 +584,37 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                 .into_inner();
             let mut roots = Vec::new();
             loop {
-                let next = tokio::time::timeout(self.timeouts.stream_idle, stream.next()).await;
-                let root = match next {
-                    Err(_elapsed) => {
-                        return Err(ChainError::Unreachable(format!(
-                            "GetSubtreeRoots({pool:?}, {start_index}) at {} stalled after {} roots",
-                            self.endpoint,
-                            roots.len()
-                        )));
-                    }
-                    Ok(None) => break,
-                    Ok(Some(Err(s))) => return Err(self.status_error("GetSubtreeRoots", s)),
-                    Ok(Some(Ok(root))) => root,
+                let stalled = || {
+                    format!(
+                        "GetSubtreeRoots({pool:?}, {start_index}) at {} stalled after {} roots",
+                        self.endpoint,
+                        roots.len()
+                    )
+                };
+                let Some(root) = self
+                    .next_or_stall(&mut stream, "GetSubtreeRoots", stalled)
+                    .await?
+                else {
+                    break;
                 };
                 let index = start_index + roots.len() as u32;
                 let end_hash = if root.completing_block_hash.is_empty() {
                     None
                 } else {
-                    Some(hash_of(&root.completing_block_hash, "GetSubtreeRoots")?)
+                    Some(bytes32(
+                        &root.completing_block_hash,
+                        "GetSubtreeRoots: hash",
+                    )?)
                 };
                 roots.push(SubtreeRoot {
                     pool,
                     index,
-                    root: hash_of(&root.root_hash, "GetSubtreeRoots")?,
+                    root: bytes32(&root.root_hash, "GetSubtreeRoots: hash")?,
                     end_height: height_of(root.completing_block_height, "GetSubtreeRoots")?,
                     end_hash,
                 });
             }
             Ok(roots)
-        })
-        .await
-    }
-
-    /// `GetTransaction(txid)`: where the endpoint has the transaction.
-    /// lightwalletd reports `height` 0 for the mempool, `u64::MAX` for a
-    /// transaction mined only on a fork, else the main-chain height
-    /// (OVERVIEW.md §4.4); NOT_FOUND is [`TxStatus::Unknown`].
-    pub async fn transaction_status(&self, txid: [u8; 32]) -> Result<TxStatus, ChainError> {
-        self.call(|mut client| async move {
-            let resp = client
-                .get_transaction(TxFilter {
-                    block: None,
-                    index: 0,
-                    hash: txid.to_vec(),
-                })
-                .await;
-            let raw = match resp {
-                Ok(r) => r.into_inner(),
-                Err(s) if s.code() == Code::NotFound => return Ok(TxStatus::Unknown),
-                Err(s) => return Err(self.status_error("GetTransaction", s)),
-            };
-            Ok(match raw.height {
-                0 => TxStatus::InMempool,
-                u64::MAX => TxStatus::Unknown,
-                h => TxStatus::Mined(height_of(h, "GetTransaction")?),
-            })
         })
         .await
     }
@@ -691,9 +651,10 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                             ChainError::Rpc(format!("GetAddressUtxos at {}: {what}", self.endpoint))
                         };
                         Ok(AddressUtxo {
-                            txid: u.txid[..]
-                                .try_into()
-                                .map_err(|_| bad("txid is not 32 bytes"))?,
+                            txid: bytes32(
+                                &u.txid,
+                                format_args!("GetAddressUtxos at {}: txid", self.endpoint),
+                            )?,
                             index: u32::try_from(u.index)
                                 .map_err(|_| bad("negative output index"))?,
                             value_zat: u64::try_from(u.value_zat)
@@ -741,7 +702,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
     /// `sendrawtransaction` result: `error_code` 0 with the txid in
     /// `error_message`, or the node's rejection code and text, which is
     /// passed through as [`ChainError::Rejected`].
-    pub async fn send_transaction(&self, raw: &[u8]) -> Result<[u8; 32], ChainError> {
+    async fn send_transaction(&self, raw: &[u8]) -> Result<[u8; 32], ChainError> {
         let raw = raw.to_vec();
         self.call(|mut client| async move {
             let resp = client
@@ -787,44 +748,28 @@ fn height_of(height: u64, method: &str) -> Result<BlockHeight, ChainError> {
         .map_err(|_| ChainError::Rpc(format!("{method}: height {height} does not fit a u32")))
 }
 
-fn hash_of(bytes: &[u8], method: &str) -> Result<[u8; 32], ChainError> {
-    <[u8; 32]>::try_from(bytes).map_err(|_| {
-        ChainError::Rpc(format!(
-            "{method}: hash has {} bytes, expected 32",
-            bytes.len()
-        ))
-    })
-}
-
-/// tonic's transport errors hide the OS error several layers down.
-fn transport_error_text(e: &tonic::transport::Error) -> String {
-    let mut cur: &dyn std::error::Error = e;
-    let mut last = e.to_string();
-    while let Some(next) = cur.source() {
-        last = next.to_string();
-        cur = next;
+/// A `BlockId` by height alone.
+fn block_id(height: u32) -> BlockId {
+    BlockId {
+        height: u64::from(height),
+        hash: vec![],
     }
-    last
 }
 
 impl<P: Parameters + Send + Sync + 'static> ChainBackend for ArtiTorLwdBackend<P> {
-    fn route(&self) -> Route {
-        Route::TorLightwalletd
+    fn source(&self) -> Source {
+        Source::TorLwd
     }
 
     fn node_bounds(&self) -> BoxFuture<'_, Result<NodeBounds, ChainError>> {
         Box::pin(async move {
-            let outcome = self.latest_block().await;
-            self.record(&outcome);
-            outcome
+            let outcome = self.latest_block().await.map(|b| (b, false));
+            self.status.record(outcome)
         })
     }
 
     fn status(&self) -> NodeStatus {
-        self.status
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.status.get()
     }
 
     fn chain_state(&self, height: BlockHeight) -> BoxFuture<'_, Result<ChainState, ChainError>> {
@@ -834,7 +779,7 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ArtiTorLwdBackend<P
     fn block_hash(&self, height: BlockHeight) -> BoxFuture<'_, Result<[u8; 32], ChainError>> {
         Box::pin(async move {
             let block = self.compact_block(height).await?;
-            hash_of(&block.hash, "GetBlock")
+            bytes32(&block.hash, "GetBlock: hash")
         })
     }
 
@@ -849,8 +794,18 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ArtiTorLwdBackend<P
         Box::pin(async move { self.send_transaction(&raw).await })
     }
 
+    /// `GetTransaction(txid)`: lightwalletd reports `height` 0 for the
+    /// mempool, `u64::MAX` for a transaction mined only on a fork, else the
+    /// main-chain height (OVERVIEW.md §4.4); NOT_FOUND is
+    /// [`TxStatus::Unknown`].
     fn transaction_status(&self, txid: [u8; 32]) -> BoxFuture<'_, Result<TxStatus, ChainError>> {
-        Box::pin(self.transaction_status(txid))
+        Box::pin(async move {
+            Ok(match self.raw_transaction(txid).await? {
+                None | Some((_, u64::MAX)) => TxStatus::Unknown,
+                Some((_, 0)) => TxStatus::InMempool,
+                Some((_, h)) => TxStatus::Mined(height_of(h, "GetTransaction")?),
+            })
+        })
     }
 
     fn subtree_roots(
@@ -894,7 +849,7 @@ mod tests {
         let be = ArtiTorLwdBackend::new("https://zec.rocks:443", Transport::Direct, p).unwrap();
         assert!(!be.is_onion());
         assert_eq!(be.tor_state(), TorState::Disabled);
-        assert_eq!(be.route(), Route::TorLightwalletd);
+        assert_eq!(be.source(), Source::TorLwd);
         assert!(!be.status().connected, "nothing contacted yet");
         let dir = tempfile::tempdir().unwrap();
         let be = ArtiTorLwdBackend::new(
@@ -1033,7 +988,7 @@ mod tests {
             matches!(
                 &err,
                 crate::FillError::Unlinked {
-                    route: Route::TorLightwalletd,
+                    from: Source::TorLwd,
                     height: 6,
                     ..
                 }
@@ -1145,7 +1100,10 @@ mod tests {
         let lwd = FakeLightwalletd::from_node(&node).await;
         let be = backend(&lwd);
         let enc = |t: &TransparentAddress| {
-            crate::compact::encode_transparent_address(NetworkType::Regtest, t)
+            crate::compact::encode_transparent_address(
+                zcash_protocol::consensus::NetworkType::Regtest,
+                t,
+            )
         };
 
         let mut utxos = be.address_utxos(vec![enc(&a)], h(0)).await.unwrap();

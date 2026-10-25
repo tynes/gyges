@@ -3,14 +3,14 @@
 //! Both routes go through the same loop: the range is fetched in
 //! `cache.fetch_batch`-sized chunks, each chunk is checked to link to the
 //! block the cache already holds below it, and the rows are tagged with
-//! the backend's [`Route::source`]. Nothing of a chunk that does not link is
+//! the backend's [`ChainBackend::source`]. Nothing of a chunk that does not link is
 //! written, so a lying or forked endpoint leaves no trace in the cache.
 
 use std::ops::Range;
 
 use zcash_protocol::consensus::BlockHeight;
 
-use crate::{BlockDb, CacheError, ChainBackend, ChainError, Route, display_hash};
+use crate::{BlockDb, CacheError, ChainBackend, ChainError, Source, display_hash};
 
 /// Why [`fill_cache`] stopped.
 #[derive(Debug, thiserror::Error)]
@@ -23,11 +23,12 @@ pub enum FillError {
     /// it: the two sources disagree on the chain (or the cache holds a
     /// reorged block). Nothing of the chunk was cached.
     #[error(
-        "block {height} from {route:?} (prev {got}) does not link to the cached block {} ({expected})",
+        "block {height} from {} (prev {got}) does not link to the cached block {} ({expected})",
+        .from.as_str(),
         .height - 1
     )]
     Unlinked {
-        route: Route,
+        from: Source,
         height: u32,
         expected: String,
         got: String,
@@ -35,7 +36,7 @@ pub enum FillError {
 }
 
 /// Fetch `range` from `chain` into `cache` in chunks of at most `batch`
-/// blocks, tagged with `chain.route().source()`. Each chunk's first block
+/// blocks, tagged with `chain.source()`. Each chunk's first block
 /// must link by `prev_hash` to the cached block at `start - 1` (when there
 /// is one); the backend itself guarantees the chunk links internally.
 /// Returns how many blocks were cached. A short answer from the backend
@@ -46,8 +47,7 @@ pub async fn fill_cache(
     range: Range<BlockHeight>,
     batch: u32,
 ) -> Result<u32, FillError> {
-    let route = chain.route();
-    let source = route.source();
+    let source = chain.source();
     let batch = batch.max(1);
     let mut next = range.start;
     let mut cached = 0u32;
@@ -62,7 +62,7 @@ pub async fn fill_cache(
             && first.prev_hash != prev
         {
             return Err(FillError::Unlinked {
-                route,
+                from: source,
                 height: u32::from(next),
                 expected: display_hash(&prev),
                 got: display_hash(&first.prev_hash),
@@ -71,7 +71,7 @@ pub async fn fill_cache(
         let fetched = blocks.len() as u32;
         cache.insert_from(source, &blocks)?;
         tracing::debug!(
-            ?route,
+            source = source.as_str(),
             from = u32::from(next),
             to = u32::from(next) + fetched - 1,
             "blocks cached"
@@ -88,8 +88,8 @@ mod tests {
     use zcash_client_backend::data_api::scanning::{ScanPriority, ScanRange};
 
     use super::*;
+    use crate::ZakuraRpcBackend;
     use crate::testing::{FakeNode, h, regtest_params};
-    use crate::{Source, ZakuraRpcBackend};
 
     #[tokio::test]
     async fn fills_in_chunks_tags_the_node_source_and_stops_at_the_tip() {
@@ -124,7 +124,7 @@ mod tests {
             matches!(
                 &err,
                 FillError::Unlinked {
-                    route: Route::ZakuraRpc,
+                    from: Source::Node,
                     height: 10,
                     ..
                 }

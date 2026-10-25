@@ -260,7 +260,8 @@ fn write_compact_size(out: &mut Vec<u8>, n: usize) {
     }
 }
 
-fn to_array(bytes: &[u8]) -> [u8; 32] {
+/// `bytes` as an array, all zeroes unless it is exactly 32 bytes long.
+pub(crate) fn to_array(bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     if bytes.len() == 32 {
         out.copy_from_slice(bytes);
