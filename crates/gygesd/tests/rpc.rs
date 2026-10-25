@@ -4387,6 +4387,162 @@ async fn an_airgapped_signer_only_daemon_signs_transparent_inputs() {
     online.task.abort();
 }
 
+/// The output checks of `gyges_core::tx::check_change` (note and value
+/// commitments, labels, change ownership) on a Sapling payment: `tx send`
+/// and the PCZT pipeline to a `zs` address both go through, and the
+/// recipient's Sapling balance moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn sapling_payments_pass_the_output_checks() {
+    use gyges_proto::v1::{
+        BroadcastPcztRequest, CreatePcztRequest, NewAddressRequest, Pool, ProvePcztRequest,
+    };
+    let node = FakeNode::start(regtest_params()).await;
+    // Sapling outputs need ZIP 212 enforced for a PCZT, which starts
+    // `ZIP212_GRACE_PERIOD` (32,256) blocks after Canopy; every upgrade is
+    // at height 1 on regtest.
+    node.mine(32_300);
+    let config = "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n";
+    let url = node.url().to_string();
+    let running = start_with(config, |o| o.zakura_rpc = Some(url)).await;
+    let mut c = client(&running.socket).await;
+    for id in ["main", "bob"] {
+        c.init_key(InitKeyRequest {
+            key_id: id.into(),
+            passphrase: "pw".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        wait_spendable(&mut c, id).await;
+    }
+    let receiver = {
+        let key = running.state.registry.resolve("main").unwrap();
+        let w = key.wallet().unwrap();
+        let account = w.get_account_ids().unwrap()[0];
+        *w.get_transparent_receivers(account, false, false)
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+    };
+    node.mine_with_payments(&[(receiver, 100_000_000)]);
+    node.mine(1);
+    wait_spendable(&mut c, "main").await;
+    c.unlock_key(UnlockKeyRequest {
+        key_id: "main".into(),
+        passphrase: "pw".into(),
+        scope: UnlockScope::Daemon as i32,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let events = collect_events(
+        c.shield_funds(ShieldFundsRequest {
+            key_id: "main".into(),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        event_names(&events).last(),
+        Some(&"broadcast"),
+        "{events:?}"
+    );
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+
+    let bob = c
+        .new_address(NewAddressRequest {
+            key_id: "bob".into(),
+            receivers: vec![],
+            label: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let zs = bob
+        .receivers
+        .iter()
+        .find(|r| r.pool() == Pool::Sapling)
+        .expect("a Sapling receiver")
+        .encoded
+        .clone();
+    let amount = |z: i64| {
+        Some(gyges_proto::v1::Amount {
+            value: Some(gyges_proto::v1::amount::Value::Zatoshis(z)),
+        })
+    };
+
+    // tx send: proven, signed (check_change), verified, broadcast.
+    let events = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to: zs.clone(),
+            amount: amount(20_000_000),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        event_names(&events).last(),
+        Some(&"broadcast"),
+        "{events:?}"
+    );
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+
+    // The PCZT pipeline to the same address.
+    let created = c
+        .create_pczt(CreatePcztRequest {
+            key_id: "main".into(),
+            to: zs,
+            amount: amount(10_000_000),
+            memo: Vec::new(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let proven = c
+        .prove_pczt(ProvePcztRequest {
+            pczt: created.pczts[0].clone(),
+            session_token: Vec::new(),
+            key_id: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .pczt;
+    let (signed, _) = sign_pczt_with_session(&mut c, proven, "pw").await.unwrap();
+    let txid = c
+        .broadcast_pczt(BroadcastPcztRequest {
+            pczt: signed,
+            via_tor: false,
+            key_id: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .txid;
+    wait_in_mempool(&node, &txid).await;
+    node.mine(2);
+    wait_spendable(&mut c, "bob").await;
+    let b = c
+        .get_balance(GetBalanceRequest {
+            key_id: "bob".into(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(balance_of(&b, Pool::Sapling), (30_000_000, 0), "{b:?}");
+    running.task.abort();
+}
+
 /// Replace every occurrence of `old` in `bytes` with `new` (equal lengths):
 /// a value or address an attacker changes everywhere the file carries it.
 fn replace_all(bytes: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
