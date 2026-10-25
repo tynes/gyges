@@ -909,7 +909,11 @@ async fn pipeline(
     // `usk` was moved into the signing task and dropped there.
 
     // 6. Verify against the approved proposal (Q-K7).
-    let pczt = core_tx::verify(pczt, &expected).map_err(err)?;
+    let owner_params = state.registry.params();
+    let owner = with_wallet(key, move |w| core_tx::Owner::of_wallet(&owner_params, w))
+        .await
+        .map_err(err)?;
+    let pczt = core_tx::verify(pczt, &expected, &owner).map_err(err)?;
 
     // 7. Extract, record in the wallet, and broadcast.
     let provers = state.provers.clone();

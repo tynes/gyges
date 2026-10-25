@@ -738,6 +738,7 @@ pub fn spending_key(
 /// derivation must name for this key to sign it.
 #[derive(Clone, Copy, Debug)]
 pub struct SignerId {
+    pub params: ConsensusParams,
     pub seed_fingerprint: zip32::fingerprint::SeedFingerprint,
     pub account: zip32::AccountId,
     /// SLIP-44 coin type of the network (133 mainnet, 1 testnet and regtest).
@@ -762,6 +763,7 @@ impl SignerId {
         let account = zip32::AccountId::try_from(profile.account_index)
             .map_err(|_| TxError::Internal("account index out of range".into()))?;
         Ok(Self {
+            params: *params,
             seed_fingerprint: zip32::fingerprint::SeedFingerprint::from_bytes(bytes),
             account,
             coin_type: params.network_type().coin_type(),
@@ -858,6 +860,10 @@ pub fn sign(
         pczt
     };
 
+    // The outputs are checked, and change that is not ours refused, before
+    // anything is signed.
+    let pczt = check_change(pczt, &Owner::of_usk(&signer.params, usk, wallet)?)?;
+
     let mut signer = Signer::new(pczt)
         .map_err(|e| TxError::Internal(format!("the PCZT cannot be signed: {e:?}")))?;
     let ask = orchard::keys::SpendAuthorizingKey::from(usk.orchard());
@@ -915,6 +921,259 @@ fn wallet_path(
     }
 }
 
+/// How far past index 0 a transparent change script is searched for in each
+/// scope when no wallet is at hand (`pczt sign` on a `signer-only`
+/// profile). Gyges' proposals send change to a shielded pool, so this only
+/// bounds a case that does not arise from its own pipeline.
+pub const TRANSPARENT_CHANGE_SEARCH: u32 = 1000;
+
+/// What a key owns, for the change checks at sign and broadcast time
+/// (THREAT_MODEL.md §6 item 8): the account's viewing keys and, when the
+/// profile has a wallet, its transparent receivers (change included).
+pub struct Owner {
+    params: ConsensusParams,
+    ufvk: zcash_keys::keys::UnifiedFullViewingKey,
+    wallet_transparent: Option<std::collections::HashSet<transparent::address::TransparentAddress>>,
+}
+
+impl fmt::Debug for Owner {
+    // The viewing key is not printed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Owner").finish_non_exhaustive()
+    }
+}
+
+impl Owner {
+    /// From the spending key (the signer always has it) and the wallet,
+    /// when the profile has one.
+    pub fn of_usk(
+        params: &ConsensusParams,
+        usk: &UnifiedSpendingKey,
+        wallet: Option<&Wallet>,
+    ) -> Result<Self, TxError> {
+        Ok(Self {
+            params: *params,
+            ufvk: usk.to_unified_full_viewing_key(),
+            wallet_transparent: wallet.map(wallet_transparent).transpose()?,
+        })
+    }
+
+    /// From the wallet alone (the broadcasting side, where the key is
+    /// locked).
+    pub fn of_wallet(params: &ConsensusParams, wallet: &Wallet) -> Result<Self, TxError> {
+        use zcash_client_backend::data_api::Account as _;
+        let id = account_of(wallet)?;
+        let account = wallet
+            .get_account(id)
+            .map_err(|e| internal("reading the account", e))?
+            .ok_or_else(|| TxError::Internal("the wallet has no account".into()))?;
+        let ufvk = account
+            .ufvk()
+            .cloned()
+            .ok_or_else(|| TxError::Internal("the account has no viewing key".into()))?;
+        Ok(Self {
+            params: *params,
+            ufvk,
+            wallet_transparent: Some(wallet_transparent(wallet)?),
+        })
+    }
+
+    /// An Orchard-protocol address (Orchard or Ironwood bundle) of this
+    /// account, in either scope.
+    pub fn owns_orchard(&self, raw: &[u8; 43]) -> bool {
+        let Some(fvk) = self.ufvk.orchard() else {
+            return false;
+        };
+        Option::<orchard::Address>::from(orchard::Address::from_raw_address_bytes(raw))
+            .is_some_and(|a| fvk.scope_for_address(&a).is_some())
+    }
+
+    pub fn owns_sapling(&self, raw: &[u8; 43]) -> bool {
+        let Some(dfvk) = self.ufvk.sapling() else {
+            return false;
+        };
+        sapling::PaymentAddress::from_bytes(raw)
+            .is_some_and(|a| dfvk.decrypt_diversifier(&a).is_some())
+    }
+
+    /// A transparent script paying this account: one of the wallet's
+    /// receivers, or (without a wallet) a P2PKH address at an external or
+    /// internal index below [`TRANSPARENT_CHANGE_SEARCH`].
+    pub fn owns_script(&self, script: &[u8]) -> bool {
+        let Some(addr) = gyges_chain::compact::address_of_script(script) else {
+            return false;
+        };
+        if let Some(known) = &self.wallet_transparent {
+            return known.contains(&addr);
+        }
+        let Some(tfvk) = self.ufvk.transparent() else {
+            return false;
+        };
+        [TransparentKeyScope::EXTERNAL, TransparentKeyScope::INTERNAL]
+            .into_iter()
+            .any(|scope| {
+                (0..TRANSPARENT_CHANGE_SEARCH).any(|i| {
+                    NonHardenedChildIndex::from_index(i)
+                        .and_then(|i| tfvk.derive_address_pubkey(scope, i).ok())
+                        .is_some_and(|pk| {
+                            transparent::address::TransparentAddress::from_pubkey(&pk) == addr
+                        })
+                })
+            })
+    }
+}
+
+fn wallet_transparent(
+    wallet: &Wallet,
+) -> Result<std::collections::HashSet<transparent::address::TransparentAddress>, TxError> {
+    let account = account_of(wallet)?;
+    Ok(wallet
+        .get_transparent_receivers(account, true, true)
+        .map_err(|e| internal("listing transparent receivers", e))?
+        .into_keys()
+        .collect())
+}
+
+/// Check what a PCZT says about its outputs before anything relies on it,
+/// and refuse change this key does not own (THREAT_MODEL.md §6 item 8; the
+/// upstream Signer role checks neither).
+///
+/// 1. Every Orchard, Ironwood and Sapling output's `recipient`, `value` and
+///    `rseed` must produce its note commitment, and every action's and
+///    Sapling output's value commitment must match its values. Nothing else
+///    ties those fields to what the transaction pays: proving needs no
+///    secret, so a file can commit to an attacker's note while naming the
+///    signer's own address. A missing field fails closed.
+/// 2. An output with a `user_address` (upstream sets one on every payment
+///    to an external address; `inspect` shows it as the recipient) must pay
+///    that address's receiver for its pool, so stolen change cannot be
+///    relabelled as a payment.
+/// 3. Every other non-zero output is change and must belong to `owner`.
+pub fn check_change(pczt: Pczt, owner: &Owner) -> Result<Pczt, TxError> {
+    let mut problem: Option<String> = None;
+    let mut flag = |what: String| {
+        problem.get_or_insert(what);
+    };
+    let label = |s: &str| Address::decode(&owner.params, s);
+    let scripts: Vec<Vec<u8>> = pczt
+        .transparent()
+        .outputs()
+        .iter()
+        .map(|o| o.script_pubkey().clone())
+        .collect();
+    let verifier = Verifier::new(pczt)
+        .with_transparent::<Infallible, _>(|bundle| {
+            for (i, o) in bundle.outputs().iter().enumerate() {
+                let script = scripts.get(i).map(Vec::as_slice).unwrap_or_default();
+                match o.user_address() {
+                    Some(s) => {
+                        let pays = label(s)
+                            .and_then(|a| a.to_transparent_address())
+                            .map(|t| transparent::address::Script::from(t.script()).0.0.clone());
+                        if pays.as_deref() != Some(script) {
+                            flag(format!("transparent output {i}: its recipient address label does not match the script it pays"));
+                        }
+                    }
+                    None if *o.value() > Zatoshis::ZERO && !owner.owns_script(script) => {
+                        flag(format!("transparent output {i} is change (no recipient address) that does not belong to this key"));
+                    }
+                    None => {}
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| TxError::InvalidArgument(format!("transparent bundle: {e:?}")))?;
+    let mut actions = |pool: &str, bundle: &orchard::pczt::Bundle| {
+        for (i, a) in bundle.actions().iter().enumerate() {
+            let out = a.output();
+            if let Err(e) = out.verify_note_commitment(a.spend()) {
+                flag(format!(
+                    "{pool} action {i}: the output does not match its note commitment ({e:?})"
+                ));
+                continue;
+            }
+            if let Err(e) = a.verify_cv_net() {
+                flag(format!(
+                    "{pool} action {i}: the values do not match the value commitment ({e:?})"
+                ));
+                continue;
+            }
+            let (Some(recipient), Some(value)) = (out.recipient(), out.value()) else {
+                continue; // unreachable: the note commitment needs both
+            };
+            let raw = recipient.to_raw_address_bytes();
+            match out.user_address() {
+                Some(s) => {
+                    let pays = label(s).and_then(|a| match a {
+                        Address::Unified(ua) => ua.orchard().map(|o| o.to_raw_address_bytes()),
+                        _ => None,
+                    });
+                    if pays != Some(raw) {
+                        flag(format!(
+                            "{pool} action {i}: its recipient address label does not match the note it pays"
+                        ));
+                    }
+                }
+                None if value.inner() > 0 && !owner.owns_orchard(&raw) => {
+                    flag(format!(
+                        "{pool} action {i} is change (no recipient address) that does not belong to this key"
+                    ));
+                }
+                None => {}
+            }
+        }
+    };
+    let verifier = verifier
+        .with_orchard::<Infallible, _>(|b| {
+            actions("Orchard", b);
+            Ok(())
+        })
+        .map_err(|e| TxError::InvalidArgument(format!("orchard bundle: {e:?}")))?
+        .with_ironwood::<Infallible, _>(|b| {
+            actions("Ironwood", b);
+            Ok(())
+        })
+        .map_err(|e| TxError::InvalidArgument(format!("ironwood bundle: {e:?}")))?
+        .with_sapling::<Infallible, _>(|bundle| {
+            for (i, o) in bundle.outputs().iter().enumerate() {
+                if let Err(e) = o.verify_note_commitment() {
+                    flag(format!("Sapling output {i}: it does not match its note commitment ({e:?})"));
+                    continue;
+                }
+                if let Err(e) = o.verify_cv() {
+                    flag(format!("Sapling output {i}: its value does not match the value commitment ({e:?})"));
+                    continue;
+                }
+                let (Some(recipient), Some(value)) = (o.recipient(), o.value()) else {
+                    continue; // unreachable: the note commitment needs both
+                };
+                let raw = recipient.to_bytes();
+                match o.user_address() {
+                    Some(s) => {
+                        let pays = label(s)
+                            .and_then(|a| a.to_sapling_address())
+                            .map(|a| a.to_bytes());
+                        if pays != Some(raw) {
+                            flag(format!("Sapling output {i}: its recipient address label does not match the note it pays"));
+                        }
+                    }
+                    None if value.inner() > 0 && !owner.owns_sapling(&raw) => {
+                        flag(format!("Sapling output {i} is change (no recipient address) that does not belong to this key"));
+                    }
+                    None => {}
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| TxError::InvalidArgument(format!("sapling bundle: {e:?}")))?;
+    match problem {
+        Some(what) => Err(TxError::Verifier(format!(
+            "verifier: {what}; refusing to sign or broadcast"
+        ))),
+        None => Ok(verifier.finish()),
+    }
+}
+
 /// What the Verifier checks a signed PCZT against: the approved proposal,
 /// reduced to the outputs a transaction must carry.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -927,7 +1186,7 @@ pub struct Expected {
     pub orchard_payments: Vec<([u8; 43], u64)>,
     /// Value of Orchard-protocol change, as a total (the change address is
     /// the wallet's internal one, which the PCZT carries but the proposal
-    /// does not).
+    /// does not; [`verify`] checks each change output's owner instead).
     pub orchard_change: u64,
     /// `(raw Sapling address, value)` of every Sapling payment.
     pub sapling_payments: Vec<([u8; 43], u64)>,
@@ -1079,9 +1338,13 @@ impl Expected {
 /// Step 6: the Verifier role (Q-K7). Every transparent output, every
 /// Orchard-protocol (Orchard or Ironwood bundle) and Sapling payment
 /// (recipient and value), the change totals, the fee (inputs minus
-/// outputs) and the expiry must match `expected`; otherwise the PCZT is
-/// refused and nothing is broadcast.
-pub fn verify(pczt: Pczt, expected: &Expected) -> Result<Pczt, TxError> {
+/// outputs) and the expiry must match `expected`, and every change output
+/// must belong to `owner` (THREAT_MODEL.md §6 item 8); otherwise the PCZT
+/// is refused and nothing is broadcast.
+pub fn verify(pczt: Pczt, expected: &Expected, owner: &Owner) -> Result<Pczt, TxError> {
+    // The output fields are authenticated (note and value commitments,
+    // address labels) before the matching below relies on them.
+    let pczt = check_change(pczt, owner)?;
     let mismatch = |what: &str| {
         TxError::Verifier(format!(
             "verifier: {what} differs from the approved proposal"
@@ -1094,7 +1357,7 @@ pub fn verify(pczt: Pczt, expected: &Expected) -> Result<Pczt, TxError> {
     }
 
     // Transparent: exact multiset of (script, value), with change matched
-    // by value against any remaining output.
+    // by value against a remaining output whose script is this key's.
     let mut want: Vec<(Vec<u8>, u64)> = expected.transparent_outputs.clone();
     let mut have: Vec<(Vec<u8>, u64)> = pczt
         .transparent()
@@ -1112,7 +1375,10 @@ pub fn verify(pczt: Pczt, expected: &Expected) -> Result<Pczt, TxError> {
     }
     want.retain(|(s, _)| s.is_empty());
     for (_, value) in &want {
-        match have.iter().position(|(_, v)| v == value) {
+        match have
+            .iter()
+            .position(|(s, v)| v == value && owner.owns_script(s))
+        {
             Some(i) => {
                 have.remove(i);
             }
@@ -1148,7 +1414,10 @@ pub fn verify(pczt: Pczt, expected: &Expected) -> Result<Pczt, TxError> {
             Some(i) => {
                 sapling_payments.remove(i);
             }
-            None => sapling_change += value,
+            None if out.recipient().is_some_and(|r| owner.owns_sapling(&r)) => {
+                sapling_change += value
+            }
+            None => return Err(mismatch("a Sapling change output (not this key's)")),
         }
     }
     if !sapling_payments.is_empty() || sapling_change != expected.sapling_change {
@@ -1165,6 +1434,7 @@ pub fn verify(pczt: Pczt, expected: &Expected) -> Result<Pczt, TxError> {
     // exposes; both carry Orchard-protocol actions.
     let mut orchard_payments = expected.orchard_payments.clone();
     let mut orchard_change = 0u64;
+    let mut foreign_change = false;
     let mut orchard_in = 0u64;
     let mut orchard_out = 0u64;
     let mut check_actions = |bundle: &orchard::pczt::Bundle| {
@@ -1187,7 +1457,10 @@ pub fn verify(pczt: Pczt, expected: &Expected) -> Result<Pczt, TxError> {
                 Some(i) => {
                     orchard_payments.remove(i);
                 }
-                None => orchard_change += value,
+                None if recipient.is_some_and(|r| owner.owns_orchard(&r)) => {
+                    orchard_change += value
+                }
+                None => foreign_change = true,
             }
         }
     };
@@ -1202,6 +1475,9 @@ pub fn verify(pczt: Pczt, expected: &Expected) -> Result<Pczt, TxError> {
             Ok(())
         })
         .map_err(|e| TxError::Internal(format!("verifier: ironwood bundle: {e:?}")))?;
+    if foreign_change {
+        return Err(mismatch("an Orchard change output (not this key's)"));
+    }
     if !orchard_payments.is_empty() || orchard_change != expected.orchard_change {
         return Err(mismatch("an Orchard output"));
     }
