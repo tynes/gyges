@@ -47,7 +47,7 @@ use zcash_protocol::consensus::BlockHeight;
 pub use cache::{BlockDb, CacheError, Source};
 pub use compact::{CompactError, TransparentOutput, TreeSizes};
 pub use fetch::{FillError, fill_cache};
-pub use lwd::{ArtiTorLwdBackend, LwdTimeouts, TorState, Transport};
+pub use lwd::{AddressUtxo, ArtiTorLwdBackend, LwdTimeouts, TorState, Transport};
 pub use rpc::ZakuraRpcBackend;
 
 /// What `getblockchaininfo` tells us about the node (OVERVIEW.md Q-D1).

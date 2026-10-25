@@ -38,8 +38,8 @@ use zcash_client_backend::data_api::chain::ChainState;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
 use zcash_client_backend::proto::service::{
-    BlockId, BlockRange, ChainSpec, Empty, GetSubtreeRootsArg, RawTransaction, ShieldedProtocol,
-    TxFilter,
+    BlockId, BlockRange, ChainSpec, Empty, GetAddressUtxosArg, GetSubtreeRootsArg, RawTransaction,
+    ShieldedProtocol, TxFilter,
 };
 use zcash_client_backend::tor;
 use zcash_primitives::transaction::Transaction;
@@ -50,6 +50,20 @@ use crate::{
     BoxFuture, ChainBackend, ChainError, NodeBounds, NodeStatus, Route, SubtreeRoot, TxStatus,
     display_hash, parse_display_hash,
 };
+
+/// One `GetAddressUtxos` entry: an output the endpoint says is unspent at
+/// one of the requested addresses. Untrusted until checked (SYNC.md §5.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddressUtxo {
+    /// As requested (`t1…`, `tm…`).
+    pub address: String,
+    /// Internal byte order, as upstream reads it.
+    pub txid: [u8; 32],
+    pub index: u32,
+    pub script_pubkey: Vec<u8>,
+    pub value_zat: u64,
+    pub height: BlockHeight,
+}
 
 /// How the endpoint is reached.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -645,6 +659,83 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         .await
     }
 
+    /// `GetAddressUtxos(addresses, start)`: the outputs the endpoint
+    /// reports unspent at `addresses`, mined at `start` or above. A reply
+    /// that does not parse (txid length, negative value or index) is
+    /// [`ChainError::Rpc`]: the endpoint is misbehaving.
+    pub async fn address_utxos(
+        &self,
+        addresses: Vec<String>,
+        start: BlockHeight,
+    ) -> Result<Vec<AddressUtxo>, ChainError> {
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.call(|mut client| {
+            let addresses = addresses.clone();
+            async move {
+                let reply = client
+                    .get_address_utxos(GetAddressUtxosArg {
+                        addresses,
+                        start_height: u64::from(u32::from(start)),
+                        max_entries: 0,
+                    })
+                    .await
+                    .map_err(|s| self.status_error("GetAddressUtxos", s))?
+                    .into_inner();
+                reply
+                    .address_utxos
+                    .into_iter()
+                    .map(|u| {
+                        let bad = |what: &str| {
+                            ChainError::Rpc(format!("GetAddressUtxos at {}: {what}", self.endpoint))
+                        };
+                        Ok(AddressUtxo {
+                            txid: u.txid[..]
+                                .try_into()
+                                .map_err(|_| bad("txid is not 32 bytes"))?,
+                            index: u32::try_from(u.index)
+                                .map_err(|_| bad("negative output index"))?,
+                            value_zat: u64::try_from(u.value_zat)
+                                .map_err(|_| bad("negative value"))?,
+                            height: height_of(u.height, "GetAddressUtxos")?,
+                            address: u.address,
+                            script_pubkey: u.script,
+                        })
+                    })
+                    .collect()
+            }
+        })
+        .await
+    }
+
+    /// `GetTransaction(txid)`: the raw bytes and the height the endpoint
+    /// reports (0 for its mempool, `u64::MAX` for a fork); `None` when it
+    /// does not have the transaction.
+    pub async fn raw_transaction(
+        &self,
+        txid: [u8; 32],
+    ) -> Result<Option<(Vec<u8>, u64)>, ChainError> {
+        self.call(|mut client| async move {
+            match client
+                .get_transaction(TxFilter {
+                    block: None,
+                    index: 0,
+                    hash: txid.to_vec(),
+                })
+                .await
+            {
+                Ok(r) => {
+                    let raw = r.into_inner();
+                    Ok(Some((raw.data, raw.height)))
+                }
+                Err(s) if s.code() == Code::NotFound => Ok(None),
+                Err(s) => Err(self.status_error("GetTransaction", s)),
+            }
+        })
+        .await
+    }
+
     /// `SendTransaction`: broadcast through the endpoint (`tx send
     /// --via-tor`, `broadcast_via_tor`). lightwalletd answers the node's
     /// `sendrawtransaction` result: `error_code` 0 with the txid in
@@ -1040,6 +1131,52 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn address_utxos_and_raw_transactions() {
+        let node = FakeNode::start(regtest_params()).await;
+        node.mine(3);
+        let a = TransparentAddress::PublicKeyHash([0xa1; 20]);
+        let b = TransparentAddress::PublicKeyHash([0xb2; 20]);
+        let first = node.mine_with_payments(&[(a, 5_000), (b, 7_000)]);
+        node.mine(2);
+        let second = node.mine_with_payments(&[(a, 9_000)]);
+        let lwd = FakeLightwalletd::from_node(&node).await;
+        let be = backend(&lwd);
+        let enc = |t: &TransparentAddress| {
+            crate::compact::encode_transparent_address(NetworkType::Regtest, t)
+        };
+
+        let mut utxos = be.address_utxos(vec![enc(&a)], h(0)).await.unwrap();
+        utxos.sort_by_key(|u| u.height);
+        assert_eq!(utxos.len(), 2, "{utxos:?}");
+        assert_eq!(
+            (utxos[0].height, utxos[0].value_zat),
+            (h(first.height), 5_000)
+        );
+        assert_eq!(
+            (utxos[1].height, utxos[1].value_zat),
+            (h(second.height), 9_000)
+        );
+        assert!(utxos.iter().all(|u| u.address == enc(&a)));
+        // `start` filters by height; no addresses asks nothing.
+        let later = be
+            .address_utxos(vec![enc(&a), enc(&b)], h(second.height))
+            .await
+            .unwrap();
+        assert_eq!(later.len(), 1);
+        assert!(be.address_utxos(vec![], h(0)).await.unwrap().is_empty());
+
+        // The raw transaction hashes to the reported txid.
+        let (raw, height) = be.raw_transaction(utxos[1].txid).await.unwrap().unwrap();
+        assert_eq!(height, u64::from(second.height));
+        let branch = BranchId::for_height(&regtest_params(), h(second.height));
+        let tx = Transaction::read(&raw[..], branch).unwrap();
+        assert_eq!(*tx.txid().as_ref(), utxos[1].txid);
+        let out = &tx.transparent_bundle().unwrap().vout[utxos[1].index as usize];
+        assert_eq!(out.value().into_u64(), 9_000);
+        assert!(be.raw_transaction([0x77; 32]).await.unwrap().is_none());
     }
 
     #[tokio::test]

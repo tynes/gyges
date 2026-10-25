@@ -20,8 +20,9 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::{
-    BlockId, BlockRange, ChainSpec, Empty, GetSubtreeRootsArg, LightdInfo, RawTransaction,
-    SendResponse, ShieldedProtocol, SubtreeRoot, TreeState, TxFilter,
+    BlockId, BlockRange, ChainSpec, Empty, GetAddressUtxosArg, GetAddressUtxosReply,
+    GetAddressUtxosReplyList, GetSubtreeRootsArg, LightdInfo, RawTransaction, SendResponse,
+    ShieldedProtocol, SubtreeRoot, TreeState, TxFilter,
 };
 use zcash_protocol::ShieldedPool;
 use zcash_protocol::consensus::BlockHeight;
@@ -48,9 +49,26 @@ pub struct FakeSubtreeRoot {
     pub end_hash: [u8; 32],
 }
 
+/// An unspent output as the fake reports it from `GetAddressUtxos`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeUtxo {
+    /// Encoded for regtest/testnet (`tm…`).
+    pub address: String,
+    /// Internal byte order.
+    pub txid: [u8; 32],
+    pub index: u32,
+    pub script: Vec<u8>,
+    pub value_zat: u64,
+    pub height: u32,
+}
+
 struct LwdState {
     chain_name: String,
     blocks: BTreeMap<u32, CompactBlock>,
+    /// Raw transactions by txid (internal order), with their height.
+    transactions: BTreeMap<[u8; 32], (Vec<u8>, u32)>,
+    /// Unspent transparent outputs of the snapshot, plus injected ones.
+    utxos: Vec<FakeUtxo>,
     tree_states: BTreeMap<u32, TreeState>,
     subtree_roots: BTreeMap<ShieldedPool, Vec<FakeSubtreeRoot>>,
     /// Heights left out of `GetBlockRange` streams (a lying endpoint).
@@ -96,6 +114,8 @@ impl FakeLightwalletd {
         let state = Arc::new(Mutex::new(LwdState {
             chain_name: chain_name.to_string(),
             blocks: blocks.into_iter().map(|b| (b.height as u32, b)).collect(),
+            transactions: BTreeMap::new(),
+            utxos: Vec::new(),
             tree_states: tree_states
                 .into_iter()
                 .map(|t| (t.height as u32, t))
@@ -130,19 +150,82 @@ impl FakeLightwalletd {
     /// the tree state at every height. Reports `"test"` like the node.
     pub async fn from_node(node: &FakeNode) -> Self {
         let (blocks, tree_states) = snapshot(node);
-        Self::start("test", blocks, tree_states).await
+        let lwd = Self::start("test", blocks, tree_states).await;
+        lwd.snapshot_transparent(node);
+        lwd
+    }
+
+    /// The node's raw transactions (for `GetTransaction`) and its unspent
+    /// transparent outputs (for `GetAddressUtxos`).
+    fn snapshot_transparent(&self, node: &FakeNode) {
+        let mut transactions = BTreeMap::new();
+        for h in 0..=node.tip().0 {
+            if let Some(b) = node.block(h) {
+                for (txid, raw) in b.txids.iter().zip(b.tx_raw.iter()) {
+                    transactions.insert(*txid, (raw.clone(), h));
+                }
+            }
+        }
+        let chain = node.compact_chain();
+        let mut spent = BTreeSet::new();
+        for b in &chain {
+            for tx in &b.vtx {
+                for i in &tx.vin {
+                    if let Ok(t) = <[u8; 32]>::try_from(&i.prevout_txid[..]) {
+                        spent.insert((t, i.prevout_index));
+                    }
+                }
+            }
+        }
+        let utxos = chain
+            .iter()
+            .flat_map(crate::compact::transparent_outputs)
+            .filter(|o| !spent.contains(&(o.txid, o.index)))
+            .filter_map(|o| {
+                Some(FakeUtxo {
+                    address: o.address_string(zcash_protocol::consensus::NetworkType::Regtest)?,
+                    txid: o.txid,
+                    index: o.index,
+                    script: o.script_pubkey.clone(),
+                    value_zat: o.value_zat,
+                    height: u32::from(o.height),
+                })
+            })
+            .collect();
+        let mut st = self.lock();
+        st.transactions = transactions;
+        st.utxos = utxos;
+    }
+
+    /// Report `utxo` from `GetAddressUtxos` too (a lying endpoint).
+    pub fn inject_utxo(&self, utxo: FakeUtxo) {
+        self.lock().utxos.push(utxo);
+    }
+
+    /// Serve `raw` as the transaction `txid` at `height` from
+    /// `GetTransaction` (a lying endpoint).
+    pub fn inject_transaction(&self, txid: [u8; 32], raw: Vec<u8>, height: u32) {
+        self.lock().transactions.insert(txid, (raw, height));
+    }
+
+    /// What `GetAddressUtxos` currently reports.
+    pub fn utxos(&self) -> Vec<FakeUtxo> {
+        self.lock().utxos.clone()
     }
 
     /// Take a fresh snapshot of `node`'s chain (blocks and tree states), as
     /// an archival endpoint following the same chain would serve it.
     pub fn resync(&self, node: &FakeNode) {
         let (blocks, tree_states) = snapshot(node);
-        let mut st = self.lock();
-        st.blocks = blocks.into_iter().map(|b| (b.height as u32, b)).collect();
-        st.tree_states = tree_states
-            .into_iter()
-            .map(|t| (t.height as u32, t))
-            .collect();
+        {
+            let mut st = self.lock();
+            st.blocks = blocks.into_iter().map(|b| (b.height as u32, b)).collect();
+            st.tree_states = tree_states
+                .into_iter()
+                .map(|t| (t.height as u32, t))
+                .collect();
+        }
+        self.snapshot_transparent(node);
     }
 
     /// Every served block, to tamper with through
@@ -394,13 +477,23 @@ impl CompactTxStreamer for Service {
     }
 
     /// Mined transactions only, by txid, with the height lightwalletd
-    /// reports; the raw bytes are not kept, so `data` is empty.
+    /// reports; the raw bytes where the snapshot (or a test) supplied them,
+    /// else empty.
     async fn get_transaction(
         &self,
         req: Request<TxFilter>,
     ) -> Result<Response<RawTransaction>, Status> {
         let wanted = req.into_inner().hash;
         let st = self.lock("GetTransaction");
+        if let Some((raw, h)) = <[u8; 32]>::try_from(&wanted[..])
+            .ok()
+            .and_then(|t| st.transactions.get(&t))
+        {
+            return Ok(Response::new(RawTransaction {
+                data: raw.clone(),
+                height: u64::from(*h),
+            }));
+        }
         for (h, block) in &st.blocks {
             if block.vtx.iter().any(|tx| tx.txid == wanted) {
                 return Ok(Response::new(RawTransaction {
@@ -410,6 +503,31 @@ impl CompactTxStreamer for Service {
             }
         }
         Err(Status::not_found("transaction not found"))
+    }
+
+    /// The snapshot's unspent outputs at the requested addresses, mined
+    /// at `start_height` or above, plus any injected ones.
+    async fn get_address_utxos(
+        &self,
+        req: Request<GetAddressUtxosArg>,
+    ) -> Result<Response<GetAddressUtxosReplyList>, Status> {
+        let arg = req.into_inner();
+        let st = self.lock("GetAddressUtxos");
+        let address_utxos = st
+            .utxos
+            .iter()
+            .filter(|u| arg.addresses.contains(&u.address))
+            .filter(|u| u64::from(u.height) >= arg.start_height)
+            .map(|u| GetAddressUtxosReply {
+                address: u.address.clone(),
+                txid: u.txid.to_vec(),
+                index: i32::try_from(u.index).unwrap_or(i32::MAX),
+                script: u.script.clone(),
+                value_zat: i64::try_from(u.value_zat).unwrap_or(i64::MAX),
+                height: u64::from(u.height),
+            })
+            .collect();
+        Ok(Response::new(GetAddressUtxosReplyList { address_utxos }))
     }
 
     async fn send_transaction(

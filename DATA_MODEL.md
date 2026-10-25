@@ -26,6 +26,7 @@ One home per network (Q-C2). `GYGES_HOME` (default `~/.gyges`) is the root.
             ├── profile.json     # KeyProfile metadata (§3)
             ├── wallet.sqlite    # zcash_client_sqlite WalletDb + Gyges tables (§5)
             ├── backfill.json    # Only while a Case B backfill awaits its handoff (SYNC.md §5)
+            ├── transparent_recovery.json  # After a validated backfill: what GetAddressUtxos gave and what was kept (SYNC.md §5.3)
             └── seed.age         # Only for local-seed and signer-only (§4)
 ```
 

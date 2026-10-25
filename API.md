@@ -319,6 +319,10 @@ node's `getblockhash`), `backfill_blocks` is how many blocks the scheduler
 will fetch from it (up to the handoff height, SYNC.md §5.1), and the key
 syncs through `Backfilling` (`SYNC_STATE_VALIDATING_HANDOFF` with `backend`
 `SYNC_BACKEND_TOR_LWD_FALLBACK` or `_DIRECT_LWD_FALLBACK`) before Case A.
+Such a restore carries one entry in `warnings`: transparent history below
+`retained_from` comes from the endpoint and is best-effort (SYNC.md §5.3).
+After the handoff validates, `GetInfo.keys[].transparent_best_effort_below`
+is that height for the key (0 for a key never backfilled).
 `set_default` on either changes `GetInfo.default_key` for this daemon run
 only: the daemon never rewrites `config.toml`. Passphrases and mnemonics are
 moved into zeroizing wrappers on arrival; a mnemonic error never echoes a

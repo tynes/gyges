@@ -27,6 +27,7 @@ pub mod paths;
 pub mod pczt_io;
 pub mod perms;
 pub mod profile;
+pub mod recovery;
 pub mod registry;
 pub mod sessions;
 pub mod sync;
