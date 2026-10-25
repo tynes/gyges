@@ -469,20 +469,19 @@ pub async fn abort_tex_transfer(
 /// session it answers `SIGNATURE_REQUIRED` and the rebuild finishes in the
 /// background). On any other live row it is a nudge: the queue re-checks
 /// the node now.
+///
+/// The row is read before the spending checks, so that a finished or
+/// in-flight transfer gets its answer whatever the key's sync state; only a
+/// rebuild needs a synced, spendable key.
 pub async fn resume_tex_transfer(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
     req: ResumeTexTransferRequest,
 ) -> Result<TexQueueEntry, Status> {
-    let prepared = tx::prepare(
-        &state,
-        conn,
-        &req.key_id,
-        &req.session_token,
-        0,
-        tx::Purpose::Spend,
-    )?;
-    let key = prepared.key.clone();
+    let key = state
+        .registry
+        .resolve(&req.key_id)
+        .map_err(|e| registry_error(e).into_status())?;
     let key_id = key.key_id().to_string();
     let id = parse_txid(&req.step1_txid)?;
     let row = load_row(&key, id).await?;
@@ -509,6 +508,14 @@ pub async fn resume_tex_transfer(
         return Ok(to_proto(&key_id, &row));
     }
 
+    let prepared = tx::prepare(
+        &state,
+        conn,
+        &key_id,
+        &req.session_token,
+        0,
+        tx::Purpose::Spend,
+    )?;
     let summary = v1::Proposal::decode(row.proposal.as_slice()).unwrap_or_default();
     match tx::key_from_unlock(&state, &prepared)? {
         Some(usk) => {
