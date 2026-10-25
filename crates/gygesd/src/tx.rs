@@ -273,6 +273,101 @@ pub(crate) fn broadcast_error(e: ChainError, key_id: &str) -> GygesError {
     }
 }
 
+/// Where a transaction goes: the node's `sendrawtransaction`, or the
+/// fallback endpoint's `SendTransaction` for `--via-tor` and
+/// `broadcast_via_tor` (THREAT_MODEL.md §3 row 10).
+#[derive(Clone)]
+pub(crate) enum Route {
+    Node,
+    Endpoint(Arc<dyn gyges_chain::ChainBackend>),
+}
+
+impl Route {
+    /// The `via` field of the `broadcast` audit event.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Route::Node => "node",
+            Route::Endpoint(_) => "fallback",
+        }
+    }
+
+    /// Broadcast `raw` over this route; `node` is used for [`Route::Node`].
+    pub(crate) async fn send(
+        &self,
+        node: &Arc<dyn gyges_chain::ChainBackend>,
+        raw: Vec<u8>,
+        key_id: &str,
+    ) -> Result<(), GygesError> {
+        match self {
+            Route::Node => node
+                .send_raw_transaction(raw)
+                .await
+                .map(drop)
+                .map_err(|e| broadcast_error(e, key_id)),
+            Route::Endpoint(endpoint) => {
+                endpoint
+                    .send_raw_transaction(raw)
+                    .await
+                    .map(drop)
+                    .map_err(|e| match e {
+                        ChainError::Unreachable(detail) => GygesError::new(
+                            ErrorReason::FallbackUnavailable,
+                            format!(
+                                "the fallback endpoint could not be reached for the --via-tor broadcast \
+                                 (it stays in the wallet as unmined until it expires): {detail}"
+                            ),
+                        )
+                        .with_key(key_id),
+                        other => broadcast_error(other, key_id),
+                    })
+            }
+        }
+    }
+}
+
+/// The route for a broadcast, decided before anything is proven or signed.
+/// `requested` is the request's `via_tor`; `broadcast_via_tor` in
+/// `config.toml` turns it on for every broadcast. Asking for Tor never falls
+/// back to the node: without a Tor endpoint the request is refused. A
+/// `use_tor = false` endpoint stands in on regtest only, as it does for
+/// backfill in CI (TESTING.md §2).
+pub(crate) fn broadcast_route(
+    state: &DaemonState,
+    requested: bool,
+    key_id: &str,
+) -> Result<Route, Status> {
+    if !(requested || state.config.fallback_lightwalletd.broadcast_via_tor) {
+        return Ok(Route::Node);
+    }
+    let refuse = |detail: &str| {
+        GygesError::new(ErrorReason::FallbackUnavailable, detail)
+            .with_key(key_id)
+            .into_status()
+    };
+    let Some(endpoint) = state.fallback.clone() else {
+        return Err(refuse(
+            "--via-tor broadcasts through the fallback endpoint's Tor client, and none is configured \
+             ([fallback_lightwalletd] enabled = true with a grpc_url); nothing was broadcast",
+        ));
+    };
+    match endpoint.transport() {
+        gyges_chain::Transport::Tor { .. } => {}
+        gyges_chain::Transport::Direct if state.network == gyges_core::Network::Regtest => {
+            tracing::warn!(
+                key_id,
+                "--via-tor on regtest with fallback_lightwalletd.use_tor = false: broadcasting to the endpoint directly"
+            );
+        }
+        gyges_chain::Transport::Direct => {
+            return Err(refuse(
+                "--via-tor needs fallback_lightwalletd.use_tor = true; the configured endpoint is reached \
+                 directly, which would show it this host's address; nothing was broadcast",
+            ));
+        }
+    }
+    Ok(Route::Endpoint(endpoint))
+}
+
 // ---------------------------------------------------------------------------
 // Proto conversion
 // ---------------------------------------------------------------------------
@@ -550,11 +645,17 @@ pub fn send_transaction(
         .map_err(|e| tx_error(e, &key_id).into_status())?;
     let memo = core_tx::memo_for(&to, &req.memo).map_err(|e| tx_error(e, &key_id).into_status())?;
     let amount = parse_amount(req.amount)?;
-    if req.via_tor {
-        tracing::warn!(
-            key_id,
-            "--via-tor requested; Tor broadcast arrives with ROADMAP.md M2, broadcasting directly"
-        );
+    let route = broadcast_route(&state, req.via_tor, &key_id)?;
+    if matches!(route, Route::Endpoint(_)) && matches!(to, zcash_keys::address::Address::Tex(_)) {
+        // The TexQueue broadcasts and rebroadcasts both steps through the
+        // node; a per-row route is not persisted yet.
+        return Err(GygesError::new(
+            ErrorReason::InvalidArgument,
+            "--via-tor (or broadcast_via_tor) is not supported for tex1 recipients yet: the ZIP 320 \
+             queue broadcasts both steps through the node; nothing was broadcast",
+        )
+        .with_key(&key_id)
+        .into_status());
     }
     let spend_pools = prepared.key.profile().spend_pools.clone();
     let min_confirmations = prepared.min_confirmations;
@@ -586,6 +687,7 @@ pub fn send_transaction(
         state,
         prepared,
         Box::new(propose),
+        route,
         req.dry_run,
         req.wait_for_mined,
     ))
@@ -606,6 +708,8 @@ pub fn shield_funds(
         0,
         Purpose::Spend,
     )?;
+    // No per-request flag: `broadcast_via_tor` decides.
+    let route = broadcast_route(&state, false, prepared.key.key_id())?;
     let params = state.registry.params();
     let threshold = u64::try_from(req.threshold).map_err(|_| {
         GygesError::new(
@@ -632,6 +736,7 @@ pub fn shield_funds(
         state,
         prepared,
         Box::new(propose),
+        route,
         req.dry_run,
         req.wait_for_mined,
     ))
@@ -645,13 +750,23 @@ fn run(
     state: Arc<DaemonState>,
     prepared: Prepared,
     propose: ProposeFn,
+    route: Route,
     dry_run: bool,
     wait_for_mined: bool,
 ) -> SendStream {
     let (tx, rx) = mpsc::channel::<Result<SendEvent, Status>>(16);
     tokio::spawn(async move {
         let key_id = prepared.key.key_id().to_string();
-        let outcome = pipeline(&state, &prepared, propose, dry_run, wait_for_mined, &tx).await;
+        let outcome = pipeline(
+            &state,
+            &prepared,
+            propose,
+            &route,
+            dry_run,
+            wait_for_mined,
+            &tx,
+        )
+        .await;
         if let Err(status) = outcome {
             tracing::debug!(key_id, error = %status.message(), "send stream ended with an error");
             let _ = tx.send(Err(status)).await;
@@ -698,6 +813,7 @@ async fn pipeline(
     state: &Arc<DaemonState>,
     prepared: &Prepared,
     propose: ProposeFn,
+    route: &Route,
     dry_run: bool,
     wait_for_mined: bool,
     tx: &mpsc::Sender<Result<SendEvent, Status>>,
@@ -801,13 +917,12 @@ async fn pipeline(
         .map_err(err)?;
     emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
     let txid_hex = txid.to_string();
-    prepared
-        .chain()?
-        .send_raw_transaction(raw)
+    route
+        .send(prepared.chain()?, raw, &key_id)
         .await
-        .map_err(|e| broadcast_error(e, &key_id).into_status())?;
-    tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast");
-    tracing::info!(key_id, "transaction broadcast");
+        .map_err(GygesError::into_status)?;
+    tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());
+    tracing::info!(key_id, via = route.name(), "transaction broadcast");
     state.sync.wake();
     emit(
         tx,

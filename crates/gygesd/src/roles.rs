@@ -375,12 +375,7 @@ pub async fn broadcast_pczt(
         )
         .into_status());
     }
-    if req.via_tor {
-        tracing::warn!(
-            key_id,
-            "--via-tor requested; Tor broadcast arrives with ROADMAP.md M2, broadcasting directly"
-        );
-    }
+    let route = tx::broadcast_route(&state, req.via_tor, &key_id)?;
 
     // What the file is missing is named before the Verifier judges it.
     let insp = pczt_io::inspect(&state.registry.params(), &pczt).map_err(err)?;
@@ -440,14 +435,18 @@ pub async fn broadcast_pczt(
     let txid_hex = txid.to_string();
     let raw_txid = *txid.as_ref();
     let sid = session_id.clone();
-    if let Err(e) = chain.send_raw_transaction(raw).await {
-        let text = e.to_string();
+    if let Err(e) = route.send(&chain, raw, &key_id).await {
+        let text = if e.node_error.is_empty() {
+            e.detail.clone()
+        } else {
+            e.node_error.clone()
+        };
         let _ = with_wallet(&key, move |w| {
             sessions::set_state(w, &sid, SessionState::Signed, None, Some(&text))
                 .map_err(|e| TxError::Internal(e.to_string()))
         })
         .await;
-        return Err(tx::broadcast_error(e, &key_id).into_status());
+        return Err(e.into_status());
     }
     with_wallet(&key, move |w| {
         sessions::set_state(w, &sid, SessionState::Broadcast, Some(raw_txid), None)
@@ -455,8 +454,8 @@ pub async fn broadcast_pczt(
     })
     .await
     .map_err(err)?;
-    tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast");
-    tracing::info!(key_id, "transaction broadcast");
+    tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());
+    tracing::info!(key_id, via = route.name(), "transaction broadcast");
     state.sync.wake();
     Ok(BroadcastPcztResponse { txid: txid_hex })
 }

@@ -253,6 +253,10 @@ pub enum ConfigError {
         "[fallback_lightwalletd] grpc_url must be https:// or an .onion host; http:// is allowed on regtest only"
     )]
     FallbackUrlInsecure,
+    #[error(
+        "[fallback_lightwalletd] broadcast_via_tor = true needs enabled = true and use_tor = true (use_tor = false is accepted on regtest only)"
+    )]
+    BroadcastViaTorUnavailable,
     #[error("[vault] scrypt_work_factor must be between 10 and 30 (log2 N), got {0}")]
     ScryptWorkFactor(u8),
     #[error("[daemon] log_level is not a valid tracing filter: {0}")]
@@ -299,6 +303,13 @@ impl Config {
             if !fallback_url_allowed(&fb.grpc_url, directory) {
                 return Err(ConfigError::FallbackUrlInsecure);
             }
+        }
+        // Every broadcast would otherwise be refused, so say so at start.
+        if fb.broadcast_via_tor
+            && !self.airgapped
+            && (!fb.enabled || (!fb.use_tor && directory != Network::Regtest))
+        {
+            return Err(ConfigError::BroadcastViaTorUnavailable);
         }
         let wf = self.vault.scrypt_work_factor;
         if !(10..=30).contains(&wf) {
@@ -436,6 +447,28 @@ mod tests {
         assert!(matches!(
             cfg.validate(Network::Mainnet),
             Err(ConfigError::FallbackUrlInsecure)
+        ));
+        cfg.validate(Network::Regtest).unwrap();
+    }
+
+    #[test]
+    fn broadcast_via_tor_needs_a_tor_endpoint() {
+        let mut cfg = Config::default();
+        cfg.fallback_lightwalletd.broadcast_via_tor = true;
+        assert!(matches!(
+            cfg.validate(Network::Mainnet),
+            Err(ConfigError::BroadcastViaTorUnavailable)
+        ));
+        cfg.airgapped = true;
+        cfg.validate(Network::Mainnet).unwrap();
+        cfg.airgapped = false;
+        cfg.fallback_lightwalletd.enabled = true;
+        cfg.fallback_lightwalletd.grpc_url = "https://zec.rocks:443".into();
+        cfg.validate(Network::Mainnet).unwrap();
+        cfg.fallback_lightwalletd.use_tor = false;
+        assert!(matches!(
+            cfg.validate(Network::Mainnet),
+            Err(ConfigError::BroadcastViaTorUnavailable)
         ));
         cfg.validate(Network::Regtest).unwrap();
     }

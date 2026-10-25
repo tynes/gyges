@@ -886,6 +886,8 @@ message SendTransactionRequest {
   Amount amount = 3;
   // UTF-8 text or raw bytes decoded by the CLI from hex; at most 512 bytes.
   bytes memo = 4;
+  // Broadcast through the fallback endpoint over Tor, never the node; refused
+  // with FALLBACK_UNAVAILABLE when no such endpoint is configured (API.md §4.1).
   bool via_tor = 5;
   bool dry_run = 6;
   // From a prior CONNECTION-scoped UnlockKey; optional. Without it the stream
@@ -1196,6 +1198,7 @@ message CombinePcztResponse {
 
 message BroadcastPcztRequest {
   bytes pczt = 1;
+  // As SendTransactionRequest.via_tor.
   bool via_tor = 2;
   // Assertion only (API.md §7.1).
   string key_id = 3;
