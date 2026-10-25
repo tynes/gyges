@@ -239,6 +239,18 @@ impl KeyProfile {
     }
 }
 
+/// `t` as Unix seconds (0 before the epoch, saturating far after it).
+pub fn unix_secs(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Now as Unix seconds.
+pub fn unix_now() -> i64 {
+    unix_secs(std::time::SystemTime::now())
+}
+
 /// `SystemTime::now()` as RFC 3339 with second precision.
 pub fn now_rfc3339() -> String {
     humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string()
