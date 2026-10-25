@@ -78,7 +78,11 @@ Design note: `SYNC.md` §Case B.
      - zaino keeps the node's old cookie after a node restart, until zaino is restarted.
 
      Subtree roots were empty on both sides, so root correctness is still untested.
-  2. Map zaino's two `Internal` answers in `gyges_chain::lwd`: the unknown txid to `TxStatus::Unknown` / `None`, and the relayed rejection to `ChainError::Rejected`. Pin `[zainod] version` and the `.crate` sha256 in `versions.toml`, with a cached build under `target/regtest-bin/`. Extend `gyges_regtest::Node` to run the archive node peered with the pruned one, and to restart zaino whenever the archive node restarts.
+  2. Map zaino's two `Internal` answers in `gyges_chain::lwd`: the unknown txid to `TxStatus::Unknown` / `None`, and the relayed rejection to `ChainError::Rejected`.
+     - Give `FakeLightwalletd` a switch that answers in zaino's shapes, so a test covers the mapping (today it answers like lightwalletd).
+     - Correct the `lwd.rs` comment that says zaino reports `"regtest"`.
+
+     Pin `[zainod] version` and the `.crate` sha256 in `versions.toml`, with a cached build under `target/regtest-bin/`. Extend `gyges_regtest::Node` to run the archive node peered with the pruned one, and to restart zaino whenever the archive node restarts.
   3. Port TESTING.md §3 rows 5–8 to the real pair.
 
 ## M3 — ZIP 320 (`tex1`) sends

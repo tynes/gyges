@@ -323,7 +323,7 @@ Gathered for ROADMAP.md M2's sixth item. The bullets below are research from sou
   Tip 210.
 
 **What worked:**
-- **Startup and adoption.** zaino adopted the node's activation heights ("Adopted activation heights from the validator": Overwinter through NU6.3 at 1). It indexed the 101-block chain and was serving 0.7 s after start. A restart over its existing database took 1.2 s. A new block reached `GetLatestBlock` within about 1 s (zaino polls the node once a second).
+- **Startup and adoption.** zaino adopted the node's activation heights ("Adopted activation heights from the validator": Overwinter through NU6.3 at 1). It indexed the 101-block chain and was serving 0.7 s after start. A restart over its existing database took 1.2 s. A new block reached `GetLatestBlock` within about 1 s (five runs: 0.28 s, then 1.0 s each), which fits a polling chain-head service with a ~1 s interval.
 - **`GetLightdInfo`** (1–3 ms):
   - `vendor "ZingoLabs ZainoD"`, `version "0.10.2"`, `chain_name "test"` (not `"regtest"`);
   - `consensus_branch_id "37a5165b"`, `upgrade_name "NU6.3"`, `sapling_activation_height 1`;
@@ -333,7 +333,9 @@ Gathered for ROADMAP.md M2's sixth item. The bullets below are research from sou
 - **`block_range(1..211)`**: 210 blocks in under 1 ms; heights, `hash` and `prev_hash` equal `getblockhash`. With `pool_types: []`, zaino answers like lightwalletd: no transparent-only transactions (the coinbases) and no `vin` / `vout`. After dropping those from the node route's blocks (`ZakuraRpcBackend::compact_blocks`), all 210 blocks are equal field for field, including `chain_metadata` and the two `ironwood_actions` (proto tag 9) of each shielded transaction. zaino's `compact_formats.proto` has the same tags as `zakura-client-backend`'s.
 - **`chain_state`** at heights 1, 105, 201–204 and 210: 6 ms each, and equal to `z_gettreestate` through `ZakuraRpcBackend`. That includes a non-empty Ironwood frontier: position 5 after three 2-action transactions.
 - **`raw_transaction` / `transaction_status`**: bytes equal to `getrawtransaction` for a coinbase, the shield, the Ironwood payment and the transparent payment (heights 1, 202, 203, 204). The shield showed height 0 / `InMempool` while unmined.
-- **`address_utxos`**: equal to the node's `getaddressutxos`, both with 101 coinbases and after the shield (0 at the key's address, 1 at the recipient's).
+- **`address_utxos`**: agrees with the node's `getaddressutxos`.
+  - With 101 coinbases: the same count, and the entries spot-checked are equal (txid, index, value, height).
+  - After the shield: 0 at the key's address, and the single output at the recipient's is identical.
 - **`send_transaction`**: `tx send --via-tor` on regtest with `use_tor = false` reached the node's mempool through zaino. The audit log records `via="fallback"`.
 - **`subtree_roots`** for Sapling, Orchard and Ironwood: empty on both sides. No subtree completes in a few blocks, so root correctness is still untested.
 
@@ -344,7 +346,7 @@ Gathered for ROADMAP.md M2's sixth item. The bullets below are research from sou
 2. **Rejected broadcast.** A `SendTransaction` the node refuses comes back after about 2.5 s as gRPC `Internal`, not as a `SendResponse` with `error_code`. The error text is `InternalServerError: error receiving data from backing node: critical error in backing block source: validator unreachable: <the node's text>`.
    - `send_transaction` maps it to `ChainError::Rpc`, so a refused `--via-tor` broadcast reaches the user as `INTERNAL` instead of `NODE_REJECTED`.
    - zaino stays `Ready` afterwards.
-3. **Stale cookie after a node restart.** zaino reads the node's cookie once, at start. `zakurad` rotates the cookie on restart and drops connections that present the old one (an empty reply). zaino logged `validator unavailable: … error sending request` and backed off, with status `RecoverableError`. Still failing at its eighth retry (attempt 8, about a minute in), it was restarted by hand. Meanwhile it kept serving its indexed blocks over gRPC. So the harness must restart zaino after every `Node::restart`.
+3. **Stale cookie after a node restart.** `zakurad` rotates its cookie on restart and drops a connection that presents the old one: an empty reply, not a 401. So a client that re-reads the cookie only on a 401 never recovers. zaino builds its credentials from the cookie file at start (`zaino-rpc` `auth_from_parts`). zaino logged `validator unavailable: … error sending request` and backed off, with status `RecoverableError`. Still failing at its eighth retry (attempt 8, about a minute in), it was restarted by hand. Meanwhile it kept serving its indexed blocks over gRPC. So the harness must restart zaino after every `Node::restart`.
 
 The `chain_name` `"test"` is already accepted.
 
@@ -352,7 +354,7 @@ The `chain_name` `"test"` is already accepted.
 - zaino in front of a pruned node;
 - the Tor transport;
 - `pool_types` other than `[]`;
-- Sapling outputs. A Sapling payment from `tx send` failed in Gyges itself: "PCZTs require that ZIP 212 is enforced for outputs".
+- Sapling outputs. A Sapling payment from `tx send` failed in Gyges itself: "PCZTs require that ZIP 212 is enforced for outputs". `sapling-crypto` builds PCZT Sapling outputs only once ZIP 212 is `On`, which is Canopy + `ZIP212_GRACE_PERIOD` (32,256 blocks). With Canopy at 1, that is height 32,257, so a Sapling scenario on the real regtest node must mine past it first.
 - Orchard actions (the wallet sends Ironwood).
 
 ---
