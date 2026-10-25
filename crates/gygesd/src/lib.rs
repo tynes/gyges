@@ -155,6 +155,20 @@ impl Daemon {
             .with_context(|| format!("invalid configuration in {}", config_path.display()))?;
 
         let pid = PidLock::acquire(&home.pid_path(network))?;
+        // First start: leave a commented config.toml naming every knob and
+        // the public endpoints (it parses to the defaults just loaded).
+        match Config::write_template(&config_path, network) {
+            Ok(true) => tracing::info!(
+                path = %config_path.display(),
+                "wrote a commented config.toml (every value is the default)"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                path = %config_path.display(),
+                error = %e,
+                "cannot write the config.toml template; continuing with the defaults"
+            ),
+        }
         // Only after the lock: opening the wallet databases runs their
         // migrations, which must not race a running daemon.
         let registry = KeyRegistry::open(home.clone(), network, &config)
@@ -188,10 +202,17 @@ impl Daemon {
                 );
                 Transport::Direct
             };
-            Some(Arc::new(
+            let backend =
                 ArtiTorLwdBackend::new(&fb.grpc_url, transport, network.consensus_params())
-                    .context("cannot set up the fallback endpoint backend")?,
-            ))
+                    .context("cannot set up the fallback endpoint backend")?;
+            if fb.use_tor && !backend.is_onion() {
+                tracing::info!(
+                    endpoint = %fb.grpc_url,
+                    "the fallback endpoint is reached through a Tor exit relay; an .onion address, \
+                     where the operator offers one, removes that hop (OVERVIEW.md Q-D5)"
+                );
+            }
+            Some(Arc::new(backend))
         };
         let block_cache = if config.airgapped {
             None

@@ -46,7 +46,7 @@ The refusal message names the path and the one-line `chmod` that fixes it. Tilde
 
 ## 2. `config.toml`
 
-Complete schema with defaults. Every key is optional except `fallback_lightwalletd.grpc_url` when `fallback_lightwalletd.enabled = true`.
+Complete schema with defaults. Every key is optional except `fallback_lightwalletd.grpc_url` when `fallback_lightwalletd.enabled = true`. On first start, when the file is missing, `gygesd` writes a commented template (`gyges_core::config::template`, 0600): every line is a comment, so it changes nothing, and on mainnet it lists the public endpoints below, with the advice to prefer an operator's `.onion` address.
 
 ```toml
 # ~/.gyges/mainnet/config.toml

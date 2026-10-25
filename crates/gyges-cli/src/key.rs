@@ -398,6 +398,11 @@ fn backfill_consent(
         return Ok(yes);
     }
     let blocks = node.retained_from - birthday;
+    if !ctx.quiet {
+        for line in endpoint_notes(&fallback.grpc_url, fallback.use_tor) {
+            eprintln!("note: {line}");
+        }
+    }
     ctx.prompter.confirm(
         &format!(
             "{blocks} blocks below the node's retention height must be fetched {} from {}; continue?",
@@ -412,6 +417,38 @@ fn backfill_consent(
         "--yes",
     )?;
     Ok(true)
+}
+
+/// What the user should know about the endpoint before consenting
+/// (OVERVIEW.md Q-D5): what it learns, and the `.onion` preference.
+pub(crate) fn endpoint_notes(url: &str, use_tor: bool) -> Vec<String> {
+    let mut notes = vec![
+        "the endpoint learns the block range fetched (about the key's birthday) and the key's \
+         transparent addresses, which it is asked about for transparent history"
+            .to_string(),
+    ];
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    if use_tor && !host.to_ascii_lowercase().ends_with(".onion") {
+        notes.push(format!(
+            "{host} is a clearnet host, reached through a Tor exit relay; prefer the operator's \
+             .onion address where it offers one"
+        ));
+    } else if !use_tor {
+        notes.push(
+            "fallback_lightwalletd.use_tor = false: the endpoint also sees this host's address"
+                .to_string(),
+        );
+    }
+    notes
 }
 
 /// `key unlock`: a daemon-scoped unlock with an idle timeout (API.md §6.3,
@@ -571,6 +608,21 @@ pub fn sapling_activation(network: Network) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn endpoint_notes_prefer_onion() {
+        let notes = super::endpoint_notes("https://zec.rocks:443", true);
+        assert_eq!(notes.len(), 2);
+        assert!(
+            notes[1].contains("zec.rocks is a clearnet host"),
+            "{notes:?}"
+        );
+        let notes = super::endpoint_notes("http://user@abcdef.ONION:9067/x", true);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let notes = super::endpoint_notes("http://127.0.0.1:9067", false);
+        assert!(notes[1].contains("use_tor = false"), "{notes:?}");
+        assert!(notes[0].contains("transparent addresses"));
+    }
+
     use super::*;
 
     #[test]
