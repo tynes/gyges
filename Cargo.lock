@@ -2298,6 +2298,7 @@ version = "0.1.0"
 dependencies = [
  "age",
  "bip0039",
+ "bip32",
  "gyges-chain",
  "hex",
  "humantime",

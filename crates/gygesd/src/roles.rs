@@ -15,8 +15,8 @@
 //!
 //! `InspectPczt`, `ProvePczt`, `SignPczt` and `CombinePczt` need no node
 //! and are on the air-gapped allow-list (API.md §8); `SignPczt` accepts a
-//! `signer-only` profile, whose transparent inputs wait for the second M4
-//! item.
+//! `signer-only` profile, which signs transparent inputs from the BIP 44
+//! derivations in the file (`gyges_core::tx::sign`).
 
 use std::sync::Arc;
 
@@ -261,6 +261,8 @@ pub fn sign_pczt(
     let insp = pczt_io::inspect(&state.registry.params(), &pczt)
         .map_err(|e| tx_error(e, &key_id).into_status())?;
     let summary = proto_proposal(&insp.summary);
+    let signer = core_tx::SignerId::of(prepared.key.profile(), &state.registry.params())
+        .map_err(|e| tx_error(e, &key_id).into_status())?;
     let (tx, rx) = mpsc::channel::<Result<SignPcztEvent, Status>>(4);
     tokio::spawn(async move {
         let err = |e: TxError| tx_error(e, &key_id).into_status();
@@ -272,7 +274,7 @@ pub fn sign_pczt(
             let key = prepared.key.clone();
             let bytes = blocking(move || {
                 let wallet = key.wallet();
-                let signed = core_tx::sign(wallet.as_deref(), pczt, &usk)?;
+                let signed = core_tx::sign(wallet.as_deref(), pczt, &usk, &signer)?;
                 pczt_io::serialize(signed)
             })
             .await

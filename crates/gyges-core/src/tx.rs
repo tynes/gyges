@@ -40,6 +40,7 @@ use pczt::roles::signer::Signer;
 use pczt::roles::verifier::Verifier;
 use prost::Message as _;
 use secrecy::ExposeSecret as _;
+use transparent::keys::{NonHardenedChildIndex, TransparentKeyScope};
 use zcash_client_backend::data_api::error::Error as WalletApiError;
 use zcash_client_backend::data_api::wallet::input_selection::{
     CoinbasePolicy, GreedyInputSelector, SpendPolicy, TransparentSpendPolicy,
@@ -733,53 +734,118 @@ pub fn spending_key(
         .map_err(|e| TxError::Internal(format!("key derivation failed: {e:?}")))
 }
 
+/// Who signs: the seed fingerprint and account a transparent input's BIP 44
+/// derivation must name for this key to sign it.
+#[derive(Clone, Copy, Debug)]
+pub struct SignerId {
+    pub seed_fingerprint: zip32::fingerprint::SeedFingerprint,
+    pub account: zip32::AccountId,
+    /// SLIP-44 coin type of the network (133 mainnet, 1 testnet and regtest).
+    pub coin_type: u32,
+}
+
+impl SignerId {
+    /// From a profile that derives from a seed (`local-seed`,
+    /// `signer-only`).
+    pub fn of(profile: &crate::KeyProfile, params: &ConsensusParams) -> Result<Self, TxError> {
+        use zcash_protocol::consensus::NetworkConstants as _;
+        let hex_fp = profile
+            .seed_fingerprint
+            .as_deref()
+            .ok_or_else(|| TxError::Internal("this profile has no seed fingerprint".into()))?;
+        let bytes: [u8; 32] = hex::decode(hex_fp)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| {
+                TxError::Internal("the profile's seed fingerprint is malformed".into())
+            })?;
+        let account = zip32::AccountId::try_from(profile.account_index)
+            .map_err(|_| TxError::Internal("account index out of range".into()))?;
+        Ok(Self {
+            seed_fingerprint: zip32::fingerprint::SeedFingerprint::from_bytes(bytes),
+            account,
+            coin_type: params.network_type().coin_type(),
+        })
+    }
+}
+
+/// The non-hardened tail of a BIP 44 path: scope and address index.
+type Bip44Path = (TransparentKeyScope, NonHardenedChildIndex);
+
+/// The `(scope, address_index)` each transparent input's BIP 44 derivation
+/// names for `signer`, in input order; `None` where the input carries no
+/// derivation for this seed and account. Read through the Verifier role,
+/// the only place the `pczt` crate exposes the field.
+fn transparent_derivations(
+    pczt: Pczt,
+    signer: &SignerId,
+) -> Result<(Pczt, Vec<Option<Bip44Path>>), TxError> {
+    let coin = bip32::ChildNumber(signer.coin_type | bip32::ChildNumber::HARDENED_FLAG);
+    let mut found = Vec::new();
+    let verifier = Verifier::new(pczt)
+        .with_transparent::<Infallible, _>(|bundle| {
+            for input in bundle.inputs() {
+                found.push(input.bip32_derivation().values().find_map(|d| {
+                    d.extract_bip_44_fields(&signer.seed_fingerprint, coin)
+                        .filter(|(account, _, _)| *account == signer.account)
+                        .map(|(_, scope, index)| (scope, index))
+                }));
+            }
+            Ok(())
+        })
+        .map_err(|e| TxError::InvalidArgument(format!("transparent bundle: {e:?}")))?;
+    Ok((verifier.finish(), found))
+}
+
 /// Step 5: the Signer role. Orchard and Ironwood spends are signed with the
 /// account's spend authorizing key (every action is tried; the ones that
 /// are not ours or are dummies answer `WrongSpendAuthorizingKey` and are
-/// skipped, as upstream does). Transparent inputs are matched to the
-/// wallet's receivers by `scriptPubKey` and signed with the key at that
-/// receiver's BIP 44 path; without a wallet (a `signer-only` profile) a
-/// PCZT with transparent inputs is refused until the signer reads the
-/// paths from the PCZT itself (ROADMAP.md M4, second item).
+/// skipped, as upstream does). Transparent inputs are
+/// signed with the key their BIP 44 derivation names (upstream writes it on
+/// every input of an HD account, which is how Gyges imports accounts), so
+/// no wallet is needed and a `signer-only` profile signs them too; an input
+/// without one falls back to the wallet's address index when `wallet` is
+/// given. The Signer role checks each derived key against the input's
+/// script, so a lying derivation is refused rather than signed.
 pub fn sign(
     wallet: Option<&Wallet>,
     pczt: Pczt,
     usk: &UnifiedSpendingKey,
+    signer: &SignerId,
 ) -> Result<Pczt, TxError> {
     use pczt::roles::signer::Error as SignErr;
 
     // Which key signs which transparent input, decided before the Signer
     // takes the PCZT.
     let mut transparent_keys = Vec::new();
-    if !pczt.transparent().inputs().is_empty() {
-        let wallet = wallet.ok_or_else(|| {
-            TxError::UnsupportedPool(
-                "transparent inputs cannot be signed on a signer-only profile yet (ROADMAP.md M4, second item)"
-                    .into(),
-            )
-        })?;
-        let account = account_of(wallet)?;
-        let receivers = wallet
-            .get_transparent_receivers(account, true, true)
-            .map_err(|e| internal("listing transparent receivers", e))?;
-        for (i, input) in pczt.transparent().inputs().iter().enumerate() {
-            let addr = gyges_chain::compact::address_of_script(input.script_pubkey()).ok_or_else(
-                || TxError::Internal(format!("transparent input {i} has an unrecognised script")),
-            )?;
-            let meta = receivers.get(&addr).ok_or_else(|| {
-                TxError::Internal(format!(
-                    "transparent input {i} pays an address this wallet does not own"
-                ))
-            })?;
-            #[allow(unreachable_patterns)] // other sources exist behind upstream features
-            let (scope, index) = match meta.source() {
-                TransparentAddressSource::Derived {
-                    scope,
-                    address_index,
-                } => (*scope, *address_index),
-                _ => {
-                    return Err(TxError::Internal(format!(
-                        "transparent input {i} is at an address without a derivation path"
+    let pczt = if pczt.transparent().inputs().is_empty() {
+        pczt
+    } else {
+        let scripts: Vec<_> = pczt
+            .transparent()
+            .inputs()
+            .iter()
+            .map(|i| i.script_pubkey().clone())
+            .collect();
+        let (pczt, derivations) = transparent_derivations(pczt, signer)?;
+        let mut receivers = None;
+        for (i, (script, derivation)) in scripts.iter().zip(derivations).enumerate() {
+            let (scope, index) = match (derivation, wallet) {
+                (Some(path), _) => path,
+                (None, Some(wallet)) => {
+                    if receivers.is_none() {
+                        let account = account_of(wallet)?;
+                        receivers = Some(
+                            wallet
+                                .get_transparent_receivers(account, true, true)
+                                .map_err(|e| internal("listing transparent receivers", e))?,
+                        );
+                    }
+                    wallet_path(receivers.as_ref().expect("set above"), script, i)?
+                }
+                (None, None) => {
+                    return Err(TxError::InvalidArgument(format!(
+                        "transparent input {i} carries no BIP 44 derivation for this key's seed and account; it cannot be signed here"
                     )));
                 }
             };
@@ -789,7 +855,8 @@ pub fn sign(
                 .map_err(|e| TxError::Internal(format!("transparent key derivation: {e}")))?;
             transparent_keys.push((i, sk));
         }
-    }
+        pczt
+    };
 
     let mut signer = Signer::new(pczt)
         .map_err(|e| TxError::Internal(format!("the PCZT cannot be signed: {e:?}")))?;
@@ -816,6 +883,36 @@ pub fn sign(
             .map_err(|e| TxError::Internal(format!("transparent signing failed: {e:?}")))?;
     }
     Ok(signer.finish())
+}
+
+/// The derivation of the wallet address `script` pays, for an input without
+/// a BIP 44 derivation of its own.
+fn wallet_path(
+    receivers: &std::collections::HashMap<
+        transparent::address::TransparentAddress,
+        zcash_client_backend::wallet::TransparentAddressMetadata,
+    >,
+    script: &[u8],
+    i: usize,
+) -> Result<Bip44Path, TxError> {
+    let addr = gyges_chain::compact::address_of_script(script).ok_or_else(|| {
+        TxError::Internal(format!("transparent input {i} has an unrecognised script"))
+    })?;
+    let meta = receivers.get(&addr).ok_or_else(|| {
+        TxError::Internal(format!(
+            "transparent input {i} pays an address this wallet does not own"
+        ))
+    })?;
+    #[allow(unreachable_patterns)] // other sources exist behind upstream features
+    match meta.source() {
+        TransparentAddressSource::Derived {
+            scope,
+            address_index,
+        } => Ok((*scope, *address_index)),
+        _ => Err(TxError::Internal(format!(
+            "transparent input {i} is at an address without a derivation path"
+        ))),
+    }
 }
 
 /// What the Verifier checks a signed PCZT against: the approved proposal,
