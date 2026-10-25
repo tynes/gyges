@@ -76,7 +76,7 @@ A single `BlockFetcher` task per daemon:
 
 1. Computes `lo = min(scanned_tip over all keys) + 1`, `hi = tip_height`.
 2. Fills `[max(lo, retained_from), hi]` from `ZakuraRpcSource` in batches of `cache.fetch_batch` (default 100) blocks.
-3. Fills any sub-`retained_from` range a key needs from `TorLwdSource`, one key at a time, tagging rows `source = 'tor'`.
+3. Fills any sub-`retained_from` range a key needs from the fallback endpoint (`ArtiTorLwdBackend` through `fill_cache`, one `cache.scan_batch` per key per tick), tagging rows `source = 'tor-lwd'` (§5).
 4. Evicts a block once every registered key has scanned past it, keeping `cache.retain_blocks` (default 1000) behind the slowest key for cheap rewinds, bounded by `cache.max_mb` (default 2048). With `cache.keep_historical = false` (default) Tor-fetched rows are dropped as soon as the key that requested them has scanned them.
 
 The node is asked for each block once regardless of how many key profiles exist.
@@ -105,7 +105,9 @@ pub enum StallReason {
     /// No fork point found within 100 blocks (Q-Y1).
     ChainInconsistent,
     /// Handoff validation failed (Q-Y5); endpoint marked untrusted.
-    UntrustedBackfill { endpoint: String },
+    UntrustedBackfill,
+    /// The fallback endpoint could not serve the backfill; retried each tick.
+    FallbackUnreachable,
     /// `--airgapped` or node unreachable for longer than `zakura_rpc.offline_grace`.
     Offline,
 }
@@ -135,10 +137,11 @@ pub enum StallReason {
 | From | Event | To | Side effects |
 |---|---|---|---|
 | `Initializing` | `scanned_tip + 1 >= retained_from` | `Scanning` | `update_chain_tip(tip_height)`; `suggest_scan_ranges()` |
-| `Initializing` | `scanned_tip + 1 < retained_from`, fallback configured, not air-gapped | `Backfilling` | Open Tor circuit; `put_*_subtree_roots` from `GetSubtreeRoots` |
+| `Initializing` | `scanned_tip + 1 < retained_from`, fallback configured, not air-gapped | `Backfilling` | Open Tor circuit; `put_*_subtree_roots` from the `GetSubtreeRoots` the node confirms (§5.2 check 3) |
 | `Initializing` | `scanned_tip + 1 < retained_from`, no fallback or air-gapped | `Stalled(PrunedPastScanTip)` | `daemon status` explains the fix |
 | `Backfilling` | Stream reaches `V = retained_from + k`, §5 checks pass | `Scanning` | Close Tor stream; log handoff |
-| `Backfilling` | §5 check fails | `Stalled(UntrustedBackfill)` | `truncate_to_height(birthday - 1)`; endpoint marked untrusted |
+| `Backfilling` | §5 check fails | `Stalled(UntrustedBackfill)` | truncate to the block before the backfill began (`birthday - 1` for a restore); endpoint marked untrusted |
+| `Backfilling` | endpoint unreachable, behind, or missing a block | `Stalled(FallbackUnreachable)` | Retries every poll tick; auto-resumes |
 | `Scanning` | `scanned_tip >= tip_height` | `Synced` | `spendable` = no range above `Ignored` |
 | `Scanning` | `getblock` pruned error or invariant check fails | `Backfilling` or `Stalled(PrunedPastScanTip)` | §4 |
 | `Scanning`/`Synced` | `PrevHashMismatch` or tip-hash mismatch | `Scanning` | §4.2 truncation to fork point |
@@ -148,7 +151,7 @@ pub enum StallReason {
 
 Each key's `SyncState` is held in memory and summarised in `GetSyncStatus`; `scanned_tip` itself is whatever `WalletRead::block_fully_scanned()` reports from the key's `wallet.sqlite` (or `birthday - 1` before the first batch), so the daemon never persists a second copy of it.
 
-**Status (landed with ROADMAP.md M1):** `gyges_core::sync::SyncState` has `Initializing`, `Scanning`, `Rewinding`, `Synced` and `Stalled(PrunedPastScanTip | ChainInconsistent | Offline)`; `Backfilling` and `UntrustedBackfill` arrive with M2, so a broken Case A invariant always stalls today, with the `daemon status` / `sync status` text above. A stalled key is re-evaluated every tick and leaves `Stalled` by itself once the cause is gone (node back, window widened, `sync run --from`). On the wire `Initializing` and `Synced` are both `SYNC_STATE_IDLE`, told apart by `scanned` / `spendable`; the CLI prints the words above.
+**Status (ROADMAP.md M1, M2):** `gyges_core::sync::SyncState` has `Initializing`, `Backfilling { via_tor, from, to }`, `Scanning`, `Rewinding`, `Synced` and `Stalled(PrunedPastScanTip | ChainInconsistent | UntrustedBackfill | FallbackUnreachable | Offline)`. `UntrustedBackfill` carries no endpoint: there is one per daemon, and the endpoint and failed check are in the key's `detail` and in `GetInfo.fallback.trust`. The entry condition is the Case A invariant of §4.2 (`scanned_tip < retained_from`, one block stricter than the table), checked before upstream's queue is consulted, so a restore backfills from its birthday up before the chain-tip range: the wallet's trees are then built in order, which the root check of §5.2 relies on. Without an endpoint (or air-gapped) a broken invariant stalls with `PrunedPastScanTip` and the `daemon status` / `sync status` text above. On the wire `Backfilling` is `SYNC_STATE_VALIDATING_HANDOFF` (the CLI's `backfilling`) with `backend` `SYNC_BACKEND_TOR_LWD_FALLBACK` or `SYNC_BACKEND_DIRECT_LWD_FALLBACK`; `FallbackUnreachable` is `STALL_REASON_FALLBACK_UNREACHABLE`. A stalled key is re-evaluated every tick and leaves `Stalled` by itself once the cause is gone (node back, window widened, `sync run --from`). On the wire `Initializing` and `Synced` are both `SYNC_STATE_IDLE`, told apart by `scanned` / `spendable`; the CLI prints the words above.
 
 ---
 
@@ -171,7 +174,7 @@ Subtree roots are refreshed from `z_getsubtreesbyindex` whenever `tip_height` cr
 
 It is checked before every batch and whenever `getblock` returns the pruned error. On violation:
 
-- if `fallback_lightwalletd.enabled` and the daemon is not air-gapped: switch the key to `Backfilling` for `[scanned_tip + 1, retained_from + k)`, log at `warn`, continue;
+- if `fallback_lightwalletd.enabled` and the daemon is not air-gapped: switch the key to `Backfilling` for `[scanned_tip + 1, retained_from + k]`, log at `warn`, continue (a `getblock` pruned error or `TreeStateUnavailable` in the middle of a batch only re-polls the bounds; the next tick finds the invariant broken and backfills);
 - otherwise `Stalled(PrunedPastScanTip)`; `sync wait` exits 7 and `daemon status` prints: "node pruned past key 'main' (scanned 2,100,000, node retains from 2,105,000); enable `fallback_lightwalletd` or increase the node's `tx_retention`".
 
 The daemon keeps every key at the tip while it runs, so this race only matters after downtime longer than the node's retention window.
@@ -204,9 +207,9 @@ A key with `scanned_tip + 1 < retained_from` streams `[scanned_tip + 1, V]` from
 
 Before streaming, `GetSubtreeRoots` for Sapling and Orchard populate the ShardTree via `put_*_subtree_roots`, so witnesses for notes found during backfill can be completed without every historical block.
 
-**Status:** the backend and the cache filler exist (`gyges_chain::{ArtiTorLwdBackend, fill_cache}`, ROADMAP.md M2 first item) and `gygesd` builds the backend at start when `fallback_lightwalletd.enabled`; the scheduler does not call it yet, so `Backfilling`, the handoff checks below and the prompt arrive with the next M2 items.
-
 The first backfill that a restore needs prompts once in the CLI: "N blocks below the node's retention height must be fetched over Tor from `<url>`; continue? [y/N]" (`--yes` for scripts).
+
+**Status (ROADMAP.md M2, second and third items):** `gygesd::backfill`. `V = min(retained_from + k, tip)`, recomputed every tick from the current bounds, so a node that keeps pruning moves the handoff with it. A *session* opens when a key enters `Backfilling`: check 3 runs first (below), then one `cache.scan_batch` per tick is fetched with `fill_cache` from the endpoint (tagged `tor-lwd`), checked at its last block against `getblockhash` (check 2 at every batch boundary, so a fork is refused before anything from it is scanned) and scanned from `[scanned_tip + 1, min(scanned_tip + 1 + scan_batch, V + 1))`. The prior chain state of a batch is the node's `z_gettreestate` where the node still serves it and the endpoint's `GetTreeState` below that; the root check covers the latter. When the key's scanned tip reaches `V` the session is validated, and only then does the key return to Case A. The session is recorded in `keys/<id>/backfill.json`, so that a daemon restarted between the last batch and the handoff still validates before scanning on from the node. A restore below the window takes its birthday's tree state from the endpoint's `GetTreeState(birthday - 1)`, refused unless its block hash equals the node's `getblockhash(birthday - 1)`; `RestoreKeyResponse.backfill_blocks` is `V + 1 - birthday`. With `cache.keep_historical = false` the endpoint's rows are evicted as soon as the slowest key has scanned them. The CLI prompt and `--yes` predate this (M1); the `.onion` preference is ROADMAP.md M2's fifth item.
 
 ### 5.2 Three checks at `V`
 
@@ -219,6 +222,14 @@ The first backfill that a restore needs prompts once in the CLI: "N blocks below
 Pass: close the Tor stream, enter `Scanning` at `V + 1`. The blocks `[retained_from, V]` were already scanned from the Tor stream and are not rescanned.
 
 Fail: `truncate_to_height(birthday - 1)`, mark the endpoint `untrusted` in daemon state (shown by `daemon status`, cleared only by a config change), enter `Stalled(UntrustedBackfill)`, log at `error` with which check failed and the two values.
+
+**As implemented** (`gyges_core::handoff`, `gygesd::backfill`):
+
+- Check 1 compares, per pool (Sapling, Orchard and Ironwood), the tree size the wallet recorded for block `V` (`block_metadata(V)`, which the scanner has already checked against each block's commitments) with the frontier size of `z_gettreestate(V)`, and the wallet's ShardTree root over that many leaves (`ShardTree::root` truncated at the size, not a checkpoint, since upstream checkpoints only blocks with commitments) with the frontier's root. The root commits to every leaf before `V`, including the frontier a restore's birthday took from the endpoint, which settles the **needs verification** of §9: a forged birthday tree state fails here. A block the scanner refuses during a backfill (tree sizes that do not add up, bad encoding, a block that does not link to the wallet's) fails the check too, since every block of the batch came from the endpoint.
+- Check 2 runs at every batch boundary (above) and at the handoff on the wallet's own recorded hashes at `V`, at `retained_from` and at the first backfilled block, against `getblockhash`. A chunk that does not link to the cached block below it (`FillError::Unlinked`) also fails it.
+- Check 3 runs when the session opens, before anything from the endpoint reaches the wallet: every root `GetSubtreeRoots` serves must equal `z_getsubtreesbyindex` for the same pool and index (root and completing height), and only the run the node confirms is handed to `put_*_subtree_roots`; an index the node does not report is left out with every later one of that pool. A node that cannot answer `z_getsubtreesbyindex` confirms nothing, which costs only witness completeness during the backfill, not correctness.
+- Fail truncates to the block before the session began (`birthday - 1` for a restore, the old scanned tip for the pruning race), through `truncate_to_chain_state` where the wallet has no block row there (a restore's `birthday - 1`); drops every `tor-lwd` row from the cache; and persists the mark in `<network>/fallback_trust.json` with the endpoint and the reason, so a restart with the same endpoint keeps it and configuring another clears it. `GetInfo.fallback.trust` is `UNTESTED` until a handoff passes (`VERIFIED`) or fails (`UNTRUSTED`); `GetInfo.tor` reflects the endpoint's Tor client (`DISABLED` for `use_tor = false`, unset until the first backfill bootstraps it). `RestoreKey` below the window is refused with `FALLBACK_UNAVAILABLE` while the endpoint is untrusted.
+- An endpoint that is unreachable, behind or missing a block stalls the key with `FallbackUnreachable`, retried every tick.
 
 ### 5.3 Transparent history below `retained_from`
 
@@ -270,7 +281,7 @@ On restart every key begins in `Initializing`, which re-derives its state from `
 
 | Step | Function (`zcash_client_backend::data_api` unless noted) |
 |---|---|
-| New or restored key | `WalletWrite::create_account` / `import_account_ufvk` with `AccountBirthday::from_treestate(z_gettreestate(birthday - 1))` when `birthday - 1 >= retained_from`, else `AccountBirthday` built from the lightwalletd `GetTreeState` over Tor, which is validated at `V` with the rest of the stream (**needs verification** that a birthday treestate from an untrusted source is fully covered by the §5.2 root check) |
+| New or restored key | `WalletWrite::create_account` / `import_account_ufvk` with `AccountBirthday::from_treestate(z_gettreestate(birthday - 1))` when `birthday - 1 >= retained_from`, else `AccountBirthday` built from the lightwalletd `GetTreeState` over Tor, whose block hash must equal the node's and whose frontier is validated at `V` with the rest of the stream (the §5.2 root at `V` commits to every leaf before the birthday, so a forged frontier fails it) |
 | Tip update | `chain::update_chain_tip` |
 | Subtree roots | `WalletCommitmentTrees::put_sapling_subtree_roots`, `put_orchard_subtree_roots` |
 | Range selection | `WalletRead::suggest_scan_ranges` |

@@ -129,19 +129,26 @@ impl FakeLightwalletd {
     /// the transparent fields stripped (lightwalletd's legacy answer), and
     /// the tree state at every height. Reports `"test"` like the node.
     pub async fn from_node(node: &FakeNode) -> Self {
-        let blocks: Vec<CompactBlock> = node
-            .compact_chain()
-            .into_iter()
-            .map(|mut b| {
-                for tx in &mut b.vtx {
-                    tx.vin.clear();
-                    tx.vout.clear();
-                }
-                b
-            })
-            .collect();
-        let tree_states = (0..=node.tip().0).map(|h| node.tree_state(h)).collect();
+        let (blocks, tree_states) = snapshot(node);
         Self::start("test", blocks, tree_states).await
+    }
+
+    /// Take a fresh snapshot of `node`'s chain (blocks and tree states), as
+    /// an archival endpoint following the same chain would serve it.
+    pub fn resync(&self, node: &FakeNode) {
+        let (blocks, tree_states) = snapshot(node);
+        let mut st = self.lock();
+        st.blocks = blocks.into_iter().map(|b| (b.height as u32, b)).collect();
+        st.tree_states = tree_states
+            .into_iter()
+            .map(|t| (t.height as u32, t))
+            .collect();
+    }
+
+    /// Every served block, to tamper with through
+    /// [`FakeLightwalletd::set_blocks`].
+    pub fn blocks(&self) -> Vec<CompactBlock> {
+        self.lock().blocks.values().cloned().collect()
     }
 
     fn lock(&self) -> MutexGuard<'_, LwdState> {
@@ -222,6 +229,24 @@ impl FakeLightwalletd {
     pub fn calls(&self) -> Vec<String> {
         self.lock().calls.clone()
     }
+}
+
+/// `node`'s chain as lightwalletd's legacy answer: compact blocks without
+/// transparent fields, and the tree state at every height.
+fn snapshot(node: &FakeNode) -> (Vec<CompactBlock>, Vec<TreeState>) {
+    let blocks = node
+        .compact_chain()
+        .into_iter()
+        .map(|mut b| {
+            for tx in &mut b.vtx {
+                tx.vin.clear();
+                tx.vout.clear();
+            }
+            b
+        })
+        .collect();
+    let tree_states = (0..=node.tip().0).map(|h| node.tree_state(h)).collect();
+    (blocks, tree_states)
 }
 
 struct Service(Arc<Mutex<LwdState>>);

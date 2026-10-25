@@ -1,5 +1,6 @@
-//! The `SyncScheduler` for Case A (SYNC.md §2.2, §3, §4, §6) and the sync
-//! RPCs (`GetSyncStatus`, `WaitSync`, `RunSync`; API.md §4.4).
+//! The `SyncScheduler` (SYNC.md §2.2, §3, §4, §6) and the sync RPCs
+//! (`GetSyncStatus`, `WaitSync`, `RunSync`; API.md §4.4). Case B, the
+//! backfill below the node's window, is in [`crate::backfill`].
 //!
 //! One task per daemon. Each tick: poll the node, reconcile the shared block
 //! cache with the node's chain (the cheap per-tick reorg detector), then for
@@ -35,6 +36,7 @@ use zcash_client_backend::data_api::chain::BlockCache as _;
 use zcash_client_backend::data_api::scanning::{ScanPriority, ScanRange};
 use zcash_protocol::consensus::BlockHeight;
 
+use crate::backfill;
 use crate::keys::registry_error;
 use crate::node;
 use crate::service::DaemonState;
@@ -194,13 +196,16 @@ impl Rate {
 
 /// The scheduler task's state.
 pub struct Scheduler {
-    state: Arc<DaemonState>,
-    chain: Arc<dyn ChainBackend>,
-    cache: Arc<BlockDb>,
+    pub(crate) state: Arc<DaemonState>,
+    pub(crate) chain: Arc<dyn ChainBackend>,
+    pub(crate) cache: Arc<BlockDb>,
     link: node::Link,
     rates: BTreeMap<String, Rate>,
     started: Instant,
     last_connected: Option<Instant>,
+    /// Open Case B sessions per key, loaded from disk on first use
+    /// (`crate::backfill`).
+    pub(crate) backfills: BTreeMap<String, Option<backfill::Session>>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -225,6 +230,7 @@ pub fn spawn(
         rates: BTreeMap::new(),
         started: Instant::now(),
         last_connected: None,
+        backfills: BTreeMap::new(),
     };
     tokio::spawn(scheduler.run())
 }
@@ -250,8 +256,19 @@ impl Scheduler {
         }
     }
 
-    fn hub(&self) -> &SyncHub {
+    pub(crate) fn hub(&self) -> &SyncHub {
         &self.state.sync
+    }
+
+    pub(crate) fn record_rate(&mut self, key_id: &str, blocks: u32) {
+        self.rates
+            .entry(key_id.to_string())
+            .or_default()
+            .record(blocks);
+    }
+
+    pub(crate) fn rate(&self, key_id: &str) -> f64 {
+        self.rates.get(key_id).map_or(0.0, Rate::per_sec)
     }
 
     /// One pass over the node and every key. Returns whether any key
@@ -319,15 +336,29 @@ impl Scheduler {
     /// retried next tick; the detail says what happened.
     fn report_step_error(&self, key_id: &str, bounds: &NodeBounds, e: SyncError) {
         let retained_from = bounds.retained_from;
+        // The node pruned under a batch (its bounds are from this tick's
+        // poll): with an endpoint the next tick re-polls, finds the key
+        // below the window and backfills (SYNC.md §4.2).
+        let pruned_under_us = match &e {
+            SyncError::Chain(ChainError::BlockUnavailable { height }) => {
+                (*height < retained_from || self.state.fallback.is_some()).then_some(*height)
+            }
+            SyncError::Chain(ChainError::TreeStateUnavailable { height, .. }) => Some(*height + 1),
+            _ => None,
+        };
         match &e {
-            SyncError::Chain(ChainError::BlockUnavailable { height })
-                if *height < retained_from =>
-            {
-                self.stall_pruned(key_id, u32::from(*height), bounds);
+            _ if pruned_under_us.is_some() && self.state.fallback.is_some() => {
+                tracing::warn!(key_id, error = %e, "node pruned under the scan; re-polling");
+                self.hub().update(key_id, |p| {
+                    p.detail = format!("{e}; switching to the fallback endpoint")
+                });
             }
-            SyncError::Chain(ChainError::TreeStateUnavailable { height, .. }) => {
-                self.stall_pruned(key_id, u32::from(*height) + 1, bounds);
+            _ if pruned_under_us.is_some() => {
+                let needed = pruned_under_us.map_or(0, u32::from);
+                self.stall_pruned(key_id, needed, bounds);
             }
+            SyncError::Fallback(chain) => self.stall_fallback(key_id, chain),
+            SyncError::Untrusted(m) => self.stall_untrusted(key_id, &m.to_string()),
             SyncError::Chain(ChainError::Unreachable(_)) => {
                 self.hub().update(key_id, |p| p.detail = e.to_string());
             }
@@ -338,13 +369,13 @@ impl Scheduler {
         }
     }
 
-    /// SYNC.md §4.2: the Case A invariant is broken and no fallback route
-    /// exists yet.
-    fn stall_pruned(&self, key_id: &str, needed: u32, bounds: &NodeBounds) {
+    /// SYNC.md §4.2: the Case A invariant is broken and no fallback
+    /// endpoint is configured.
+    pub(crate) fn stall_pruned(&self, key_id: &str, needed: u32, bounds: &NodeBounds) {
         let retained_from = u32::from(bounds.retained_from);
         let detail = format!(
             "node pruned past key '{key_id}' (needs block {needed}, node retains from {retained_from}); \
-             enable fallback_lightwalletd (ROADMAP.md M2) or increase the node's tx_retention"
+             enable fallback_lightwalletd or increase the node's tx_retention"
         );
         tracing::warn!(
             key_id,
@@ -418,6 +449,10 @@ impl Scheduler {
         if removed > 0 {
             tracing::debug!(removed, keep_from, "block cache evicted");
         }
+        if !cfg.keep_historical {
+            // Endpoint blocks go as soon as the slowest key has scanned them.
+            self.cache.evict_source_below(Source::TorLwd, slowest + 1)?;
+        }
         let budget = u64::from(cfg.max_mb) * 1024 * 1024;
         if self.cache.size_bytes()? > budget {
             let removed = self.cache.evict_below(slowest + 1)?;
@@ -479,6 +514,26 @@ impl Scheduler {
             return Ok((true, scanned_tip));
         }
 
+        // An open backfill session runs to its handoff before anything is
+        // scanned from the node (SYNC.md §5).
+        if self.in_backfill(key) {
+            return self.step_backfill(key, bounds, scanned_tip).await;
+        }
+        // SYNC.md §3: a key whose scanned tip is below the window backfills
+        // first, from its scanned tip up, before upstream's queue sends it
+        // to the chain tip: the wallet's trees are then built in order and
+        // the root check at the handoff sees every leaf (§5.2).
+        let retained_from = bounds.retained_from;
+        if self.state.fallback.is_some()
+            && retained_from > BlockHeight::from_u32(0)
+            && scanned_tip < retained_from
+            && scanned_tip < tip
+        {
+            return self
+                .enter_backfill(key, bounds, scanned_tip, scanned_tip + 1)
+                .await;
+        }
+
         // SYNC.md §4.2 invariant: the next batch starts at a height whose
         // body the node has, and its prior tree state is still served.
         let Some(range) = view.next_range(self.state.config.cache.scan_batch as usize) else {
@@ -493,10 +548,12 @@ impl Scheduler {
             return Ok((false, scanned_tip));
         };
         let start = range.block_range().start;
-        let retained_from = bounds.retained_from;
         if start < retained_from
             || (retained_from > BlockHeight::from_u32(0) && start.saturating_sub(1) < retained_from)
         {
+            // Without an endpoint (or for a range below a scanned tip that
+            // is inside the window, which a backfill would not reach) the
+            // key cannot go on.
             self.stall_pruned(&key_id, u32::from(start), bounds);
             return Ok((false, scanned_tip));
         }
@@ -549,7 +606,7 @@ impl Scheduler {
             } => {
                 let scanned = summary.scanned_range();
                 let n = u32::from(scanned.end).saturating_sub(u32::from(scanned.start));
-                self.rates.entry(key_id.clone()).or_default().record(n);
+                self.record_rate(&key_id, n);
                 tracing::info!(
                     key_id,
                     from = u32::from(scanned.start),
@@ -723,7 +780,7 @@ impl Scheduler {
         detail: String,
     ) {
         let tip = bounds.tip_height;
-        let rate = self.rates.get(key_id).map_or(0.0, Rate::per_sec);
+        let rate = self.rate(key_id);
         self.hub().publish(KeyProgress {
             key_id: key_id.to_string(),
             state,
@@ -749,7 +806,7 @@ fn clamp_end(range: &ScanRange, max_end: BlockHeight) -> ScanRange {
 }
 
 /// Run `f` with the key's wallet on a blocking thread.
-async fn with_wallet<T: Send + 'static>(
+pub(crate) async fn with_wallet<T: Send + 'static>(
     key: &Arc<KeyEntry>,
     f: impl FnOnce(&mut gyges_core::registry::Wallet) -> Result<T, SyncError> + Send + 'static,
 ) -> Result<T, SyncError> {
@@ -775,12 +832,20 @@ pub fn proto_state(state: &SyncState) -> (v1::SyncState, v1::StallReason) {
             (v1::SyncState::Idle, v1::StallReason::Unspecified)
         }
         SyncState::Scanning { .. } => (v1::SyncState::Scanning, v1::StallReason::Unspecified),
+        // Case B runs until its handoff checks pass: the wire's
+        // VALIDATING_HANDOFF, `backfilling` in the CLI.
+        SyncState::Backfilling { .. } => (
+            v1::SyncState::ValidatingHandoff,
+            v1::StallReason::Unspecified,
+        ),
         SyncState::Rewinding { .. } => (v1::SyncState::Rewinding, v1::StallReason::Unspecified),
         SyncState::Stalled(reason) => (
             v1::SyncState::Stalled,
             match reason {
                 StallReason::PrunedPastScanTip => v1::StallReason::PrunedPastScanTip,
                 StallReason::ChainInconsistent => v1::StallReason::ChainInconsistent,
+                StallReason::UntrustedBackfill => v1::StallReason::FallbackUntrusted,
+                StallReason::FallbackUnreachable => v1::StallReason::FallbackUnreachable,
                 StallReason::Offline => v1::StallReason::NodeUnreachable,
             },
         ),
@@ -794,7 +859,7 @@ pub fn to_proto(p: &KeyProgress) -> KeySyncStatus {
         key_id: p.key_id.clone(),
         state: state as i32,
         stall_reason: stall_reason as i32,
-        backend: v1::SyncBackend::ZakuraRpc as i32,
+        backend: backfill::proto_backend(&p.state) as i32,
         scanned_tip: p.scanned_tip,
         chain_tip: p.chain_tip,
         scanned: p.scanned,

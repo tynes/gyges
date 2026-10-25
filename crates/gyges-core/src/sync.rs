@@ -39,10 +39,18 @@ pub const FINALITY_DEPTH: u32 = 100;
 #[serde(rename_all = "kebab-case")]
 pub enum StallReason {
     /// Case A invariant broken (`scanned_tip + 1 < retained_from`) and no
-    /// fallback route is implemented.
+    /// fallback endpoint is configured (or the daemon is air-gapped).
     PrunedPastScanTip,
     /// No fork point within [`FINALITY_DEPTH`] blocks.
     ChainInconsistent,
+    /// Handoff validation failed (SYNC.md §5.2) and the endpoint is marked
+    /// untrusted; cleared only by configuring another endpoint. The
+    /// endpoint and the failed check are in `KeyProgress.detail` and
+    /// `GetInfo.fallback`.
+    UntrustedBackfill,
+    /// The fallback endpoint could not serve the backfill (unreachable,
+    /// behind, or missing a block); retried every tick.
+    FallbackUnreachable,
     /// Node unreachable for longer than `daemon.offline_grace`.
     Offline,
 }
@@ -52,17 +60,27 @@ impl StallReason {
         match self {
             StallReason::PrunedPastScanTip => "pruned-past-scan-tip",
             StallReason::ChainInconsistent => "chain-inconsistent",
+            StallReason::UntrustedBackfill => "fallback-untrusted",
+            StallReason::FallbackUnreachable => "fallback-unreachable",
             StallReason::Offline => "offline",
         }
     }
 }
 
-/// The per-key state machine (SYNC.md §3). `Backfilling` arrives with the
-/// Tor route (ROADMAP.md M2).
+/// The per-key state machine (SYNC.md §3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncState {
     /// Profile loaded, nothing decided yet.
     Initializing,
+    /// Case B: scanning `[from, to)` from blocks the fallback endpoint
+    /// served (over Tor unless `via_tor` is false), below the node's
+    /// retention window; handed back to Case A once the handoff checks of
+    /// SYNC.md §5.2 pass at `to - 1`.
+    Backfilling {
+        via_tor: bool,
+        from: BlockHeight,
+        to: BlockHeight,
+    },
     /// Scanning `[from, to)` from the shared cache.
     Scanning {
         from: BlockHeight,
@@ -80,11 +98,12 @@ pub enum SyncState {
 }
 
 impl SyncState {
-    /// The CLI's state word: `initializing`, `scanning`, `rewinding`,
-    /// `synced`, `stalled(<reason>)`.
+    /// The CLI's state word: `initializing`, `backfilling`, `scanning`,
+    /// `rewinding`, `synced`, `stalled(<reason>)`.
     pub fn name(&self) -> String {
         match self {
             SyncState::Initializing => "initializing".into(),
+            SyncState::Backfilling { .. } => "backfilling".into(),
             SyncState::Scanning { .. } => "scanning".into(),
             SyncState::Rewinding { .. } => "rewinding".into(),
             SyncState::Synced { .. } => "synced".into(),
@@ -143,6 +162,14 @@ pub enum SyncError {
     Cache(#[from] CacheError),
     #[error(transparent)]
     Chain(#[from] ChainError),
+    /// The fallback endpoint could not answer during a backfill
+    /// (`Stalled(FallbackUnreachable)`, retried).
+    #[error("fallback endpoint: {0}")]
+    Fallback(ChainError),
+    /// What the fallback endpoint served failed a handoff check
+    /// (`Stalled(UntrustedBackfill)`).
+    #[error("{0}")]
+    Untrusted(crate::handoff::Mismatch),
     /// A scan error that is not a continuity error (bad encoding, tree size
     /// overflow): the cache holds something the wallet cannot digest.
     #[error("scan: {0}")]
@@ -423,6 +450,24 @@ pub fn rewind(wallet: &mut Wallet, fork_point: BlockHeight) -> Result<BlockHeigh
         }),
         Err(e) => Err(wallet_err(e)),
     }
+}
+
+/// Truncate to `state`'s height when [`rewind`] cannot (no block row at
+/// that height, e.g. the block before a restore's birthday): upstream
+/// inserts the frontier as a checkpoint there and truncates to it. Used to
+/// drop what an untrusted endpoint served (SYNC.md §5.2).
+pub fn truncate_to_chain_state(wallet: &mut Wallet, state: &ChainState) -> Result<(), SyncError> {
+    wallet
+        .truncate_to_chain_state(state.clone())
+        .map_err(wallet_err)
+}
+
+/// The highest block the wallet has scanned, contiguous or not.
+pub fn max_scanned(wallet: &Wallet) -> Result<Option<BlockHeight>, SyncError> {
+    Ok(wallet
+        .block_max_scanned()
+        .map_err(wallet_err)?
+        .map(|m| m.block_height()))
 }
 
 /// SYNC.md §4.3 step 2 when the fork is at or below the key's first scanned
