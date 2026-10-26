@@ -10,76 +10,17 @@
 //! `GYGES_PASSPHRASE_FILE`, and the Orchard balance after mining.
 
 use std::os::unix::fs::PermissionsExt as _;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use gyges_chain::testing::{FakeNode, regtest_params};
-use gyges_regtest::Fixture;
+use gyges_regtest::{
+    Fixture, PASSPHRASE, SPEND_CONFIG, TEX_CONFIG, fund_transparent, poll_until, pool_spendable,
+    synced_key, wait_spendable, wait_tex_state,
+};
 use transparent::address::TransparentAddress;
-use zcash_client_backend::data_api::WalletRead as _;
-
-struct Node {
-    _rt: tokio::runtime::Runtime,
-    node: FakeNode,
-}
-
-fn fake_node(blocks: u32) -> Node {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(FakeNode::start(regtest_params()));
-    node.mine(blocks);
-    Node { _rt: rt, node }
-}
-
-/// The key's first external transparent receiver, read from its wallet
-/// (the daemon holds no lock on the file; the read is one SQLite query).
-fn first_transparent_receiver(fx: &Fixture, key_id: &str) -> TransparentAddress {
-    let params = gyges_core::Network::Regtest.consensus_params();
-    let path = fx.key_dir(key_id).join("wallet.sqlite");
-    let db = zcash_client_sqlite::WalletDb::for_path(
-        &path,
-        params,
-        zcash_client_sqlite::util::SystemClock,
-        rand::rand_core::UnwrapErr(rand::rngs::SysRng),
-    )
-    .unwrap()
-    .with_transparent_ledger_mode(
-        zcash_client_backend::data_api::transparent_ledger::TransparentLedgerMode::Public,
-    );
-    let account = db.get_account_ids().unwrap()[0];
-    *db.get_transparent_receivers(account, false, false)
-        .unwrap()
-        .keys()
-        .next()
-        .expect("a transparent receiver")
-}
-
-fn wait_spendable(fx: &Fixture) {
-    let run = fx
-        .gyges(&["-k", "main", "sync", "wait", "--timeout", "60s"])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-}
 
 #[test]
 fn balance_send_and_shield_through_the_binaries() {
-    let n = fake_node(10);
-    let mut fx = Fixture::new("regtest");
-    fx.write_config(
-        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n",
-    );
-    fx.start_daemon(&["--zakura-rpc", n.node.url()]).unwrap();
-    const PASSPHRASE: &str = "correct-horse-battery-staple-7731";
-    let pw = fx.passphrase_file(PASSPHRASE);
-
-    let run = fx
-        .gyges(&["key", "init", "--id", "main", "--json"])
-        .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    wait_spendable(&fx);
+    let (n, fx, pw) = synced_key(10, SPEND_CONFIG);
 
     // Fresh key: zero everywhere, in both renderings.
     let run = fx.gyges(&["-k", "main", "balance", "--json"]).run();
@@ -109,10 +50,7 @@ fn balance_send_and_shield_through_the_binaries() {
     assert!(run.stderr.contains("insufficient funds"), "{}", run.stderr);
 
     // Fund 1 ZEC transparent and confirm it.
-    let receiver = first_transparent_receiver(&fx, "main");
-    n.node.mine_with_payments(&[(receiver, 100_000_000)]);
-    n.node.mine(1);
-    wait_spendable(&fx);
+    fund_transparent(&n, &fx, 100_000_000);
     let run = fx.gyges(&["-k", "main", "balance", "--json"]).run();
     assert_eq!(run.json()["total_spendable"], "100000000", "{run:?}");
 
@@ -230,42 +168,33 @@ fn balance_send_and_shield_through_the_binaries() {
         ])
         .run();
     assert_eq!(run.code(), 0, "{run:?}");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let run = fx.gyges(&["-k", "main", "balance", "--json"]).run();
-        let b = run.json();
-        let orchard = b["pools"]
+    let (b, spendable) = poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        "orchard balance never appeared",
+        || {
+            let b = fx.gyges(&["-k", "main", "balance", "--json"]).run().json();
+            match pool_spendable(&b, "POOL_IRONWOOD") {
+                Some(s) => Ok((b, s)),
+                None => Err(b.to_string()),
+            }
+        },
+    );
+    assert!(spendable > 99_000_000 && spendable < 100_000_000, "{b}");
+    assert!(
+        b["pools"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|p| p["pool"] == "POOL_IRONWOOD")
-            .cloned()
-            .unwrap_or_default();
-        if orchard["spendable"].as_str().is_some() {
-            let spendable: u64 = orchard["spendable"].as_str().unwrap().parse().unwrap();
-            assert!(spendable > 99_000_000 && spendable < 100_000_000, "{b}");
-            assert!(
-                b["pools"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .all(|p| p["pool"] != "POOL_ORCHARD" || p.get("spendable").is_none())
-            );
-            assert!(
-                b["pools"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .all(|p| p["pool"] != "POOL_TRANSPARENT" || p.get("spendable").is_none())
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "orchard balance never appeared: {b}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+            .all(|p| p["pool"] != "POOL_ORCHARD" || p.get("spendable").is_none())
+    );
+    assert!(
+        b["pools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["pool"] != "POOL_TRANSPARENT" || p.get("spendable").is_none())
+    );
     let run = fx.gyges(&["-k", "main", "balance"]).run();
     assert!(run.stdout.contains("ironwood"), "{}", run.stdout);
 
@@ -391,39 +320,15 @@ fn balance_send_and_shield_through_the_binaries() {
     }
 }
 
-/// Poll `tx sessions --include-finished --json` until the ZIP 320 row for
-/// `step1` is in `state` (a `TEX_STATE_*` name).
-fn wait_tex_state(fx: &Fixture, step1: &str, state: &str) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut last = serde_json::Value::Null;
-    loop {
-        let run = fx
-            .gyges(&[
-                "-k",
-                "main",
-                "tx",
-                "sessions",
-                "--include-finished",
-                "--json",
-            ])
-            .run();
-        assert_eq!(run.code(), 0, "{run:?}");
-        let v = run.json();
-        if let Some(row) = v["tex_transfers"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|r| r["step1_txid"] == step1))
-        {
-            if row["state"] == state {
-                return row.clone();
-            }
-            last = row.clone();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "row never reached {state}; last {last}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+/// `wait_tex_state` against the fake node: 60s, polled every 200ms.
+fn wait_tex(fx: &Fixture, step1: &str, state: &str) -> serde_json::Value {
+    wait_tex_state(
+        fx,
+        step1,
+        state,
+        Duration::from_secs(60),
+        Duration::from_millis(200),
+    )
 }
 
 /// A ZIP 320 send through the binaries (CLI_SPEC.md §2.5 `tex1`), against a
@@ -434,26 +339,8 @@ fn wait_tex_state(fx: &Fixture, step1: &str, state: &str) -> serde_json::Value {
 /// sessions`, and the `tx abort` / `tx resume` refusals.
 #[test]
 fn zip320_send_survives_a_daemon_crash() {
-    let n = fake_node(10);
-    let mut fx = Fixture::new("regtest");
-    fx.write_config(
-        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n\
-         [policy]\nmin_confirmations = 1\n[tex]\nrebroadcast_interval = \"1s\"\n",
-    );
-    let node_url = n.node.url().to_string();
-    fx.start_daemon(&["--zakura-rpc", &node_url]).unwrap();
-    const PASSPHRASE: &str = "correct-horse-battery-staple-7731";
-    let pw = fx.passphrase_file(PASSPHRASE);
-    let run = fx
-        .gyges(&["key", "init", "--id", "main", "--json"])
-        .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    wait_spendable(&fx);
-    let receiver = first_transparent_receiver(&fx, "main");
-    n.node.mine_with_payments(&[(receiver, 200_000_000)]);
-    n.node.mine(1);
-    wait_spendable(&fx);
+    let (n, mut fx, pw) = synced_key(10, TEX_CONFIG);
+    fund_transparent(&n, &fx, 200_000_000);
     let run = fx
         .gyges(&["-k", "main", "tx", "shield", "--yes"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
@@ -532,7 +419,7 @@ fn zip320_send_survives_a_daemon_crash() {
         n.node.mempool(),
         vec![gyges_chain::parse_display_hash(&s1).unwrap()]
     );
-    let row = wait_tex_state(&fx, &s1, "TEX_STATE_STEP1_BROADCAST");
+    let row = wait_tex(&fx, &s1, "TEX_STATE_STEP1_BROADCAST");
     assert_eq!(row["step2_txid"], s2, "{row}");
     assert!(
         row["last_error"]
@@ -559,17 +446,24 @@ fn zip320_send_survives_a_daemon_crash() {
     fx.kill_daemon();
     n.node.mine(1);
     n.node.set_reject_transparent_only(None);
-    fx.start_daemon(&["--zakura-rpc", &node_url]).unwrap();
+    fx.start_daemon(&["--zakura-rpc", n.url()]).unwrap();
     // The restarted queue rebroadcasts step 2 from its stored bytes: same
     // txid, no passphrase asked.
     let want = gyges_chain::parse_display_hash(&s2).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !n.node.mempool().contains(&want) {
-        assert!(Instant::now() < deadline, "step 2 never rebroadcast");
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(200),
+        "step 2 never rebroadcast",
+        || {
+            let mempool = n.node.mempool();
+            if mempool.contains(&want) {
+                return Ok(());
+            }
+            Err(format!("mempool {mempool:?}"))
+        },
+    );
     n.node.mine(1);
-    let row = wait_tex_state(&fx, &s1, "TEX_STATE_STEP2_MINED");
+    let row = wait_tex(&fx, &s1, "TEX_STATE_STEP2_MINED");
     assert_eq!(row["step2_txid"], s2, "{row}");
     assert_eq!(row["amount"], "50000000", "{row}");
     assert_eq!(row["recipient"], tex_addr, "{row}");
@@ -579,15 +473,7 @@ fn zip320_send_survives_a_daemon_crash() {
     wait_spendable(&fx);
     let run = fx.gyges(&["-k", "main", "balance", "--json"]).run();
     let b = run.json();
-    let ironwood: u64 = b["pools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["pool"] == "POOL_IRONWOOD")
-        .and_then(|p| p["spendable"].as_str())
-        .unwrap()
-        .parse()
-        .unwrap();
+    let ironwood = pool_spendable(&b, "POOL_IRONWOOD").expect("ironwood spendable");
     assert!(
         ironwood < 150_000_000 && ironwood > 149_900_000,
         "amount and both fees left: {b}"
@@ -615,19 +501,22 @@ fn zip320_send_survives_a_daemon_crash() {
 
 /// Wait until `tx status TXID --json` reports `status`.
 fn wait_tx_status(fx: &Fixture, txid: &str, status: &str) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let run = fx
-            .gyges(&["-k", "main", "tx", "status", txid, "--json"])
-            .run();
-        assert_eq!(run.code(), 0, "{run:?}");
-        let v = run.json();
-        if v["status"] == status {
-            return v;
-        }
-        assert!(Instant::now() < deadline, "never {status}: {v}");
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(200),
+        &format!("never {status}"),
+        || {
+            let run = fx
+                .gyges(&["-k", "main", "tx", "status", txid, "--json"])
+                .run();
+            assert_eq!(run.code(), 0, "{run:?}");
+            let v = run.json();
+            if v["status"] == status {
+                return Ok(v);
+            }
+            Err(v.to_string())
+        },
+    )
 }
 
 /// `gyges address current/new/qr/inspect`, `gyges notes`, `gyges tx list`
@@ -637,20 +526,7 @@ fn wait_tx_status(fx: &Fixture, txid: &str, status: &str) -> serde_json::Value {
 /// `--pir` exits and the exit-6 inspection of a bad address.
 #[test]
 fn addresses_notes_and_history_through_the_binaries() {
-    let n = fake_node(10);
-    let mut fx = Fixture::new("regtest");
-    fx.write_config(
-        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n",
-    );
-    fx.start_daemon(&["--zakura-rpc", n.node.url()]).unwrap();
-    const PASSPHRASE: &str = "correct-horse-battery-staple-7731";
-    let pw = fx.passphrase_file(PASSPHRASE);
-    let run = fx
-        .gyges(&["key", "init", "--id", "main", "--json"])
-        .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    wait_spendable(&fx);
+    let (n, fx, pw) = synced_key(10, SPEND_CONFIG);
 
     // The address alone on stdout, details on stderr; JSON is AddressInfo.
     let run = fx.gyges(&["-k", "main", "address", "current"]).run();
@@ -740,10 +616,7 @@ fn addresses_notes_and_history_through_the_binaries() {
     assert_eq!(run.stdout, "no transactions\n");
 
     // Fund, then shield.
-    let receiver = first_transparent_receiver(&fx, "main");
-    n.node.mine_with_payments(&[(receiver, 100_000_000)]);
-    n.node.mine(1);
-    wait_spendable(&fx);
+    fund_transparent(&n, &fx, 100_000_000);
     let run = fx.gyges(&["-k", "main", "notes", "--json"]).run();
     let v = run.json();
     let notes = v["notes"].as_array().unwrap();
@@ -781,22 +654,22 @@ fn addresses_notes_and_history_through_the_binaries() {
 
     // The scan catches up with the shield: spent UTXO, Ironwood note.
     wait_spendable(&fx);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let run = fx
-            .gyges(&["-k", "main", "notes", "--spent", "--json"])
-            .run();
-        let v = run.json();
-        if v["notes"].as_array().is_some_and(|a| !a.is_empty()) {
-            assert_eq!(v["notes"][0]["spent_txid"], shield.as_str(), "{v}");
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the UTXO never showed as spent: {v}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    let v = poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        "the UTXO never showed as spent",
+        || {
+            let v = fx
+                .gyges(&["-k", "main", "notes", "--spent", "--json"])
+                .run()
+                .json();
+            if v["notes"].as_array().is_some_and(|a| !a.is_empty()) {
+                return Ok(v);
+            }
+            Err(v.to_string())
+        },
+    );
+    assert_eq!(v["notes"][0]["spent_txid"], shield.as_str(), "{v}");
     let run = fx
         .gyges(&["-k", "main", "notes", "--pool", "ironwood"])
         .run();

@@ -47,19 +47,20 @@ toml = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }  # JSON-RPC to zakurad from the sync harness
-
-[dev-dependencies]
+# The fake-node helpers in harness/fake.rs (shared by the scenarios).
 gyges-chain = { workspace = true, features = ["test-util"] }
 gyges-core = { workspace = true }
 zcash_client_backend = { workspace = true }
 zcash_client_sqlite = { workspace = true }
-zcash_protocol = { workspace = true }
-zcash_keys = { workspace = true }
 transparent = { workspace = true }
-bip0039 = { workspace = true }
-zip32 = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+zcash_protocol = { workspace = true }
+zcash_keys = { workspace = true }
+bip0039 = { workspace = true }
+zip32 = { workspace = true }
 
 [lints]
 workspace = true

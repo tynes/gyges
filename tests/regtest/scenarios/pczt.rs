@@ -5,82 +5,28 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use gyges_chain::testing::{FakeNode, regtest_params};
-use gyges_regtest::{Fixture, tamper_value};
+use gyges_regtest::{
+    FakeNodeHandle, Fixture, SPEND_CONFIG, fund_transparent, poll_until, pool_spendable,
+    synced_key, tamper_value, wait_spendable,
+};
 use transparent::address::TransparentAddress;
-use zcash_client_backend::data_api::WalletRead as _;
-
-struct Node {
-    _rt: tokio::runtime::Runtime,
-    node: FakeNode,
-}
-
-fn fake_node(blocks: u32) -> Node {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(FakeNode::start(regtest_params()));
-    node.mine(blocks);
-    Node { _rt: rt, node }
-}
-
-fn first_transparent_receiver(fx: &Fixture, key_id: &str) -> TransparentAddress {
-    let params = gyges_core::Network::Regtest.consensus_params();
-    let path = fx.key_dir(key_id).join("wallet.sqlite");
-    let db = zcash_client_sqlite::WalletDb::for_path(
-        &path,
-        params,
-        zcash_client_sqlite::util::SystemClock,
-        rand::rand_core::UnwrapErr(rand::rngs::SysRng),
-    )
-    .unwrap()
-    .with_transparent_ledger_mode(
-        zcash_client_backend::data_api::transparent_ledger::TransparentLedgerMode::Public,
-    );
-    let account = db.get_account_ids().unwrap()[0];
-    *db.get_transparent_receivers(account, false, false)
-        .unwrap()
-        .keys()
-        .next()
-        .expect("a transparent receiver")
-}
-
-fn wait_spendable(fx: &Fixture) {
-    let run = fx
-        .gyges(&["-k", "main", "sync", "wait", "--timeout", "60s"])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-}
 
 /// The Ironwood spendable balance, once it is non-zero.
 fn wait_ironwood_spendable(fx: &Fixture) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let run = fx.gyges(&["-k", "main", "balance", "--json"]).run();
-        let b = run.json();
-        let spendable = b["pools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["pool"] == "POOL_IRONWOOD")
-            .and_then(|p| p["spendable"].as_str())
-            .and_then(|s| s.parse::<u64>().ok());
-        if let Some(s) = spendable {
-            return s;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "ironwood balance never appeared: {b}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        "ironwood balance never appeared",
+        || {
+            let b = fx.gyges(&["-k", "main", "balance", "--json"]).run().json();
+            pool_spendable(&b, "POOL_IRONWOOD").ok_or_else(|| b.to_string())
+        },
+    )
 }
 
-fn mempool_has(n: &Node, txid: &str) -> bool {
+fn mempool_has(n: &FakeNodeHandle, txid: &str) -> bool {
     n.node
         .mempool()
         .contains(&gyges_chain::parse_display_hash(txid).unwrap())
@@ -88,26 +34,10 @@ fn mempool_has(n: &Node, txid: &str) -> bool {
 
 #[test]
 fn pczt_pipeline_over_files_and_pipes_through_the_binaries() {
-    let n = fake_node(10);
-    let mut fx = Fixture::new("regtest");
-    fx.write_config(
-        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n",
-    );
-    fx.start_daemon(&["--zakura-rpc", n.node.url()]).unwrap();
-    const PASSPHRASE: &str = "correct-horse-battery-staple-7731";
-    let pw = fx.passphrase_file(PASSPHRASE);
-    let run = fx
-        .gyges(&["key", "init", "--id", "main", "--json"])
-        .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    wait_spendable(&fx);
+    let (n, mut fx, pw) = synced_key(10, SPEND_CONFIG);
 
     // Fund 2 ZEC transparent and confirm it.
-    let receiver = first_transparent_receiver(&fx, "main");
-    n.node.mine_with_payments(&[(receiver, 200_000_000)]);
-    n.node.mine(1);
-    wait_spendable(&fx);
+    fund_transparent(&n, &fx, 200_000_000);
     let t_addr = gyges_chain::compact::encode_transparent_address(
         zcash_protocol::consensus::NetworkType::Regtest,
         &TransparentAddress::PublicKeyHash([0x42; 20]),
@@ -191,7 +121,7 @@ fn pczt_pipeline_over_files_and_pipes_through_the_binaries() {
     // The stored proposal survives a daemon restart (the session row is in
     // the key's wallet.sqlite).
     fx.kill_daemon();
-    fx.start_daemon(&["--zakura-rpc", n.node.url()]).unwrap();
+    fx.start_daemon(&["--zakura-rpc", n.url()]).unwrap();
 
     let run = fx
         .gyges(&["pczt", "prove", &path("a.pczt"), "-o", &path("b.pczt")])
@@ -301,14 +231,18 @@ fn pczt_pipeline_over_files_and_pipes_through_the_binaries() {
         ])
         .run();
     assert_eq!(run.code(), 0, "{run:?}");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while wait_ironwood_spendable(&fx) >= ironwood {
-        assert!(
-            Instant::now() < deadline,
-            "the change never became spendable"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        "the change never became spendable",
+        || {
+            let s = wait_ironwood_spendable(&fx);
+            if s < ironwood {
+                return Ok(());
+            }
+            Err(format!("ironwood {s}"))
+        },
+    );
 
     // --- Tampered: one output value changed on the way ------------------
     let run = fx
@@ -359,12 +293,11 @@ fn pczt_pipeline_over_files_and_pipes_through_the_binaries() {
 /// offline signer derives each input's key from the BIP 44 path in the file.
 #[test]
 fn airgapped_signer_only_daemon_signs_a_transparent_funded_file() {
-    let n = fake_node(10);
-    const CONFIG: &str = "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[policy]\nmin_confirmations = 1\n";
+    let n = FakeNodeHandle::start(10);
 
     // The offline box makes the seed.
     let mut off = Fixture::new("regtest");
-    off.write_config(CONFIG);
+    off.write_config(SPEND_CONFIG);
     off.start_daemon(&["--airgapped"]).unwrap();
     let off_pw = off.passphrase_file("offline-passphrase-1234");
     let run = off
@@ -377,8 +310,8 @@ fn airgapped_signer_only_daemon_signs_a_transparent_funded_file() {
 
     // The online daemon restores it with a wallet and is funded.
     let mut fx = Fixture::new("regtest");
-    fx.write_config(CONFIG);
-    fx.start_daemon(&["--zakura-rpc", n.node.url()]).unwrap();
+    fx.write_config(SPEND_CONFIG);
+    fx.start_daemon(&["--zakura-rpc", n.url()]).unwrap();
     let pw = fx.passphrase_file("online-passphrase-5678");
     let run = fx
         .gyges(&[
@@ -397,10 +330,7 @@ fn airgapped_signer_only_daemon_signs_a_transparent_funded_file() {
         .run();
     assert_eq!(run.code(), 0, "{run:?}");
     wait_spendable(&fx);
-    let receiver = first_transparent_receiver(&fx, "main");
-    n.node.mine_with_payments(&[(receiver, 200_000_000)]);
-    n.node.mine(1);
-    wait_spendable(&fx);
+    fund_transparent(&n, &fx, 200_000_000);
     let t_addr = gyges_chain::compact::encode_transparent_address(
         zcash_protocol::consensus::NetworkType::Regtest,
         &TransparentAddress::PublicKeyHash([0x42; 20]),
@@ -459,11 +389,17 @@ fn airgapped_signer_only_daemon_signs_a_transparent_funded_file() {
     assert_eq!(run.code(), 0, "{run:?}");
     let txid = run.stdout.trim().to_string();
     assert_eq!(txid.len(), 64, "{run:?}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !mempool_has(&n, &txid) {
-        assert!(Instant::now() < deadline, "{txid} never reached the node");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        &format!("{txid} never reached the node"),
+        || {
+            if mempool_has(&n, &txid) {
+                return Ok(());
+            }
+            Err(format!("mempool {:?}", n.node.mempool()))
+        },
+    );
     off.kill_daemon();
     fx.kill_daemon();
 }

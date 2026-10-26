@@ -6,37 +6,14 @@
 
 use std::time::{Duration, Instant};
 
-use gyges_chain::testing::{FakeNode, regtest_params};
-use gyges_regtest::Fixture;
-
-/// The fake node lives on a runtime whose worker threads keep serving while
-/// the test thread drives the binaries.
-struct Node {
-    _rt: tokio::runtime::Runtime,
-    node: FakeNode,
-}
-
-fn fake_node(blocks: u32) -> Node {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(FakeNode::start(regtest_params()));
-    node.mine(blocks);
-    Node { _rt: rt, node }
-}
-
-fn fast_config(fx: &Fixture) {
-    fx.write_config("[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n");
-}
+use gyges_regtest::{FAST_CONFIG, FakeNodeHandle, Fixture};
 
 #[test]
 fn a_new_key_syncs_to_the_tip_and_sync_wait_follows_new_blocks() {
-    let n = fake_node(25);
+    let n = FakeNodeHandle::start(25);
     let mut fx = Fixture::new("regtest");
-    fast_config(&fx);
-    fx.start_daemon(&["--zakura-rpc", n.node.url()]).unwrap();
+    fx.write_config(FAST_CONFIG);
+    fx.start_daemon(&["--zakura-rpc", n.url()]).unwrap();
 
     let run = fx.gyges(&["daemon", "status"]).run();
     assert_eq!(run.code(), 0, "{run:?}");
@@ -158,7 +135,7 @@ fn a_new_key_syncs_to_the_tip_and_sync_wait_follows_new_blocks() {
 #[test]
 fn sync_wait_times_out_with_exit_7_when_the_node_is_down() {
     let mut fx = Fixture::new("regtest");
-    fast_config(&fx);
+    fx.write_config(FAST_CONFIG);
     // A port nobody listens on.
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
@@ -193,15 +170,11 @@ fn sync_wait_times_out_with_exit_7_when_the_node_is_down() {
 /// first start also leaves a commented `config.toml`.
 #[test]
 fn restore_below_the_window_asks_consent_warns_and_backfills() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let node = rt.block_on(FakeNode::start(regtest_params()));
-    node.mine(50);
-    node.set_prune_height(Some(30));
-    let lwd = rt.block_on(gyges_chain::testing::FakeLightwalletd::from_node(&node));
+    let n = FakeNodeHandle::start(50);
+    n.node.set_prune_height(Some(30));
+    let lwd = n
+        .runtime()
+        .block_on(gyges_chain::testing::FakeLightwalletd::from_node(&n.node));
 
     // A first start without a config writes the commented template.
     let mut plain = Fixture::new("regtest");
@@ -222,7 +195,7 @@ fn restore_below_the_window_asks_consent_warns_and_backfills() {
          [fallback_lightwalletd]\nenabled = true\ngrpc_url = \"{}\"\nuse_tor = false\n",
         lwd.url()
     ));
-    fx.start_daemon(&["--zakura-rpc", node.url()]).unwrap();
+    fx.start_daemon(&["--zakura-rpc", n.url()]).unwrap();
     let pw = fx.passphrase_file("restore-passphrase-0001");
     let mnemonic = "abandon ".repeat(23) + "art";
     let restore = |extra: &[&str]| {

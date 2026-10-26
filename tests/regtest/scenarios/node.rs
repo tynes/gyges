@@ -8,19 +8,19 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use gyges_regtest::{BURN_MINER_ADDRESS, Fixture, Node, NodeOpts};
+use gyges_regtest::{
+    BURN_MINER_ADDRESS, Fixture, Node, NodeOpts, PASSPHRASE, poll_until, pool_spendable,
+    transparent_receivers,
+};
 use transparent::address::TransparentAddress;
-use zcash_client_backend::data_api::WalletRead as _;
 use zcash_protocol::consensus::NetworkType;
 
 /// 23×abandon + art: the all-zero-entropy BIP 39 vector.
 fn mnemonic() -> String {
     "abandon ".repeat(23) + "art"
 }
-
-const PASSPHRASE: &str = "correct-horse-battery-staple-7731";
 
 fn regtest() -> gyges_core::ConsensusParams {
     gyges_core::Network::Regtest.consensus_params()
@@ -61,27 +61,6 @@ fn test_key_tex_address() -> String {
     zcash_keys::address::Address::Tex(hash).encode(&regtest())
 }
 
-/// The transparent receivers the key's wallet watches (the gap-limit set).
-fn transparent_receivers(fx: &Fixture, key_id: &str) -> Vec<TransparentAddress> {
-    let path = fx.key_dir(key_id).join("wallet.sqlite");
-    let db = zcash_client_sqlite::WalletDb::for_path(
-        &path,
-        regtest(),
-        zcash_client_sqlite::util::SystemClock,
-        rand::rand_core::UnwrapErr(rand::rngs::SysRng),
-    )
-    .unwrap()
-    .with_transparent_ledger_mode(
-        zcash_client_backend::data_api::transparent_ledger::TransparentLedgerMode::Public,
-    );
-    let account = db.get_account_ids().unwrap()[0];
-    db.get_transparent_receivers(account, false, false)
-        .unwrap()
-        .keys()
-        .copied()
-        .collect()
-}
-
 fn daemon_config(fx: &Fixture) {
     fx.write_config(
         "[vault]\nscrypt_work_factor = 10\n\
@@ -91,39 +70,15 @@ fn daemon_config(fx: &Fixture) {
     );
 }
 
-/// Poll `tx sessions --include-finished --json` until the ZIP 320 row for
-/// `step1` is in `state` (a `TEX_STATE_*` name).
-fn wait_tex_state(fx: &Fixture, step1: &str, state: &str) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let mut last = serde_json::Value::Null;
-    loop {
-        let run = fx
-            .gyges(&[
-                "-k",
-                "main",
-                "tx",
-                "sessions",
-                "--include-finished",
-                "--json",
-            ])
-            .run();
-        assert_eq!(run.code(), 0, "{run:?}");
-        let v = run.json();
-        if let Some(row) = v["tex_transfers"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|r| r["step1_txid"] == step1))
-        {
-            if row["state"] == state {
-                return row.clone();
-            }
-            last = row.clone();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "row never reached {state}; last {last}"
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
+/// `wait_tex_state` against the real node: 90s, polled every 250ms.
+fn wait_tex(fx: &Fixture, step1: &str, state: &str) -> serde_json::Value {
+    gyges_regtest::wait_tex_state(
+        fx,
+        step1,
+        state,
+        Duration::from_secs(90),
+        Duration::from_millis(250),
+    )
 }
 
 /// Both txids of a `tx send --to tex…` run: step 1 is the first stdout
@@ -175,19 +130,18 @@ fn tex_txids(fx: &Fixture, run: &gyges_regtest::Run) -> (String, String) {
 
 /// Wait until the node's mempool holds every txid in `want`.
 fn wait_mempool(node: &Node, want: &[&str]) {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let mp = node.mempool();
-        if want.iter().all(|t| mp.iter().any(|m| m == t)) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "mempool never held {want:?}: {mp:?}\n{}",
-            node.log_tail()
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(250),
+        &format!("mempool never held {want:?}"),
+        || {
+            let mp = node.mempool();
+            if want.iter().all(|t| mp.iter().any(|m| m == t)) {
+                return Ok(());
+            }
+            Err(format!("{mp:?}\n{}", node.log_tail()))
+        },
+    );
 }
 
 fn node_args(node: &Node) -> [String; 4] {
@@ -214,14 +168,7 @@ fn balance(fx: &Fixture, key: &str) -> serde_json::Value {
 
 /// Spendable zatoshis of one pool in a `balance --json`, 0 when omitted.
 fn spendable(b: &serde_json::Value, pool: &str) -> u64 {
-    b["pools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["pool"] == pool)
-        .and_then(|p| p["spendable"].as_str())
-        .map(|s| s.parse().unwrap())
-        .unwrap_or(0)
+    pool_spendable(b, pool).unwrap_or(0)
 }
 
 fn sync_wait(fx: &Fixture, key: &str, extra: &[&str]) {
@@ -241,15 +188,18 @@ fn wait_balance(
     key: &str,
     ok: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let b = balance(fx, key);
-        if ok(&b) {
-            return b;
-        }
-        assert!(Instant::now() < deadline, "balance never settled: {b}");
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(250),
+        "balance never settled",
+        || {
+            let b = balance(fx, key);
+            if ok(&b) {
+                return Ok(b);
+            }
+            Err(b.to_string())
+        },
+    )
 }
 
 /// Make sure `txid` is in the chain after a reorg: rebroadcast the raw bytes
@@ -669,7 +619,7 @@ fn zip320_against_the_real_node() {
     let mined_at = node.tip_height();
     assert_eq!(node.mined_height(&s1), Some(mined_at));
     assert_eq!(node.mined_height(&s2), Some(mined_at), "same block");
-    let row = wait_tex_state(&fx, &s1, "TEX_STATE_STEP2_MINED");
+    let row = wait_tex(&fx, &s1, "TEX_STATE_STEP2_MINED");
     assert_eq!(row["step2_txid"], s2, "{row}");
     assert_eq!(row["amount"], "100000000", "{row}");
     wait_for_txid(&fx, "main", &s1);
@@ -700,7 +650,7 @@ fn zip320_against_the_real_node() {
     start_daemon(&mut fx, &node);
     wait_mempool(&node, &[&s1b, &s2b]);
     node.mine(1);
-    let row = wait_tex_state(&fx, &s1b, "TEX_STATE_STEP2_MINED");
+    let row = wait_tex(&fx, &s1b, "TEX_STATE_STEP2_MINED");
     assert_eq!(row["step2_txid"], s2b, "{row}");
     assert!(
         row["attempts"].as_u64().unwrap() >= 2,

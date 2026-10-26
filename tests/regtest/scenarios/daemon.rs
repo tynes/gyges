@@ -182,11 +182,17 @@ fn start_and_stop_through_the_cli_daemonizes() {
     assert_eq!(run.code(), 0, "{run:?}");
     assert!(!fx.socket().exists());
     // The detached daemon removes its pid file on the way out.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while fx.pid_file().exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(!fx.pid_file().exists(), "pid file removed");
+    gyges_regtest::poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        "pid file removed",
+        || {
+            if fx.pid_file().exists() {
+                return Err(fx.pid_file().display().to_string());
+            }
+            Ok(())
+        },
+    );
 }
 
 #[test]
