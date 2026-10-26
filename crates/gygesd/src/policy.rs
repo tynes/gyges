@@ -286,39 +286,25 @@ mod tests {
             .into_status()
             .code() as i32;
 
-        // Own and listed uids reach the handler (no grpc-status header: the
-        // inner service answered).
-        assert_eq!(
-            grpc_status(&call(false, Some(501), "GetBalance").await),
-            None
-        );
-        assert_eq!(
-            grpc_status(&call(false, Some(1000), "GetBalance").await),
-            None
-        );
-        // A foreign uid, or no credentials, never does.
-        assert_eq!(
-            grpc_status(&call(false, Some(502), "GetInfo").await),
-            Some(denied)
-        );
-        assert_eq!(
-            grpc_status(&call(false, Some(0), "GetInfo").await),
-            Some(denied)
-        );
-        assert_eq!(
-            grpc_status(&call(false, None, "GetInfo").await),
-            Some(denied)
-        );
-        // Air-gapped: the allow-list applies after the uid check.
-        assert_eq!(grpc_status(&call(true, Some(501), "GetInfo").await), None);
-        assert_eq!(
-            grpc_status(&call(true, Some(501), "GetBalance").await),
-            Some(airgapped)
-        );
-        assert_eq!(
-            grpc_status(&call(true, Some(502), "GetInfo").await),
-            Some(denied)
-        );
+        // (air-gapped, peer uid, method, grpc-status). `None`: the inner
+        // service answered.
+        let cases = [
+            // Own and listed uids reach the handler.
+            (false, Some(501), "GetBalance", None),
+            (false, Some(1000), "GetBalance", None),
+            // A foreign uid, or no credentials, never does.
+            (false, Some(502), "GetInfo", Some(denied)),
+            (false, Some(0), "GetInfo", Some(denied)),
+            (false, None, "GetInfo", Some(denied)),
+            // Air-gapped: the allow-list applies after the uid check.
+            (true, Some(501), "GetInfo", None),
+            (true, Some(501), "GetBalance", Some(airgapped)),
+            (true, Some(502), "GetInfo", Some(denied)),
+        ];
+        for (airgapped, uid, method, want) in cases {
+            let got = grpc_status(&call(airgapped, uid, method).await);
+            assert_eq!(got, want, "airgapped={airgapped} uid={uid:?} {method}");
+        }
     }
 
     #[test]

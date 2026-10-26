@@ -57,6 +57,19 @@ pub use logs::LogHub;
 pub use policy::{PeerPolicy, PolicyLayer};
 pub use service::{DaemonState, GygesService};
 
+/// Poison-tolerant locking: a holder that panicked leaves the data usable.
+pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn read<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn write<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// What the command line decided (CLI_SPEC.md §2.1 `gyges daemon start`).
 #[derive(Clone, Debug)]
 pub struct Options {

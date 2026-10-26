@@ -67,15 +67,6 @@ impl PidLock {
             path: path.to_path_buf(),
         })
     }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// The pid recorded in a lock file, if any; `None` when the file is absent.
-    pub fn read_pid(path: &Path) -> Option<u32> {
-        fs::read_to_string(path).ok()?.trim().parse().ok()
-    }
 }
 
 impl Drop for PidLock {
@@ -95,13 +86,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gygesd.pid");
         let lock = PidLock::acquire(&path).unwrap();
-        assert_eq!(PidLock::read_pid(&path), Some(std::process::id()));
+        let pid = fs::read_to_string(&path).unwrap();
+        assert_eq!(pid.trim(), std::process::id().to_string());
         let err = PidLock::acquire(&path).unwrap_err();
         assert!(matches!(err, PidLockError::AlreadyRunning { .. }), "{err}");
         assert!(err.to_string().contains(&std::process::id().to_string()));
         drop(lock);
         assert!(!path.exists());
-        assert_eq!(PidLock::read_pid(&path), None);
         let _again = PidLock::acquire(&path).unwrap();
     }
 }

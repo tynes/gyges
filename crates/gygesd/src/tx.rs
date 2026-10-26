@@ -44,7 +44,7 @@ use zcash_protocol::value::Zatoshis;
 use crate::conn::ConnInfo;
 use crate::keys::{AUDIT_TARGET, proto_pool, vault_error};
 use crate::service::{DaemonState, invalid, unix_now};
-use crate::tex::queue_error;
+use crate::tex::{self, DriveError, Offered, queue_error};
 
 /// The server-streaming response type for `SendTransaction` / `ShieldFunds`.
 pub type SendStream = tonic::codegen::BoxStream<SendEvent>;
@@ -105,7 +105,7 @@ impl std::fmt::Debug for SessionHub {
 
 impl SessionHub {
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Session>> {
-        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock(&self.sessions)
     }
 
     /// Create a session awaiting a passphrase for `key_id`. Returns its id
@@ -423,14 +423,10 @@ pub(crate) struct Prepared {
     /// `None` for `SignPczt`, which needs no node (and runs air-gapped).
     pub(crate) chain: Option<Arc<dyn gyges_chain::ChainBackend>>,
     auth: PreAuth,
-    min_confirmations: u32,
+    pub(crate) min_confirmations: u32,
 }
 
 impl Prepared {
-    pub(crate) fn min_confirmations(&self) -> u32 {
-        self.min_confirmations
-    }
-
     fn chain(&self) -> Result<&Arc<dyn gyges_chain::ChainBackend>, Status> {
         self.chain
             .as_ref()
@@ -447,6 +443,9 @@ pub(crate) enum Purpose {
     /// `CreatePczt`: nothing is signed here, so a watch-only profile
     /// qualifies too.
     CreatePczt,
+    /// `SignPczt`: a profile that holds a seed (`local-seed` or
+    /// `signer-only`); no node and no sync state needed.
+    SignPczt,
 }
 
 /// How the key may be obtained without a session.
@@ -467,57 +466,60 @@ pub(crate) fn prepare(
     let key = state.resolve_key(key_id)?;
     let kid = key.key_id().to_string();
     let typed = |reason, detail: &str| GygesError::new(reason, detail).with_key(&kid).into_status();
-    match key.profile().signing_mode {
-        SigningMode::LocalSeed => {}
-        SigningMode::WatchOnly if purpose == Purpose::CreatePczt => {}
-        SigningMode::SignerOnly => {
-            return Err(typed(
-                ErrorReason::InvalidArgument,
-                "a signer-only profile has no wallet to spend from; use `gyges pczt sign` on it",
-            ));
-        }
-        SigningMode::WatchOnly => {
-            return Err(typed(
-                ErrorReason::InvalidArgument,
-                "a watch-only profile cannot sign; use `gyges pczt create` and sign elsewhere",
-            ));
-        }
-        SigningMode::KeystoneQr => {
-            return Err(typed(
-                ErrorReason::HardwareSigner,
-                "Keystone signing arrives with ROADMAP.md M5",
-            ));
-        }
+    let refused = match (key.profile().signing_mode, purpose) {
+        (SigningMode::LocalSeed, _)
+        | (SigningMode::WatchOnly, Purpose::CreatePczt)
+        | (SigningMode::SignerOnly, Purpose::SignPczt) => None,
+        (SigningMode::KeystoneQr, _) => Some((
+            ErrorReason::HardwareSigner,
+            "Keystone signing arrives with ROADMAP.md M5",
+        )),
+        (SigningMode::WatchOnly, Purpose::SignPczt) => Some((
+            ErrorReason::InvalidArgument,
+            "a watch-only profile holds no seed and cannot sign",
+        )),
+        (SigningMode::WatchOnly, _) => Some((
+            ErrorReason::InvalidArgument,
+            "a watch-only profile cannot sign; use `gyges pczt create` and sign elsewhere",
+        )),
+        (SigningMode::SignerOnly, _) => Some((
+            ErrorReason::InvalidArgument,
+            "a signer-only profile has no wallet to spend from; use `gyges pczt sign` on it",
+        )),
+    };
+    if let Some((reason, detail)) = refused {
+        return Err(typed(reason, detail));
     }
-    let chain = connected_chain(state, &kid)?;
-    match state.sync.get(&kid) {
-        Some(p) if p.spendable => {}
-        Some(p) => {
-            return Err(typed(
-                ErrorReason::NotSynced,
-                &format!(
-                    "key '{kid}' is not spendable yet ({}); run `gyges sync wait`",
-                    crate::sync::to_proto(&p).detail
-                ),
-            ));
+    let chain = if purpose == Purpose::SignPczt {
+        None
+    } else {
+        let chain = connected_chain(state, &kid)?;
+        match state.sync.get(&kid) {
+            Some(p) if p.spendable => {}
+            Some(p) => {
+                return Err(typed(
+                    ErrorReason::NotSynced,
+                    &format!(
+                        "key '{kid}' is not spendable yet ({}); run `gyges sync wait`",
+                        crate::sync::to_proto(&p).detail
+                    ),
+                ));
+            }
+            None => {
+                return Err(typed(
+                    ErrorReason::NotSynced,
+                    "synchronisation has not started for this key yet; run `gyges sync wait`",
+                ));
+            }
         }
-        None => {
-            return Err(typed(
-                ErrorReason::NotSynced,
-                "synchronisation has not started for this key yet; run `gyges sync wait`",
-            ));
-        }
-    }
+        Some(chain)
+    };
     let auth = parse_auth(conn, session_token, &kid)?;
     Ok(Prepared {
         key,
-        chain: Some(chain),
+        chain,
         auth,
-        min_confirmations: if min_confirmations == 0 {
-            state.config.policy.min_confirmations
-        } else {
-            min_confirmations
-        },
+        min_confirmations: state.min_confirmations(min_confirmations),
     })
 }
 
@@ -535,41 +537,6 @@ fn parse_auth(conn: Option<ConnInfo>, session_token: &[u8], kid: &str) -> Result
     })?;
     let conn = conn.ok_or_else(|| Status::internal("no connection info on this request"))?;
     Ok(PreAuth::Token { conn, token })
-}
-
-/// `SignPczt`'s checks: a profile that holds a seed (`local-seed` or
-/// `signer-only`), no node and no sync state needed.
-pub(crate) fn prepare_signer(
-    state: &DaemonState,
-    conn: Option<ConnInfo>,
-    key_id: &str,
-    session_token: &[u8],
-) -> Result<Prepared, Status> {
-    let key = state.resolve_key(key_id)?;
-    let kid = key.key_id().to_string();
-    let typed = |reason, detail: &str| GygesError::new(reason, detail).with_key(&kid).into_status();
-    match key.profile().signing_mode {
-        SigningMode::LocalSeed | SigningMode::SignerOnly => {}
-        SigningMode::WatchOnly => {
-            return Err(typed(
-                ErrorReason::InvalidArgument,
-                "a watch-only profile holds no seed and cannot sign",
-            ));
-        }
-        SigningMode::KeystoneQr => {
-            return Err(typed(
-                ErrorReason::HardwareSigner,
-                "Keystone signing arrives with ROADMAP.md M5",
-            ));
-        }
-    }
-    let auth = parse_auth(conn, session_token, &kid)?;
-    Ok(Prepared {
-        key,
-        chain: None,
-        auth,
-        min_confirmations: 0,
-    })
 }
 
 pub(crate) fn parse_amount(amount: Option<v1::Amount>) -> Result<AmountSpec, Status> {
@@ -778,9 +745,46 @@ async fn emit(
     tx: &mpsc::Sender<Result<SendEvent, Status>>,
     event: send_event::Event,
 ) -> Result<(), Status> {
-    tx.send(Ok(SendEvent { event: Some(event) }))
-        .await
-        .map_err(|_| Status::cancelled("client disconnected"))
+    send(tx, SendEvent { event: Some(event) }).await
+}
+
+async fn emit_broadcast(
+    tx: &mpsc::Sender<Result<SendEvent, Status>>,
+    step: u32,
+    txid: String,
+) -> Result<(), Status> {
+    emit(
+        tx,
+        send_event::Event::Broadcast(v1::StepBroadcast { step, txid }),
+    )
+    .await
+}
+
+async fn emit_mined(
+    tx: &mpsc::Sender<Result<SendEvent, Status>>,
+    step: u32,
+    txid: String,
+    height: u32,
+) -> Result<(), Status> {
+    let mined = v1::StepMined { step, txid, height };
+    emit(tx, send_event::Event::Mined(mined)).await
+}
+
+/// Send one stream item; `CANCELLED` once the client went away.
+pub(crate) async fn send<E>(tx: &mpsc::Sender<Result<E, Status>>, item: E) -> Result<(), Status> {
+    tx.send(Ok(item)).await.map_err(|_| cancelled())
+}
+
+pub(crate) fn cancelled() -> Status {
+    Status::cancelled("client disconnected")
+}
+
+/// Wait a second between polls; `CANCELLED` once the client went away.
+async fn idle_or_closed<E>(tx: &mpsc::Sender<E>) -> Result<(), Status> {
+    tokio::select! {
+        () = tokio::time::sleep(Duration::from_secs(1)) => Ok(()),
+        () = tx.closed() => Err(cancelled()),
+    }
 }
 
 /// The node backend for a broadcast, refused when air-gapped or offline.
@@ -894,17 +898,9 @@ async fn pipeline(
     })
     .await?;
     let signer = core_tx::SignerId::of(key.profile(), &state.registry.params()).map_err(err)?;
-    let pczt = {
-        let key = key.clone();
-        blocking(move || {
-            let wallet = key
-                .wallet()
-                .ok_or_else(|| TxError::Internal("this profile has no wallet".into()))?;
-            core_tx::sign(Some(&wallet), pczt, &usk, &signer)
-        })
+    let pczt = with_wallet(key, move |w| core_tx::sign(Some(&*w), pczt, &usk, &signer))
         .await
-        .map_err(err)?
-    };
+        .map_err(err)?;
     // `usk` was moved into the signing task and dropped there.
 
     // 6. Verify against the approved proposal (Q-K7).
@@ -925,45 +921,16 @@ async fn pipeline(
     tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());
     tracing::info!(key_id, via = route.name(), "transaction broadcast");
     state.sync.wake();
-    emit(
-        tx,
-        send_event::Event::Broadcast(v1::StepBroadcast {
-            step: 1,
-            txid: txid_hex.clone(),
-        }),
-    )
-    .await?;
+    emit_broadcast(tx, 1, txid_hex.clone()).await?;
 
     if wait_for_mined {
         let raw_txid = *txid.as_ref();
         loop {
-            let height = {
-                let key = key.clone();
-                tokio::task::spawn_blocking(move || {
-                    key.wallet()
-                        .and_then(|w| gyges_core::sync::tx_height(&w, raw_txid).ok().flatten())
-                })
-                .await
-                .ok()
-                .flatten()
-            };
-            if let Some(h) = height {
-                emit(
-                    tx,
-                    send_event::Event::Mined(v1::StepMined {
-                        step: 1,
-                        txid: txid_hex,
-                        height: u32::from(h),
-                    }),
-                )
-                .await?;
-                break;
+            if let Some(h) = crate::sync::mined_height(key, raw_txid).await {
+                return emit_mined(tx, 1, txid_hex, u32::from(h)).await;
             }
             state.sync.wake();
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(1)) => {}
-                () = tx.closed() => return Err(Status::cancelled("client disconnected")),
-            }
+            idle_or_closed(tx).await?;
         }
     }
     Ok(())
@@ -1041,7 +1008,7 @@ pub(crate) async fn obtain_key<E: Send + 'static>(
         let (session_id, expires_at, rx) =
             state.sessions.create(&key_id, step, ttl, summary.clone());
         tracing::info!(target: AUDIT_TARGET, key_id, event = "session_created");
-        tx.send(Ok(wrap(SignatureRequired {
+        let required = SignatureRequired {
             key_id: key_id.clone(),
             kind: SignatureKind::Passphrase as i32,
             session_id: session_id.clone(),
@@ -1049,9 +1016,8 @@ pub(crate) async fn obtain_key<E: Send + 'static>(
             payload: Vec::new(),
             step,
             summary: Some(summary.clone()),
-        })))
-        .await
-        .map_err(|_| Status::cancelled("client disconnected"))?;
+        };
+        send(tx, wrap(required)).await?;
         let guard = SessionGuard {
             hub: state.clone(),
             session_id: session_id.clone(),
@@ -1095,9 +1061,7 @@ pub(crate) async fn obtain_key<E: Send + 'static>(
                     // Otherwise: a fresh session, same proposal.
                 }
             },
-            () = tx.closed() => {
-                return Err(Status::cancelled("client disconnected"));
-            }
+            () = tx.closed() => return Err(cancelled()),
         }
     }
 }
@@ -1185,43 +1149,31 @@ async fn tex_pipeline(
     let step1_hex = built.step1_txid.to_string();
     let step2_hex = built.step2_txid.to_string();
 
+    // Both steps go through the queue's broadcast, so a node that already
+    // has a step counts as having taken it, as it does for the queue.
+    let drive = |e: DriveError| match e {
+        DriveError::Wallet(e) => err(e),
+        DriveError::Node(e) => broadcast_error(e, &key_id).into_status(),
+    };
+    let offer = |raw, step| tex::offer(chain.as_ref(), key, id, raw, step, "transaction broadcast");
+
     // Step 1: a refusal fails the transfer (nothing left the shielded pool).
-    let now = unix_now();
-    match chain.send_raw_transaction(built.step1_raw).await {
-        Ok(_) => {
-            with_wallet(key, move |w| {
-                core_tex::record_attempt(w, id, now, None).map_err(queue_error)?;
-                core_tex::set_state(w, id, TexState::Step1Broadcast, None).map_err(queue_error)
-            })
-            .await
-            .map_err(err)?;
-            tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast");
-            tracing::info!(key_id, step = 1, "transaction broadcast");
+    let refused = match offer(built.step1_raw, 1).await {
+        Ok(Offered::Accepted) => None,
+        Ok(Offered::Refused(text)) => {
+            let _ = tex::set_state(key, id, TexState::Failed, Some(text.clone())).await;
+            Some(DriveError::Node(ChainError::Rejected(text)))
         }
-        Err(e) => {
-            let text = e.to_string();
-            let rejected = matches!(e, ChainError::Rejected(_));
-            let _ = with_wallet(key, move |w| {
-                core_tex::record_attempt(w, id, now, Some(&text)).map_err(queue_error)?;
-                if rejected {
-                    core_tex::set_state(w, id, TexState::Failed, Some(&text))
-                        .map_err(queue_error)?;
-                }
-                Ok(())
-            })
-            .await;
-            state.tex.wake();
-            return Err(broadcast_error(e, &key_id).into_status());
-        }
+        Err(e) => Some(e),
+    };
+    if let Some(e) = refused {
+        state.tex.wake();
+        return Err(drive(e));
     }
-    emit(
-        tx,
-        send_event::Event::Broadcast(v1::StepBroadcast {
-            step: 1,
-            txid: step1_hex.clone(),
-        }),
-    )
-    .await?;
+    tex::set_state(key, id, TexState::Step1Broadcast, None)
+        .await
+        .map_err(drive)?;
+    emit_broadcast(tx, 1, step1_hex.clone()).await?;
     emit(
         tx,
         send_event::Event::TexQueued(v1::TexQueued {
@@ -1234,37 +1186,16 @@ async fn tex_pipeline(
     // Step 2: offered at once; a node that does not chain mempool
     // transactions refuses it now and takes it from the queue once step 1
     // is mined.
-    let now = unix_now();
-    match chain.send_raw_transaction(built.step2_raw).await {
-        Ok(_) => {
-            with_wallet(key, move |w| {
-                core_tex::record_attempt(w, id, now, None).map_err(queue_error)?;
-                core_tex::set_state(w, id, TexState::Step2Broadcast, None).map_err(queue_error)
-            })
+    if let Ok(Offered::Accepted) = offer(built.step2_raw, 2).await {
+        tex::set_state(key, id, TexState::Step2Broadcast, None)
             .await
-            .map_err(err)?;
-            tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast");
-            tracing::info!(key_id, step = 2, "transaction broadcast");
-            emit(
-                tx,
-                send_event::Event::Broadcast(v1::StepBroadcast {
-                    step: 2,
-                    txid: step2_hex.clone(),
-                }),
-            )
-            .await?;
-        }
-        Err(e) => {
-            let text = e.to_string();
-            let _ = with_wallet(key, move |w| {
-                core_tex::record_attempt(w, id, now, Some(&text)).map_err(queue_error)
-            })
-            .await;
-            tracing::warn!(
-                key_id,
-                "the node did not take zip 320 step 2 yet; the queue retries once step 1 is mined"
-            );
-        }
+            .map_err(drive)?;
+        emit_broadcast(tx, 2, step2_hex.clone()).await?;
+    } else {
+        tracing::warn!(
+            key_id,
+            "the node did not take zip 320 step 2 yet; the queue retries once step 1 is mined"
+        );
     }
     state.tex.wake();
     state.sync.wake();
@@ -1277,15 +1208,7 @@ async fn tex_pipeline(
                 && !step1_done
             {
                 step1_done = true;
-                emit(
-                    tx,
-                    send_event::Event::Mined(v1::StepMined {
-                        step: 1,
-                        txid: step1_hex.clone(),
-                        height: u32::from(h),
-                    }),
-                )
-                .await?;
+                emit_mined(tx, 1, step1_hex.clone(), u32::from(h)).await?;
             }
             let row = with_wallet(key, move |w| core_tex::get(w, id).map_err(queue_error))
                 .await
@@ -1299,16 +1222,8 @@ async fn tex_pipeline(
                         Ok(gyges_chain::TxStatus::Mined(h)) => u32::from(h),
                         _ => 0,
                     };
-                    emit(
-                        tx,
-                        send_event::Event::Mined(v1::StepMined {
-                            step: 2,
-                            txid: gyges_chain::display_hash(&row.step2_txid),
-                            height: h,
-                        }),
-                    )
-                    .await?;
-                    return Ok(());
+                    let txid = gyges_chain::display_hash(&row.step2_txid);
+                    return emit_mined(tx, 2, txid, h).await;
                 }
                 TexState::Expired
                 | TexState::Failed
@@ -1335,10 +1250,7 @@ async fn tex_pipeline(
                 _ => {}
             }
             state.tex.wake();
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(1)) => {}
-                () = tx.closed() => return Err(Status::cancelled("client disconnected")),
-            }
+            idle_or_closed(tx).await?;
         }
     }
     Ok(())
@@ -1454,11 +1366,7 @@ pub async fn get_balance(
         &req.key_id,
         "a signer-only profile has no wallet and no balance",
     )?;
-    let min_confirmations = if req.min_confirmations == 0 {
-        state.config.policy.min_confirmations
-    } else {
-        req.min_confirmations
-    };
+    let min_confirmations = state.min_confirmations(req.min_confirmations);
     let key_id = key.key_id().to_string();
     let b = with_wallet(&key, move |w| core_tx::balance(w, min_confirmations))
         .await

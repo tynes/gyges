@@ -164,6 +164,22 @@ impl DaemonState {
         }
         Ok(key)
     }
+
+    /// Every key with a wallet (all but `signer-only`).
+    pub(crate) fn wallet_keys(&self) -> Vec<Arc<KeyEntry>> {
+        let mut keys = self.registry.list();
+        keys.retain(|k| k.profile().has_wallet());
+        keys
+    }
+
+    /// A request's `min_confirmations`; `0` means the policy default.
+    pub(crate) fn min_confirmations(&self, requested: u32) -> u32 {
+        if requested == 0 {
+            self.config.policy.min_confirmations
+        } else {
+            requested
+        }
+    }
 }
 
 /// An `INVALID_ARGUMENT` status with `detail`.
@@ -455,8 +471,7 @@ impl Gyges for GygesService {
         &self,
         request: Request<ExportUfvkRequest>,
     ) -> Result<Response<ExportUfvkResponse>, Status> {
-        let conn = crate::conn::of_request(&request);
-        keys::export_ufvk(&self.state, conn, request.into_inner()).map(Response::new)
+        keys::export_ufvk(&self.state, request.into_inner()).map(Response::new)
     }
 
     async fn export_seed(
