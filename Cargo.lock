@@ -2379,6 +2379,7 @@ dependencies = [
  "bip0039",
  "gyges-chain",
  "gyges-core",
+ "gyges-qr",
  "hex",
  "rand 0.10.3",
  "reqwest",
@@ -2402,16 +2403,19 @@ version = "0.1.0"
 dependencies = [
  "age",
  "anyhow",
+ "bip32",
  "clap",
  "gyges-chain",
  "gyges-core",
  "gyges-proto",
+ "gyges-qr",
  "hex",
  "http",
  "nix",
  "proptest",
  "prost 0.14.4",
  "rand 0.10.3",
+ "secrecy 0.8.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -2423,6 +2427,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "zakura-address",
  "zakura-client-backend",
  "zakura-keys",
  "zakura-orchard",
@@ -2431,6 +2436,7 @@ dependencies = [
  "zakura-protocol",
  "zakura-transparent",
  "zeroize",
+ "zip32",
 ]
 
 [[package]]

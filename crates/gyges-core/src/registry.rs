@@ -1,7 +1,8 @@
 //! `KeyRegistry` (ARCHITECTURE.md §2.1): enumerates `keys/<id>/profile.json`,
 //! opens one `WalletDb` per key, enforces the 0700/0600 rule on every key
 //! directory, resolves `default_key`, and creates new `local-seed` and
-//! `signer-only` profiles for `key init` / `key restore`.
+//! `signer-only` profiles for `key init` / `key restore` and `keystone-qr`
+//! profiles for `key import-keystone`.
 //!
 //! A key directory is created in one go and removed again if any step
 //! fails, so a half-written profile never survives to the next start.
@@ -15,11 +16,13 @@ use age::secrecy::SecretString;
 use secrecy::ExposeSecret as _;
 use zcash_client_backend::data_api::status::TransactionStatusMode;
 use zcash_client_backend::data_api::transparent_ledger::TransparentLedgerMode;
-use zcash_client_backend::data_api::{Account as _, WalletRead as _, WalletWrite as _};
+use zcash_client_backend::data_api::{
+    Account as _, AccountPurpose, WalletRead as _, WalletWrite as _, Zip32Derivation,
+};
 use zcash_client_sqlite::WalletDb;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::wallet::init::{WalletMigrationError, WalletMigrator};
-use zcash_keys::keys::UnifiedSpendingKey;
+use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
 use zip32::fingerprint::SeedFingerprint;
 
 use crate::birthday::ResolvedBirthday;
@@ -165,6 +168,23 @@ impl KeyEntry {
         let account = wallet.get_account(id).ok()??;
         account.ufvk().map(|k| k.encode(&self.params))
     }
+}
+
+/// What `key import-keystone` hands to [`KeyRegistry::create_keystone`],
+/// after the daemon has checked the export (ARCHITECTURE.md §3.4).
+#[derive(Debug)]
+pub struct NewKeystoneKey<'a> {
+    pub key_id: &'a str,
+    pub ufvk: &'a UnifiedFullViewingKey,
+    /// The device's ZIP 32 seed fingerprint.
+    pub seed_fingerprint: SeedFingerprint,
+    /// ZIP 32 account index on the device.
+    pub account_index: zip32::AccountId,
+    /// As reported, or `"unknown"`.
+    pub device_version: String,
+    pub birthday: &'a ResolvedBirthday,
+    /// The account's name on the device.
+    pub label: Option<String>,
 }
 
 /// What `key init` / `key restore` hand to [`KeyRegistry::create_local_seed`].
@@ -473,6 +493,60 @@ impl KeyRegistry {
                 dir: dir.clone(),
                 params: self.params,
                 wallet: None,
+            })
+        })();
+        self.finish_create(dir, result)
+    }
+
+    /// `key import-keystone`: a wallet holding the device's UFVK as a
+    /// spending account with its ZIP 32 derivation (seed fingerprint and
+    /// account index), so every PCZT the wallet builds names the device's
+    /// key. No seed is ever on this host.
+    pub fn create_keystone(&self, req: NewKeystoneKey<'_>) -> Result<Arc<KeyEntry>, RegistryError> {
+        let dir = self.reserve_dir(req.key_id)?;
+        let result = (|| {
+            let key_id = req.key_id;
+            let mut wallet = self.open_wallet(key_id, &dir.join(WALLET_FILE))?;
+            wallet
+                .import_account_ufvk(
+                    key_id,
+                    req.ufvk,
+                    &req.birthday.birthday,
+                    AccountPurpose::Spending {
+                        derivation: Some(Zip32Derivation::new(
+                            req.seed_fingerprint,
+                            req.account_index,
+                        )),
+                    },
+                    Some(KEY_SOURCE),
+                )
+                .map_err(|e| wallet_error(key_id, e))?;
+            // The device signs Orchard and Ironwood spends and transparent
+            // inputs, never Sapling (OVERVIEW.md §4.1), and its UFVK has no
+            // Sapling component, so it cannot receive there either.
+            let pools = vec![Pool::Orchard, Pool::Ironwood, Pool::Transparent];
+            let profile = KeyProfile {
+                schema_version: profile::SCHEMA_VERSION,
+                key_id: key_id.to_string(),
+                network: self.network,
+                signing_mode: SigningMode::KeystoneQr,
+                birthday_height: Some(req.birthday.height),
+                created_at: profile::now_rfc3339(),
+                spend_pools: pools.clone(),
+                receive_pools: pools,
+                seed_format: None,
+                seed_fingerprint: Some(hex::encode(req.seed_fingerprint.to_bytes())),
+                device_version: Some(req.device_version),
+                account_index: u32::from(req.account_index),
+                ufvk: Some(req.ufvk.encode(&self.params)),
+                label: req.label,
+            };
+            self.write_profile(&dir, key_id, &profile)?;
+            Ok(KeyEntry {
+                profile,
+                dir: dir.clone(),
+                params: self.params,
+                wallet: Some(Mutex::new(wallet)),
             })
         })();
         self.finish_create(dir, result)

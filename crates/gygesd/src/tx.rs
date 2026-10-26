@@ -440,8 +440,8 @@ pub(crate) enum Purpose {
     /// `SendTransaction` / `ShieldFunds`: the daemon signs, so `local-seed`
     /// only.
     Spend,
-    /// `CreatePczt`: nothing is signed here, so a watch-only profile
-    /// qualifies too.
+    /// `CreatePczt`: nothing is signed here, so a watch-only or Keystone
+    /// profile qualifies too.
     CreatePczt,
     /// `SignPczt`: a profile that holds a seed (`local-seed` or
     /// `signer-only`); no node and no sync state needed.
@@ -468,11 +468,12 @@ pub(crate) fn prepare(
     let typed = |reason, detail: &str| GygesError::new(reason, detail).with_key(&kid).into_status();
     let refused = match (key.profile().signing_mode, purpose) {
         (SigningMode::LocalSeed, _)
-        | (SigningMode::WatchOnly, Purpose::CreatePczt)
+        | (SigningMode::WatchOnly | SigningMode::KeystoneQr, Purpose::CreatePczt)
         | (SigningMode::SignerOnly, Purpose::SignPczt) => None,
         (SigningMode::KeystoneQr, _) => Some((
             ErrorReason::HardwareSigner,
-            "Keystone signing arrives with ROADMAP.md M5",
+            "signing with a Keystone arrives with its QR signing protocols (ROADMAP.md M5, \
+             third item); `gyges pczt create` already builds the PCZT the device will sign",
         )),
         (SigningMode::WatchOnly, Purpose::SignPczt) => Some((
             ErrorReason::InvalidArgument,

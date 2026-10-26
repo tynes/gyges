@@ -7,7 +7,9 @@
 //!   and put back together from frames in any order, with gaps;
 //! * [`Payload`]: the Keystone Zcash registry types 49201, 49203, 49204,
 //!   49205 and 49207 to and from their CBOR bodies;
-//! * [`Animation`]: the 8 FPS loop that shows a multi-frame payload.
+//! * [`Animation`]: the 8 FPS loop that shows a multi-frame payload;
+//! * [`firmware`]: the device version a pairing export reports, and the
+//!   minimum Gyges accepts.
 //!
 //! Frames from a camera arrive with M5's `qr-scan`; the CLI's `qr-export`,
 //! `qr-import` and `sign --qr-out` with the signing protocols.
@@ -15,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 mod animate;
+pub mod firmware;
 mod fountain;
 mod registry;
 mod render;

@@ -90,6 +90,41 @@ pub fn test_key_transparent() -> TransparentAddress {
     addr
 }
 
+/// The Keystone pairing export (`ur:zcash-accounts`) of [`mnemonic`]'s
+/// account 0, reporting `device_version`, as the frames a camera sees, one
+/// per line. The UFVK is the seed's full one (with a Sapling item, unlike a
+/// real device's); the in-process tests cover the device's exact shape.
+pub fn keystone_export(device_version: Option<&str>) -> String {
+    let seed = bip0039::Mnemonic::<bip0039::English>::from_phrase(mnemonic())
+        .unwrap()
+        .to_seed("");
+    let usk =
+        zcash_keys::keys::UnifiedSpendingKey::from_seed(&regtest(), &seed, zip32::AccountId::ZERO)
+            .unwrap();
+    let payload = gyges_qr::Payload::Accounts(gyges_qr::Accounts {
+        seed_fingerprint: zip32::fingerprint::SeedFingerprint::from_seed(&seed)
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+        accounts: vec![gyges_qr::Account {
+            ufvk: usk.to_unified_full_viewing_key().encode(&regtest()),
+            index: 0,
+            name: Some("Keystone".into()),
+        }],
+        device_version: device_version.map(Into::into),
+    });
+    let mut frames = payload.frames(gyges_qr::DEFAULT_FRAGMENT_LEN).unwrap();
+    let n = if frames.is_single() {
+        1
+    } else {
+        2 * frames.fragment_count()
+    };
+    (0..n)
+        .map(|_| frames.next_frame().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn test_key_transparent_address() -> String {
     gyges_chain::compact::encode_transparent_address(NetworkType::Regtest, &test_key_transparent())
 }

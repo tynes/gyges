@@ -9,9 +9,9 @@ use std::io::IsTerminal as _;
 
 use clap::{Args, Subcommand};
 use gyges_proto::v1::{
-    ErrorReason, ExportSeedRequest, ExportUfvkRequest, GetInfoResponse, GygesError, InitKeyRequest,
-    KeySummary, ListKeysRequest, LockKeyRequest, Network, RestoreKeyRequest, SigningMode,
-    UnlockKeyRequest, UnlockScope,
+    ErrorReason, ExportSeedRequest, ExportUfvkRequest, GetInfoResponse, GygesError,
+    ImportKeystoneRequest, InitKeyRequest, KeySummary, ListKeysRequest, LockKeyRequest, Network,
+    RestoreKeyRequest, SigningMode, UnlockKeyRequest, UnlockScope,
 };
 use zeroize::Zeroizing;
 
@@ -28,7 +28,7 @@ pub enum KeyCmd {
     /// Restore a 24-word mnemonic; --birthday avoids a full rescan.
     Restore(RestoreArgs),
     /// Register a Keystone 3 Pro profile from its UR export.
-    ImportKeystone(Unimplemented),
+    ImportKeystone(ImportKeystoneArgs),
     /// Create a watch-only profile from a UFVK.
     ImportUfvk(Unimplemented),
     /// Unlock a key for a limited time; any process of this user may then spend from it.
@@ -84,6 +84,31 @@ pub struct RestoreArgs {
     pub set_default: bool,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct ImportKeystoneArgs {
+    /// Key id: ^[a-z0-9][a-z0-9_-]{0,31}$.
+    #[arg(long, value_name = "KEY_ID")]
+    pub id: String,
+    /// Block height to scan from. The device stores none; without it the NU5 activation height is offered.
+    #[arg(long, value_name = "HEIGHT")]
+    pub birthday: Option<u32>,
+    /// A ur:zcash-accounts frame from the device's Connect Software Wallet screen; repeat for a multi-part export [default: read the frames from standard input, one per line].
+    #[arg(long = "ur", value_name = "UR_STRING")]
+    pub frames: Vec<String>,
+    /// ZIP 32 account to import when the export lists several.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub account: u32,
+    /// Import even though the export does not report the device's firmware version.
+    #[arg(long)]
+    pub allow_unknown_firmware: bool,
+    /// Confirm a backfill below the node's retention window without prompting.
+    #[arg(long)]
+    pub yes: bool,
+    /// Make this the daemon's default key for this run (set `default_key` in config.toml to persist).
+    #[arg(long)]
+    pub set_default: bool,
+}
+
 /// `--id`, falling back to the global `--key`; empty means the daemon's
 /// default key (API.md §1.4).
 #[derive(Debug, Clone, Args)]
@@ -122,7 +147,7 @@ pub async fn run(ctx: &Ctx, cmd: KeyCmd) -> Result<(), CliError> {
         KeyCmd::List => list(ctx).await,
         KeyCmd::Init(args) => init(ctx, args).await,
         KeyCmd::Restore(args) => restore(ctx, args).await,
-        KeyCmd::ImportKeystone(_) => Err(CliError::NotImplemented("key import-keystone")),
+        KeyCmd::ImportKeystone(args) => import_keystone(ctx, args).await,
         KeyCmd::ImportUfvk(_) => Err(CliError::NotImplemented("key import-ufvk")),
         KeyCmd::Unlock(args) => unlock(ctx, args).await,
         KeyCmd::Lock(args) => lock(ctx, args).await,
@@ -359,6 +384,138 @@ async fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<(), CliError> {
     })
 }
 
+/// `key import-keystone` (CLI_SPEC.md §2.2): the frames from `--ur` or
+/// stdin, checked locally first so that a wrong payload or old firmware is
+/// refused before any question is asked (the daemon checks again), then the
+/// birthday (asked when not given) and the backfill consent.
+async fn import_keystone(ctx: &Ctx, args: ImportKeystoneArgs) -> Result<(), CliError> {
+    let payload = if args.frames.is_empty() {
+        ctx.prompter.read_stdin()?.to_string()
+    } else {
+        args.frames.join("\n")
+    };
+    precheck_accounts_export(&payload, args.allow_unknown_firmware)?;
+
+    let mut conn = ctx.connect().await?;
+    let network = conn.info.network();
+    let birthday = match args.birthday {
+        Some(h) => h,
+        None => {
+            let h = nu5_activation(network);
+            ctx.prompter.confirm(
+                &format!(
+                    "The Keystone stores no birthday. Scan from the NU5 activation height ({h}), \
+                     the earliest block its account can have received funds in?"
+                ),
+                false,
+                "--birthday",
+            )?;
+            h
+        }
+    };
+    let allow_backfill = backfill_consent(ctx, &conn.info, birthday, args.yes)?;
+    let resp = conn
+        .client
+        .import_keystone(ImportKeystoneRequest {
+            key_id: args.id.clone(),
+            payload,
+            birthday_height: birthday,
+            set_default: args.set_default,
+            account_index: args.account,
+            allow_backfill,
+            allow_unknown_firmware: args.allow_unknown_firmware,
+        })
+        .await?
+        .into_inner();
+    ctx.report(&resp, || {
+        let firmware = gyges_qr::firmware::Firmware::parse(&resp.device_version).map_or_else(
+            || resp.device_version.clone(),
+            |v| format!("{v} ({} on the device)", v.displayed()),
+        );
+        let name = if resp.account_name.is_empty() {
+            String::new()
+        } else {
+            format!(" \"{}\"", resp.account_name)
+        };
+        eprintln!(
+            "key '{}' imported from the Keystone: account {}{name}, seed fingerprint {}, \
+             firmware {firmware}, birthday {}{}",
+            resp.key_id,
+            resp.account_index,
+            resp.seed_fingerprint,
+            resp.birthday_height,
+            if resp.backfill_blocks > 0 {
+                format!("; {} blocks will be backfilled", resp.backfill_blocks)
+            } else {
+                String::new()
+            }
+        );
+        for w in &resp.warnings {
+            eprintln!("warning: {w}");
+        }
+        if args.set_default {
+            note_set_default(&resp.key_id);
+        }
+    })
+}
+
+/// The checks the CLI can make without the daemon: a complete
+/// `ur:zcash-accounts` export and its firmware version. Exit codes follow
+/// the daemon's: 6 for the wrong payload, 9 for firmware below the minimum,
+/// 4 for an unknown version without `--allow-unknown-firmware`.
+fn precheck_accounts_export(payload: &str, allow_unknown_firmware: bool) -> Result<(), CliError> {
+    use gyges_qr::firmware::{self, FirmwareCheck};
+    let fail = |reason, detail: String| Err(CliError::Daemon(GygesError::new(reason, detail)));
+    let mut asm = gyges_qr::Assembler::new();
+    for frame in payload.split_whitespace() {
+        if frame.to_ascii_lowercase().starts_with("uview") {
+            return fail(
+                ErrorReason::InvalidArgument,
+                "a bare UFVK carries no seed fingerprint, so the Keystone could not recognise its \
+                 key in a PCZT; pass the device's ur:zcash-accounts QR, or use `key import-ufvk` \
+                 for a watch-only key"
+                    .into(),
+            );
+        }
+        if let Err(e) = asm.receive(frame) {
+            return fail(
+                ErrorReason::InvalidArgument,
+                format!("not a Keystone accounts export: {e}"),
+            );
+        }
+    }
+    match asm.ur_type() {
+        None => {
+            return fail(
+                ErrorReason::InvalidArgument,
+                "no ur:zcash-accounts frame given (pass --ur, or the frames on stdin)".into(),
+            );
+        }
+        // The daemon refuses the other types with the full explanation.
+        Some(t) if t != gyges_qr::ur_types::ZCASH_ACCOUNTS => return Ok(()),
+        Some(_) => {}
+    }
+    let Ok(Some(gyges_qr::Payload::Accounts(accounts))) = gyges_qr::Payload::from_assembler(&asm)
+    else {
+        // Incomplete or undecodable: the daemon's refusal says which.
+        return Ok(());
+    };
+    let reported = accounts.device_version.as_deref();
+    match firmware::check(reported) {
+        FirmwareCheck::Supported(_) => Ok(()),
+        FirmwareCheck::TooOld(v) => fail(ErrorReason::HardwareSigner, firmware::too_old_message(v)),
+        FirmwareCheck::Unknown if allow_unknown_firmware => Ok(()),
+        FirmwareCheck::Unknown => fail(
+            ErrorReason::ConfirmationRequired,
+            format!(
+                "{}; update it and export again, or pass --allow-unknown-firmware to import it \
+                 anyway",
+                firmware::unknown_message(reported)
+            ),
+        ),
+    }
+}
+
 /// Ask (or `--yes`) when the birthday is below the node's retention height
 /// and a fallback endpoint exists. Without a fallback the daemon's own
 /// `FALLBACK_UNAVAILABLE` says what is missing, so no question is asked.
@@ -566,6 +723,16 @@ pub fn sapling_activation(network: Network) -> u32 {
     match network {
         Network::Mainnet | Network::Unspecified => 419_200,
         Network::Testnet => 280_000,
+        Network::Regtest => 1,
+    }
+}
+
+/// NU5 activation height, the default Keystone birthday (the device's UFVK
+/// has no Sapling component, so nothing earlier can belong to it).
+pub fn nu5_activation(network: Network) -> u32 {
+    match network {
+        Network::Mainnet | Network::Unspecified => 1_687_104,
+        Network::Testnet => 1_842_420,
         Network::Regtest => 1,
     }
 }

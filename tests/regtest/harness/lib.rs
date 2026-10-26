@@ -19,8 +19,8 @@ mod zaino;
 
 pub use common::{
     FAST_CONFIG, NODE_CONFIG, SPEND_CONFIG, TEX_CONFIG, balance, burn_t_address, burn_tex_address,
-    funded_wallet, mnemonic, parse_tex_txids, regtest, send, shield, spendable, start_daemon,
-    sweep_logs, sync_wait, sync_wait_within, test_key_miner, test_key_transparent,
+    funded_wallet, keystone_export, mnemonic, parse_tex_txids, regtest, send, shield, spendable,
+    start_daemon, sweep_logs, sync_wait, sync_wait_within, test_key_miner, test_key_transparent,
     test_key_transparent_address, wait_balance, wait_for_txid, wait_stalled,
 };
 pub use fake::{

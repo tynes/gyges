@@ -426,16 +426,32 @@ message RestoreKeyResponse {
 
 message ImportKeystoneRequest {
   string key_id = 1;
-  // Either a `ur:zcash-accounts/...` or `ur:zcash-unified-full-viewing-key/...`
-  // string, or a bare `uview1...` UFVK.
+  // One or more `ur:zcash-accounts/...` frames (tag 49201), separated by
+  // whitespace: an export of several accounts may be fountain-coded over
+  // many frames. Only this type carries the seed fingerprint the device
+  // needs in every PCZT to recognise its own keys, so a
+  // `ur:zcash-unified-full-viewing-key` or a bare `uview1...` UFVK is refused
+  // with INVALID_ARGUMENT (use ImportUfvk for a watch-only profile).
   string payload = 2;
-  // Required: no Keystone UR type carries a birthday. The CLI defaults to the
-  // NU5 activation height after confirming with the user.
+  // No Keystone UR type carries a birthday. 0 means the network's NU5
+  // activation height, which the CLI sends only after the user confirms it
+  // (the device's UFVK has no Sapling component, so nothing before NU5 can
+  // belong to it).
   uint32 birthday_height = 3;
   bool set_default = 4;
-  // Which account from `zcash-accounts` to import when it lists several;
-  // 0 means the first.
+  // The ZIP 32 account index to import from the export. An export that
+  // lists a single account is imported whatever its index.
   uint32 account_index = 5;
+  // As RestoreKeyRequest.allow_backfill: must be true when the birthday is
+  // below the node's retention window, or the daemon returns
+  // CONFIRMATION_REQUIRED and creates nothing.
+  bool allow_backfill = 6;
+  // Firmware older than the minimum is refused with HARDWARE_SIGNER. An
+  // export that does not report a version (firmware before the pairing QR
+  // carried one), or reports one that does not parse, is refused with
+  // CONFIRMATION_REQUIRED unless this is true; the profile then records the
+  // reported string, or "unknown".
+  bool allow_unknown_firmware = 7;
 }
 
 message ImportKeystoneResponse {
@@ -445,6 +461,16 @@ message ImportKeystoneResponse {
   string ufvk = 4;
   repeated Pool spend_pools = 5;
   uint32 birthday_height = 6;
+  // Blocks that will be fetched over the fallback endpoint (0 inside the
+  // node's window).
+  uint32 backfill_blocks = 7;
+  // Printed by the CLI: the best-effort transparent history warning below
+  // the node's window, and the firmware warning for an unknown version.
+  repeated string warnings = 8;
+  // ZIP 32 account index imported.
+  uint32 account_index = 9;
+  // The account's name on the device, when the export carries one.
+  string account_name = 10;
 }
 
 message ImportUfvkRequest {

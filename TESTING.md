@@ -95,7 +95,7 @@ Keystone transport is QR in both directions, so tests replay recorded UR payload
 | `accounts.ur` | `ur:zcash-accounts` export (tag 49201) for a known test seed |
 | `batch_request.ur` / `batch_result.ur` | `zcash-sign-batch` (49205) sent for a 2-action Orchard spend and the `zcash-batch-sig-result` (49207) returned |
 | `pczt_request.ur` / `pczt_result.ur` | single-PCZT flow (49204) for a transaction with a transparent input |
-| `firmware_old.ur` | accounts export with `device_version` below the minimum, expected to be refused |
+| `firmware_old.ur` | accounts export with `device_version` below the minimum, expected to be refused. *Covered synthetically until a recording exists (ROADMAP.md M5, second item): `rpc.rs::keystone_import_refusals_and_account_choice` builds exports of the abandon mnemonic with `gyges-qr` (13.0.1, none, two accounts over several frames, a mainnet UFVK, a 16-byte fingerprint).* |
 
 The test seed's `UnifiedSpendingKey` is also known, so each recorded signature is checked against a locally computed one; a fixture that fails this check is a corrupted recording, not a code bug.
 
