@@ -5025,6 +5025,7 @@ async fn zip320_send_treats_already_known_as_accepted() {
             ..Default::default()
         },
         "pw",
+        |_| {},
     )
     .await
     .unwrap();
