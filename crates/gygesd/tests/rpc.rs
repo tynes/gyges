@@ -2165,6 +2165,129 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
     running.task.abort();
 }
 
+/// A fully transparent send without change (transparent inputs, one
+/// transparent output) has nothing scanning can find: no nullifier of ours
+/// and no shielded output. Upstream queues it for a status lookup, and the
+/// scheduler asks the node and records the mined height, so
+/// `wait_for_mined`, `WaitSync { txid }` and `ListTransactions` see it
+/// (ROADMAP.md M1 leftovers). Before that, `wait_for_mined` never ended.
+#[tokio::test]
+async fn a_fully_transparent_send_is_marked_mined_from_the_node() {
+    use gyges_proto::v1::Pool;
+    let _ = test_hub();
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(10);
+    let url = node.url().to_string();
+    let running = start_with(ONE_CONF_CONFIG, |o| o.zakura_rpc = Some(url)).await;
+    let state = &running.state;
+    let mut c = client(&running.socket).await;
+
+    init_key(&mut c, "tsend").await;
+    wait_spendable(&mut c, "tsend").await;
+    node.mine_with_payments(&[(transparent_receiver(state, "tsend"), 100_000_000)]);
+    node.mine(1);
+    wait_spendable(&mut c, "tsend").await;
+    unlock_daemon(&mut c, "tsend").await;
+    let key = state.registry.resolve("tsend").unwrap();
+    let t_recipient = t_recipient();
+
+    let mut s = c
+        .send_transaction(SendTransactionRequest {
+            key_id: "tsend".into(),
+            to: t_recipient.clone(),
+            amount: Some(gyges_proto::v1::Amount {
+                value: Some(gyges_proto::v1::amount::Value::Max(true)),
+            }),
+            wait_for_mined: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut events = Vec::new();
+    let deadline = Duration::from_secs(60);
+    while let Some(item) = tokio::time::timeout(deadline, s.next())
+        .await
+        .expect("wait_for_mined never ended")
+    {
+        let ev = item.unwrap_or_else(|e| panic!("transparent send: {e:?}"));
+        if let Some(send_event::Event::Broadcast(b)) = &ev.event {
+            // Scanning cannot see it, so upstream queued it for a status
+            // lookup (the reason this test exists).
+            let mut internal = hex::decode(&b.txid).unwrap();
+            internal.reverse();
+            let queued = gyges_core::sync::pending_status(&key.wallet().unwrap()).unwrap();
+            assert!(
+                queued.iter().any(|t| t[..] == internal[..]),
+                "not queued for a status lookup: {queued:?}"
+            );
+            node.mine(2);
+        }
+        events.push(ev);
+    }
+    let p = proposal_of(&events);
+    let step = &p.steps[0];
+    assert!(
+        step.inputs.iter().all(|i| i.pool() == Pool::Transparent),
+        "{p:?}"
+    );
+    assert!(
+        step.outputs.iter().all(|o| o.pool() == Pool::Transparent),
+        "fully transparent, no change output: {p:?}"
+    );
+    assert_eq!(
+        event_names(&events).last(),
+        Some(&"mined"),
+        "{:?}",
+        event_names(&events)
+    );
+    let txid = broadcast_txid(&events);
+    let mined_height = events
+        .iter()
+        .find_map(|e| match &e.event {
+            Some(send_event::Event::Mined(m)) => Some(m.height),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        mined_height,
+        node.tip().0 - 1,
+        "the first of the two blocks"
+    );
+
+    // `sync wait --txid` reads the same mined height.
+    tokio::time::timeout(
+        deadline,
+        drain(
+            c.wait_sync(WaitSyncRequest {
+                key_id: "tsend".into(),
+                txid: txid.clone(),
+                confirmations: 1,
+                ..Default::default()
+            })
+            .await,
+        ),
+    )
+    .await
+    .expect("WaitSync on the txid never ended")
+    .expect("wait_sync");
+    let queued = gyges_core::sync::pending_status(&key.wallet().unwrap()).unwrap();
+    assert!(queued.is_empty(), "still queued after mining: {queued:?}");
+
+    let b = c
+        .get_balance(GetBalanceRequest {
+            key_id: "tsend".into(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(b.total_spendable, 0, "{b:?}");
+    assert_eq!(b.total_pending, 0, "{b:?}");
+
+    running.task.abort();
+}
+
 // ---------------------------------------------------------------------------
 // ZIP 320 (ROADMAP.md M3)
 // ---------------------------------------------------------------------------

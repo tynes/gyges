@@ -318,6 +318,7 @@ pub fn replace_step2(
 mod tests {
     use super::*;
     use crate::Network;
+    use zcash_client_backend::data_api::status::TransactionStatusMode;
     use zcash_client_backend::data_api::transparent_ledger::TransparentLedgerMode;
     use zcash_client_sqlite::WalletDb;
     use zcash_client_sqlite::util::SystemClock;
@@ -332,7 +333,8 @@ mod tests {
             rand::rand_core::UnwrapErr(rand::rngs::SysRng),
         )
         .unwrap()
-        .with_transparent_ledger_mode(TransparentLedgerMode::Public);
+        .with_transparent_ledger_mode(TransparentLedgerMode::Public)
+        .with_status_mode(TransactionStatusMode::Public);
         WalletMigrator::new()
             .with_external_migrations(vec![Box::new(MIGRATION)])
             .init_or_migrate(&mut w)

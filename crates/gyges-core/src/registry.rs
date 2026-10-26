@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use age::secrecy::SecretString;
 use secrecy::ExposeSecret as _;
+use zcash_client_backend::data_api::status::TransactionStatusMode;
 use zcash_client_backend::data_api::transparent_ledger::TransparentLedgerMode;
 use zcash_client_backend::data_api::{Account as _, WalletRead as _, WalletWrite as _};
 use zcash_client_sqlite::WalletDb;
@@ -323,7 +324,14 @@ impl KeyRegistry {
         // local node's raw blocks (SYNC.md §2.1), which upstream classes as
         // the "public" ledger source; Zakura's transparent APIs fail closed
         // until a mode is chosen.
-        .with_transparent_ledger_mode(TransparentLedgerMode::Public);
+        .with_transparent_ledger_mode(TransparentLedgerMode::Public)
+        // Per-handle too. Status lookups for the wallet's own transactions
+        // that scanning cannot observe (a fully transparent send without
+        // change) go by txid to the configured node only, never to the
+        // fallback endpoint (`gygesd::sync`); the node already sees every
+        // broadcast, so a public lookup there discloses nothing new.
+        // Without a mode upstream's status work fails closed.
+        .with_status_mode(TransactionStatusMode::Public);
         // The daemon's umask makes this a no-op; tests and tools without it
         // still get a private file.
         perms::set_mode(path, 0o600).map_err(|source| RegistryError::Io {
