@@ -88,13 +88,18 @@ jobs:
           print(f"{len(blocks)} toml block(s) parse")
           PY
 
-  # End-to-end scenarios against the pinned real zakurad (TESTING.md §2,
-  # tests/regtest/versions.toml). The harness downloads the release asset
-  # into target/regtest-bin/ and verifies its sha256; the directory is cached
-  # on the pinned tag. The node-free scenarios of the same crate also run in
-  # `check`; this job is where the node ones stop skipping.
+  # End-to-end scenarios against the pinned real zakurad and zainod
+  # (TESTING.md §2, tests/regtest/versions.toml). The harness downloads the
+  # zakurad release asset and the zainod `.crate` into target/regtest-bin/,
+  # verifies both sha256s and builds zainod there (`cargo install --locked`,
+  # in its own target directory, deleted afterwards; only where
+  # GYGES_BUILD_ZAINOD is set, so `check` skips the backfill scenarios); the
+  # directory is
+  # cached on versions.toml. The node-free scenarios of the same crate also
+  # run in `check`; this job is where the node and backfill ones stop
+  # skipping.
   regtest:
-    name: regtest (real zakurad)
+    name: regtest (real zakurad + zaino)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -115,9 +120,14 @@ jobs:
         with:
           version: "29.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Cache the pinned zakurad
+      - name: Cache the pinned zakurad and zainod
         uses: actions/cache@v4
         with:
           path: target/regtest-bin
-          key: zakurad-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/regtest/versions.toml') }}
+          key: regtest-bin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/regtest/versions.toml') }}
       - run: cargo test --locked -p gyges-regtest --test node -- --nocapture
+      - run: cargo test --locked -p gyges-regtest --test backfill -- --nocapture
+        env:
+          GYGES_BUILD_ZAINOD: "1"
+      - run: df -h /
+        if: always()

@@ -2,7 +2,8 @@
 //!
 //! [`Fixture`] runs `gygesd` and `gyges` against a temporary `GYGES_HOME`;
 //! [`Node`] runs the pinned `zakurad` in regtest (`versions.toml`) and drives
-//! it over JSON-RPC. The archival `zaino` arrives with ROADMAP.md M2. Gyges
+//! it over JSON-RPC; [`Fallback`] adds an archive node and `zaino` in front of
+//! it as the fallback endpoint (ROADMAP.md M2). Gyges
 //! binaries are taken from `GYGES_DAEMON_BIN` / `GYGES_CLI_BIN` when set;
 //! otherwise they are built (once per test process, a no-op when fresh)
 //! into the same target directory as the test executable, so a `cargo test
@@ -12,12 +13,17 @@
 
 mod fake;
 mod node;
+mod zaino;
 
 pub use fake::{
     FAST_CONFIG, FakeNodeHandle, PASSPHRASE, SPEND_CONFIG, TEX_CONFIG, fund_transparent,
     pool_spendable, synced_key, transparent_receivers, wait_spendable, wait_tex_state,
 };
-pub use node::{BURN_MINER_ADDRESS, MIN_TX_RETENTION, Node, NodeOpts, pinned_tag, zakurad_binary};
+pub use node::{
+    BURN_MINER_ADDRESS, FINALITY_DEPTH, MIN_TX_RETENTION, Node, NodeOpts, pinned_tag,
+    zakurad_binary,
+};
+pub use zaino::{Fallback, Zaino, zainod_binary};
 
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt as _;

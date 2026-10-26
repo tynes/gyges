@@ -357,6 +357,27 @@ The `chain_name` `"test"` is already accepted.
 - Sapling outputs. A Sapling payment from `tx send` failed in Gyges itself: "PCZTs require that ZIP 212 is enforced for outputs". `sapling-crypto` builds PCZT Sapling outputs only once ZIP 212 is `On`, which is Canopy + `ZIP212_GRACE_PERIOD` (32,256 blocks). With Canopy at 1, that is height 32,257, so a Sapling scenario on the real regtest node must mine past it first.
 - Orchard actions (the wallet sends Ironwood).
 
+#### Harness facts: a pruned node, an archive node and zaino (2026-10-26, v1.6.0, macOS arm64)
+
+Measured while building `tests/regtest/harness/zaino.rs` (ROADMAP.md M2, sixth item, step 2).
+
+- **Pruning starts about 2,000 blocks deep, not 1,001.** A pruned node counts `tx_retention` from its *finalized* tip, and a block is finalized 1,000 deep. So `pruneheight` is `tip - 1000 - (tx_retention - 1)` once that is positive, and 0 before. With `tx_retention = 1001`:
+  - at tips 1,100, 1,200 and 1,500, `pruneheight` was 0;
+  - at tip 2,100 it was 100, and `getblock("50", 0)` answered `-8 "Block not found"`.
+
+  So a regtest scenario must mine past tip 2,001 before the node prunes block 1. `getblockchaininfo.header_chain.finalized.height` shows the finalized tip (100 at tip 1,100). The harness constant is `gyges_regtest::FINALITY_DEPTH`.
+- **Only the newest 1,000 blocks are in the non-finalized backup.** Finalized blocks leave `state/non_finalized_state/<net>/`, so a wait for "every block in the backup" never ends on a chain longer than 1,000. `Node::wait_for_backup` now waits for the non-finalized blocks only.
+- **Two regtest nodes peer, but slowly.** With `p2p_stack = "legacy"` and the second node's `initial_testnet_peers = ["127.0.0.1:<first node's listen_addr>"]`, the second node connected at once (`getpeerinfo`). It first reported the 20 blocks mined on the first node 27 s later.
+- **`submitblock` copies blocks quickly and in order.** `getblock(h, 0)` on one node and `submitblock` on the other: the answer is `null` for an accepted block. 1,100 blocks took 34 s from a shell loop and well under that from the harness. Mining 2,100 blocks, copying them and waiting for zaino takes about 20 s in all. The harness copies after every 100 mined blocks, far inside the 2,000-block pruning depth.
+- **zaino follows an archive node fed by `submitblock`** and serves blocks below the pruned node's `pruneheight`, with hashes equal to the pruned node's `getblockhash`. After an archive-node restart, restarting zaino is enough: it serves new blocks again.
+
+The harness therefore runs the three as `gyges_regtest::Fallback`:
+- the pruned node, which mines and takes broadcasts;
+- the archive node, which receives blocks by `submitblock` and has no peers;
+- zaino in front of the archive node, restarted with it.
+
+One consequence: a transaction broadcast through zaino (`--via-tor`) reaches only the archive node's mempool, and nothing mines there.
+
 ---
 
 ## 5. Missing Documents
