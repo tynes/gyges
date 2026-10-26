@@ -20,10 +20,10 @@ use gyges_proto::v1::{
     TransactionSummary,
 };
 use tonic::Status;
-use zcash_protocol::consensus::NetworkType;
+use zcash_protocol::consensus::{NetworkType, Parameters as _};
 
 use crate::keys::proto_pool;
-use crate::service::{DaemonState, invalid};
+use crate::service::{DaemonState, invalid, proto_network};
 use crate::tex;
 use crate::tx::{tx_error, with_wallet};
 
@@ -50,19 +50,11 @@ fn core_pool(p: i32) -> Result<Pool, Status> {
     }
 }
 
-fn proto_network_type(net: NetworkType) -> v1::Network {
+fn network_of(net: NetworkType) -> Network {
     match net {
-        NetworkType::Main => v1::Network::Mainnet,
-        NetworkType::Test => v1::Network::Testnet,
-        NetworkType::Regtest => v1::Network::Regtest,
-    }
-}
-
-fn network_type(net: Network) -> NetworkType {
-    match net {
-        Network::Mainnet => NetworkType::Main,
-        Network::Testnet => NetworkType::Test,
-        Network::Regtest => NetworkType::Regtest,
+        NetworkType::Main => Network::Mainnet,
+        NetworkType::Test => Network::Testnet,
+        NetworkType::Regtest => Network::Regtest,
     }
 }
 
@@ -169,7 +161,7 @@ fn proto_kind(k: AddressKind) -> v1::AddressKind {
 /// (the RPC itself succeeds); `network` is reported whenever the encoding
 /// names one.
 pub fn inspect_address(state: &DaemonState, req: InspectAddressRequest) -> InspectAddressResponse {
-    let daemon_net = network_type(state.network);
+    let daemon_net = state.network.consensus_params().network_type();
     match addresses::inspect(&req.address) {
         Err(error) => InspectAddressResponse {
             valid: false,
@@ -186,7 +178,7 @@ pub fn inspect_address(state: &DaemonState, req: InspectAddressRequest) -> Inspe
             } = &i;
             InspectAddressResponse {
                 valid: on_network,
-                network: proto_network_type(shown) as i32,
+                network: proto_network(network_of(shown)) as i32,
                 kind: proto_kind(*kind) as i32,
                 receivers: proto_receivers(receivers),
                 transparent_source_only: i.transparent_source_only(),
@@ -195,20 +187,12 @@ pub fn inspect_address(state: &DaemonState, req: InspectAddressRequest) -> Inspe
                 } else {
                     format!(
                         "the address is for {}; this daemon is on {}",
-                        net_name(i.network),
-                        net_name(daemon_net)
+                        network_of(i.network).name(),
+                        state.network.name()
                     )
                 },
             }
         }
-    }
-}
-
-fn net_name(n: NetworkType) -> &'static str {
-    match n {
-        NetworkType::Main => "mainnet",
-        NetworkType::Test => "testnet",
-        NetworkType::Regtest => "regtest",
     }
 }
 

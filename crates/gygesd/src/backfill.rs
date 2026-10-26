@@ -22,9 +22,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use gyges_chain::{ChainBackend, ChainError, FillError, NodeBounds, Source, TorState};
+use gyges_chain::{
+    ArtiTorLwdBackend, ChainBackend, ChainError, FillError, NodeBounds, Source, TorState,
+};
 use gyges_core::KeyEntry;
 use gyges_core::handoff::{self, Check, Mismatch};
+use gyges_core::network::ConsensusParams;
 use gyges_core::recovery::{self, Placement, Report};
 use gyges_core::sync::{self as core_sync, ScanOutcome, StallReason, SyncError, SyncState};
 use gyges_proto::v1;
@@ -118,7 +121,7 @@ impl TrustHub {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, TrustInner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock(&self.inner)
     }
 
     pub fn get(&self) -> Trust {
@@ -140,13 +143,7 @@ impl TrustHub {
                 reason: reason.clone(),
                 marked_at: crate::service::unix_now(),
             };
-            let written = serde_json::to_vec_pretty(&file)
-                .map_err(std::io::Error::other)
-                .and_then(|bytes: Vec<u8>| {
-                    use std::io::Write as _;
-                    gyges_core::perms::create_private_file(path)?.write_all(&bytes)
-                });
-            if let Err(e) = written {
+            if let Err(e) = write_private_json(path, &file) {
                 tracing::error!(path = %path.display(), error = %e, "cannot persist the untrusted mark");
             }
         }
@@ -215,10 +212,11 @@ pub fn load_session(key: &KeyEntry) -> Option<Session> {
     }
 }
 
-fn save_session(key: &KeyEntry, session: &Session) -> std::io::Result<()> {
+/// Write `value` as pretty JSON to a new owner-only file at `path`.
+fn write_private_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
     use std::io::Write as _;
-    let bytes = serde_json::to_vec_pretty(session).map_err(std::io::Error::other)?;
-    gyges_core::perms::create_private_file(&session_path(key))?.write_all(&bytes)
+    let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
+    gyges_core::perms::create_private_file(path)?.write_all(&bytes)
 }
 
 fn report_path(key: &KeyEntry) -> PathBuf {
@@ -232,13 +230,7 @@ pub fn load_report(key: &KeyEntry) -> Option<Report> {
 }
 
 fn save_report(key: &KeyEntry, report: &Report) {
-    use std::io::Write as _;
-    let result = serde_json::to_vec_pretty(report)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| {
-            gyges_core::perms::create_private_file(&report_path(key))?.write_all(&bytes)
-        });
-    if let Err(e) = result {
+    if let Err(e) = write_private_json(&report_path(key), report) {
         tracing::warn!(error = %e, "cannot record the transparent recovery");
     }
 }
@@ -316,7 +308,7 @@ impl Scheduler {
     fn set_session(&mut self, key: &KeyEntry, session: Option<Session>) {
         match &session {
             Some(s) => {
-                if let Err(e) = save_session(key, s) {
+                if let Err(e) = write_private_json(&session_path(key), s) {
                     tracing::error!(key_id = key.key_id(), error = %e, "cannot write the backfill marker");
                 }
             }
@@ -331,6 +323,26 @@ impl Scheduler {
         self.session(key).is_some()
     }
 
+    /// The fallback endpoint if the key may backfill from it; otherwise the
+    /// key is stalled. Without an endpoint (removed from the config with a
+    /// session open) the key waits for the node to serve its next block.
+    fn usable_fallback(
+        &self,
+        key_id: &str,
+        scanned_tip: BlockHeight,
+        bounds: &NodeBounds,
+    ) -> Option<Arc<ArtiTorLwdBackend<ConsensusParams>>> {
+        let Some(fallback) = self.state.fallback.clone() else {
+            self.stall_pruned(key_id, u32::from(scanned_tip) + 1, bounds);
+            return None;
+        };
+        if let Trust::Untrusted { reason } = self.state.fallback_trust.get() {
+            self.stall_untrusted(key_id, &reason);
+            return None;
+        }
+        Some(fallback)
+    }
+
     /// SYNC.md §4.2: the next range starts below the node's window. With a
     /// usable endpoint, open a session (check 3 first) and backfill;
     /// otherwise stall.
@@ -339,17 +351,15 @@ impl Scheduler {
         key: &Arc<KeyEntry>,
         bounds: &NodeBounds,
         scanned_tip: BlockHeight,
-        needed: BlockHeight,
     ) -> Result<(bool, BlockHeight), SyncError> {
         let key_id = key.key_id().to_string();
-        let Some(fallback) = self.state.fallback.clone() else {
-            self.stall_pruned(&key_id, u32::from(needed), bounds);
+        let Some(fallback) = self.usable_fallback(&key_id, scanned_tip, bounds) else {
             return Ok((false, scanned_tip));
         };
-        if let Trust::Untrusted { reason } = self.state.fallback_trust.get() {
-            self.stall_untrusted(&key_id, &reason);
-            return Ok((false, scanned_tip));
-        }
+        let session = Session {
+            from: u32::from(scanned_tip) + 1,
+            endpoint: fallback.endpoint(),
+        };
         tracing::warn!(
             key_id,
             scanned_tip = u32::from(scanned_tip),
@@ -364,10 +374,6 @@ impl Scheduler {
         let agreed = match handoff::agreed_subtree_roots(&fb_roots, &node_roots) {
             Ok(a) => a,
             Err(m) => {
-                let session = Session {
-                    from: u32::from(scanned_tip) + 1,
-                    endpoint: fallback.endpoint(),
-                };
                 self.refuse(key, &session, m).await;
                 return Ok((false, scanned_tip));
             }
@@ -377,10 +383,6 @@ impl Scheduler {
             with_wallet(key, move |w| handoff::put_subtree_roots(w, &agreed)).await?;
             tracing::info!(key_id, roots = n, "node-confirmed subtree roots added");
         }
-        let session = Session {
-            from: u32::from(scanned_tip) + 1,
-            endpoint: fallback.endpoint(),
-        };
         self.set_session(key, Some(session));
         self.step_backfill(key, bounds, scanned_tip).await
     }
@@ -419,17 +421,9 @@ impl Scheduler {
             return self.validate(key, bounds, scanned_tip).await;
         }
 
-        let Some(fallback) = self.state.fallback.clone() else {
-            // The endpoint was removed from the config with a session open:
-            // nothing to fetch from; the key waits for the node to serve
-            // the handoff height.
-            self.stall_pruned(&key_id, u32::from(scanned_tip) + 1, bounds);
+        let Some(fallback) = self.usable_fallback(&key_id, scanned_tip, bounds) else {
             return Ok((false, scanned_tip));
         };
-        if let Trust::Untrusted { reason } = self.state.fallback_trust.get() {
-            self.stall_untrusted(&key_id, &reason);
-            return Ok((false, scanned_tip));
-        }
         let via_tor = !matches!(fallback.transport(), gyges_chain::Transport::Direct);
         let start = scanned_tip + 1;
         let batch = self.state.config.cache.scan_batch.max(1);
@@ -493,14 +487,7 @@ impl Scheduler {
                 .map_err(SyncError::Fallback)?
         };
 
-        let params = self.state.registry.params();
-        let cache = self.cache.clone();
-        let scan = range.clone();
-        let outcome = with_wallet(key, move |w| {
-            core_sync::scan_range(&params, &cache, w, &scan, &prior)
-        })
-        .await;
-        let outcome = match outcome {
+        let outcome = match self.scan(key, &range, prior).await {
             Ok(o) => o,
             // Every block of the batch came from the endpoint: a block the
             // scanner refuses (tree sizes that do not add up, bad encoding)

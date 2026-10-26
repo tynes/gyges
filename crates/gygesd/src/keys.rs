@@ -512,7 +512,6 @@ pub fn lock_key(state: &DaemonState, req: LockKeyRequest) -> Result<LockKeyRespo
 /// it needs a live daemon-scoped unlock (`VAULT_LOCKED` otherwise).
 pub fn export_ufvk(
     state: &DaemonState,
-    _conn: Option<ConnInfo>,
     req: ExportUfvkRequest,
 ) -> Result<ExportUfvkResponse, Status> {
     let key = state.resolve_key(&req.key_id)?;

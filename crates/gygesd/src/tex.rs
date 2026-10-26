@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gyges_chain::{ChainBackend, ChainError, TxStatus, display_hash, parse_display_hash};
+use gyges_core::sync as core_sync;
 use gyges_core::tex::{self as core_tex, TexQueueError, TexRow};
 use gyges_core::tx::{self as core_tx, TxError};
 use gyges_core::{KeyEntry, TexState};
@@ -37,14 +38,13 @@ use gyges_proto::v1::{
 use prost::Message as _;
 use tokio::sync::Notify;
 use tonic::Status;
-use zcash_client_backend::data_api::{TransactionStatus, WalletWrite as _};
 use zcash_keys::keys::UnifiedSpendingKey;
-use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::conn::ConnInfo;
 use crate::keys::AUDIT_TARGET;
 use crate::service::{DaemonState, unix_now};
+use crate::sync;
 use crate::tx::{self, tx_error};
 
 /// The queue's wake-up and the rows a `tx resume` is rebuilding.
@@ -61,7 +61,7 @@ impl TexHub {
     }
 
     fn rebuilding(&self) -> std::sync::MutexGuard<'_, BTreeSet<[u8; 32]>> {
-        self.rebuilding.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock(&self.rebuilding)
     }
 }
 
@@ -97,13 +97,7 @@ pub async fn tick(state: &Arc<DaemonState>, chain: &dyn ChainBackend) {
     if !chain.status().connected {
         return;
     }
-    let keys: Vec<Arc<KeyEntry>> = state
-        .registry
-        .list()
-        .into_iter()
-        .filter(|k| k.profile().has_wallet())
-        .collect();
-    for key in keys {
+    for key in state.wallet_keys() {
         let ids = match tx::with_wallet(&key, |w| {
             core_tex::list_ids(w, &ACTIVE).map_err(queue_error)
         })
@@ -149,11 +143,8 @@ pub(crate) fn already_known(text: &str) -> bool {
 /// Record a mined height in the wallet. Failures are logged only: the
 /// wallet may learn it from the scanner too.
 async fn mark_mined(key: &Arc<KeyEntry>, txid: [u8; 32], height: BlockHeight) {
-    let outcome = tx::with_wallet(key, move |w| {
-        w.set_transaction_status(TxId::from_bytes(txid), TransactionStatus::Mined(height))
-            .map_err(|e| TxError::Internal(e.to_string()))
-    })
-    .await;
+    let status = TxStatus::Mined(height);
+    let outcome = sync::with_wallet(key, move |w| core_sync::record_status(w, txid, status)).await;
     if let Err(e) = outcome {
         tracing::debug!(key_id = key.key_id(), error = %e, "could not record a mined height");
     }
@@ -383,8 +374,8 @@ pub fn to_proto(key_id: &str, row: &TexRow) -> TexQueueEntry {
 /// Every transfer of `key_id` (all keys when empty), for `tx sessions`.
 pub async fn list(state: &DaemonState, key_id: &str, include_finished: bool) -> Vec<TexQueueEntry> {
     let mut out = Vec::new();
-    for key in state.registry.list() {
-        if !key.profile().has_wallet() || (!key_id.is_empty() && key.key_id() != key_id) {
+    for key in state.wallet_keys() {
+        if !key_id.is_empty() && key.key_id() != key_id {
             continue;
         }
         let rows = tx::with_wallet(&key, move |w| {

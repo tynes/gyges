@@ -88,6 +88,10 @@ fn parse_and_check(
     Ok((pczt, tags))
 }
 
+fn session_error(e: impl std::fmt::Display) -> TxError {
+    TxError::Internal(e.to_string())
+}
+
 fn proto_role(r: Role) -> PcztRole {
     match r {
         Role::Creator => PcztRole::Creator,
@@ -146,7 +150,7 @@ pub async fn create_pczt(
     let memo = core_tx::memo_for(&to, &req.memo).map_err(err)?;
     let amount = tx::parse_amount(req.amount)?;
     let spend_pools = prepared.key.profile().spend_pools.clone();
-    let min_confirmations = prepared.min_confirmations();
+    let min_confirmations = prepared.min_confirmations;
     let network = state.network;
     let ttl = i64::try_from(state.config.vault.signing_session_ttl.as_secs()).unwrap_or(i64::MAX);
     let kid = key_id.clone();
@@ -200,7 +204,7 @@ pub async fn create_pczt(
                 last_error: None,
             },
         )
-        .map_err(|e| TxError::Internal(e.to_string()))?;
+        .map_err(session_error)?;
         Ok((proto, bytes, session_id))
     })
     .await
@@ -256,7 +260,14 @@ pub fn sign_pczt(
     req: SignPcztRequest,
 ) -> Result<SignStream, Status> {
     let (pczt, tags) = parse_and_check(&state, &req.pczt, &req.key_id)?;
-    let prepared = tx::prepare_signer(&state, conn, &tags.key_id, &req.session_token)?;
+    let prepared = tx::prepare(
+        &state,
+        conn,
+        &tags.key_id,
+        &req.session_token,
+        0,
+        Purpose::SignPczt,
+    )?;
     let key_id = prepared.key.key_id().to_string();
     let insp = pczt_io::inspect(&state.registry.params(), &pczt)
         .map_err(|e| tx_error(e, &key_id).into_status())?;
@@ -280,11 +291,8 @@ pub fn sign_pczt(
             .await
             .map_err(err)?;
             tracing::info!(key_id, "pczt signed");
-            tx.send(Ok(SignPcztEvent {
-                event: Some(sign_pczt_event::Event::Signed(bytes)),
-            }))
-            .await
-            .map_err(|_| Status::cancelled("client disconnected"))
+            let event = Some(sign_pczt_event::Event::Signed(bytes));
+            tx::send(&tx, SignPcztEvent { event }).await
         }
         .await;
         if let Err(status) = outcome {
@@ -378,11 +386,9 @@ pub async fn broadcast_pczt(
     // The approved proposal, from the key's own table.
     let session_id = tags.session_id.clone();
     let sid = session_id.clone();
-    let row = with_wallet(&key, move |w| {
-        sessions::get(w, &sid).map_err(|e| TxError::Internal(e.to_string()))
-    })
-    .await
-    .map_err(err)?;
+    let row = with_wallet(&key, move |w| sessions::get(w, &sid).map_err(session_error))
+        .await
+        .map_err(err)?;
     let Some(row) = row else {
         return Err(typed(
             ErrorReason::SessionNotFound,
@@ -428,14 +434,14 @@ pub async fn broadcast_pczt(
         };
         let _ = with_wallet(&key, move |w| {
             sessions::set_state(w, &sid, SessionState::Signed, None, Some(&text))
-                .map_err(|e| TxError::Internal(e.to_string()))
+                .map_err(session_error)
         })
         .await;
         return Err(e.into_status());
     }
     with_wallet(&key, move |w| {
         sessions::set_state(w, &sid, SessionState::Broadcast, Some(raw_txid), None)
-            .map_err(|e| TxError::Internal(e.to_string()))
+            .map_err(session_error)
     })
     .await
     .map_err(err)?;

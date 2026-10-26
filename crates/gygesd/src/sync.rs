@@ -33,13 +33,14 @@ use gyges_proto::v1::{
 };
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tonic::Status;
-use zcash_client_backend::data_api::chain::BlockCache as _;
+use zcash_client_backend::data_api::chain::{BlockCache as _, ChainState};
 use zcash_client_backend::data_api::scanning::{ScanPriority, ScanRange};
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::backfill;
 use crate::node;
 use crate::service::DaemonState;
+use crate::{lock, read, write};
 
 /// What the RPC handlers and the scheduler share: the latest progress per
 /// key, a change counter for streams to wait on, a wake-up for the
@@ -91,47 +92,27 @@ impl Default for SyncHub {
 
 impl SyncHub {
     pub fn get(&self, key_id: &str) -> Option<KeyProgress> {
-        self.progress
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(key_id)
-            .cloned()
+        read(&self.progress).get(key_id).cloned()
     }
 
-    pub fn snapshot(&self) -> Vec<KeyProgress> {
-        self.progress
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .cloned()
-            .collect()
+    /// A key's progress, `Initializing` before the scheduler reached it.
+    pub fn progress(&self, key_id: &str) -> KeyProgress {
+        self.get(key_id)
+            .unwrap_or_else(|| KeyProgress::initializing(key_id))
     }
 
     /// Replace a key's progress and notify waiters.
     pub fn publish(&self, mut progress: KeyProgress) {
         progress.updated_at = SystemTime::now();
-        self.progress
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(progress.key_id.clone(), progress);
+        write(&self.progress).insert(progress.key_id.clone(), progress);
         self.generation.send_modify(|g| *g += 1);
     }
 
     /// Edit a key's progress in place (creating it as `Initializing`).
     pub fn update(&self, key_id: &str, f: impl FnOnce(&mut KeyProgress)) {
-        let mut p = self
-            .get(key_id)
-            .unwrap_or_else(|| KeyProgress::initializing(key_id));
+        let mut p = self.progress(key_id);
         f(&mut p);
         self.publish(p);
-    }
-
-    pub fn forget(&self, key_id: &str) {
-        self.progress
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key_id);
-        self.generation.send_modify(|g| *g += 1);
     }
 
     /// A receiver that wakes whenever any progress changes.
@@ -147,25 +128,16 @@ impl SyncHub {
     /// `RunSync.from_height`: rescan from `from` (truncating to `from - 1`)
     /// at the next tick.
     pub fn request_rewind(&self, key_id: &str, from: BlockHeight) {
-        self.rewinds
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key_id.to_string(), from);
+        lock(&self.rewinds).insert(key_id.to_string(), from);
         self.wake();
     }
 
     pub fn rewind_pending(&self, key_id: &str) -> bool {
-        self.rewinds
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(key_id)
+        lock(&self.rewinds).contains_key(key_id)
     }
 
     fn take_rewind(&self, key_id: &str) -> Option<BlockHeight> {
-        self.rewinds
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key_id)
+        lock(&self.rewinds).remove(key_id)
     }
 
     /// `ScanMempool`: run a full mempool pass at the next tick and report it.
@@ -174,21 +146,13 @@ impl SyncHub {
         key_id: Option<String>,
     ) -> oneshot::Receiver<Result<(u32, u32), String>> {
         let (reply, rx) = oneshot::channel();
-        self.mempool_requests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(MempoolRequest { key_id, reply });
+        lock(&self.mempool_requests).push(MempoolRequest { key_id, reply });
         self.wake();
         rx
     }
 
     fn take_mempool_requests(&self) -> Vec<MempoolRequest> {
-        std::mem::take(
-            &mut *self
-                .mempool_requests
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        )
+        std::mem::take(&mut *lock(&self.mempool_requests))
     }
 
     /// Ask the scheduler to stop at the next batch boundary.
@@ -202,15 +166,15 @@ impl SyncHub {
 
     /// `(ticks begun, ticks completed)`.
     pub fn ticks(&self) -> (u64, u64) {
-        *self.ticks.lock().unwrap_or_else(|e| e.into_inner())
+        *lock(&self.ticks)
     }
 
     fn tick_begun(&self) {
-        self.ticks.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+        lock(&self.ticks).0 += 1;
     }
 
     fn tick_completed(&self) {
-        self.ticks.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+        lock(&self.ticks).1 += 1;
         self.generation.send_modify(|g| *g += 1);
     }
 }
@@ -252,6 +216,8 @@ pub struct Scheduler {
     pub(crate) chain: Arc<dyn ChainBackend>,
     pub(crate) cache: Arc<BlockDb>,
     link: node::Link,
+    /// `zakura_rpc.poll_interval_secs`, at least one second.
+    poll: Duration,
     rates: BTreeMap<String, Rate>,
     started: Instant,
     last_connected: Option<Instant>,
@@ -281,11 +247,13 @@ pub fn spawn(
     cache: Arc<BlockDb>,
     link: node::Link,
 ) -> tokio::task::JoinHandle<()> {
+    let poll = Duration::from_secs(u64::from(state.config.zakura_rpc.poll_interval_secs.max(1)));
     let scheduler = Scheduler {
         state,
         chain,
         cache,
         link,
+        poll,
         rates: BTreeMap::new(),
         started: Instant::now(),
         last_connected: None,
@@ -299,9 +267,6 @@ pub fn spawn(
 
 impl Scheduler {
     async fn run(mut self) {
-        let poll = Duration::from_secs(u64::from(
-            self.state.config.zakura_rpc.poll_interval_secs.max(1),
-        ));
         let mut stop = self.state.sync.stop.subscribe();
         loop {
             if self.hub().stopping() {
@@ -317,7 +282,7 @@ impl Scheduler {
             } else {
                 tokio::select! {
                     () = self.state.sync.wake.notified() => {}
-                    () = tokio::time::sleep(poll) => {}
+                    () = tokio::time::sleep(self.poll) => {}
                     _ = stop.changed() => {}
                 }
             }
@@ -347,30 +312,23 @@ impl Scheduler {
         if connected {
             self.last_connected = Some(Instant::now());
         }
-        let keys: Vec<Arc<KeyEntry>> = self
-            .state
-            .registry
-            .list()
-            .into_iter()
-            .filter(|k| k.profile().has_wallet())
-            .collect();
+        let keys = self.state.wallet_keys();
 
         if !connected {
             let down_for = self
                 .last_connected
                 .map_or_else(|| self.started.elapsed(), |t| t.elapsed());
-            let stalled = down_for > self.state.config.daemon.offline_grace;
+            let err = &status.last_error;
             for key in &keys {
-                let err = status.last_error.clone();
-                self.hub().update(key.key_id(), |p| {
-                    if stalled {
-                        p.state = SyncState::Stalled(StallReason::Offline);
-                        p.detail = format!("node unreachable for {}s: {err}", down_for.as_secs());
-                    } else {
+                if down_for > self.state.config.daemon.offline_grace {
+                    let detail = format!("node unreachable for {}s: {err}", down_for.as_secs());
+                    self.stall(key.key_id(), StallReason::Offline, detail);
+                } else {
+                    self.hub().update(key.key_id(), |p| {
                         p.detail = format!("node unreachable, retrying: {err}");
-                    }
-                    p.blocks_per_sec = 0.0;
-                });
+                        p.blocks_per_sec = 0.0;
+                    });
+                }
             }
             return false;
         }
@@ -422,25 +380,16 @@ impl Scheduler {
             let outcome = self.mempool_pass(keys, bounds, true).await;
             for req in requests {
                 let reply = match &outcome {
-                    Ok((scanned, notes)) => Ok((
-                        *scanned,
-                        req.key_id.as_ref().map_or_else(
-                            || notes.values().sum(),
-                            |k| notes.get(k).copied().unwrap_or(0),
-                        ),
-                    )),
+                    Ok((scanned, notes)) => Ok((*scanned, notes_for(req.key_id.as_deref(), notes))),
                     Err(e) => Err(e.to_string()),
                 };
                 let _ = req.reply.send(reply);
             }
             return;
         }
-        let poll = Duration::from_secs(u64::from(
-            self.state.config.zakura_rpc.poll_interval_secs.max(1),
-        ));
         if !self.state.config.mempool.scan
             || did_work
-            || self.mempool_scanned_at.is_some_and(|t| t.elapsed() < poll)
+            || !due(self.mempool_scanned_at.as_ref(), self.poll)
         {
             return;
         }
@@ -462,12 +411,7 @@ impl Scheduler {
     ) -> Result<(u32, BTreeMap<String, u32>), SyncError> {
         self.mempool_scanned_at = Some(Instant::now());
         let current = self.chain.mempool_txids().await?;
-        let todo: Vec<[u8; 32]> = current
-            .iter()
-            .filter(|t| full || !self.mempool_seen.contains(*t))
-            .take(MEMPOOL_MAX_NEW)
-            .copied()
-            .collect();
+        let todo = mempool_todo(&current, &self.mempool_seen, full);
         let params = self.state.registry.params();
         let mut scanned = 0u32;
         let mut notes: BTreeMap<String, u32> = BTreeMap::new();
@@ -522,16 +466,8 @@ impl Scheduler {
     /// `self.chain` is the node, and the fallback endpoint is never asked
     /// about the wallet's own txids. Failures are logged and retried.
     async fn check_status(&mut self, key: &Arc<KeyEntry>, scanned_tip: BlockHeight) {
-        let poll = Duration::from_secs(u64::from(
-            self.state.config.zakura_rpc.poll_interval_secs.max(1),
-        ));
         let key_id = key.key_id().to_string();
-        if self
-            .status_checked
-            .get(&key_id)
-            .is_some_and(|t| t.elapsed() < poll)
-            || self.in_backfill(key)
-        {
+        if !due(self.status_checked.get(&key_id), self.poll) || self.in_backfill(key) {
             return;
         }
         self.status_checked.insert(key_id.clone(), Instant::now());
@@ -787,22 +723,13 @@ impl Scheduler {
             && scanned_tip < retained_from
             && scanned_tip < tip
         {
-            return self
-                .enter_backfill(key, bounds, scanned_tip, scanned_tip + 1)
-                .await;
+            return self.enter_backfill(key, bounds, scanned_tip).await;
         }
 
         // SYNC.md §4.2 invariant: the next batch starts at a height whose
         // body the node has, and its prior tree state is still served.
         let Some(range) = view.next_range(self.state.config.cache.scan_batch as usize) else {
-            let spendable = view.is_spendable(tip);
-            self.publish_view(
-                &key_id,
-                &view,
-                bounds,
-                SyncState::Synced { spendable },
-                String::new(),
-            );
+            self.publish_synced(&key_id, &view, bounds);
             return Ok((false, scanned_tip));
         };
         let start = range.block_range().start;
@@ -818,14 +745,7 @@ impl Scheduler {
 
         let range = clamp_end(&range, tip + 1);
         if range.is_empty() {
-            let spendable = view.is_spendable(tip);
-            self.publish_view(
-                &key_id,
-                &view,
-                bounds,
-                SyncState::Synced { spendable },
-                String::new(),
-            );
+            self.publish_synced(&key_id, &view, bounds);
             return Ok((false, scanned_tip));
         }
         let Range { start, end } = range.block_range().clone();
@@ -847,15 +767,8 @@ impl Scheduler {
 
         self.ensure_cached(&range, bounds).await?;
         let prior = self.chain.chain_state(start - 1).await?;
-
-        let params = self.state.registry.params();
-        let cache = self.cache.clone();
-        let scan_range = range.clone();
         let t0 = Instant::now();
-        let outcome = with_wallet(key, move |w| {
-            core_sync::scan_range(&params, &cache, w, &scan_range, &prior)
-        })
-        .await?;
+        let outcome = self.scan(key, &range, prior).await?;
 
         match outcome {
             ScanOutcome::Scanned {
@@ -1022,6 +935,29 @@ impl Scheduler {
         }
     }
 
+    /// Scan `range` of the cache into the key's wallet, from `prior`.
+    pub(crate) async fn scan(
+        &self,
+        key: &Arc<KeyEntry>,
+        range: &ScanRange,
+        prior: ChainState,
+    ) -> Result<ScanOutcome, SyncError> {
+        let params = self.state.registry.params();
+        let cache = self.cache.clone();
+        let range = range.clone();
+        with_wallet(key, move |w| {
+            core_sync::scan_range(&params, &cache, w, &range, &prior)
+        })
+        .await
+    }
+
+    /// Nothing left to scan up to the tip.
+    fn publish_synced(&self, key_id: &str, view: &WalletView, bounds: &NodeBounds) {
+        let spendable = view.is_spendable(bounds.tip_height);
+        let state = SyncState::Synced { spendable };
+        self.publish_view(key_id, view, bounds, state, String::new());
+    }
+
     fn publish_view(
         &self,
         key_id: &str,
@@ -1054,6 +990,42 @@ fn whole(lo: BlockHeight, hi: BlockHeight) -> ScanRange {
 fn clamp_end(range: &ScanRange, max_end: BlockHeight) -> ScanRange {
     let Range { start, end } = range.block_range().clone();
     ScanRange::from_parts(start..end.min(max_end).max(start), range.priority())
+}
+
+/// Whether work last done at `last` (never: `None`) is due again.
+fn due(last: Option<&Instant>, every: Duration) -> bool {
+    last.is_none_or(|t| t.elapsed() >= every)
+}
+
+/// The mempool transactions a pass fetches: all of `current` when `full`,
+/// else those not seen last pass; at most [`MEMPOOL_MAX_NEW`].
+fn mempool_todo(current: &[[u8; 32]], seen: &HashSet<[u8; 32]>, full: bool) -> Vec<[u8; 32]> {
+    current
+        .iter()
+        .filter(|t| full || !seen.contains(*t))
+        .take(MEMPOOL_MAX_NEW)
+        .copied()
+        .collect()
+}
+
+/// The notes a pass found for one key, or for every key (`None`).
+fn notes_for(key_id: Option<&str>, notes: &BTreeMap<String, u32>) -> u32 {
+    match key_id {
+        Some(k) => notes.get(k).copied().unwrap_or(0),
+        None => notes.values().sum(),
+    }
+}
+
+/// The height the key's wallet saw `txid` mined at, if any.
+pub(crate) async fn mined_height(key: &Arc<KeyEntry>, txid: [u8; 32]) -> Option<BlockHeight> {
+    let key = key.clone();
+    tokio::task::spawn_blocking(move || {
+        key.wallet()
+            .and_then(|w| core_sync::tx_height(&w, txid).ok().flatten())
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Run `f` with the key's wallet on a blocking thread.
@@ -1133,13 +1105,6 @@ fn resolve_synced_key(state: &DaemonState, key_id: &str) -> Result<Arc<KeyEntry>
     state.wallet_key(key_id, "a signer-only profile has no wallet to synchronise")
 }
 
-fn progress_of(state: &DaemonState, key_id: &str) -> KeyProgress {
-    state
-        .sync
-        .get(key_id)
-        .unwrap_or_else(|| KeyProgress::initializing(key_id))
-}
-
 /// `GetSyncStatus`: every wallet-bearing key, or one.
 pub fn get_sync_status(
     state: &DaemonState,
@@ -1149,15 +1114,13 @@ pub fn get_sync_status(
         // An empty key_id means "all keys" for status even with a default
         // configured (CLI_SPEC.md §2.3 `--all`), unlike the other RPCs.
         state
-            .registry
-            .list()
-            .into_iter()
-            .filter(|k| k.profile().has_wallet())
-            .map(|k| to_proto(&progress_of(state, k.key_id())))
+            .wallet_keys()
+            .iter()
+            .map(|k| to_proto(&state.sync.progress(k.key_id())))
             .collect()
     } else {
         let key = resolve_synced_key(state, &req.key_id)?;
-        vec![to_proto(&progress_of(state, key.key_id()))]
+        vec![to_proto(&state.sync.progress(key.key_id()))]
     };
     Ok(GetSyncStatusResponse { keys })
 }
@@ -1251,7 +1214,7 @@ pub fn run_sync(state: Arc<DaemonState>, req: RunSyncRequest) -> Result<Progress
         .into_status());
     }
     if req.from_height != 0 {
-        let current = progress_of(&state, key.key_id()).scanned_tip;
+        let current = state.sync.progress(key.key_id()).scanned_tip;
         let birthday = key.profile().birthday_height.unwrap_or(0);
         if req.from_height <= current {
             if !req.confirm_rewind {
@@ -1300,7 +1263,7 @@ fn progress_stream(
         state.sync.wake();
         let mut rewind_seen_applied = !wait_for_rewind;
         loop {
-            let p = progress_of(&state, &key_id);
+            let p = state.sync.progress(&key_id);
             let fresh = state.sync.ticks().1 >= need_completed;
             if !rewind_seen_applied && !state.sync.rewind_pending(&key_id) {
                 rewind_seen_applied = true;
@@ -1314,17 +1277,7 @@ fn progress_stream(
                 Until::Scanned => (0, ready && p.scanned),
                 Until::Spendable => (0, ready && p.spendable),
                 Until::Confirmations { txid, wanted } => {
-                    let txid = *txid;
-                    let height = tokio::task::spawn_blocking({
-                        let key = key.clone();
-                        move || {
-                            key.wallet()
-                                .and_then(|w| core_sync::tx_height(&w, txid).ok().flatten())
-                        }
-                    })
-                    .await
-                    .ok()
-                    .flatten();
+                    let height = mined_height(&key, *txid).await;
                     let confs =
                         height.map_or(0, |h| (p.chain_tip + 1).saturating_sub(u32::from(h)));
                     (confs, ready && confs >= *wanted)
@@ -1390,8 +1343,33 @@ mod tests {
         assert!(hub.rewind_pending("a"));
         assert_eq!(hub.take_rewind("a"), Some(BlockHeight::from_u32(3)));
         assert!(!hub.rewind_pending("a"));
-        hub.forget("a");
-        assert!(hub.snapshot().is_empty());
+        assert_eq!(hub.progress("b").state, SyncState::Initializing);
+    }
+
+    #[test]
+    fn throttled_work_is_due_once_per_interval() {
+        let every = Duration::from_secs(60);
+        assert!(due(None, every));
+        assert!(!due(Some(&Instant::now()), every));
+        assert!(due(Some(&Instant::now()), Duration::ZERO));
+    }
+
+    #[test]
+    fn a_mempool_pass_skips_what_it_saw_and_is_capped() {
+        let current: Vec<[u8; 32]> = (0..=MEMPOOL_MAX_NEW).map(|i| [i as u8; 32]).collect();
+        let seen: HashSet<[u8; 32]> = [[0; 32], [1; 32]].into();
+        let new = mempool_todo(&current[..3], &seen, false);
+        assert_eq!(new, vec![[2; 32]]);
+        assert_eq!(mempool_todo(&current[..3], &seen, true).len(), 3);
+        assert_eq!(mempool_todo(&current, &seen, true).len(), MEMPOOL_MAX_NEW);
+    }
+
+    #[test]
+    fn mempool_notes_are_counted_per_key_or_in_all() {
+        let notes: BTreeMap<String, u32> = [("a".into(), 2), ("b".into(), 3)].into();
+        assert_eq!(notes_for(Some("a"), &notes), 2);
+        assert_eq!(notes_for(Some("c"), &notes), 0);
+        assert_eq!(notes_for(None, &notes), 5);
     }
 
     #[test]

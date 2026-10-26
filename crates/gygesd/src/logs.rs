@@ -96,7 +96,7 @@ impl fmt::Debug for Ring {
 impl Ring {
     fn push(&self, entry: LogEntry) {
         let numbered = {
-            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut s = crate::lock(&self.state);
             let numbered = Numbered {
                 seq: s.next_seq,
                 entry,
@@ -114,7 +114,7 @@ impl Ring {
 
     /// The last `lines` entries and the sequence number the next entry gets.
     fn snapshot(&self, lines: usize) -> (Vec<Numbered>, u64) {
-        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let s = crate::lock(&self.state);
         let skip = s.entries.len().saturating_sub(lines);
         (s.entries.iter().skip(skip).cloned().collect(), s.next_seq)
     }
