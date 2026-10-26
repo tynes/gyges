@@ -83,7 +83,21 @@ Design note: `SYNC.md` §Case B.
      - Correct the `lwd.rs` comment that says zaino reports `"regtest"`.
 
      Pin `[zainod] version` and the `.crate` sha256 in `versions.toml`, with a cached build under `target/regtest-bin/`. Extend `gyges_regtest::Node` to run the archive node peered with the pruned one, and to restart zaino whenever the archive node restarts.
-  3. Port TESTING.md §3 rows 5–8 to the real pair.
+
+     **Harness half landed 2026-10-26** as `gyges_regtest::{Fallback, Zaino, zainod_binary}` (`tests/regtest/harness/zaino.rs`):
+     - `versions.toml` pins `zainod` 0.10.2 by the sha256 of its crates.io `.crate`. On Linux with `GYGES_BUILD_ZAINOD=1` (set in the CI `regtest` job only, since the build needs minutes and disk) the harness downloads and checks it, then runs `cargo install --locked --path` into `target/regtest-bin/zainod-0.10.2/`, in its own target directory, which it deletes afterwards. Elsewhere it uses `ZAINOD_BIN`, or skips.
+     - `NodeOpts.archive` omits the `storage_mode` line.
+     - `Fallback` runs the pruned node (mines, takes broadcasts), an archive node, and zaino in front of the archive node. The archive node is fed by `submitblock` every 100 mined blocks rather than peered: peering works but took 27 s to pass on 20 blocks (`OVERVIEW.md` §4.5).
+     - `Fallback::restart_archive` restarts zaino too.
+     - `config_section()` gives the daemon's `[fallback_lightwalletd]`.
+
+     Found on the way, and recorded in §4.5:
+     - the node counts `tx_retention` from its finalized tip, so block 1 is pruned only at tip 2,002 (`FINALITY_DEPTH`);
+     - only the newest 1,000 blocks sit in the non-finalized backup. `Node::wait_for_backup` waited for every block, so it never returned on a chain longer than that; it now waits for the newest 1,000 only.
+
+     Test: `scenarios/backfill.rs::zaino_serves_what_the_pruned_node_dropped`. It mines 2,100 blocks; asserts `pruneheight`; checks zaino's blocks below it against the pruned node's hashes; restarts the archive node; then checks that zaino follows. About 26 s. The CI `regtest` job runs it after the node scenarios. The error-mapping half is its own PR (branch `zaino-error-mapping`).
+  3. Port TESTING.md §3 rows 5–7 to the real pair. Each needs some 2,100 blocks before the node prunes (above). Row 8 needs an endpoint that lies, so it stays covered by `FakeLightwalletd` only.
+  4. Nightly job through a local Tor network (the workflow's first `schedule:` trigger), the Tor half of this item's heading. Not started.
 
 ## M3 — ZIP 320 (`tex1`) sends
 

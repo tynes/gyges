@@ -37,9 +37,17 @@ pub const BURN_MINER_ADDRESS: &str = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV";
 /// The smallest `tx_retention` a regtest node accepts (`MAX_BLOCK_REORG_HEIGHT + 1`).
 pub const MIN_TX_RETENTION: u32 = 1001;
 
+/// How deep a block is when the node finalizes it. A pruned node counts
+/// `tx_retention` from its finalized tip, not from the chain tip, so its
+/// `pruneheight` is `tip - FINALITY_DEPTH - (tx_retention - 1)` once that
+/// is positive, and 0 before: with the smallest window, block 1 is pruned
+/// at tip 2,002 (measured on v1.6.0, `OVERVIEW.md` §4.5).
+pub const FINALITY_DEPTH: u32 = 1000;
+
 #[derive(Debug, Deserialize)]
-struct Versions {
+pub(crate) struct Versions {
     zakurad: ZakuradVersion,
+    pub(crate) zainod: crate::zaino::ZainodVersion,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,7 +56,7 @@ struct ZakuradVersion {
     sha256: BTreeMap<String, String>,
 }
 
-fn versions() -> Versions {
+pub(crate) fn versions() -> Versions {
     toml::from_str(VERSIONS).expect("versions.toml parses")
 }
 
@@ -78,7 +86,7 @@ pub fn zakurad_binary() -> Option<PathBuf> {
 }
 
 /// `target/regtest-bin/`, beside the profile directory the tests run from.
-fn regtest_bin_dir() -> PathBuf {
+pub(crate) fn regtest_bin_dir() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
     // target/<profile>/deps/<test>-<hash> -> target/
     let target = exe
@@ -87,6 +95,31 @@ fn regtest_bin_dir() -> PathBuf {
         .and_then(Path::parent)
         .expect("target dir");
     target.join("regtest-bin")
+}
+
+/// Download `url` to `dest` and check its sha256 against `expected`; a
+/// mismatch removes the file.
+pub(crate) fn download_verified(url: &str, dest: &Path, expected: &str) -> anyhow::Result<()> {
+    eprintln!("downloading {url}");
+    let status = Command::new("curl")
+        .args(["-fsSL", "--retry", "3", "-o"])
+        .arg(dest)
+        .arg(url)
+        .status()
+        .context("run curl")?;
+    if !status.success() {
+        bail!("curl {url} failed: {status}");
+    }
+    let bytes = fs::read(dest)?;
+    let digest = {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(&bytes))
+    };
+    if digest != expected {
+        let _ = fs::remove_file(dest);
+        bail!("{url}: sha256 {digest}, versions.toml expects {expected}");
+    }
+    Ok(())
 }
 
 fn download_pinned() -> anyhow::Result<PathBuf> {
@@ -115,25 +148,7 @@ fn download_pinned() -> anyhow::Result<PathBuf> {
         v.tag
     );
     let tmp = regtest_bin_dir().join(format!("{archive}.{}.part", std::process::id()));
-    eprintln!("downloading {url}");
-    let status = Command::new("curl")
-        .args(["-fsSL", "--retry", "3", "-o"])
-        .arg(&tmp)
-        .arg(&url)
-        .status()
-        .context("run curl")?;
-    if !status.success() {
-        bail!("curl {url} failed: {status}");
-    }
-    let bytes = fs::read(&tmp)?;
-    let digest = {
-        use sha2::Digest as _;
-        hex::encode(sha2::Sha256::digest(&bytes))
-    };
-    if digest != *expected {
-        let _ = fs::remove_file(&tmp);
-        bail!("{archive}: sha256 {digest}, versions.toml expects {expected}");
-    }
+    download_verified(&url, &tmp, expected)?;
     let staging = regtest_bin_dir().join(format!(
         "{}.{}.extract",
         dir.file_name().unwrap().to_string_lossy(),
@@ -179,6 +194,10 @@ pub struct NodeOpts {
     pub miner_address: String,
     /// `state.storage_mode.pruned.tx_retention`.
     pub tx_retention: u32,
+    /// Keep every block and transaction (no `storage_mode` line, so the
+    /// node's default `archive`); `tx_retention` is then ignored. The
+    /// archival node behind zaino ([`crate::Fallback`]) runs this way.
+    pub archive: bool,
 }
 
 impl Default for NodeOpts {
@@ -186,6 +205,7 @@ impl Default for NodeOpts {
         Self {
             miner_address: BURN_MINER_ADDRESS.into(),
             tx_retention: MIN_TX_RETENTION,
+            archive: false,
         }
     }
 }
@@ -204,7 +224,7 @@ pub struct Node {
     client: reqwest::blocking::Client,
 }
 
-fn free_port() -> u16 {
+pub(crate) fn free_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
     l.local_addr().unwrap().port()
 }
@@ -251,13 +271,15 @@ impl Node {
         self.dir_path.join("state/non_finalized_state/regtest")
     }
 
-    /// Block until every block of the best chain is in the backup directory.
-    /// The node writes the backup at most every five seconds after a change
-    /// and only while running; a stop before that loses the blocks (they are
-    /// non-finalized until 1,000 deep on regtest).
+    /// Block until every non-finalized block of the best chain (the newest
+    /// [`FINALITY_DEPTH`]) is in the backup directory. The node writes the
+    /// backup at most every five seconds after a change and only while
+    /// running; a stop before that loses the blocks. Finalized blocks are
+    /// on disk already and leave the backup.
     pub fn wait_for_backup(&self) {
         let tip = self.tip_height();
-        let hashes: Vec<String> = (1..=tip).map(|h| self.block_hash(h)).collect();
+        let first = (tip + 1).saturating_sub(FINALITY_DEPTH).max(1);
+        let hashes: Vec<String> = (first..=tip).map(|h| self.block_hash(h)).collect();
         crate::poll_until(
             Duration::from_secs(30),
             Duration::from_millis(200),
@@ -297,7 +319,12 @@ impl Node {
     }
 
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.rpc_port)
+        format!("http://{}", self.rpc_addr())
+    }
+
+    /// The JSON-RPC listen address, `127.0.0.1:<port>`.
+    pub fn rpc_addr(&self) -> String {
+        format!("127.0.0.1:{}", self.rpc_port)
     }
 
     pub fn opts(&self) -> &NodeOpts {
@@ -306,6 +333,14 @@ impl Node {
 
     fn write_config(&self) -> anyhow::Result<()> {
         let d = self.dir_path.display();
+        let storage = if self.opts.archive {
+            String::new()
+        } else {
+            format!(
+                "storage_mode = {{ pruned = {{ tx_retention = {} }} }}",
+                self.opts.tx_retention
+            )
+        };
         let config = format!(
             r#"# Written by the gyges regtest harness.
 [network]
@@ -334,7 +369,7 @@ NU6 = 1
 
 [state]
 cache_dir = "{d}/state"
-storage_mode = {{ pruned = {{ tx_retention = {retention} }} }}
+{storage}
 
 [rpc]
 listen_addr = "127.0.0.1:{rpc}"
@@ -353,7 +388,6 @@ use_color = false
             p2p = self.p2p_port,
             zakura = self.zakura_port,
             rpc = self.rpc_port,
-            retention = self.opts.tx_retention,
             miner = self.opts.miner_address,
         );
         fs::write(self.config_path(), config)?;
@@ -500,6 +534,36 @@ use_color = false
             .map(|h| u32::try_from(h).unwrap())
     }
 
+    /// `getblockchaininfo.pruneheight`: the lowest height whose block body
+    /// the node still stores (0 for an archive node or before any pruning).
+    pub fn prune_height(&self) -> u32 {
+        let info = self
+            .rpc("getblockchaininfo", json!([]))
+            .expect("getblockchaininfo");
+        info["pruneheight"]
+            .as_u64()
+            .map_or(0, |h| u32::try_from(h).unwrap())
+    }
+
+    /// `getblock(h, 0)`: the serialized block as hex.
+    pub fn raw_block(&self, height: u32) -> String {
+        self.rpc("getblock", json!([height.to_string(), 0]))
+            .expect("getblock")
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// `submitblock`: the node answers `null` for a block it accepted and a
+    /// BIP 22 reason string (`"duplicate"`, `"rejected"`, …) otherwise.
+    pub fn submit_block(&self, hex: &str) -> anyhow::Result<()> {
+        match self.rpc("submitblock", json!([hex]))? {
+            Value::Null => Ok(()),
+            Value::String(r) if r == "duplicate" => Ok(()),
+            other => bail!("submitblock: {other}"),
+        }
+    }
+
     pub fn send_raw_transaction(&self, hex: &str) -> anyhow::Result<String> {
         Ok(self
             .rpc("sendrawtransaction", json!([hex]))?
@@ -605,6 +669,14 @@ impl Drop for Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versions_file_pins_zainod_and_its_crate_hash() {
+        let v = versions().zainod;
+        assert!(v.version.split('.').count() == 3, "{}", v.version);
+        assert_eq!(v.sha256.len(), 64);
+        assert!(v.sha256.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn versions_file_pins_a_tag_and_both_linux_hashes() {

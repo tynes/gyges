@@ -38,6 +38,12 @@ path = "scenarios/pczt.rs"
 name = "node"
 path = "scenarios/node.rs"
 
+# Against a pruned zakurad, an archive zakurad and zainod (TESTING.md §3
+# rows 5–7); skips itself where either binary is unavailable.
+[[test]]
+name = "backfill"
+path = "scenarios/backfill.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -55,9 +61,9 @@ zcash_client_sqlite = { workspace = true }
 transparent = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
+zcash_protocol = { workspace = true }  # LocalNetwork, for the client harness/zaino.rs checks zaino with
 
 [dev-dependencies]
-zcash_protocol = { workspace = true }
 zcash_keys = { workspace = true }
 bip0039 = { workspace = true }
 zip32 = { workspace = true }

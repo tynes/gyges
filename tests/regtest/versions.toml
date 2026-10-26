@@ -17,3 +17,14 @@ tag = "v1.6.0"
 [zakurad.sha256]
 linux-x86_64 = "12842638072feb3b2fab500b60da979738d884b484194c4d2aef5220f7a3f372"
 linux-aarch64 = "ffc346c2279f8b9a580e7b35dee468c036d31bcd9d1dc530460583bdb049c9d5"
+
+# The archival endpoint for the backfill scenarios (ROADMAP.md M2, sixth
+# item; OVERVIEW.md §4.5). zaino publishes no binaries, so the harness pins
+# the crates.io `.crate` by its sha256, unpacks it and runs `cargo install
+# --locked --path` into `target/regtest-bin/zainod-<version>/` (Linux, with
+# `GYGES_BUILD_ZAINOD=1` as the CI `regtest` job sets it; a few minutes).
+# Otherwise set `ZAINOD_BIN` (`cargo install zainod --version <version>
+# --locked`) or the backfill scenarios skip themselves.
+[zainod]
+version = "0.10.2"
+sha256 = "501b24362ae267a9c64a2236c7089208a3db63e7b09f38f93c5658c6c8edf76e"
