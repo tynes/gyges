@@ -276,11 +276,12 @@ The request pattern is identical whether or not the wallet has activity, so memp
 
 On `daemon stop` or `SIGTERM`:
 
-1. Cancel the `BlockFetcher` and every key's scan task at the next batch boundary (a batch is at most `cache.scan_batch` blocks; `scan_cached_blocks` commits per batch, so no partial batch is ever visible).
+1. Stop the scheduler at the next batch boundary. A batch is at most `cache.scan_batch` blocks, and `scan_cached_blocks` commits per batch, so no partial batch is ever visible. Shutdown sets a stop flag on the `SyncHub`. The scheduler finishes the batch in hand, its fetch from the node and its scan, and then returns. Shutdown waits up to 30 s for it and cancels it after that; a cancelled batch commits nothing.
 2. Close Tor streams; the Arti cache under `tor_cache/` is kept.
-3. Run `PRAGMA wal_checkpoint(TRUNCATE)` on every `wallet.sqlite` and on `blocks.sqlite`.
+3. Run `PRAGMA wal_checkpoint(TRUNCATE)` on `blocks.sqlite`. The `wallet.sqlite` files use upstream's default rollback journal, not WAL, so they have nothing to checkpoint.
 4. Zeroize unlocked keys and destroy signing sessions held in memory (persisted sessions in `signing_sessions` survive).
 5. Leave `ext_gyges_tex_queue` rows as they are; the queue resumes on next start (it re-checks every active row against the node, so a step the node lost while the daemon was down is simply rebroadcast).
+6. Unlink the socket last, after every step above. `gyges daemon stop` waits for the file to go, so it returns only once the batch is committed, the keys are zeroized and the cache is checkpointed.
 
 On restart every key begins in `Initializing`, which re-derives its state from `block_fully_scanned` and `NodeBounds`, so an interrupted scan simply continues.
 

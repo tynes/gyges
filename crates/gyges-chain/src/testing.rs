@@ -291,6 +291,14 @@ struct State {
     /// `(n, height)`: after `n` more raw blocks (`getblock(h, 0)`) have
     /// been served, prune below `height` (a node pruning under a scan).
     prune_after_raw: Option<(u32, u32)>,
+    /// `n`: after `n` more raw blocks have been served, every further
+    /// `getblock` waits until [`FakeNode::release`] (a node that stalls in
+    /// the middle of a scan). `Some(0)` means the gate is closed.
+    hold_after_raw: Option<u32>,
+    /// `getblock` requests waiting at the closed gate.
+    held: u32,
+    /// Bumped by [`FakeNode::release`] to wake the waiting requests.
+    gate: tokio::sync::watch::Sender<u64>,
     cookie: Option<String>,
     /// Overrides the computed sizes in `getblock(h, 1).trees` when set.
     tree_sizes: Option<TreeSizes>,
@@ -466,6 +474,9 @@ impl FakeNode {
             blocks,
             prune_height: None,
             prune_after_raw: None,
+            hold_after_raw: None,
+            held: 0,
+            gate: tokio::sync::watch::Sender::new(0),
             cookie: None,
             tree_sizes: None,
             calls: Vec::new(),
@@ -539,6 +550,26 @@ impl FakeNode {
     /// have been served: deterministically, in the middle of a scan.
     pub fn prune_after_raw_blocks(&self, n: u32, height: u32) {
         self.lock().prune_after_raw = Some((n, height));
+    }
+
+    /// After `n` more raw blocks (`getblock(h, 0)`) have been served, hold
+    /// every further `getblock` until [`Self::release`]: deterministically,
+    /// a node that stalls in the middle of a scan.
+    pub fn hold_after_raw_blocks(&self, n: u32) {
+        self.lock().hold_after_raw = Some(n);
+    }
+
+    /// Open the gate of [`Self::hold_after_raw_blocks`]; the held requests
+    /// are answered.
+    pub fn release(&self) {
+        let mut st = self.lock();
+        st.hold_after_raw = None;
+        st.gate.send_modify(|g| *g += 1);
+    }
+
+    /// How many `getblock` requests are waiting at the closed gate.
+    pub fn held_requests(&self) -> u32 {
+        self.lock().held
     }
 
     /// `pruneheight`: bodies below it answer `-8 Block not found`.
@@ -666,6 +697,22 @@ async fn handle(
         .cloned()
         .unwrap_or_default();
 
+    if method == "getblock" {
+        // The gate of `hold_after_raw_blocks`. Subscribing under the lock
+        // that `release` takes means no wake-up is missed.
+        let waiter = {
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            (st.hold_after_raw == Some(0)).then(|| {
+                st.held += 1;
+                st.gate.subscribe()
+            })
+        };
+        if let Some(mut rx) = waiter {
+            let _ = rx.changed().await;
+            state.lock().unwrap_or_else(|e| e.into_inner()).held -= 1;
+        }
+    }
+
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
     st.calls.push(method.clone());
     if let Some(secret) = &st.cookie {
@@ -693,6 +740,14 @@ async fn handle(
         } else {
             st.prune_after_raw = Some((n - 1, height));
         }
+    }
+    if method == "getblock"
+        && params.get(1).and_then(Value::as_u64) == Some(0)
+        && outcome.is_ok()
+        && let Some(n) = st.hold_after_raw
+        && n > 0
+    {
+        st.hold_after_raw = Some(n - 1);
     }
     if let Ok(Value::Object(obj)) = &outcome
         && let Some(Value::String(txid_hex)) = obj.get("__accept__")

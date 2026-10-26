@@ -56,7 +56,19 @@ The exit criterion is met. These gaps were recorded under "Not done" in the item
   Not done:
   - A transparent-only transaction whose block the node pruned before the daemon asked: the node answers `Unknown`, so the wallet treats it as unmined until it expires. Asking the fallback endpoint instead would disclose the txid to it.
   - The real-node scenario.
-- [ ] `TESTING.md` §3 rows 16 (`daemon stop` mid-scan, restart resumes without rescanning) and 17 (one `getblock` per block across three keys).
+- [x] `TESTING.md` §3 rows 16 (`daemon stop` mid-scan, restart resumes without rescanning) and 17 (one `getblock` per block across three keys).
+
+  Row 16 found that shutdown did not wait for the batch in hand. It aborted the scheduler task without awaiting it, then checkpointed the cache while the batch's `spawn_blocking` scan could still be running. It also unlinked the socket first, so `daemon stop` returned before any of that finished. `gyges daemon stop --help` ("finish the current batch") was therefore not true. Landed as:
+  - `SyncHub::request_stop`. The scheduler checks it between ticks and between keys, so it finishes the batch in hand (fetch and scan) and returns.
+  - `Daemon::serve` waits for the scheduler for up to 30 s (`SCHEDULER_STOP_GRACE`) before cancelling it, then zeroizes, checkpoints, and unlinks the socket last.
+  - SYNC.md §8 now says the wallet databases use a rollback journal, so only `blocks.sqlite` is checkpointed.
+  - `FakeNode::{hold_after_raw_blocks, release, held_requests}` stall the node in the middle of a scan, deterministically.
+
+  Tests:
+  - Row 16, `rpc.rs::daemon_stop_mid_scan_finishes_the_batch_and_restart_does_not_rescan`. Exactly one batch is committed after the stop is asked for, and the wallet's max scanned height equals the last logged batch end. The cache WAL is empty, and after a restart no range is scanned twice. With the old abort put back, the test fails (checked).
+  - Row 17, `rpc.rs::three_keys_fetch_each_block_from_the_node_once`. Three keys over 60 blocks cost exactly 120 `getblock` calls, two per block. The count comes from the fake node's call log instead of a harness proxy.
+
+  Not done: both rows run in-process against the fake node only, not through the binaries or against `zakurad`.
 
 ## M2 — Historical restore over Tor
 
