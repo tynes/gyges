@@ -123,13 +123,10 @@ impl FakeLightwalletd {
     ) -> Self {
         let state = Arc::new(Mutex::new(LwdState {
             chain_name: chain_name.to_string(),
-            blocks: blocks.into_iter().map(|b| (b.height as u32, b)).collect(),
+            blocks: by_height(blocks, |b| b.height),
             transactions: BTreeMap::new(),
             utxos: Vec::new(),
-            tree_states: tree_states
-                .into_iter()
-                .map(|t| (t.height as u32, t))
-                .collect(),
+            tree_states: by_height(tree_states, |t| t.height),
             subtree_roots: BTreeMap::new(),
             omitted: BTreeSet::new(),
             hang_after: None,
@@ -165,9 +162,23 @@ impl FakeLightwalletd {
         lwd
     }
 
-    /// The node's raw transactions (for `GetTransaction`) and its unspent
-    /// transparent outputs (for `GetAddressUtxos`).
-    fn snapshot_transparent(&self, node: &FakeNode) {
+    /// Report `utxo` from `GetAddressUtxos` too (a lying endpoint).
+    pub fn inject_utxo(&self, utxo: FakeUtxo) {
+        self.lock().utxos.push(utxo);
+    }
+
+    /// What `GetAddressUtxos` currently reports.
+    pub fn utxos(&self) -> Vec<FakeUtxo> {
+        self.lock().utxos.clone()
+    }
+
+    /// Take a fresh snapshot of `node`'s chain, as an archival endpoint
+    /// following the same chain would serve it: compact blocks without the
+    /// transparent fields (lightwalletd's legacy answer), the tree state at
+    /// every height, the raw transactions (for `GetTransaction`) and the
+    /// unspent transparent outputs (for `GetAddressUtxos`).
+    pub fn resync(&self, node: &FakeNode) {
+        let chain = node.compact_chain();
         let mut transactions = BTreeMap::new();
         for h in 0..=node.tip().0 {
             if let Some(b) = node.block(h) {
@@ -176,7 +187,6 @@ impl FakeLightwalletd {
                 }
             }
         }
-        let chain = node.compact_chain();
         let mut spent = BTreeSet::new();
         for b in &chain {
             for tx in &b.vtx {
@@ -202,34 +212,19 @@ impl FakeLightwalletd {
                 })
             })
             .collect();
+        let blocks = chain.into_iter().map(|mut b| {
+            for tx in &mut b.vtx {
+                tx.vin.clear();
+                tx.vout.clear();
+            }
+            b
+        });
+        let tree_states = (0..=node.tip().0).map(|h| node.tree_state(h));
         let mut st = self.lock();
+        st.blocks = by_height(blocks, |b| b.height);
+        st.tree_states = by_height(tree_states, |t| t.height);
         st.transactions = transactions;
         st.utxos = utxos;
-    }
-
-    /// Report `utxo` from `GetAddressUtxos` too (a lying endpoint).
-    pub fn inject_utxo(&self, utxo: FakeUtxo) {
-        self.lock().utxos.push(utxo);
-    }
-
-    /// What `GetAddressUtxos` currently reports.
-    pub fn utxos(&self) -> Vec<FakeUtxo> {
-        self.lock().utxos.clone()
-    }
-
-    /// Take a fresh snapshot of `node`'s chain (blocks and tree states), as
-    /// an archival endpoint following the same chain would serve it.
-    pub fn resync(&self, node: &FakeNode) {
-        let (blocks, tree_states) = snapshot(node);
-        {
-            let mut st = self.lock();
-            st.blocks = blocks.into_iter().map(|b| (b.height as u32, b)).collect();
-            st.tree_states = tree_states
-                .into_iter()
-                .map(|t| (t.height as u32, t))
-                .collect();
-        }
-        self.snapshot_transparent(node);
     }
 
     /// Every served block, to tamper with through
@@ -249,7 +244,7 @@ impl FakeLightwalletd {
 
     /// Replace the served blocks.
     pub fn set_blocks(&self, blocks: Vec<CompactBlock>) {
-        self.lock().blocks = blocks.into_iter().map(|b| (b.height as u32, b)).collect();
+        self.lock().blocks = by_height(blocks, |b| b.height);
     }
 
     /// Leave `height` out of every `GetBlockRange` stream (the stream jumps
@@ -329,22 +324,12 @@ impl FakeLightwalletd {
     }
 }
 
-/// `node`'s chain as lightwalletd's legacy answer: compact blocks without
-/// transparent fields, and the tree state at every height.
-fn snapshot(node: &FakeNode) -> (Vec<CompactBlock>, Vec<TreeState>) {
-    let blocks = node
-        .compact_chain()
-        .into_iter()
-        .map(|mut b| {
-            for tx in &mut b.vtx {
-                tx.vin.clear();
-                tx.vout.clear();
-            }
-            b
-        })
-        .collect();
-    let tree_states = (0..=node.tip().0).map(|h| node.tree_state(h)).collect();
-    (blocks, tree_states)
+/// `items` keyed by the height `height` reads off each.
+fn by_height<T>(
+    items: impl IntoIterator<Item = T>,
+    height: impl Fn(&T) -> u64,
+) -> BTreeMap<u32, T> {
+    items.into_iter().map(|t| (height(&t) as u32, t)).collect()
 }
 
 struct Service(Arc<Mutex<LwdState>>);
@@ -445,19 +430,6 @@ impl CompactTxStreamer for Service {
             .cloned()
             .map(Response::new)
             .ok_or_else(|| Status::not_found(format!("no tree state at {h}")))
-    }
-
-    async fn get_latest_tree_state(
-        &self,
-        _: Request<Empty>,
-    ) -> Result<Response<TreeState>, Status> {
-        let st = self.lock("GetLatestTreeState");
-        st.tree_states
-            .values()
-            .next_back()
-            .cloned()
-            .map(Response::new)
-            .ok_or_else(|| Status::not_found("no tree state"))
     }
 
     async fn get_subtree_roots(
