@@ -12,21 +12,11 @@ fn status_reports_version_network_and_json_schema() {
     let mut fx = Fixture::new("regtest");
     fx.start_daemon(&[]).unwrap();
 
-    let run = fx.gyges(&["daemon", "status"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stdout.contains("(API 0.1) on regtest"),
-        "{}",
-        run.stdout
-    );
-    assert!(
-        run.stdout.contains("node:         not connected"),
-        "{}",
-        run.stdout
-    );
+    let run = fx.gyges(&["daemon", "status"]).ok();
+    run.stdout_has("(API 0.1) on regtest");
+    run.stdout_has("node:         not connected");
 
-    let run = fx.gyges(&["daemon", "status", "--json"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    let run = fx.gyges(&["daemon", "status", "--json"]).ok();
     let json = run.json();
     assert_eq!(json["schema_version"], "0.1");
     assert_eq!(json["network"], "NETWORK_REGTEST");
@@ -49,8 +39,7 @@ fn status_reports_version_network_and_json_schema() {
             "status",
             "-j",
         ])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .ok();
     assert_eq!(run.json()["network"], "NETWORK_REGTEST");
 }
 
@@ -69,10 +58,9 @@ fn network_mismatch_exits_6_before_any_other_rpc() {
             "daemon",
             "status",
         ])
-        .run();
-    assert_eq!(run.code(), 6, "{run:?}");
-    assert!(run.stderr.contains("serves regtest"), "{}", run.stderr);
-    assert!(run.stderr.contains("testnet"), "{}", run.stderr);
+        .code(6);
+    run.stderr_has("serves regtest");
+    run.stderr_has("testnet");
 
     let run = fx
         .gyges_no_network(&[
@@ -84,8 +72,7 @@ fn network_mismatch_exits_6_before_any_other_rpc() {
             "status",
             "--json",
         ])
-        .run();
-    assert_eq!(run.code(), 6, "{run:?}");
+        .code(6);
     let json = run.json();
     assert_eq!(json["schema_version"], "0.1");
     assert_eq!(json["error"]["reason"], "ERROR_REASON_NETWORK_MISMATCH");
@@ -94,17 +81,10 @@ fn network_mismatch_exits_6_before_any_other_rpc() {
 #[test]
 fn missing_daemon_exits_3_with_the_fix() {
     let fx = Fixture::new("regtest");
-    let run = fx.gyges(&["daemon", "status"]).run();
-    assert_eq!(run.code(), 3, "{run:?}");
-    assert!(
-        run.stderr
-            .contains("gygesd is not running; start it with 'gyges daemon start'"),
-        "{}",
-        run.stderr
-    );
+    let run = fx.gyges(&["daemon", "status"]).code(3);
+    run.stderr_has("gygesd is not running; start it with 'gyges daemon start'");
 
-    let run = fx.gyges(&["daemon", "stop", "--json"]).run();
-    assert_eq!(run.code(), 3, "{run:?}");
+    let run = fx.gyges(&["daemon", "stop", "--json"]).code(3);
     let json = run.json();
     // A client-side failure has no daemon reason; proto3 JSON omits the
     // zero value, so `reason` is absent rather than "ERROR_REASON_UNSPECIFIED".
@@ -129,38 +109,32 @@ fn stop_removes_the_socket_and_the_daemon_exits_cleanly() {
         pid.to_string()
     );
 
-    let run = fx.gyges(&["daemon", "stop"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(run.stderr.contains("gygesd stopped"), "{}", run.stderr);
+    fx.gyges(&["daemon", "stop"])
+        .ok()
+        .stderr_has("gygesd stopped");
     assert!(!fx.socket().exists(), "socket removed");
     let status = fx.wait_daemon(Duration::from_secs(10)).unwrap();
     assert!(status.success(), "{status}");
     assert!(!fx.pid_file().exists(), "pid file removed");
 
-    let run = fx.gyges(&["daemon", "status"]).run();
-    assert_eq!(run.code(), 3, "{run:?}");
+    fx.gyges(&["daemon", "status"]).code(3);
 }
 
 #[test]
 fn start_and_stop_through_the_cli_daemonizes() {
     let fx = Fixture::new("regtest");
-    let run = fx.gyges(&["daemon", "start", "--airgapped"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stderr.contains("gygesd started for regtest (pid "),
-        "{}",
-        run.stderr
-    );
+    fx.gyges(&["daemon", "start", "--airgapped"])
+        .ok()
+        .stderr_has("gygesd started for regtest (pid ");
     assert!(fx.socket().exists());
     assert!(fx.pid_file().is_file());
 
     // Idempotent.
-    let run = fx.gyges(&["daemon", "start"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(run.stderr.contains("already running"), "{}", run.stderr);
+    fx.gyges(&["daemon", "start"])
+        .ok()
+        .stderr_has("already running");
 
-    let run = fx.gyges(&["daemon", "status", "--json"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    let run = fx.gyges(&["daemon", "status", "--json"]).ok();
     assert_eq!(run.json()["airgapped"], true);
 
     // Everything the daemon wrote is private (umask 077 + 0700 dirs).
@@ -178,8 +152,7 @@ fn start_and_stop_through_the_cli_daemonizes() {
         .collect();
     assert!(!logs.is_empty(), "a log file was written");
 
-    let run = fx.gyges(&["daemon", "stop"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    fx.gyges(&["daemon", "stop"]).ok();
     assert!(!fx.socket().exists());
     // The detached daemon removes its pid file on the way out.
     gyges_regtest::poll_until(
@@ -201,14 +174,10 @@ fn second_daemon_for_the_same_home_refuses_to_start() {
     fx.start_daemon(&[]).unwrap();
     let run = fx.run_daemon_to_exit(&[]);
     assert_ne!(run.code(), 0, "{run:?}");
-    assert!(run.stderr.contains("already running"), "{}", run.stderr);
-    assert!(
-        run.stderr.contains(&fx.daemon_pid().unwrap().to_string()),
-        "{}",
-        run.stderr
-    );
+    run.stderr_has("already running");
+    run.stderr_has(&fx.daemon_pid().unwrap().to_string());
     // The first daemon is unharmed.
-    assert_eq!(fx.gyges(&["daemon", "status"]).run().code(), 0);
+    fx.gyges(&["daemon", "status"]).ok();
 }
 
 #[test]
@@ -220,12 +189,7 @@ fn wide_permissions_refuse_start_with_a_chmod_hint() {
     std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o755)).unwrap();
     let run = fx.run_daemon_to_exit(&[]);
     assert_ne!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stderr
-            .contains(&format!("chmod 700 {}", keys.display())),
-        "{}",
-        run.stderr
-    );
+    run.stderr_has(&format!("chmod 700 {}", keys.display()));
     assert!(!fx.socket().exists());
 }
 
@@ -235,32 +199,24 @@ fn config_errors_refuse_start_and_cli_start_relays_them() {
     fx.write_config("network = \"regtest\"\n[vault]\nunlock_tll = \"5m\"\n");
     let run = fx.run_daemon_to_exit(&[]);
     assert_ne!(run.code(), 0, "{run:?}");
-    assert!(run.stderr.contains("unknown field"), "{}", run.stderr);
+    run.stderr_has("unknown field");
 
-    let run = fx.gyges(&["daemon", "start"]).run();
-    assert_eq!(run.code(), 1, "{run:?}");
-    assert!(
-        run.stderr.contains("gygesd failed to start"),
-        "{}",
-        run.stderr
-    );
-    assert!(run.stderr.contains("unknown field"), "{}", run.stderr);
+    let run = fx.gyges(&["daemon", "start"]).code(1);
+    run.stderr_has("gygesd failed to start");
+    run.stderr_has("unknown field");
     assert!(!fx.socket().exists());
 }
 
 #[test]
 fn unimplemented_commands_exit_1_not_2() {
     let fx = Fixture::new("regtest");
-    let run = fx.gyges(&["key", "backup", "-o", "x.tar"]).run();
-    assert_eq!(run.code(), 1, "{run:?}");
-    assert!(run.stderr.contains("not implemented yet"), "{}", run.stderr);
+    fx.gyges(&["key", "backup", "-o", "x.tar"])
+        .code(1)
+        .stderr_has("not implemented yet");
     // Usage errors are still exit 2.
-    let run = fx.gyges(&["daemon", "frobnicate"]).run();
-    assert_eq!(run.code(), 2, "{run:?}");
-    let run = fx
-        .gyges_no_network(&["-n", "devnet", "daemon", "status"])
-        .run();
-    assert_eq!(run.code(), 2, "{run:?}");
+    fx.gyges(&["daemon", "frobnicate"]).code(2);
+    fx.gyges_no_network(&["-n", "devnet", "daemon", "status"])
+        .code(2);
 }
 
 /// `gyges daemon logs` replays the in-memory tail through `StreamLogs`
@@ -271,17 +227,13 @@ fn unimplemented_commands_exit_1_not_2() {
 fn logs_command_streams_the_daemon_log() {
     let mut fx = Fixture::new("regtest");
     fx.start_daemon(&[]).unwrap();
-    let run = fx.gyges(&["daemon", "logs", "--lines", "100"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(run.stdout.contains("gygesd listening"), "{}", run.stdout);
-    assert!(run.stdout.contains(" INFO "), "{}", run.stdout);
+    let run = fx.gyges(&["daemon", "logs", "--lines", "100"]).ok();
+    run.stdout_has("gygesd listening");
+    run.stdout_has(" INFO ");
     let all = run.stdout.lines().count();
     assert!(all >= 2, "{}", run.stdout);
 
-    let run = fx
-        .gyges(&["daemon", "logs", "--lines", "1", "--json"])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    let run = fx.gyges(&["daemon", "logs", "--lines", "1", "--json"]).ok();
     assert_eq!(run.stdout.lines().count(), 1, "{}", run.stdout);
     let entry = run.json();
     // The last line is the node poll (no node here: a warning).
@@ -297,8 +249,7 @@ fn logs_command_streams_the_daemon_log() {
 
     let run = fx
         .gyges(&["daemon", "logs", "--audit", "--lines", "100"])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .ok();
     assert_eq!(run.stdout, "", "{run:?}");
     assert!(fx.network_dir().join("logs/audit.log").is_file());
 }

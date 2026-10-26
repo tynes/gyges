@@ -9,45 +9,36 @@
 //! the exit-6 memo-to-transparent refusal, a non-interactive shield with
 //! `GYGES_PASSPHRASE_FILE`, and the Orchard balance after mining.
 
-use std::os::unix::fs::PermissionsExt as _;
 use std::time::Duration;
 
 use gyges_regtest::{
-    Fixture, PASSPHRASE, SPEND_CONFIG, TEX_CONFIG, fund_transparent, poll_until, pool_spendable,
-    synced_key, wait_spendable, wait_tex_state,
+    Fixture, PASSPHRASE, SPEND_CONFIG, TEX_CONFIG, burn_t_address, burn_tex_address,
+    fund_transparent, parse_tex_txids, poll_until, pool_spendable, spendable, sweep_logs,
+    synced_key, wait_balance, wait_for_txid, wait_spendable, wait_tex_state,
 };
-use transparent::address::TransparentAddress;
 
 #[test]
 fn balance_send_and_shield_through_the_binaries() {
     let (n, fx, pw) = synced_key(10, SPEND_CONFIG);
 
     // Fresh key: zero everywhere, in both renderings.
-    let run = fx.gyges(&["-k", "main", "balance", "--json"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    let run = fx.gyges(&["-k", "main", "balance", "--json"]).ok();
     let b = run.json();
     assert_eq!(b["schema_version"], "0.1");
     assert!(b.get("total_spendable").is_none(), "zero is omitted: {b}");
     assert_eq!(b["min_confirmations"], 1);
-    let run = fx.gyges(&["-k", "main", "balance"]).run();
-    assert!(
-        run.stdout.contains("orchard") && run.stdout.contains("0.00000000"),
-        "{}",
-        run.stdout
-    );
+    fx.gyges(&["-k", "main", "balance"])
+        .run()
+        .stdout_has("orchard")
+        .stdout_has("0.00000000");
 
     // Insufficient funds is exit 5, before any passphrase is asked.
-    let t_addr = gyges_chain::compact::encode_transparent_address(
-        zcash_protocol::consensus::NetworkType::Regtest,
-        &TransparentAddress::PublicKeyHash([0x42; 20]),
-    );
-    let run = fx
-        .gyges(&[
-            "-k", "main", "tx", "send", "--to", &t_addr, "--amount", "0.5", "--yes",
-        ])
-        .run();
-    assert_eq!(run.code(), 5, "{run:?}");
-    assert!(run.stderr.contains("insufficient funds"), "{}", run.stderr);
+    let t_addr = burn_t_address();
+    fx.gyges(&[
+        "-k", "main", "tx", "send", "--to", &t_addr, "--amount", "0.5", "--yes",
+    ])
+    .code(5)
+    .stderr_has("insufficient funds");
 
     // Fund 1 ZEC transparent and confirm it.
     fund_transparent(&n, &fx, 100_000_000);
@@ -59,9 +50,8 @@ fn balance_send_and_shield_through_the_binaries() {
         .gyges(&[
             "-k", "main", "tx", "send", "--to", &t_addr, "--amount", "0.5", "--memo", "hi", "--yes",
         ])
-        .run();
-    assert_eq!(run.code(), 6, "{run:?}");
-    assert!(run.stderr.contains("memo"), "{}", run.stderr);
+        .code(6);
+    run.stderr_has("memo");
 
     // `--dry-run --json` prints the proposal only.
     let run = fx
@@ -77,13 +67,8 @@ fn balance_send_and_shield_through_the_binaries() {
             "--dry-run",
             "--json",
         ])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    let lines: Vec<serde_json::Value> = run
-        .stdout
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+        .ok();
+    let lines = run.json_lines();
     assert_eq!(lines.len(), 1, "{}", run.stdout);
     let proposed = &lines[0]["proposed"];
     assert_eq!(
@@ -103,13 +88,11 @@ fn balance_send_and_shield_through_the_binaries() {
     assert_eq!(lines[0]["schema_version"], "0.1");
 
     // The confirmation prompt needs a terminal or --yes (exit 4).
-    let run = fx
-        .gyges(&[
-            "-k", "main", "tx", "send", "--to", &t_addr, "--amount", "0.5",
-        ])
-        .run();
-    assert_eq!(run.code(), 4, "{run:?}");
-    assert!(run.stderr.contains("--yes"), "{}", run.stderr);
+    fx.gyges(&[
+        "-k", "main", "tx", "send", "--to", &t_addr, "--amount", "0.5",
+    ])
+    .code(4)
+    .stderr_has("--yes");
 
     // Locked key, no terminal, no passphrase source: exit 4 with the fix,
     // the session aborted, JSON carrying reason and session_id.
@@ -117,8 +100,7 @@ fn balance_send_and_shield_through_the_binaries() {
         .gyges(&[
             "-k", "main", "tx", "send", "--to", &t_addr, "--amount", "0.5", "--yes", "--json",
         ])
-        .run();
-    assert_eq!(run.code(), 4, "{run:?}");
+        .code(4);
     let last: serde_json::Value = serde_json::from_str(run.stdout.lines().last().unwrap()).unwrap();
     assert_eq!(last["error"]["reason"], "ERROR_REASON_VAULT_LOCKED");
     assert_eq!(last["error"]["session_id"].as_str().unwrap().len(), 32);
@@ -129,22 +111,19 @@ fn balance_send_and_shield_through_the_binaries() {
             .contains("run 'gyges key unlock' or pass --passphrase-fd"),
         "{last}"
     );
-    let run = fx
-        .gyges(&["-k", "main", "tx", "sessions", "--include-finished"])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(run.stdout.contains("aborted"), "{}", run.stdout);
+    fx.gyges(&["-k", "main", "tx", "sessions", "--include-finished"])
+        .ok()
+        .stdout_has("aborted");
 
     // Shield everything with the passphrase from a file; the txid is on
     // stdout and the node has it.
     let run = fx
         .gyges(&["-k", "main", "tx", "shield", "--yes"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .ok();
     let txid = run.stdout.trim().to_string();
     assert_eq!(txid.len(), 64, "{run:?}");
-    assert!(run.stderr.contains("broadcast"), "{}", run.stderr);
+    run.stderr_has("broadcast");
     assert_eq!(
         n.node.mempool(),
         vec![gyges_chain::parse_display_hash(&txid).unwrap()]
@@ -153,34 +132,12 @@ fn balance_send_and_shield_through_the_binaries() {
     // Mined: the Orchard balance is the input minus the fee the proposal
     // showed, and `sync wait --txid` sees the confirmations.
     n.node.mine(2);
-    let run = fx
-        .gyges(&[
-            "-k",
-            "main",
-            "sync",
-            "wait",
-            "--txid",
-            &txid,
-            "--confirmations",
-            "2",
-            "--timeout",
-            "60s",
-        ])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    let (b, spendable) = poll_until(
-        Duration::from_secs(30),
-        Duration::from_millis(200),
-        "orchard balance never appeared",
-        || {
-            let b = fx.gyges(&["-k", "main", "balance", "--json"]).run().json();
-            match pool_spendable(&b, "POOL_IRONWOOD") {
-                Some(s) => Ok((b, s)),
-                None => Err(b.to_string()),
-            }
-        },
-    );
-    assert!(spendable > 99_000_000 && spendable < 100_000_000, "{b}");
+    wait_for_txid(&fx, "main", &txid, 2);
+    let b = wait_balance(&fx, "main", |b| {
+        pool_spendable(b, "POOL_IRONWOOD").is_some()
+    });
+    let ironwood = spendable(&b, "POOL_IRONWOOD");
+    assert!(ironwood > 99_000_000 && ironwood < 100_000_000, "{b}");
     assert!(
         b["pools"]
             .as_array()
@@ -195,8 +152,9 @@ fn balance_send_and_shield_through_the_binaries() {
             .iter()
             .all(|p| p["pool"] != "POOL_TRANSPARENT" || p.get("spendable").is_none())
     );
-    let run = fx.gyges(&["-k", "main", "balance"]).run();
-    assert!(run.stdout.contains("ironwood"), "{}", run.stdout);
+    fx.gyges(&["-k", "main", "balance"])
+        .run()
+        .stdout_has("ironwood");
 
     // TESTING.md §5, system level: neither log shows the address, the txid,
     // an amount (as zatoshis or decimal) or the passphrase.
@@ -209,38 +167,23 @@ fn balance_send_and_shield_through_the_binaries() {
         "0.50000000",
         PASSPHRASE,
     ];
+    sweep_logs(&log_dir, &secrets);
     let mut main_log = String::new();
-    let mut audit_log = None;
     for entry in std::fs::read_dir(&log_dir).unwrap().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let text = std::fs::read_to_string(entry.path()).unwrap();
-        assert_eq!(
-            std::fs::metadata(entry.path())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600,
-            "{name}"
-        );
-        for secret in secrets {
-            assert!(!text.contains(secret), "{secret:?} in {name}");
-        }
-        if name == "audit.log" {
-            audit_log = Some(text);
-        } else {
+        if name != "audit.log" {
             assert!(
                 name.starts_with("gygesd.") && name.ends_with(".log"),
                 "{name}"
             );
-            main_log.push_str(&text);
+            main_log.push_str(&std::fs::read_to_string(entry.path()).unwrap());
         }
     }
     assert!(main_log.contains("transaction broadcast"), "{main_log}");
 
     // `audit.log`: one JSON object per line, key id and event only, and the
     // events of this scenario in order.
-    let audit_log = audit_log.expect("audit.log written");
+    let audit_log = std::fs::read_to_string(log_dir.join("audit.log")).expect("audit.log written");
     let lines: Vec<serde_json::Value> = audit_log
         .lines()
         .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l}")))
@@ -283,13 +226,8 @@ fn balance_send_and_shield_through_the_binaries() {
     // §4.5), as JSON `LogEntry` messages or rendered lines.
     let run = fx
         .gyges(&["daemon", "logs", "--audit", "--lines", "200", "--json"])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    let streamed: Vec<serde_json::Value> = run
-        .stdout
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+        .ok();
+    let streamed = run.json_lines();
     assert_eq!(streamed.len(), lines.len(), "{}", run.stdout);
     let last = streamed.last().unwrap();
     assert_eq!(last["target"], "gyges::audit");
@@ -307,28 +245,12 @@ fn balance_send_and_shield_through_the_binaries() {
     for secret in secrets {
         assert!(!run.stdout.contains(secret), "{secret:?} streamed");
     }
-    let run = fx.gyges(&["daemon", "logs", "--lines", "500"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stdout.contains("transaction broadcast"),
-        "{}",
-        run.stdout
-    );
-    assert!(run.stdout.contains("gygesd listening"), "{}", run.stdout);
+    let run = fx.gyges(&["daemon", "logs", "--lines", "500"]).ok();
+    run.stdout_has("transaction broadcast");
+    run.stdout_has("gygesd listening");
     for secret in secrets {
         assert!(!run.stdout.contains(secret), "{secret:?} streamed");
     }
-}
-
-/// `wait_tex_state` against the fake node: 60s, polled every 200ms.
-fn wait_tex(fx: &Fixture, step1: &str, state: &str) -> serde_json::Value {
-    wait_tex_state(
-        fx,
-        step1,
-        state,
-        Duration::from_secs(60),
-        Duration::from_millis(200),
-    )
 }
 
 /// A ZIP 320 send through the binaries (CLI_SPEC.md §2.5 `tex1`), against a
@@ -341,16 +263,13 @@ fn wait_tex(fx: &Fixture, step1: &str, state: &str) -> serde_json::Value {
 fn zip320_send_survives_a_daemon_crash() {
     let (n, mut fx, pw) = synced_key(10, TEX_CONFIG);
     fund_transparent(&n, &fx, 200_000_000);
-    let run = fx
-        .gyges(&["-k", "main", "tx", "shield", "--yes"])
+    fx.gyges(&["-k", "main", "tx", "shield", "--yes"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .ok();
     n.node.mine(2);
     wait_spendable(&fx);
 
-    let params = gyges_core::Network::Regtest.consensus_params();
-    let tex_addr = zcash_keys::address::Address::Tex([0x42; 20]).encode(&params);
+    let tex_addr = burn_tex_address();
 
     // The dry run shows both steps and both fees.
     let run = fx
@@ -365,15 +284,10 @@ fn zip320_send_survives_a_daemon_crash() {
             "0.5",
             "--dry-run",
         ])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stderr.contains("Step 1 of 2") && run.stderr.contains("Step 2 of 2"),
-        "{}",
-        run.stderr
-    );
-    assert!(run.stderr.contains("ephemeral"), "{}", run.stderr);
-    assert!(run.stderr.contains(&tex_addr), "{}", run.stderr);
+        .ok();
+    run.stderr_has("Step 1 of 2").stderr_has("Step 2 of 2");
+    run.stderr_has("ephemeral");
+    run.stderr_has(&tex_addr);
     let run = fx
         .gyges(&[
             "-k",
@@ -387,8 +301,7 @@ fn zip320_send_survives_a_daemon_crash() {
             "--dry-run",
             "--json",
         ])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .ok();
     let proposed = &run.json()["proposed"];
     assert_eq!(proposed["steps"].as_array().unwrap().len(), 2, "{proposed}");
     assert_eq!(proposed["steps"][1]["transparent_only"], true, "{proposed}");
@@ -402,24 +315,18 @@ fn zip320_send_survives_a_daemon_crash() {
             "-k", "main", "tx", "send", "--to", &tex_addr, "--amount", "0.5", "--yes",
         ])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    let txids: Vec<&str> = run.stdout.lines().collect();
-    assert_eq!(txids.len(), 1, "only step 1 reached the node: {run:?}");
-    let s1 = txids[0].to_string();
-    assert_eq!(s1.len(), 64);
-    let pending = run
-        .stderr
-        .lines()
-        .find(|l| l.starts_with("tex pending (step 2 of 2)"))
-        .unwrap_or_else(|| panic!("no tex pending line: {}", run.stderr));
-    let s2 = pending.rsplit(' ').next().unwrap().to_string();
-    assert_eq!(s2.len(), 64, "{pending}");
+        .ok();
+    let (s1, s2) = parse_tex_txids(&run);
+    assert_eq!(
+        run.stdout.lines().count(),
+        1,
+        "only step 1 reached the node: {run:?}"
+    );
     assert_eq!(
         n.node.mempool(),
         vec![gyges_chain::parse_display_hash(&s1).unwrap()]
     );
-    let row = wait_tex(&fx, &s1, "TEX_STATE_STEP1_BROADCAST");
+    let row = wait_tex_state(&fx, &s1, "TEX_STATE_STEP1_BROADCAST");
     assert_eq!(row["step2_txid"], s2, "{row}");
     assert!(
         row["last_error"]
@@ -428,19 +335,16 @@ fn zip320_send_survives_a_daemon_crash() {
             .contains("missingorspent"),
         "{row}"
     );
-    let run = fx.gyges(&["-k", "main", "tx", "sessions"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stdout.contains(&s1) && run.stdout.contains("step1_broadcast"),
-        "{}",
-        run.stdout
-    );
+    fx.gyges(&["-k", "main", "tx", "sessions"])
+        .ok()
+        .stdout_has(&s1)
+        .stdout_has("step1_broadcast");
     // Too late to abort (exit 6), and the argument shapes are checked.
-    let run = fx.gyges(&["-k", "main", "tx", "abort", &s1]).run();
-    assert_eq!(run.code(), 6, "{run:?}");
-    assert!(run.stderr.contains("built"), "{}", run.stderr);
-    let run = fx.gyges(&["-k", "main", "tx", "resume", "nonsense"]).run();
-    assert_eq!(run.code(), 6, "{run:?}");
+    fx.gyges(&["-k", "main", "tx", "abort", &s1])
+        .code(6)
+        .stderr_has("built");
+    fx.gyges(&["-k", "main", "tx", "resume", "nonsense"])
+        .code(6);
 
     // Crash with the row pending; mine step 1 while the daemon is down.
     fx.kill_daemon();
@@ -463,16 +367,15 @@ fn zip320_send_survives_a_daemon_crash() {
         },
     );
     n.node.mine(1);
-    let row = wait_tex(&fx, &s1, "TEX_STATE_STEP2_MINED");
+    let row = wait_tex_state(&fx, &s1, "TEX_STATE_STEP2_MINED");
     assert_eq!(row["step2_txid"], s2, "{row}");
     assert_eq!(row["amount"], "50000000", "{row}");
     assert_eq!(row["recipient"], tex_addr, "{row}");
-    let run = fx.gyges(&["-k", "main", "tx", "resume", &s1]).run();
-    assert_eq!(run.code(), 6, "{run:?}");
-    assert!(run.stderr.contains("nothing to resume"), "{}", run.stderr);
+    fx.gyges(&["-k", "main", "tx", "resume", &s1])
+        .code(6)
+        .stderr_has("nothing to resume");
     wait_spendable(&fx);
-    let run = fx.gyges(&["-k", "main", "balance", "--json"]).run();
-    let b = run.json();
+    let b = fx.gyges(&["-k", "main", "balance", "--json"]).run().json();
     let ironwood = pool_spendable(&b, "POOL_IRONWOOD").expect("ironwood spendable");
     assert!(
         ironwood < 150_000_000 && ironwood > 149_900_000,
@@ -480,23 +383,10 @@ fn zip320_send_survives_a_daemon_crash() {
     );
 
     // Nothing identifying in the logs, across both daemon runs.
-    let log_dir = fx.network_dir().join("logs");
-    for entry in std::fs::read_dir(&log_dir).unwrap().flatten() {
-        let text = std::fs::read_to_string(entry.path()).unwrap();
-        for secret in [
-            tex_addr.as_str(),
-            s1.as_str(),
-            s2.as_str(),
-            "50000000",
-            PASSPHRASE,
-        ] {
-            assert!(
-                !text.contains(secret),
-                "{secret:?} in {}",
-                entry.file_name().to_string_lossy()
-            );
-        }
-    }
+    sweep_logs(
+        &fx.network_dir().join("logs"),
+        &[&tex_addr, &s1, &s2, "50000000", PASSPHRASE],
+    );
 }
 
 /// Wait until `tx status TXID --json` reports `status`.
@@ -506,11 +396,10 @@ fn wait_tx_status(fx: &Fixture, txid: &str, status: &str) -> serde_json::Value {
         Duration::from_millis(200),
         &format!("never {status}"),
         || {
-            let run = fx
+            let v = fx
                 .gyges(&["-k", "main", "tx", "status", txid, "--json"])
-                .run();
-            assert_eq!(run.code(), 0, "{run:?}");
-            let v = run.json();
+                .ok()
+                .json();
             if v["status"] == status {
                 return Ok(v);
             }
@@ -529,16 +418,11 @@ fn addresses_notes_and_history_through_the_binaries() {
     let (n, fx, pw) = synced_key(10, SPEND_CONFIG);
 
     // The address alone on stdout, details on stderr; JSON is AddressInfo.
-    let run = fx.gyges(&["-k", "main", "address", "current"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    let run = fx.gyges(&["-k", "main", "address", "current"]).ok();
     let current = run.stdout.trim().to_string();
     assert!(current.starts_with("uregtest1"), "{run:?}");
     assert_eq!(run.stdout.lines().count(), 1, "{run:?}");
-    assert!(
-        run.stderr.contains("receivers:") && run.stderr.contains("transparent"),
-        "{}",
-        run.stderr
-    );
+    run.stderr_has("receivers:").stderr_has("transparent");
     let run = fx
         .gyges(&["-k", "main", "address", "current", "--json"])
         .run();
@@ -555,7 +439,7 @@ fn addresses_notes_and_history_through_the_binaries() {
     ] {
         let run = fx.gyges(args).run();
         assert_eq!(run.code(), 1, "{args:?}: {run:?}");
-        assert!(run.stderr.contains("not implemented"), "{}", run.stderr);
+        run.stderr_has("not implemented");
     }
 
     let run = fx
@@ -570,8 +454,7 @@ fn addresses_notes_and_history_through_the_binaries() {
             "shop",
             "--json",
         ])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .ok();
     let fresh = run.json();
     let fresh_addr = fresh["address"].as_str().unwrap().to_string();
     assert_ne!(fresh_addr, current);
@@ -579,38 +462,30 @@ fn addresses_notes_and_history_through_the_binaries() {
     assert_eq!(fresh["receivers"].as_array().unwrap().len(), 1, "{fresh}");
     let run = fx.gyges(&["-k", "main", "address", "current"]).run();
     assert_eq!(run.stdout.trim(), fresh_addr);
-    assert!(run.stderr.contains("shop"), "{}", run.stderr);
-    let run = fx
-        .gyges(&["-k", "main", "address", "new", "--receivers", "transparent"])
-        .run();
-    assert_eq!(run.code(), 6, "{run:?}");
+    run.stderr_has("shop");
+    fx.gyges(&["-k", "main", "address", "new", "--receivers", "transparent"])
+        .code(6);
 
-    let run = fx.gyges(&["address", "inspect", &current]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stdout.contains("valid:      yes") && run.stdout.contains("unified"),
-        "{}",
-        run.stdout
-    );
+    fx.gyges(&["address", "inspect", &current])
+        .ok()
+        .stdout_has("valid:      yes")
+        .stdout_has("unified");
     let run = fx.gyges(&["address", "inspect", &current, "--json"]).run();
     let v = run.json();
     assert_eq!(v["valid"], true);
     assert_eq!(v["network"], "NETWORK_REGTEST");
     assert_eq!(v["kind"], "ADDRESS_KIND_UNIFIED");
-    let run = fx.gyges(&["address", "inspect", "nonsense"]).run();
-    assert_eq!(run.code(), 6, "{run:?}");
+    fx.gyges(&["address", "inspect", "nonsense"]).code(6);
     let run = fx
         .gyges(&["address", "inspect", "nonsense", "--json"])
-        .run();
-    assert_eq!(run.code(), 6, "{run:?}");
+        .code(6);
     assert_eq!(
         run.json()["error"]["reason"],
         "ERROR_REASON_INVALID_ARGUMENT"
     );
 
     // Empty history.
-    let run = fx.gyges(&["-k", "main", "notes"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    let run = fx.gyges(&["-k", "main", "notes"]).ok();
     assert_eq!(run.stdout, "no notes\n");
     let run = fx.gyges(&["-k", "main", "tx", "list"]).run();
     assert_eq!(run.stdout, "no transactions\n");
@@ -628,15 +503,13 @@ fn addresses_notes_and_history_through_the_binaries() {
     let run = fx
         .gyges(&["-k", "main", "tx", "shield", "--yes"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .ok();
     let shield = run.stdout.trim().to_string();
     let v = wait_tx_status(&fx, &shield, "TRANSACTION_STATUS_PENDING");
     assert_eq!(v["source"], "STATUS_SOURCE_NODE");
     // `sync mempool` forces a pass over the node's mempool, which holds the
     // shield alone; its Ironwood output is main's note, pending until mined.
-    let run = fx.gyges(&["-k", "main", "sync", "mempool"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    let run = fx.gyges(&["-k", "main", "sync", "mempool"]).ok();
     assert_eq!(run.stdout, "scanned 1 transaction, found 1 note\n");
     let run = fx.gyges(&["-k", "main", "sync", "mempool", "--json"]).run();
     let v = run.json();
@@ -649,26 +522,21 @@ fn addresses_notes_and_history_through_the_binaries() {
     // Zero amounts are left out of the JSON.
     assert!(v["total_spendable"].is_null(), "{v}");
     assert!(v["total_pending"].is_string(), "{v}");
-    let run = fx.gyges(&["-k", "main", "balance"]).run();
-    assert!(run.stdout.contains("PENDING"), "{}", run.stdout);
+    fx.gyges(&["-k", "main", "balance"])
+        .run()
+        .stdout_has("PENDING");
     n.node.mine(2);
     let v = wait_tx_status(&fx, &shield, "TRANSACTION_STATUS_MINED");
     assert_eq!(v["confirmations"], 2, "{v}");
-    let run = fx.gyges(&["-k", "main", "tx", "status", &shield]).run();
-    assert!(
-        run.stdout.contains("mined at height") && run.stdout.contains("2 confirmations"),
-        "{}",
-        run.stdout
-    );
-    let run = fx
-        .gyges(&["-k", "main", "tx", "status", &shield, "--pir"])
-        .run();
-    assert_eq!(run.code(), 1, "{run:?}");
-    assert!(run.stderr.contains("not implemented"), "{}", run.stderr);
-    let run = fx
-        .gyges(&["-k", "main", "tx", "status", &"00".repeat(32)])
-        .run();
-    assert_eq!(run.code(), 6, "{run:?}");
+    fx.gyges(&["-k", "main", "tx", "status", &shield])
+        .run()
+        .stdout_has("mined at height")
+        .stdout_has("2 confirmations");
+    fx.gyges(&["-k", "main", "tx", "status", &shield, "--pir"])
+        .code(1)
+        .stderr_has("not implemented");
+    fx.gyges(&["-k", "main", "tx", "status", &"00".repeat(32)])
+        .code(6);
 
     // The scan catches up with the shield: spent UTXO, Ironwood note.
     wait_spendable(&fx);
@@ -688,24 +556,14 @@ fn addresses_notes_and_history_through_the_binaries() {
         },
     );
     assert_eq!(v["notes"][0]["spent_txid"], shield.as_str(), "{v}");
-    let run = fx
-        .gyges(&["-k", "main", "notes", "--pool", "ironwood"])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stdout.contains("ironwood") && run.stdout.contains("unspent,witness-ready"),
-        "{}",
-        run.stdout
-    );
+    fx.gyges(&["-k", "main", "notes", "--pool", "ironwood"])
+        .ok()
+        .stdout_has("ironwood")
+        .stdout_has("unspent,witness-ready");
 
-    let run = fx.gyges(&["-k", "main", "tx", "list"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stdout.contains(&shield) && run.stdout.contains(&funding_txid),
-        "{}",
-        run.stdout
-    );
-    assert!(run.stdout.contains("mined"), "{}", run.stdout);
+    let run = fx.gyges(&["-k", "main", "tx", "list"]).ok();
+    run.stdout_has(&shield).stdout_has(&funding_txid);
+    run.stdout_has("mined");
     let run = fx
         .gyges(&["-k", "main", "tx", "list", "--limit", "1", "--json"])
         .run();
@@ -720,17 +578,8 @@ fn addresses_notes_and_history_through_the_binaries() {
     assert_eq!(run.json()["transactions"][0]["txid"], funding_txid.as_str());
 
     // None of this reaches the logs (TESTING.md §5).
-    let log_dir = fx.network_dir().join("logs");
-    for entry in std::fs::read_dir(&log_dir).unwrap().flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let text = std::fs::read_to_string(entry.path()).unwrap();
-        for secret in [
-            current.as_str(),
-            fresh_addr.as_str(),
-            shield.as_str(),
-            "shop",
-        ] {
-            assert!(!text.contains(secret), "{secret:?} in {name}");
-        }
-    }
+    sweep_logs(
+        &fx.network_dir().join("logs"),
+        &[&current, &fresh_addr, &shield, "shop"],
+    );
 }

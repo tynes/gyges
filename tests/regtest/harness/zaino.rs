@@ -23,16 +23,20 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use gyges_chain::{ArtiTorLwdBackend, ChainBackend as _, Transport};
 use serde::Deserialize;
 use zcash_protocol::local_consensus::LocalNetwork;
 
-use crate::node::{download_verified, free_port, regtest_bin_dir, versions};
+use crate::node::versions;
+use crate::process::{
+    KeptDir, download_verified, env_bin, free_port, kill, log_tail, move_into_place,
+    regtest_bin_dir, spawn_logged, untar, wait_ready,
+};
 use crate::{Node, NodeOpts, zakurad_binary};
 
 /// `[zainod]` in `versions.toml`.
@@ -52,9 +56,7 @@ pub(crate) struct ZainodVersion {
 pub fn zainod_binary() -> Option<PathBuf> {
     static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
     BIN.get_or_init(|| {
-        if let Some(p) = std::env::var_os("ZAINOD_BIN").filter(|p| !p.is_empty()) {
-            let p = PathBuf::from(p);
-            assert!(p.is_file(), "ZAINOD_BIN={} is not a file", p.display());
+        if let Some(p) = env_bin("ZAINOD_BIN") {
             return Some(p);
         }
         let cached = pinned_dir().join("bin/zainod");
@@ -98,16 +100,7 @@ fn build_pinned() -> anyhow::Result<PathBuf> {
             v.version
         );
         download_verified(&url, &krate, &v.sha256)?;
-        let status = Command::new("tar")
-            .arg("-xzf")
-            .arg(&krate)
-            .arg("-C")
-            .arg(work.path())
-            .status()
-            .context("run tar")?;
-        if !status.success() {
-            bail!("tar failed: {status}");
-        }
+        untar(&krate, work.path())?;
         let src = work.path().join(format!("zainod-{}", v.version));
         eprintln!(
             "building zainod {} (cargo install --locked, a few minutes)",
@@ -128,12 +121,7 @@ fn build_pinned() -> anyhow::Result<PathBuf> {
         if dir.exists() {
             let _ = fs::remove_dir_all(&dir);
         }
-        // Another test process may have finished first: keep either copy.
-        match fs::rename(&root, &dir) {
-            Ok(()) => Ok(()),
-            Err(_) if bin.is_file() => Ok(()),
-            Err(e) => Err(e).context(format!("move zainod into {}", dir.display())),
-        }
+        move_into_place(&root, &dir, &bin)
     })();
     let _ = fs::remove_dir_all(&root);
     drop(work);
@@ -145,8 +133,7 @@ fn build_pinned() -> anyhow::Result<PathBuf> {
 /// is kept when `GYGES_TEST_KEEP` is set.
 #[derive(Debug)]
 pub struct Zaino {
-    dir: Option<tempfile::TempDir>,
-    dir_path: PathBuf,
+    dir: KeptDir,
     child: Option<Child>,
     grpc_port: u16,
     runtime: tokio::runtime::Runtime,
@@ -155,12 +142,10 @@ pub struct Zaino {
 impl Zaino {
     /// Start zaino in front of `node` and wait until it serves `node`'s tip.
     pub fn start(node: &Node) -> anyhow::Result<Self> {
-        let dir = tempfile::tempdir()?;
-        let dir_path = dir.path().to_path_buf();
-        fs::create_dir_all(dir_path.join("db"))?;
+        let dir = KeptDir::new("zaino")?;
+        fs::create_dir_all(dir.path().join("db"))?;
         let mut zaino = Self {
-            dir: Some(dir),
-            dir_path,
+            dir,
             child: None,
             grpc_port: free_port(),
             runtime: tokio::runtime::Builder::new_current_thread()
@@ -178,18 +163,16 @@ impl Zaino {
     }
 
     pub fn log_path(&self) -> PathBuf {
-        self.dir_path.join("zainod.log")
+        self.dir.path().join("zainod.log")
     }
 
     fn config_path(&self) -> PathBuf {
-        self.dir_path.join("zindexer.toml")
+        self.dir.path().join("zindexer.toml")
     }
 
     /// The last lines of zaino's log, for failure messages.
     pub fn log_tail(&self) -> String {
-        let text = fs::read_to_string(self.log_path()).unwrap_or_default();
-        let lines: Vec<&str> = text.lines().collect();
-        lines[lines.len().saturating_sub(30)..].join("\n")
+        log_tail(&self.log_path())
     }
 
     /// The configuration of `OVERVIEW.md` §4.5's smoke test.
@@ -212,7 +195,7 @@ path = "{db}"
             rpc = node.rpc_addr(),
             cookie = node.cookie_path().display(),
             grpc = self.grpc_port,
-            db = self.dir_path.join("db").display(),
+            db = self.dir.path().join("db").display(),
         );
         fs::write(self.config_path(), config)?;
         Ok(())
@@ -221,50 +204,36 @@ path = "{db}"
     fn spawn(&mut self, node: &Node) -> anyhow::Result<()> {
         assert!(self.child.is_none(), "zaino already running");
         self.write_config(node)?;
-        let log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.log_path())?;
         let bin = zainod_binary().context("no zainod binary")?;
-        let child = Command::new(&bin)
-            .arg("start")
-            .arg("--config")
-            .arg(self.config_path())
-            .current_dir(&self.dir_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .with_context(|| format!("spawn {}", bin.display()))?;
-        self.child = Some(child);
+        self.child = Some(spawn_logged(
+            Command::new(&bin)
+                .arg("start")
+                .arg("--config")
+                .arg(self.config_path())
+                .current_dir(self.dir.path()),
+            &self.log_path(),
+        )?);
         self.wait_for_tip(node.tip_height(), Duration::from_secs(120))
     }
 
     /// Block until zaino's `GetLatestBlock` reports at least `height`.
     pub fn wait_for_tip(&mut self, height: u32, timeout: Duration) -> anyhow::Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = self
-                .child
-                .as_mut()
-                .and_then(|c| c.try_wait().ok().flatten())
-            {
-                self.child = None;
-                bail!("zainod exited: {status}\n{}", self.log_tail());
-            }
-            let last = match self.tip() {
-                Ok(tip) if tip >= height => return Ok(()),
-                Ok(tip) => format!("at {tip}"),
-                Err(e) => e.to_string(),
-            };
-            if Instant::now() > deadline {
-                bail!(
-                    "zaino did not reach height {height}: {last}\n{}",
-                    self.log_tail()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
+        let child = self.child.take().context("zainod is not running")?;
+        let log = self.log_path();
+        let child = wait_ready(
+            "zainod",
+            child,
+            Some(&log),
+            timeout,
+            Duration::from_millis(250),
+            || match self.tip() {
+                Ok(tip) if tip >= height => Ok(()),
+                Ok(tip) => Err(format!("at {tip}, waiting for {height}")),
+                Err(e) => Err(e.to_string()),
+            },
+        )?;
+        self.child = Some(child);
+        Ok(())
     }
 
     /// The tip zaino serves, through the backend `gygesd` uses for it
@@ -297,8 +266,7 @@ path = "{db}"
 
     pub fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill(&mut child);
         }
     }
 
@@ -308,23 +276,11 @@ path = "{db}"
         self.stop();
         self.spawn(node)
     }
-
-    /// Keep the directory for inspection and return its path.
-    pub fn keep(&mut self) -> PathBuf {
-        if let Some(dir) = self.dir.take() {
-            return dir.keep();
-        }
-        self.dir_path.clone()
-    }
 }
 
 impl Drop for Zaino {
     fn drop(&mut self) {
         self.stop();
-        if std::env::var_os("GYGES_TEST_KEEP").is_some() {
-            let path = self.keep();
-            eprintln!("GYGES_TEST_KEEP: left zaino at {}", path.display());
-        }
     }
 }
 
@@ -429,14 +385,12 @@ impl Fallback {
 
     /// The `[fallback_lightwalletd]` section pointing `gygesd` at zaino.
     pub fn config_section(&self) -> String {
-        format!(
-            "[fallback_lightwalletd]\nenabled = true\ngrpc_url = \"{}\"\nuse_tor = false\n",
-            self.zaino.url()
-        )
+        fallback_section(&self.zaino.url())
     }
+}
 
-    /// Keep every directory for inspection.
-    pub fn keep(&mut self) -> Vec<PathBuf> {
-        vec![self.node.keep(), self.archive.keep(), self.zaino.keep()]
-    }
+/// A `[fallback_lightwalletd]` section pointing `gygesd` at the plaintext
+/// gRPC endpoint `url`.
+pub fn fallback_section(url: &str) -> String {
+    format!("[fallback_lightwalletd]\nenabled = true\ngrpc_url = \"{url}\"\nuse_tor = false\n")
 }

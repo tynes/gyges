@@ -62,8 +62,7 @@ transparent = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 zcash_protocol = { workspace = true }  # LocalNetwork, for the client harness/zaino.rs checks zaino with
-
-[dev-dependencies]
+# The test key harness/common.rs derives.
 zcash_keys = { workspace = true }
 bip0039 = { workspace = true }
 zip32 = { workspace = true }

@@ -4,9 +4,11 @@
 //! node bounds in `daemon status`, the exit-7 stall on a prune race and the
 //! `--from` rewind confirmation.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use gyges_regtest::{FAST_CONFIG, FakeNodeHandle, Fixture};
+use gyges_regtest::{
+    FAST_CONFIG, FakeNodeHandle, Fixture, fallback_section, mnemonic, wait_stalled,
+};
 
 #[test]
 fn a_new_key_syncs_to_the_tip_and_sync_wait_follows_new_blocks() {
@@ -15,52 +17,38 @@ fn a_new_key_syncs_to_the_tip_and_sync_wait_follows_new_blocks() {
     fx.write_config(FAST_CONFIG);
     fx.start_daemon(&["--zakura-rpc", n.url()]).unwrap();
 
-    let run = fx.gyges(&["daemon", "status"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stdout.contains("node:         connected, tip 25"),
-        "{}",
-        run.stdout
-    );
+    fx.gyges(&["daemon", "status"])
+        .ok()
+        .stdout_has("node:         connected, tip 25");
 
     // No wallet yet: status says so, wait is a typed error.
-    let run = fx.gyges(&["sync", "status"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stdout.contains("no keys with a wallet"),
-        "{}",
-        run.stdout
-    );
-    let run = fx
-        .gyges(&["-k", "main", "sync", "wait", "--timeout", "5s"])
-        .run();
-    assert_eq!(run.code(), 6, "{run:?}");
+    fx.gyges(&["sync", "status"])
+        .ok()
+        .stdout_has("no keys with a wallet");
+    fx.gyges(&["-k", "main", "sync", "wait", "--timeout", "5s"])
+        .code(6);
 
     let pw = fx.passphrase_file("pw");
     let run = fx
         .gyges(&["key", "init", "--id", "main", "--json"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .ok();
     assert_eq!(run.json()["birthday_height"], 25);
 
-    let run = fx
-        .gyges(&[
-            "-k",
-            "main",
-            "sync",
-            "wait",
-            "--until",
-            "spendable",
-            "--timeout",
-            "30s",
-        ])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(run.stderr.contains("main: synced"), "{}", run.stderr);
+    fx.gyges(&[
+        "-k",
+        "main",
+        "sync",
+        "wait",
+        "--until",
+        "spendable",
+        "--timeout",
+        "30s",
+    ])
+    .ok()
+    .stderr_has("main: synced");
 
-    let run = fx.gyges(&["sync", "status", "--json"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    let run = fx.gyges(&["sync", "status", "--json"]).ok();
     let keys = run.json()["keys"].clone();
     assert_eq!(keys[0]["key_id"], "main");
     assert_eq!(keys[0]["scanned_tip"], 25);
@@ -69,17 +57,16 @@ fn a_new_key_syncs_to_the_tip_and_sync_wait_follows_new_blocks() {
     assert_eq!(keys[0]["spendable"], true);
     assert_eq!(keys[0]["backend"], "SYNC_BACKEND_ZAKURA_RPC");
     let run = fx.gyges(&["sync", "status"]).run();
-    assert!(run.stdout.contains("synced"), "{}", run.stdout);
-    assert!(run.stdout.contains("scanned spendable"), "{}", run.stdout);
+    run.stdout_has("synced");
+    run.stdout_has("scanned spendable");
 
     // New blocks: `sync wait --json` streams one object per element and the
     // last has done = true at the new tip.
     n.node.mine(7);
     let run = fx
         .gyges(&["-k", "main", "sync", "wait", "--json", "--timeout", "30s"])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    let last: serde_json::Value = serde_json::from_str(run.stdout.lines().last().unwrap()).unwrap();
+        .ok();
+    let last = run.json_lines().pop().unwrap();
     assert_eq!(last["done"], true);
     assert_eq!(last["status"]["scanned_tip"], 32);
     assert_eq!(last["schema_version"], "0.1");
@@ -92,44 +79,19 @@ fn a_new_key_syncs_to_the_tip_and_sync_wait_follows_new_blocks() {
     // rescans with --yes.
     let run = fx
         .gyges(&["-k", "main", "sync", "run", "--from", "30"])
-        .run();
-    assert_eq!(run.code(), 4, "{run:?}");
-    assert!(run.stderr.contains("--yes"), "{}", run.stderr);
-    let run = fx
-        .gyges(&["-k", "main", "sync", "run", "--from", "30", "--yes"])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stderr.contains("synced scanned 32/32"),
-        "{}",
-        run.stderr
-    );
+        .code(4);
+    run.stderr_has("--yes");
+    fx.gyges(&["-k", "main", "sync", "run", "--from", "30", "--yes"])
+        .ok()
+        .stderr_has("synced scanned 32/32");
 
     // Prune race: the node forgets bodies the key still needs.
     n.node.mine(10);
     n.node.set_prune_height(Some(40));
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let run = fx
-            .gyges(&["-k", "main", "sync", "wait", "--timeout", "3s"])
-            .run();
-        if run.code() == 7 && run.stderr.contains("pruned-past-scan-tip") {
-            assert!(run.stderr.contains("tx_retention"), "{}", run.stderr);
-            break;
-        }
-        assert!(Instant::now() < deadline, "no stall: {run:?}");
-    }
+    wait_stalled(&fx, "main", Duration::from_secs(30)).stderr_has("tx_retention");
     let run = fx.gyges(&["sync", "status"]).run();
-    assert!(
-        run.stdout.contains("stalled(pruned-past-scan-tip)"),
-        "{}",
-        run.stdout
-    );
-    assert!(
-        run.stdout.contains("node pruned past key 'main'"),
-        "{}",
-        run.stdout
-    );
+    run.stdout_has("stalled(pruned-past-scan-tip)");
+    run.stdout_has("node pruned past key 'main'");
 }
 
 #[test]
@@ -142,25 +104,17 @@ fn sync_wait_times_out_with_exit_7_when_the_node_is_down() {
     drop(l);
     fx.start_daemon(&["--zakura-rpc", &url]).unwrap();
     let pw = fx.passphrase_file("pw");
-    let run = fx
-        .gyges(&["key", "restore", "--id", "r", "--stdin", "--json"])
+    fx.gyges(&["key", "restore", "--id", "r", "--stdin", "--json"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .stdin("abandon ".repeat(23) + "art\n")
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .stdin(mnemonic() + "\n")
+        .ok();
 
-    let run = fx
-        .gyges(&["-k", "r", "sync", "wait", "--timeout", "2s"])
-        .run();
-    assert_eq!(run.code(), 7, "{run:?}");
-    assert!(
-        run.stderr.contains("still not there after 2s"),
-        "{}",
-        run.stderr
-    );
-    let run = fx.gyges(&["sync", "status"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(run.stdout.contains("initializing"), "{}", run.stdout);
+    fx.gyges(&["-k", "r", "sync", "wait", "--timeout", "2s"])
+        .code(7)
+        .stderr_has("still not there after 2s");
+    fx.gyges(&["sync", "status"])
+        .ok()
+        .stdout_has("initializing");
 }
 
 /// `key restore` below the node's window through the binaries (ROADMAP.md
@@ -190,62 +144,32 @@ fn restore_below_the_window_asks_consent_warns_and_backfills() {
     plain.kill_daemon();
 
     let mut fx = Fixture::new("regtest");
-    fx.write_config(&format!(
-        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n\
-         [fallback_lightwalletd]\nenabled = true\ngrpc_url = \"{}\"\nuse_tor = false\n",
-        lwd.url()
-    ));
+    fx.write_config(&format!("{FAST_CONFIG}{}", fallback_section(lwd.url())));
     fx.start_daemon(&["--zakura-rpc", n.url()]).unwrap();
     let pw = fx.passphrase_file("restore-passphrase-0001");
-    let mnemonic = "abandon ".repeat(23) + "art";
     let restore = |extra: &[&str]| {
         let mut args = vec!["key", "restore", "--id", "r", "--stdin", "--birthday", "4"];
         args.extend_from_slice(extra);
         fx.gyges(&args)
             .env("GYGES_PASSPHRASE_FILE", &pw)
-            .stdin(mnemonic.clone())
-            .run()
+            .stdin(mnemonic())
     };
 
     // No terminal, no --yes: exit 4, nothing created.
-    let run = restore(&[]);
-    assert_eq!(run.code(), 4, "{run:?}");
-    assert!(run.stderr.contains("--yes"), "{}", run.stderr);
+    restore(&[]).code(4).stderr_has("--yes");
     assert!(!fx.key_dir("r").exists());
 
-    let run = restore(&["--yes"]);
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stderr
-            .contains("note: the endpoint learns the block range"),
-        "{}",
-        run.stderr
-    );
-    assert!(run.stderr.contains("use_tor = false"), "{}", run.stderr);
-    assert!(
-        run.stderr
-            .contains("warning: transparent history below height 30"),
-        "{}",
-        run.stderr
-    );
-    assert!(
-        run.stderr.contains("blocks will be backfilled"),
-        "{}",
-        run.stderr
-    );
+    let run = restore(&["--yes"]).ok();
+    run.stderr_has("note: the endpoint learns the block range");
+    run.stderr_has("use_tor = false");
+    run.stderr_has("warning: transparent history below height 30");
+    run.stderr_has("blocks will be backfilled");
 
-    let run = fx
-        .gyges(&["-k", "r", "sync", "wait", "--timeout", "60s"])
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    let run = fx.gyges(&["daemon", "status"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stdout
-            .contains("transparent history below 30 is best-effort"),
-        "{}",
-        run.stdout
-    );
+    fx.gyges(&["-k", "r", "sync", "wait", "--timeout", "60s"])
+        .ok();
+    fx.gyges(&["daemon", "status"])
+        .ok()
+        .stdout_has("transparent history below 30 is best-effort");
     fx.kill_daemon();
     drop(lwd);
 }
