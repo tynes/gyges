@@ -3,7 +3,9 @@
 //! once when the node's retention window is shorter than
 //! `zakura_rpc.min_retention_blocks`.
 //!
-//! The sync scheduler (`crate::sync`) calls [`poll_once`] on every tick.
+//! The sync scheduler (`crate::sync`) drives its ticks from the same poll:
+//! each tick starts with [`poll_once`], and `Daemon::serve` polls once before
+//! binding the socket.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
