@@ -96,10 +96,16 @@ pub fn too_old_message(v: Firmware) -> String {
 }
 
 /// What to tell the user about a device that reports no usable version.
+/// Every release since v3.0.0 puts its version in the pairing QR (the
+/// `firmwareVersion` field is in `gui_connect_wallet_widgets.c` at the
+/// `3.0.0` and `3.0.2` tags), so a device that reports none is older than
+/// the minimum.
 pub fn unknown_message(reported: Option<&str>) -> String {
     let what = match reported {
         Some(s) => format!("reports a firmware version this release cannot read ({s:?})"),
-        None => "does not report its firmware version".to_string(),
+        None => "does not report its firmware version, which every firmware since v3.0.0 \
+                 does, so it is almost certainly too old to sign"
+            .to_string(),
     };
     format!(
         "the Keystone {what}; signing after NU6.3 needs the Cypherpunk firmware {} or later \

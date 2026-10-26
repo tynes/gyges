@@ -112,7 +112,7 @@ Firmware: the export's `device_version` is the raw `MAJOR.MINOR.BUILD` of the fi
 
 Exit codes: 6 for the wrong payload, an incomplete one or an account the export does not list; 9 when the export decodes but its content is refused (old firmware, a seed fingerprint that is not 32 bytes, a UFVK for another network or without an Orchard component); 4 for the unknown version and the birthday or backfill confirmations. The CLI checks the payload type and firmware itself before any question, and the daemon checks everything again. On success it prints the account, seed fingerprint, firmware (both forms) and birthday on stderr; `--json` prints `ImportKeystoneResponse`.
 
-**Landed (ROADMAP.md M5, second item).** The key syncs, shows balances, hands out addresses (Orchard, Ironwood and transparent receivers) and builds PCZTs with `pczt create`; `tx send`, `tx shield`, `pczt sign` and `key unlock` refuse it until the QR signing protocols (third item).
+**Landed (ROADMAP.md M5, second item).** The key syncs, survives a daemon restart, shows balances, hands out unified addresses with Orchard and transparent receivers (never Sapling; an Orchard receiver also takes Ironwood payments) and builds PCZTs with `pczt create`; `tx send`, `tx shield`, `pczt sign` and `key unlock` refuse it until the QR signing protocols (third item).
 
 #### `gyges key import-ufvk --id <KEY_ID> --ufvk <UFVK> --birthday <HEIGHT>`
 Creates a watch-only profile (Orchard proving-only: Sapling spends need the proof generation key, which a UFVK does not contain).

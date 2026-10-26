@@ -491,13 +491,36 @@ fn precheck_accounts_export(payload: &str, allow_unknown_firmware: bool) -> Resu
                 "no ur:zcash-accounts frame given (pass --ur, or the frames on stdin)".into(),
             );
         }
-        // The daemon refuses the other types with the full explanation.
-        Some(t) if t != gyges_qr::ur_types::ZCASH_ACCOUNTS => return Ok(()),
+        Some(gyges_qr::ur_types::ZCASH_UNIFIED_FULL_VIEWING_KEY) => {
+            return fail(
+                ErrorReason::InvalidArgument,
+                "ur:zcash-unified-full-viewing-key carries no seed fingerprint, so the Keystone \
+                 could not recognise its key in a PCZT; pass the device's ur:zcash-accounts QR \
+                 (Connect Software Wallet), or use `key import-ufvk` for a watch-only key"
+                    .into(),
+            );
+        }
+        Some(t) if t != gyges_qr::ur_types::ZCASH_ACCOUNTS => {
+            return fail(
+                ErrorReason::InvalidArgument,
+                format!("expected ur:zcash-accounts, got ur:{t}"),
+            );
+        }
         Some(_) => {}
+    }
+    if !asm.is_complete() {
+        let (resolved, total) = asm.progress();
+        return fail(
+            ErrorReason::InvalidArgument,
+            format!(
+                "the accounts export is incomplete ({resolved} of {total} fragments); pass every \
+                 frame"
+            ),
+        );
     }
     let Ok(Some(gyges_qr::Payload::Accounts(accounts))) = gyges_qr::Payload::from_assembler(&asm)
     else {
-        // Incomplete or undecodable: the daemon's refusal says which.
+        // It does not decode: the daemon's HARDWARE_SIGNER refusal says why.
         return Ok(());
     };
     let reported = accounts.device_version.as_deref();

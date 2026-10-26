@@ -397,6 +397,24 @@ fn import_keystone_through_the_binaries() {
     run(import(&["--ur", &good]))
         .code(4)
         .stderr_has("--birthday");
+    // 6 before any question, with no --birthday: a lone UFVK as a UR, and
+    // one frame of a multi-frame export.
+    let lone = gyges_qr::Payload::Ufvk(gyges_qr::Account {
+        ufvk: "uview1qqqq".into(),
+        index: 0,
+        name: None,
+    })
+    .frames(gyges_qr::DEFAULT_FRAGMENT_LEN)
+    .unwrap()
+    .next_frame()
+    .unwrap();
+    run(import(&["--ur", &lone]))
+        .code(6)
+        .stderr_has("import-ufvk");
+    assert!(good.lines().count() > 1, "the export should span frames");
+    run(import(&["--ur", good.lines().next().unwrap()]))
+        .code(6)
+        .stderr_has("incomplete");
     assert!(!keys.join("ks").exists());
 
     // The frames on stdin, one per line.
@@ -437,15 +455,49 @@ fn import_keystone_through_the_binaries() {
     assert_eq!(ks["signing_mode"], "SIGNING_MODE_KEYSTONE_QR", "{ks}");
     assert_eq!(ks["device_version"], "13.2.0");
     fx.gyges(&["key", "list"]).ok().stdout_has("keystone-qr");
-    fx.gyges(&[
-        "-k",
-        "ks",
-        "sync",
-        "wait",
-        "--until",
-        "spendable",
-        "--timeout",
-        "30s",
-    ])
-    .ok();
+    let wait = |fx: &Fixture| {
+        fx.gyges(&[
+            "-k",
+            "ks",
+            "sync",
+            "wait",
+            "--until",
+            "spendable",
+            "--timeout",
+            "30s",
+        ])
+        .ok();
+    };
+    wait(&fx);
+
+    // Addresses: Orchard and transparent receivers, never Sapling.
+    let run = fx.gyges(&["-k", "ks", "address", "current"]).ok();
+    assert!(run.stdout.trim().starts_with("uregtest1"), "{run:?}");
+    assert!(!run.stderr.contains("sapling"), "{run:?}");
+    let v = fx
+        .gyges(&["-k", "ks", "address", "new", "--json"])
+        .ok()
+        .json();
+    let pools: Vec<&str> = v["receivers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["pool"].as_str().unwrap())
+        .collect();
+    assert_eq!(pools, ["POOL_ORCHARD", "POOL_TRANSPARENT"], "{v}");
+
+    // A restart loads the seedless profile and keeps syncing it.
+    fx.stop_daemon();
+    fx.start_daemon(&["--zakura-rpc", n.url()]).unwrap();
+    let list = fx.gyges(&["key", "list", "--json"]).ok().json();
+    let ks = list["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key_id"] == "ks")
+        .unwrap()
+        .clone();
+    assert_eq!(ks["signing_mode"], "SIGNING_MODE_KEYSTONE_QR", "{ks}");
+    assert_eq!(ks["device_version"], "13.2.0");
+    wait(&fx);
 }

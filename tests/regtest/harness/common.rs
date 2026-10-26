@@ -92,9 +92,10 @@ pub fn test_key_transparent() -> TransparentAddress {
 
 /// The Keystone pairing export (`ur:zcash-accounts`) of [`mnemonic`]'s
 /// account 0, reporting `device_version`, as the frames a camera sees, one
-/// per line. The UFVK is the seed's full one (with a Sapling item, unlike a
-/// real device's); the in-process tests cover the device's exact shape.
+/// per line. The UFVK has the device's shape: the seed's Orchard and
+/// transparent items, no Sapling.
 pub fn keystone_export(device_version: Option<&str>) -> String {
+    use zcash_address::unified::{Container as _, Encoding as _, Fvk, Ufvk};
     let seed = bip0039::Mnemonic::<bip0039::English>::from_phrase(mnemonic())
         .unwrap()
         .to_seed("");
@@ -107,7 +108,16 @@ pub fn keystone_export(device_version: Option<&str>) -> String {
             .to_bytes()
             .to_vec(),
         accounts: vec![gyges_qr::Account {
-            ufvk: usk.to_unified_full_viewing_key().encode(&regtest()),
+            ufvk: {
+                let full = usk.to_unified_full_viewing_key().encode(&regtest());
+                let (net, ufvk) = Ufvk::decode(&full).unwrap();
+                let items: Vec<Fvk> = ufvk
+                    .items()
+                    .into_iter()
+                    .filter(|i| !matches!(i, Fvk::Sapling(_)))
+                    .collect();
+                Ufvk::try_from_items(items).unwrap().encode(&net)
+            },
             index: 0,
             name: Some("Keystone".into()),
         }],
