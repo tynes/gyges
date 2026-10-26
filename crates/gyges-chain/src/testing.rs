@@ -1025,6 +1025,13 @@ fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
             }
             Err((-5, "No such mempool or main chain transaction".into()))
         }
+        // Zakura answers an array of display-order txids.
+        "getrawmempool" => Ok(json!(
+            st.mempool
+                .iter()
+                .map(|(id, _)| crate::display_hash(id))
+                .collect::<Vec<_>>()
+        )),
         _ => Err((-32601, format!("Method not found: {method}"))),
     }
 }

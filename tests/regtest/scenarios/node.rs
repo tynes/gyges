@@ -256,6 +256,19 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
         .run();
     assert_eq!(run.code(), 0, "{run:?}\n{}", node.log_tail());
     let pay_bob_txid = run.stdout.trim().to_string();
+    // SYNC.md §7: while the payment is in the node's mempool, bob sees it
+    // as pending (the loop finds it on its own; `sync mempool` forces it).
+    let run = fx.gyges(&["-k", "bob", "sync", "mempool"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert!(run.stdout.contains("found 1 note"), "{}", run.stdout);
+    let b = wait_balance(&fx, "bob", |b| {
+        b["pools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["pool"] == "POOL_IRONWOOD" && p["pending"] == "100000000")
+    });
+    assert!(b["total_spendable"].is_null(), "{b}");
     node.mine(1);
     wait_for_txid(&fx, "bob", &pay_bob_txid);
     let b = wait_balance(&fx, "bob", |b| spendable(b, "POOL_IRONWOOD") == 100_000_000);

@@ -39,7 +39,27 @@ Exit criterion: a fresh user can run a regtest node, `gyges key init`, mine, `gy
 
 The exit criterion is met. These gaps were recorded under "Not done" in the items above and had no checkbox of their own; none blocks M2 or M4.
 
-- [ ] Mempool loop (`SYNC.md` §7): `getrawmempool` diff per poll tick, trial decryption into **Pending Confirmation** in `balance`, `gyges sync mempool`.
+- [x] Mempool loop (`SYNC.md` §7): `getrawmempool` diff per poll tick, trial decryption into **Pending Confirmation** in `balance`, `gyges sync mempool`. Landed as:
+  - `ChainBackend::{mempool_txids, fetch_transaction}`, implemented by `ZakuraRpcBackend` over `getrawmempool` and `getrawtransaction(txid, 1)`. The default bodies refuse, so the fallback endpoint never lists or fetches mempool transactions. `FakeNode` answers `getrawmempool`.
+  - `gyges_core::mempool::{parse, scan_tx}`: upstream's `decrypt_and_store_transaction` (Sapling, Orchard and Ironwood) with a count of the notes found.
+  - `gygesd::sync::Scheduler::{mempool_step, mempool_pass}`. A pass runs once per poll interval, on a tick that scanned no batch. It diffs against the last listing, fetches each new transaction once whatever the number of keys, and takes at most 500 per pass.
+  - The `ScanMempool` RPC: a full pass at the next tick, even with `mempool.scan = false`.
+  - `gyges sync mempool` prints `scanned N transactions, found M notes`.
+
+  `balance` needed no change. Upstream's summary already counts an unmined received note as pending and the notes it spends as spent, and drops both once the transaction expires.
+
+  **Fixed on the way:** upstream's `store_decrypted_tx` logs every txid it stores at `info`, and the binary scenario's log sweep caught one in `gygesd.log`. `logs::filter_spec` now caps that target at `warn` under `daemon.log_level`.
+
+  Tests:
+  - `rpc.rs::the_mempool_loop_shows_an_unmined_payment_as_pending`: `bob` sees `main`'s unmined payment as pending, `ScanMempool` for `bob` reports 1 transaction and 1 note, and the payment becomes spendable once mined.
+  - `rpc.rs::scan_mempool_forces_a_pass_when_the_loop_is_off`: with `mempool.scan = false` nothing is pending until `ScanMempool` runs.
+  - `scenarios/tx.rs`: `sync mempool` output and `balance` while the shield is unmined, with the log sweep.
+  - `scenarios/node.rs`: on the real `zakurad`, `bob`'s Ironwood pending balance before the block.
+
+  Not done:
+  - The indexer `mempool_change` path (no indexer exists).
+  - `PoolBalance.pending_spend`, which stays 0 because upstream's summary has no separate figure for it.
+  - A new key misses transactions that were already in the mempool before it existed, until it scans their block or `sync mempool` runs.
 - [x] Mined status for fully transparent transactions without change: no `TransactionDataRequest::GetStatus` in rc9.1, so mark them from the node's `getrawtransaction` with `set_transaction_status`, as the `TexQueue` already does for a transparent step 2.
 
   The premise was half right. rc9.1 has no `GetStatus` data request, but upstream already queues a status lookup for every sent transaction that scanning cannot see, behind `TransactionStatusRead::transaction_status_work()`. That call failed with `StatusModeNotConfigured`, because gyges never chose a status mode (`OVERVIEW.md` §4.3). Landed as:

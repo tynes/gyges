@@ -292,13 +292,25 @@ impl Visit for Fields {
     }
 }
 
-/// The effective filter: `RUST_LOG` when set and non-empty, else
-/// `daemon.log_level`.
+/// Upstream targets that log identifying data (txids) at `info`, capped at
+/// `warn` under `daemon.log_level` so the main log keeps none (THREAT_MODEL.md
+/// log redaction, TESTING.md §5). `store_decrypted_tx` logs every txid it
+/// stores, which the mempool loop calls for each transaction of ours.
+const QUIET_UPSTREAM: &[&str] = &["zcash_client_backend::data_api::ll::wallet=warn"];
+
+/// The effective filter: `RUST_LOG` when set and non-empty (the operator's
+/// own choice, taken as given), else `daemon.log_level` with
+/// [`QUIET_UPSTREAM`] appended.
 pub fn filter_spec(configured: &str) -> String {
     std::env::var("RUST_LOG")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| configured.to_string())
+        .unwrap_or_else(|| {
+            std::iter::once(configured)
+                .chain(QUIET_UPSTREAM.iter().copied())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
 }
 
 fn audit_only() -> FilterFn {
@@ -628,7 +640,10 @@ mod tests {
     fn filter_spec_prefers_a_non_empty_rust_log() {
         // Not touching the process environment: only the fallback is tested.
         if std::env::var_os("RUST_LOG").is_none_or(|v| v.is_empty()) {
-            assert_eq!(filter_spec("info"), "info");
+            assert_eq!(
+                filter_spec("info"),
+                "info,zcash_client_backend::data_api::ll::wallet=warn"
+            );
         }
         assert!(
             layers::<tracing_subscriber::Registry, _, _>(

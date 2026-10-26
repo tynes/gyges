@@ -287,6 +287,16 @@ nullifiers and ShardTree checkpoints to `from_height - 1` and requires
 `confirm_rewind = true` (the CLI prompts, or `--yes`). Unmined transactions
 survive and are re-evaluated against their expiry.
 
+`ScanMempool` (unary) runs one full mempool pass at the scheduler's next tick
+(SYNC.md §7). The pass covers every transaction in the node's mempool and
+every key, whether or not `mempool.scan` is on. `transactions_scanned`
+counts the transactions fetched and parsed. `notes_found` counts the notes
+they pay to `key_id`, or to every key when `key_id` is empty; received notes
+and change are counted, outputs the wallet sent elsewhere are not. What is
+found shows as `pending` in `GetBalance` until mined. An unknown `key_id`
+is `KEY_NOT_FOUND`. A daemon without a node, or a pass that cannot reach
+it, answers `NODE_UNREACHABLE`.
+
 ### 4.5 `StreamLogs`
 
 Replays the last `lines` entries (at most 1,000: the daemon keeps that many

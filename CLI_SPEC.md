@@ -141,7 +141,7 @@ Blocks until the key is *spendable* (default: `scanned_tip` at the node tip and 
 Triggers an immediate foreground scan. `--from` **rewinds**: it truncates notes, nullifiers and ShardTree checkpoints above `HEIGHT - 1` before rescanning; unmined transactions are kept and re-evaluated against their expiry. Requires confirmation unless `--yes`.
 
 #### `gyges sync mempool [--key <KEY_ID>]`
-Forces an immediate mempool pass. Mempool scanning otherwise runs continuously in the daemon (`mempool.scan = true`), fed by the node's `mempool_change` stream or `getrawmempool` diffs.
+Forces an immediate mempool pass over every transaction in the node's mempool and every key, even with `mempool.scan = false`. Mempool scanning otherwise runs continuously in the daemon (`mempool.scan = true`), fed by `getrawmempool` diffs (the node's `mempool_change` stream once an indexer exists). Prints `scanned N transactions, found M notes`, where the notes are those paying `--key` (every key without it). Notes found show as pending in `balance` until mined. `--json` prints `ScanMempoolResponse`.
 
 ---
 

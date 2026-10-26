@@ -19,9 +19,10 @@ use gyges_proto::v1::{
     InspectPcztRequest, InspectPcztResponse, ListKeysRequest, ListKeysResponse,
     ListSigningSessionsRequest, ListSigningSessionsResponse, LockKeyRequest, LockKeyResponse,
     NodeStatus, ProvePcztRequest, ProvePcztResponse, RestoreKeyRequest, RestoreKeyResponse,
-    ResumeTexTransferRequest, RunSyncRequest, SendTransactionRequest, ShieldFundsRequest,
-    ShutdownRequest, ShutdownResponse, SignPcztRequest, SigningSession, StreamLogsRequest,
-    TexQueueEntry, UnlockKeyRequest, UnlockKeyResponse, WaitSyncRequest,
+    ResumeTexTransferRequest, RunSyncRequest, ScanMempoolRequest, ScanMempoolResponse,
+    SendTransactionRequest, ShieldFundsRequest, ShutdownRequest, ShutdownResponse, SignPcztRequest,
+    SigningSession, StreamLogsRequest, TexQueueEntry, UnlockKeyRequest, UnlockKeyResponse,
+    WaitSyncRequest,
 };
 use gyges_proto::v1::{
     AddressInfo, GetCurrentAddressRequest, GetTransactionStatusRequest,
@@ -365,6 +366,15 @@ impl Gyges for GygesService {
         request: Request<RunSyncRequest>,
     ) -> Result<Response<ProgressStream>, Status> {
         sync::run_sync(self.state.clone(), request.into_inner()).map(Response::new)
+    }
+
+    async fn scan_mempool(
+        &self,
+        request: Request<ScanMempoolRequest>,
+    ) -> Result<Response<ScanMempoolResponse>, Status> {
+        sync::scan_mempool(&self.state, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn get_info(

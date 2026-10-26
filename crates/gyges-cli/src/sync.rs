@@ -1,20 +1,18 @@
 //! `gyges sync …` (CLI_SPEC.md §2.3, API.md §4.4).
 //!
-//! Implemented: `status`, `wait`, `run`. `mempool` arrives with the mempool
-//! loop (SYNC.md §7).
+//! `status`, `wait`, `run` and `mempool` (SYNC.md §7).
 
 use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
 use gyges_proto::v1::{
-    ErrorReason, GetSyncStatusRequest, GygesError, KeySyncStatus, RunSyncRequest, StallReason,
-    SyncProgress, SyncState, SyncTarget, WaitSyncRequest,
+    ErrorReason, GetSyncStatusRequest, GygesError, KeySyncStatus, RunSyncRequest,
+    ScanMempoolRequest, StallReason, SyncProgress, SyncState, SyncTarget, WaitSyncRequest,
 };
 use tokio_stream::StreamExt as _;
 
 use crate::client::Ctx;
 use crate::exit::CliError;
-use crate::key::Unimplemented;
 use crate::output::to_json;
 
 #[derive(Debug, Subcommand)]
@@ -25,8 +23,8 @@ pub enum SyncCmd {
     Wait(WaitArgs),
     /// Scan now; --from rewinds the wallet before rescanning (asks unless --yes).
     Run(RunArgs),
-    /// Force one mempool pass.
-    Mempool(Unimplemented),
+    /// Force one mempool pass now; notes found show as pending in `balance`.
+    Mempool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -81,8 +79,39 @@ pub async fn run(ctx: &Ctx, cmd: SyncCmd) -> Result<(), CliError> {
         SyncCmd::Status(args) => status(ctx, args).await,
         SyncCmd::Wait(args) => wait(ctx, args).await,
         SyncCmd::Run(args) => run_sync(ctx, args).await,
-        SyncCmd::Mempool(_) => Err(CliError::NotImplemented("sync mempool")),
+        SyncCmd::Mempool => mempool(ctx).await,
     }
+}
+
+/// `sync mempool`: every key is scanned; `--key` picks whose notes are
+/// counted (all keys without it).
+async fn mempool(ctx: &Ctx) -> Result<(), CliError> {
+    let mut conn = ctx.connect().await?;
+    let resp = conn
+        .client
+        .scan_mempool(ScanMempoolRequest {
+            key_id: ctx.key.clone(),
+        })
+        .await?
+        .into_inner();
+    if ctx.json {
+        println!("{}", to_json(&resp)?);
+    } else if !ctx.quiet {
+        println!(
+            "{}",
+            render_mempool(resp.transactions_scanned, resp.notes_found)
+        );
+    }
+    Ok(())
+}
+
+fn render_mempool(transactions: u32, notes: u32) -> String {
+    let plural = |n: u32, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    format!(
+        "scanned {}, found {}",
+        plural(transactions, "transaction", "transactions"),
+        plural(notes, "note", "notes")
+    )
 }
 
 async fn status(ctx: &Ctx, args: StatusArgs) -> Result<(), CliError> {

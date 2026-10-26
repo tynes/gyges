@@ -15,7 +15,7 @@
 //! and CPU and runs under `spawn_blocking`, holding the key's wallet lock for
 //! one batch of at most `cache.scan_batch` blocks.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -28,9 +28,10 @@ use gyges_core::sync::{
 };
 use gyges_proto::v1::{
     self, ErrorReason, GetSyncStatusRequest, GetSyncStatusResponse, GygesError, KeySyncStatus,
-    RunSyncRequest, SyncProgress, SyncTarget, WaitSyncRequest,
+    RunSyncRequest, ScanMempoolRequest, ScanMempoolResponse, SyncProgress, SyncTarget,
+    WaitSyncRequest,
 };
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tonic::Status;
 use zcash_client_backend::data_api::chain::BlockCache as _;
 use zcash_client_backend::data_api::scanning::{ScanPriority, ScanRange};
@@ -57,7 +58,21 @@ pub struct SyncHub {
     /// Set once at shutdown: the scheduler finishes the batch in hand and
     /// returns (SYNC.md §8 step 1).
     stop: watch::Sender<bool>,
+    /// `ScanMempool` requests waiting for the scheduler's next tick.
+    mempool_requests: Mutex<Vec<MempoolRequest>>,
 }
+
+/// One `ScanMempool` call: the key it is about (`None`: every key) and
+/// where to send `(transactions scanned, notes found)`.
+#[derive(Debug)]
+struct MempoolRequest {
+    key_id: Option<String>,
+    reply: oneshot::Sender<Result<(u32, u32), String>>,
+}
+
+/// At most this many transactions new to the mempool are fetched per pass,
+/// so a burst cannot hold up block sync; the rest are taken next pass.
+const MEMPOOL_MAX_NEW: usize = 500;
 
 impl Default for SyncHub {
     fn default() -> Self {
@@ -68,6 +83,7 @@ impl Default for SyncHub {
             rewinds: Mutex::new(BTreeMap::new()),
             ticks: Mutex::new((0, 0)),
             stop: watch::Sender::new(false),
+            mempool_requests: Mutex::new(Vec::new()),
         }
     }
 }
@@ -151,6 +167,29 @@ impl SyncHub {
             .remove(key_id)
     }
 
+    /// `ScanMempool`: run a full mempool pass at the next tick and report it.
+    fn request_mempool_scan(
+        &self,
+        key_id: Option<String>,
+    ) -> oneshot::Receiver<Result<(u32, u32), String>> {
+        let (reply, rx) = oneshot::channel();
+        self.mempool_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(MempoolRequest { key_id, reply });
+        self.wake();
+        rx
+    }
+
+    fn take_mempool_requests(&self) -> Vec<MempoolRequest> {
+        std::mem::take(
+            &mut *self
+                .mempool_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
     /// Ask the scheduler to stop at the next batch boundary.
     pub fn request_stop(&self) {
         self.stop.send_replace(true);
@@ -221,6 +260,10 @@ pub struct Scheduler {
     /// When each key's transaction status work last went to the node
     /// ([`Self::check_status`]).
     status_checked: BTreeMap<String, Instant>,
+    /// The node's mempool as of the last pass (SYNC.md §7): only txids not
+    /// in it are fetched.
+    mempool_seen: HashSet<[u8; 32]>,
+    mempool_scanned_at: Option<Instant>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -247,6 +290,8 @@ pub fn spawn(
         last_connected: None,
         backfills: BTreeMap::new(),
         status_checked: BTreeMap::new(),
+        mempool_seen: HashSet::new(),
+        mempool_scanned_at: None,
     };
     tokio::spawn(scheduler.run())
 }
@@ -353,10 +398,112 @@ impl Scheduler {
                 Err(e) => self.report_step_error(key.key_id(), &bounds, e),
             }
         }
+        self.mempool_step(&keys, &bounds, did_work).await;
         if let Err(e) = self.evict(slowest) {
             tracing::warn!(error = %e, "block cache eviction failed");
         }
         did_work
+    }
+
+    /// SYNC.md §7. `ScanMempool` requests get a full pass over the whole
+    /// mempool now. Otherwise, with `mempool.scan` on, a pass over what is
+    /// new runs once per poll interval on a tick that scanned no batch, so
+    /// catching up is not slowed down.
+    async fn mempool_step(&mut self, keys: &[Arc<KeyEntry>], bounds: &NodeBounds, did_work: bool) {
+        let requests = self.hub().take_mempool_requests();
+        if !requests.is_empty() {
+            let outcome = self.mempool_pass(keys, bounds, true).await;
+            for req in requests {
+                let reply = match &outcome {
+                    Ok((scanned, notes)) => Ok((
+                        *scanned,
+                        req.key_id.as_ref().map_or_else(
+                            || notes.values().sum(),
+                            |k| notes.get(k).copied().unwrap_or(0),
+                        ),
+                    )),
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = req.reply.send(reply);
+            }
+            return;
+        }
+        let poll = Duration::from_secs(u64::from(
+            self.state.config.zakura_rpc.poll_interval_secs.max(1),
+        ));
+        if !self.state.config.mempool.scan
+            || did_work
+            || self.mempool_scanned_at.is_some_and(|t| t.elapsed() < poll)
+        {
+            return;
+        }
+        if let Err(e) = self.mempool_pass(keys, bounds, false).await {
+            tracing::debug!(error = %e, "mempool pass failed; retrying next poll");
+        }
+    }
+
+    /// One pass: list the node's mempool, fetch each transaction once
+    /// (every transaction when `full`, else only those not seen last pass),
+    /// and trial-decrypt it for every key. The request pattern does not
+    /// depend on the keys or on what they find. Returns the transactions
+    /// scanned and the notes found per key.
+    async fn mempool_pass(
+        &mut self,
+        keys: &[Arc<KeyEntry>],
+        bounds: &NodeBounds,
+        full: bool,
+    ) -> Result<(u32, BTreeMap<String, u32>), SyncError> {
+        self.mempool_scanned_at = Some(Instant::now());
+        let current = self.chain.mempool_txids().await?;
+        let todo: Vec<[u8; 32]> = current
+            .iter()
+            .filter(|t| full || !self.mempool_seen.contains(*t))
+            .take(MEMPOOL_MAX_NEW)
+            .copied()
+            .collect();
+        let params = self.state.registry.params();
+        let mut scanned = 0u32;
+        let mut notes: BTreeMap<String, u32> = BTreeMap::new();
+        let mut done: HashSet<[u8; 32]> = HashSet::new();
+        for txid in todo {
+            done.insert(txid);
+            // Gone since the listing (mined or evicted): nothing to do.
+            let Some(raw) = self.chain.fetch_transaction(txid).await? else {
+                continue;
+            };
+            if let Err(e) = gyges_core::mempool::parse(&params, &raw, bounds.tip_height) {
+                tracing::warn!(error = %e, "skipping a mempool transaction");
+                continue;
+            }
+            scanned += 1;
+            let raw = Arc::new(raw);
+            for key in keys {
+                let raw = raw.clone();
+                let tip = bounds.tip_height;
+                let found = with_wallet(key, move |w| {
+                    let tx =
+                        gyges_core::mempool::parse(&params, &raw, tip).map_err(SyncError::Scan)?;
+                    gyges_core::mempool::scan_tx(&params, w, &tx)
+                })
+                .await;
+                match found {
+                    Ok(n) => *notes.entry(key.key_id().to_string()).or_default() += n as u32,
+                    Err(e) => {
+                        tracing::warn!(key_id = key.key_id(), error = %e, "mempool transaction not stored");
+                    }
+                }
+            }
+        }
+        // Forget what left the mempool; remember what was taken this pass
+        // (a transaction over the per-pass cap is taken next time).
+        let current: HashSet<[u8; 32]> = current.into_iter().collect();
+        self.mempool_seen.retain(|t| current.contains(t));
+        self.mempool_seen.extend(done);
+        let found: u32 = notes.values().sum();
+        if found > 0 {
+            tracing::info!(transactions = scanned, notes = found, "mempool notes found");
+        }
+        Ok((scanned, notes))
     }
 
     /// Ask the node about the key's own transactions whose mined status
@@ -1006,6 +1153,40 @@ pub fn get_sync_status(
         vec![to_proto(&progress_of(state, key.key_id()))]
     };
     Ok(GetSyncStatusResponse { keys })
+}
+
+/// `ScanMempool`: one full mempool pass now (CLI_SPEC.md `sync mempool`),
+/// whether or not `mempool.scan` runs them continuously. An empty `key_id`
+/// counts the notes of every key; every key is scanned either way.
+pub async fn scan_mempool(
+    state: &DaemonState,
+    req: ScanMempoolRequest,
+) -> Result<ScanMempoolResponse, Status> {
+    let key_id = if req.key_id.is_empty() {
+        None
+    } else {
+        Some(resolve_synced_key(state, &req.key_id)?.key_id().to_string())
+    };
+    if state.chain.is_none() {
+        return Err(GygesError::new(
+            ErrorReason::NodeUnreachable,
+            "the mempool is scanned through the node, and this daemon has none",
+        )
+        .into());
+    }
+    let rx = state.sync.request_mempool_scan(key_id);
+    let unreachable =
+        |why: String| Status::from(GygesError::new(ErrorReason::NodeUnreachable, why));
+    match tokio::time::timeout(Duration::from_secs(60), rx).await {
+        Ok(Ok(Ok((transactions_scanned, notes_found)))) => Ok(ScanMempoolResponse {
+            transactions_scanned,
+            notes_found,
+        }),
+        Ok(Ok(Err(e))) => Err(unreachable(format!("mempool pass failed: {e}"))),
+        Ok(Err(_)) | Err(_) => Err(unreachable(
+            "the sync scheduler did not run a mempool pass (is the node reachable?)".into(),
+        )),
+    }
 }
 
 /// The server-streaming response type for `WaitSync` and `RunSync` (what

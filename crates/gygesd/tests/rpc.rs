@@ -235,7 +235,7 @@ async fn get_info_over_uds_and_socket_is_owner_only() {
 
     // Unimplemented RPCs answer UNIMPLEMENTED without a GygesError detail.
     let err = c
-        .scan_mempool(gyges_proto::v1::ScanMempoolRequest::default())
+        .delete_key(gyges_proto::v1::DeleteKeyRequest::default())
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unimplemented);
@@ -2472,6 +2472,144 @@ async fn a_fully_transparent_send_is_marked_mined_from_the_node() {
     assert_eq!(b.total_spendable, 0, "{b:?}");
     assert_eq!(b.total_pending, 0, "{b:?}");
 
+    running.task.abort();
+}
+
+/// A daemon with `main` holding 1 ZEC (less the shielding fee) in Ironwood
+/// and `bob` empty, both spendable, the vault locked again.
+async fn sender_and_recipient(config: &str) -> (FakeNode, Running, GygesClient<Channel>) {
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(10);
+    let url = node.url().to_string();
+    let running = start_with(config, |o| o.zakura_rpc = Some(url)).await;
+    let mut c = client(&running.socket).await;
+    init_key(&mut c, "main").await;
+    init_key(&mut c, "bob").await;
+    wait_spendable(&mut c, "main").await;
+    node.mine_with_payments(&[(transparent_receiver(&running.state, "main"), 100_000_000)]);
+    node.mine(1);
+    wait_spendable(&mut c, "main").await;
+    unlock_daemon(&mut c, "main").await;
+    collect_events(
+        c.shield_funds(ShieldFundsRequest {
+            key_id: "main".into(),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    wait_spendable(&mut c, "bob").await;
+    (node, running, c)
+}
+
+/// `main` pays `bob` `amount` and the transaction stays in the mempool.
+async fn pay_bob_unmined(node: &FakeNode, c: &mut GygesClient<Channel>, amount: i64) -> String {
+    let to = current_address(c, "bob").await;
+    let events = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to,
+            amount: zats(amount),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    let txid = broadcast_txid(&events);
+    assert_eq!(
+        node.mempool(),
+        vec![gyges_chain::parse_display_hash(&txid).unwrap()]
+    );
+    txid
+}
+
+async fn bob_balance(c: &mut GygesClient<Channel>) -> GetBalanceResponse {
+    c.get_balance(GetBalanceRequest {
+        key_id: "bob".into(),
+        min_confirmations: 0,
+    })
+    .await
+    .unwrap()
+    .into_inner()
+}
+
+/// SYNC.md §7 with `mempool.scan` on (the default): a payment to another
+/// key of the daemon shows as pending for it while still in the mempool,
+/// and becomes spendable once mined. `ScanMempool` reports the pass.
+#[tokio::test]
+async fn the_mempool_loop_shows_an_unmined_payment_as_pending() {
+    const AMOUNT: i64 = 10_000_000;
+    let _ = test_hub();
+    let (node, running, mut c) = sender_and_recipient(ONE_CONF_CONFIG).await;
+    pay_bob_unmined(&node, &mut c, AMOUNT).await;
+
+    let mut b = bob_balance(&mut c).await;
+    for _ in 0..300 {
+        if b.total_pending == AMOUNT {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b = bob_balance(&mut c).await;
+    }
+    assert_eq!((b.total_spendable, b.total_pending), (0, AMOUNT), "{b:?}");
+
+    // A forced pass rescans the whole mempool; `bob` has one note there.
+    let r = c
+        .scan_mempool(gyges_proto::v1::ScanMempoolRequest {
+            key_id: "bob".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((r.transactions_scanned, r.notes_found), (1, 1), "{r:?}");
+    let err = c
+        .scan_mempool(gyges_proto::v1::ScanMempoolRequest {
+            key_id: "nobody".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::KeyNotFound);
+
+    node.mine(1);
+    wait_spendable(&mut c, "bob").await;
+    let b = bob_balance(&mut c).await;
+    assert_eq!((b.total_spendable, b.total_pending), (AMOUNT, 0), "{b:?}");
+    let r = c
+        .scan_mempool(gyges_proto::v1::ScanMempoolRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((r.transactions_scanned, r.notes_found), (0, 0), "{r:?}");
+    running.task.abort();
+}
+
+/// With `mempool.scan = false` nothing is pending until `ScanMempool`
+/// forces a pass (CLI_SPEC.md `sync mempool`).
+#[tokio::test]
+async fn scan_mempool_forces_a_pass_when_the_loop_is_off() {
+    const AMOUNT: i64 = 20_000_000;
+    let _ = test_hub();
+    let config = format!("{ONE_CONF_CONFIG}[mempool]\nscan = false\n");
+    let (node, running, mut c) = sender_and_recipient(&config).await;
+    pay_bob_unmined(&node, &mut c, AMOUNT).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let b = bob_balance(&mut c).await;
+    assert_eq!((b.total_spendable, b.total_pending), (0, 0), "{b:?}");
+
+    // No key: every key's notes are counted (bob's payment and main's
+    // change).
+    let r = c
+        .scan_mempool(gyges_proto::v1::ScanMempoolRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((r.transactions_scanned, r.notes_found), (1, 2), "{r:?}");
+    let b = bob_balance(&mut c).await;
+    assert_eq!((b.total_spendable, b.total_pending), (0, AMOUNT), "{b:?}");
     running.task.abort();
 }
 

@@ -269,6 +269,29 @@ pub trait ChainBackend: Send + Sync + fmt::Debug {
     /// its mempool or its main chain. `txid` is in internal byte order.
     fn transaction_status(&self, txid: [u8; 32]) -> BoxFuture<'_, Result<TxStatus, ChainError>>;
 
+    /// `getrawmempool`: the txids in the node's mempool, in internal byte
+    /// order (SYNC.md §7). Only the local node is asked; a backend without
+    /// a mempool listing (the fallback endpoint, which must not learn what
+    /// the wallet looks at) refuses.
+    fn mempool_txids(&self) -> BoxFuture<'_, Result<Vec<[u8; 32]>, ChainError>> {
+        Box::pin(async { Err(ChainError::Rpc("no mempool listing on this backend".into())) })
+    }
+
+    /// `getrawtransaction(txid, 1)`'s raw bytes: the transaction if the node
+    /// has it in its mempool or main chain, `None` if it does not (evicted,
+    /// mined and pruned, never seen). `txid` is in internal byte order.
+    fn fetch_transaction(
+        &self,
+        txid: [u8; 32],
+    ) -> BoxFuture<'_, Result<Option<Vec<u8>>, ChainError>> {
+        let _ = txid;
+        Box::pin(async {
+            Err(ChainError::Rpc(
+                "no transaction lookup on this backend".into(),
+            ))
+        })
+    }
+
     /// Completed subtree roots of `pool`'s note commitment tree from
     /// `start_index` on, at most `max_entries` of them (0 for all):
     /// `z_getsubtreesbyindex` on the node, `GetSubtreeRoots` on lightwalletd.

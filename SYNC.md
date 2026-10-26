@@ -263,12 +263,19 @@ A failure discards the output with a log line naming the height and the reason, 
 
 Runs continuously inside the daemon when `mempool.scan = true` (default):
 
-- With the indexer gRPC: subscribe to `mempool_change` (`Added`, `Invalidated`, `Mined` with txid) and `getrawtransaction` only added txids.
-- Without: on every poll tick `getrawmempool`, diff against the seen set, fetch only new txids.
+- With the indexer gRPC: subscribe to `mempool_change` (`Added`, `Invalidated`, `Mined` with txid) and `getrawtransaction` only added txids. *Not built: there is no Zakura indexer (`OVERVIEW.md` §4.5).*
+- Without: `getrawmempool`, diff against the seen set, fetch only new txids with `getrawtransaction(txid, 1)`. *Built (`gygesd::sync::Scheduler::mempool_pass`).* A pass runs at most once per `poll_interval_secs`, and only on a tick that scanned no batch, so a key catching up is not slowed down. At most 500 new transactions are fetched per pass; the rest are fetched on the next one. Only the node is asked (`ChainBackend::mempool_txids` / `fetch_transaction`); the fallback endpoint has no mempool listing.
 
-Each new transaction is trial-decrypted for every key with `zcash_client_backend::decrypt_transaction` and stored unmined via `WalletWrite::store_decrypted_tx`, which is what `balance` shows under **Pending Confirmation**. `Mined` and `Invalidated` events, and txids that vanish from `getrawmempool`, are handed to `tex_queue` (see `DATA_MODEL.md` §5.1) and to the expiry check. `gyges sync mempool` forces one immediate pass.
+Each new transaction is fetched once, whatever the number of keys, and trial-decrypted for every key with `zcash_client_backend::decrypt_transaction` (the Sapling, Orchard and Ironwood outputs). What it finds is stored unmined via `WalletWrite::store_decrypted_tx` (`gyges_core::mempool::scan_tx`, which follows upstream's `decrypt_and_store_transaction`). That is what `balance` shows under *pending*: upstream's summary counts unmined received value as pending and the notes it spends as spent, so no balance code is involved. A key without a chain tip yet is skipped.
 
-The request pattern is identical whether or not the wallet has activity, so mempool polling leaks nothing beyond the block requests.
+Nothing has to be done about txids that vanish from `getrawmempool`:
+- the wallet's own sends get their mined status from the status work (`OVERVIEW.md` §4.3) or from scanning;
+- an incoming transaction that never gets mined stops counting once the tip passes its expiry height, because upstream's balance ignores expired unmined transactions;
+- `tex_queue` polls the node itself.
+
+`gyges sync mempool` (`ScanMempool`) forces one immediate full pass, over every transaction in the mempool and for every key, even with `mempool.scan = false`.
+
+The request pattern is identical whether or not the wallet has activity, so mempool polling leaks nothing beyond the block requests. Upstream logs every txid `store_decrypted_tx` stores at `info`; under `daemon.log_level` that target is capped at `warn` (`gygesd::logs::filter_spec`), so the main log keeps no txid.
 
 ---
 
