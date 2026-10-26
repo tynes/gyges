@@ -106,7 +106,14 @@ async fn start(configure: impl FnOnce(&mut Options)) -> Running {
 }
 
 async fn start_with(config: &str, configure: impl FnOnce(&mut Options)) -> Running {
-    let (dir, home) = fresh_home_with(config);
+    let (dir, _) = fresh_home_with(config);
+    start_in(dir, configure).await
+}
+
+/// Start a daemon on an existing home: a restart, once the previous
+/// daemon's task has returned.
+async fn start_in(dir: tempfile::TempDir, configure: impl FnOnce(&mut Options)) -> Running {
+    let home = Home::new(dir.path());
     let mut opts = Options::new(home.clone(), Network::Regtest);
     opts.log_hub = Some(test_hub());
     configure(&mut opts);
@@ -1582,6 +1589,186 @@ async fn offline_node_keeps_keys_initializing_then_stalls_after_the_grace() {
         stalled.detail.contains("node unreachable"),
         "{}",
         stalled.detail
+    );
+    running.task.abort();
+}
+
+/// Every `(from, to)` of a "batch scanned" line for `key_id` from now on.
+/// A follower on the shared hub, so a line the ring later evicts (every
+/// test in this binary logs there) is still counted.
+fn batch_ranges(key_id: &'static str) -> Arc<std::sync::Mutex<Vec<(u32, u32)>>> {
+    let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = out.clone();
+    let mut stream = test_hub().stream(&StreamLogsRequest {
+        follow: true,
+        ..Default::default()
+    });
+    tokio::spawn(async move {
+        while let Some(Ok(e)) = stream.next().await {
+            if e.message == "batch scanned"
+                && e.fields.get("key_id").map(String::as_str) == Some(key_id)
+            {
+                let field = |k: &str| e.fields[k].parse::<u32>().unwrap();
+                sink.lock().unwrap().push((field("from"), field("to")));
+            }
+        }
+    });
+    out
+}
+
+/// Wait until `f` holds, polling every 20 ms for at most 30 s.
+async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+    for _ in 0..1500 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// Small batches, so a 300-block chain is thirty of them.
+fn small_batch_config() -> String {
+    format!("{ONE_CONF_CONFIG}[cache]\nscan_batch = 10\nfetch_batch = 10\n")
+}
+
+/// TESTING.md §3 row 16: `daemon stop` mid-scan. The node holds the
+/// scheduler's next fetch, so the stop lands deterministically inside a
+/// batch. Shutdown waits for that batch to finish (one more batch is
+/// committed after the stop was asked for, not zero), checkpoints the
+/// cache, and the restarted daemon goes on from where the wallet is,
+/// scanning no range it had scanned before.
+#[tokio::test]
+async fn daemon_stop_mid_scan_finishes_the_batch_and_restart_does_not_rescan() {
+    let _ = test_hub();
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(300);
+    let url = node.url().to_string();
+    let running = start_with(&small_batch_config(), |o| o.zakura_rpc = Some(url.clone())).await;
+    let mut c = client(&running.socket).await;
+    let batches = batch_ranges("row16");
+
+    node.hold_after_raw_blocks(120);
+    c.restore_key(RestoreKeyRequest {
+        key_id: "row16".into(),
+        mnemonic: known_mnemonic(),
+        passphrase: "pw".into(),
+        birthday_height: 1,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    eventually("the scheduler to wait on the node", || {
+        node.held_requests() > 0
+    })
+    .await;
+    let before = batches.lock().unwrap().len();
+    assert!(before > 0, "some batches were scanned before the stop");
+
+    c.shutdown(ShutdownRequest { graceful: true })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let Running {
+        _home: home,
+        state,
+        task,
+        ..
+    } = running;
+    assert!(
+        !task.is_finished(),
+        "shutdown waits for the batch the scheduler is fetching"
+    );
+    node.release();
+    tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("shutdown within 30 s")
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let stopped: Vec<(u32, u32)> = batches.lock().unwrap().clone();
+    assert_eq!(
+        stopped.len(),
+        before + 1,
+        "exactly the batch in hand was finished: {stopped:?}"
+    );
+
+    // What the wallet committed is exactly what was logged as scanned: no
+    // batch was cut off between its commit and its log line.
+    let max_scanned = state
+        .registry
+        .resolve("row16")
+        .unwrap()
+        .wallet()
+        .unwrap()
+        .block_max_scanned()
+        .unwrap()
+        .expect("scanned something")
+        .block_height();
+    let logged_max = stopped.iter().map(|&(_, to)| to).max().unwrap();
+    assert_eq!(u32::from(max_scanned), logged_max, "{stopped:?}");
+    assert!(logged_max < 300, "the stop landed mid-scan: {stopped:?}");
+    let wal = home.path().join("regtest/cache/blocks.sqlite-wal");
+    assert!(
+        !wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0,
+        "WAL not checkpointed"
+    );
+    drop(state);
+
+    // Restart on the same home: the key resumes and reaches the tip
+    // without scanning any range again.
+    let running = start_in(home, |o| o.zakura_rpc = Some(url)).await;
+    let mut c = client(&running.socket).await;
+    wait_spendable(&mut c, "row16").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let all: Vec<(u32, u32)> = batches.lock().unwrap().clone();
+    let after = &all[stopped.len()..];
+    assert!(!after.is_empty(), "the restart scanned the rest: {all:?}");
+    for &(a_from, a_to) in after {
+        for &(b_from, b_to) in &stopped {
+            assert!(
+                a_to < b_from || b_to < a_from,
+                "{a_from}..={a_to} after the restart rescans {b_from}..={b_to}: {all:?}"
+            );
+        }
+    }
+    running.task.abort();
+}
+
+/// TESTING.md §3 row 17: three keys over one node share the block cache, so
+/// each block is fetched from the node once. A block costs two `getblock`
+/// calls (verbosity 0 for the body, 1 for the tree sizes), so the count is
+/// twice the chain's length, not six times.
+#[tokio::test]
+async fn three_keys_fetch_each_block_from_the_node_once() {
+    const BLOCKS: usize = 60;
+    let _ = test_hub();
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(BLOCKS as u32);
+    let url = node.url().to_string();
+    let running = start_with(&small_batch_config(), |o| o.zakura_rpc = Some(url)).await;
+    let mut c = client(&running.socket).await;
+    let getblocks = |node: &FakeNode| node.calls().iter().filter(|m| *m == "getblock").count();
+    let before = getblocks(&node);
+
+    for id in ["row17a", "row17b", "row17c"] {
+        c.restore_key(RestoreKeyRequest {
+            key_id: id.into(),
+            mnemonic: known_mnemonic(),
+            passphrase: "pw".into(),
+            birthday_height: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    for id in ["row17a", "row17b", "row17c"] {
+        wait_spendable(&mut c, id).await;
+    }
+    assert_eq!(
+        getblocks(&node) - before,
+        2 * BLOCKS,
+        "each of the {BLOCKS} blocks fetched once, at both verbosities"
     );
     running.task.abort();
 }

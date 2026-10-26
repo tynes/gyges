@@ -118,6 +118,11 @@ impl Options {
     }
 }
 
+/// How long shutdown waits for the sync scheduler to finish the batch in
+/// hand (a fetch from the node plus one `scan_cached_blocks`) before
+/// cancelling it.
+const SCHEDULER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A daemon that has passed every startup check and holds the pid lock, but
 /// is not yet listening.
 #[derive(Debug)]
@@ -353,18 +358,23 @@ impl Daemon {
             .await
             .context("gRPC server failed");
 
-        // The listener is closed; unlink its file first so that a `daemon
-        // stop` waiting on it returns while the rest of the shutdown runs.
-        if let Err(e) = std::fs::remove_file(&socket)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(error = %e, "could not remove socket file");
-        }
         sweeper.abort();
-        // Cancel at the next batch boundary: `scan_cached_blocks` commits per
-        // batch, so no partial batch is ever visible (SYNC.md §8 step 1).
-        if let Some(s) = scheduler {
-            s.abort();
+        // SYNC.md §8 step 1: the scheduler finishes the batch in hand (each
+        // `scan_cached_blocks` call commits one batch) and returns before
+        // the cache is checkpointed. A batch stuck on the node past the
+        // bound is cancelled; nothing of it is committed.
+        if let Some(mut s) = scheduler {
+            self.state.sync.request_stop();
+            if tokio::time::timeout(SCHEDULER_STOP_GRACE, &mut s)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    secs = SCHEDULER_STOP_GRACE.as_secs(),
+                    "sync scheduler did not stop in time; cancelling it"
+                );
+                s.abort();
+            }
         }
         // Rows stay in `wallet.sqlite`; the next start picks them up.
         if let Some(t) = tex_queue {
@@ -381,6 +391,15 @@ impl Daemon {
             && let Err(e) = cache.checkpoint()
         {
             tracing::warn!(error = %e, "block cache checkpoint failed");
+        }
+        // Unlinked last: `daemon stop` waits for the file to go, so it
+        // returns only once the batch is committed and the cache
+        // checkpointed. The pid lock is released when `self` drops, right
+        // after, so a `stop && start` sees a free lock.
+        if let Err(e) = std::fs::remove_file(&socket)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, "could not remove socket file");
         }
         tracing::info!("gygesd stopped");
         result

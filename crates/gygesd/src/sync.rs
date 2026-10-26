@@ -54,6 +54,9 @@ pub struct SyncHub {
     /// the node newer than its own start waits for a tick that *began*
     /// after it woke the scheduler (see [`SyncHub::ticks`]).
     ticks: Mutex<(u64, u64)>,
+    /// Set once at shutdown: the scheduler finishes the batch in hand and
+    /// returns (SYNC.md §8 step 1).
+    stop: watch::Sender<bool>,
 }
 
 impl Default for SyncHub {
@@ -64,6 +67,7 @@ impl Default for SyncHub {
             wake: Notify::new(),
             rewinds: Mutex::new(BTreeMap::new()),
             ticks: Mutex::new((0, 0)),
+            stop: watch::Sender::new(false),
         }
     }
 }
@@ -145,6 +149,15 @@ impl SyncHub {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key_id)
+    }
+
+    /// Ask the scheduler to stop at the next batch boundary.
+    pub fn request_stop(&self) {
+        self.stop.send_replace(true);
+    }
+
+    pub fn stopping(&self) -> bool {
+        *self.stop.borrow()
     }
 
     /// `(ticks begun, ticks completed)`.
@@ -243,7 +256,12 @@ impl Scheduler {
         let poll = Duration::from_secs(u64::from(
             self.state.config.zakura_rpc.poll_interval_secs.max(1),
         ));
+        let mut stop = self.state.sync.stop.subscribe();
         loop {
+            if self.hub().stopping() {
+                tracing::debug!("sync scheduler stopped");
+                return;
+            }
             self.hub().tick_begun();
             let did_work = self.tick().await;
             self.hub().tick_completed();
@@ -254,6 +272,7 @@ impl Scheduler {
                 tokio::select! {
                     () = self.state.sync.wake.notified() => {}
                     () = tokio::time::sleep(poll) => {}
+                    _ = stop.changed() => {}
                 }
             }
         }
@@ -321,6 +340,10 @@ impl Scheduler {
         let mut did_work = false;
         let mut slowest: Option<BlockHeight> = None;
         for key in &keys {
+            // Shutdown: the batch in hand is committed; leave the rest.
+            if self.hub().stopping() {
+                break;
+            }
             match self.step_key(key, &bounds).await {
                 Ok((worked, scanned_tip)) => {
                     did_work |= worked;
