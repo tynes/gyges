@@ -288,8 +288,8 @@ nullifiers and ShardTree checkpoints to `from_height - 1` and requires
 survive and are re-evaluated against their expiry.
 
 `ScanMempool` (unary) runs one full mempool pass at the scheduler's next tick
-(SYNC.md §7). The pass covers every transaction in the node's mempool and
-every key, whether or not `mempool.scan` is on. `transactions_scanned`
+(SYNC.md §7). The pass covers every key and every transaction in the
+node's mempool, up to 500, whether or not `mempool.scan` is on. `transactions_scanned`
 counts the transactions fetched and parsed. `notes_found` counts the notes
 they pay to `key_id`, or to every key when `key_id` is empty; received notes
 and change are counted, outputs the wallet sent elsewhere are not. What is

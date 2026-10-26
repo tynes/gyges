@@ -273,9 +273,9 @@ Nothing has to be done about txids that vanish from `getrawmempool`:
 - an incoming transaction that never gets mined stops counting once the tip passes its expiry height, because upstream's balance ignores expired unmined transactions;
 - `tex_queue` polls the node itself.
 
-`gyges sync mempool` (`ScanMempool`) forces one immediate full pass, over every transaction in the mempool and for every key, even with `mempool.scan = false`.
+`gyges sync mempool` (`ScanMempool`) forces one immediate full pass for every key, even with `mempool.scan = false`. It covers every transaction in the mempool, seen before or not, up to the same 500.
 
-The request pattern is identical whether or not the wallet has activity, so mempool polling leaks nothing beyond the block requests. Upstream logs every txid `store_decrypted_tx` stores at `info`; under `daemon.log_level` that target is capped at `warn` (`gygesd::logs::filter_spec`), so the main log keeps no txid.
+The request pattern is identical whether or not the wallet has activity, so mempool polling leaks nothing beyond the block requests. Upstream logs every txid `store_decrypted_tx` stores at `info`, and some of its warnings and `zcash_client_sqlite`'s messages name txids too. Under `daemon.log_level` those targets are capped (`gygesd::logs::QUIET_UPSTREAM`), so the main log keeps no txid.
 
 ---
 

@@ -292,11 +292,18 @@ impl Visit for Fields {
     }
 }
 
-/// Upstream targets that log identifying data (txids) at `info`, capped at
-/// `warn` under `daemon.log_level` so the main log keeps none (THREAT_MODEL.md
-/// log redaction, TESTING.md §5). `store_decrypted_tx` logs every txid it
-/// stores, which the mempool loop calls for each transaction of ours.
-const QUIET_UPSTREAM: &[&str] = &["zcash_client_backend::data_api::ll::wallet=warn"];
+/// Upstream targets that put txids or addresses in their messages, capped
+/// under `daemon.log_level` so the main log keeps none (THREAT_MODEL.md log
+/// redaction, TESTING.md §5).
+/// - `ll::wallet`: `store_decrypted_tx` logs every txid it stores at `info`
+///   (the mempool loop stores each transaction of ours), and its `warn`s
+///   about unsupported scripts and unknown recipients name the txid too.
+/// - `zcash_client_sqlite`: `put_received_transparent_utxo` logs the txid of
+///   a spender it attributes at `info`.
+const QUIET_UPSTREAM: &[&str] = &[
+    "zcash_client_backend::data_api::ll::wallet=error",
+    "zcash_client_sqlite=warn",
+];
 
 /// The effective filter: `RUST_LOG` when set and non-empty (the operator's
 /// own choice, taken as given), else `daemon.log_level` with
@@ -642,7 +649,7 @@ mod tests {
         if std::env::var_os("RUST_LOG").is_none_or(|v| v.is_empty()) {
             assert_eq!(
                 filter_spec("info"),
-                "info,zcash_client_backend::data_api::ll::wallet=warn"
+                "info,zcash_client_backend::data_api::ll::wallet=error,zcash_client_sqlite=warn"
             );
         }
         assert!(

@@ -48,7 +48,7 @@ The exit criterion is met. These gaps were recorded under "Not done" in the item
 
   `balance` needed no change. Upstream's summary already counts an unmined received note as pending and the notes it spends as spent, and drops both once the transaction expires.
 
-  **Fixed on the way:** upstream's `store_decrypted_tx` logs every txid it stores at `info`, and the binary scenario's log sweep caught one in `gygesd.log`. `logs::filter_spec` now caps that target at `warn` under `daemon.log_level`.
+  **Fixed on the way:** upstream's `store_decrypted_tx` logs every txid it stores at `info`, and the binary scenario's log sweep caught one in `gygesd.log`. `logs::filter_spec` now caps it under `daemon.log_level` (`QUIET_UPSTREAM`). It caps that target at `error`, because its warnings name txids too, and `zcash_client_sqlite` at `warn`, because `put_received_transparent_utxo` logs an attributed spender's txid at `info`.
 
   Tests:
   - `rpc.rs::the_mempool_loop_shows_an_unmined_payment_as_pending`: `bob` sees `main`'s unmined payment as pending, `ScanMempool` for `bob` reports 1 transaction and 1 note, and the payment becomes spendable once mined.

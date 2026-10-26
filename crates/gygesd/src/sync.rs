@@ -70,8 +70,9 @@ struct MempoolRequest {
     reply: oneshot::Sender<Result<(u32, u32), String>>,
 }
 
-/// At most this many transactions new to the mempool are fetched per pass,
-/// so a burst cannot hold up block sync; the rest are taken next pass.
+/// At most this many transactions are fetched per pass (forced passes
+/// included), so a burst cannot hold up block sync or outlast
+/// `ScanMempool`'s wait; the rest are taken next pass.
 const MEMPOOL_MAX_NEW: usize = 500;
 
 impl Default for SyncHub {
@@ -410,6 +411,12 @@ impl Scheduler {
     /// new runs once per poll interval on a tick that scanned no batch, so
     /// catching up is not slowed down.
     async fn mempool_step(&mut self, keys: &[Arc<KeyEntry>], bounds: &NodeBounds, did_work: bool) {
+        // Shutdown: no new node fetches while `serve` waits for the scheduler
+        // (a waiting `ScanMempool` gets `NODE_UNREACHABLE` when its reply is
+        // dropped).
+        if self.hub().stopping() {
+            return;
+        }
         let requests = self.hub().take_mempool_requests();
         if !requests.is_empty() {
             let outcome = self.mempool_pass(keys, bounds, true).await;
