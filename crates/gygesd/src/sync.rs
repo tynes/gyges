@@ -115,6 +115,16 @@ impl SyncHub {
         self.publish(p);
     }
 
+    /// Mark `key_id` stalled for `reason`: it scans nothing until the cause
+    /// is gone.
+    pub fn stall(&self, key_id: &str, reason: StallReason, detail: String) {
+        self.update(key_id, |p| {
+            p.state = SyncState::Stalled(reason);
+            p.detail = detail;
+            p.blocks_per_sec = 0.0;
+        });
+    }
+
     /// A receiver that wakes whenever any progress changes.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.generation.subscribe()
@@ -562,13 +572,8 @@ impl Scheduler {
         self.stall(key_id, StallReason::PrunedPastScanTip, detail);
     }
 
-    /// Mark `key_id` stalled for `reason`.
     pub(crate) fn stall(&self, key_id: &str, reason: StallReason, detail: String) {
-        self.hub().update(key_id, |p| {
-            p.state = SyncState::Stalled(reason);
-            p.detail = detail;
-            p.blocks_per_sec = 0.0;
-        });
+        self.hub().stall(key_id, reason, detail);
     }
 
     /// How many leading blocks of `range` the cache already holds. A gap
@@ -926,10 +931,7 @@ impl Scheduler {
                     detected_at = u32::from(at_height),
                     "key stalled: chain inconsistent"
                 );
-                self.hub().update(&key_id, |p| {
-                    p.state = SyncState::Stalled(StallReason::ChainInconsistent);
-                    p.detail = detail;
-                });
+                self.stall(&key_id, StallReason::ChainInconsistent, detail);
                 Ok(())
             }
         }
@@ -1344,6 +1346,17 @@ mod tests {
         assert_eq!(hub.take_rewind("a"), Some(BlockHeight::from_u32(3)));
         assert!(!hub.rewind_pending("a"));
         assert_eq!(hub.progress("b").state, SyncState::Initializing);
+    }
+
+    #[test]
+    fn a_stalled_key_reports_no_scan_rate() {
+        let hub = SyncHub::default();
+        hub.update("a", |p| p.blocks_per_sec = 12.5);
+        hub.stall("a", StallReason::ChainInconsistent, "no fork point".into());
+        let p = hub.progress("a");
+        assert_eq!(p.state, SyncState::Stalled(StallReason::ChainInconsistent));
+        assert_eq!(p.detail, "no fork point");
+        assert_eq!(p.blocks_per_sec, 0.0);
     }
 
     #[test]
