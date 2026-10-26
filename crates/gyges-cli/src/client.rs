@@ -33,6 +33,53 @@ pub struct Conn {
 }
 
 impl Ctx {
+    /// `--json`: `value` as one JSON line on stdout; otherwise `human()`
+    /// printed to stdout as is.
+    pub fn print<T: serde::Serialize>(
+        &self,
+        value: &T,
+        human: impl FnOnce() -> String,
+    ) -> Result<(), CliError> {
+        if self.json {
+            println!("{}", crate::output::to_json(value)?);
+        } else {
+            print!("{}", human());
+        }
+        Ok(())
+    }
+
+    /// `--json`: `value` as one JSON line on stdout; otherwise `note()`
+    /// (a human note, usually on stderr), unless `-q`.
+    pub fn report<T: serde::Serialize>(
+        &self,
+        value: &T,
+        note: impl FnOnce(),
+    ) -> Result<(), CliError> {
+        if self.json {
+            println!("{}", crate::output::to_json(value)?);
+        } else if !self.quiet {
+            note();
+        }
+        Ok(())
+    }
+
+    /// The next item of a server stream; `CliError::Cancelled` on Ctrl-C.
+    pub async fn next_or_cancel<T>(
+        stream: &mut tonic::Streaming<T>,
+    ) -> Result<Option<T>, CliError> {
+        tokio::select! {
+            r = stream.message() => Ok(r?),
+            _ = tokio::signal::ctrl_c() => Err(CliError::Cancelled),
+        }
+    }
+
+    /// A human note on stderr, unless `--json` or `-q`.
+    pub fn note(&self, msg: impl std::fmt::Display) {
+        if !self.quiet && !self.json {
+            eprintln!("{msg}");
+        }
+    }
+
     pub fn new(g: Global) -> Result<Self, CliError> {
         let socket = match g.socket {
             Some(p) => p,

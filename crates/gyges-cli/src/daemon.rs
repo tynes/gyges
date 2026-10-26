@@ -10,7 +10,7 @@ use gyges_proto::v1::{GetInfoResponse, LogEntry, LogLevel, ShutdownRequest, Stre
 
 use crate::client::Ctx;
 use crate::exit::CliError;
-use crate::output::{format_unix, to_json};
+use crate::output::format_unix;
 
 #[derive(Debug, Subcommand)]
 pub enum DaemonCmd {
@@ -125,15 +125,13 @@ async fn start(ctx: &Ctx, args: StartArgs) -> Result<(), CliError> {
     // the network).
     match ctx.connect().await {
         Ok(conn) => {
-            if ctx.json {
-                println!("{}", to_json(&conn.info)?);
-            } else if !ctx.quiet {
+            ctx.report(&conn.info, || {
                 eprintln!(
                     "gygesd is already running for {} (since {})",
                     conn.info.network().name(),
                     format_unix(conn.info.started_at)
                 );
-            }
+            })?;
             return Ok(());
         }
         Err(CliError::Unreachable { .. }) => {}
@@ -187,9 +185,7 @@ async fn start(ctx: &Ctx, args: StartArgs) -> Result<(), CliError> {
         )));
     }
     let conn = ctx.connect().await?;
-    if ctx.json {
-        println!("{}", to_json(&conn.info)?);
-    } else if !ctx.quiet {
+    ctx.report(&conn.info, || {
         let line = String::from_utf8_lossy(&output.stdout);
         let line = line.trim();
         if line.is_empty() {
@@ -197,8 +193,7 @@ async fn start(ctx: &Ctx, args: StartArgs) -> Result<(), CliError> {
         } else {
             eprintln!("{line}");
         }
-    }
-    Ok(())
+    })
 }
 
 fn spawn_error(bin: &std::path::Path, e: std::io::Error) -> CliError {
@@ -228,22 +223,14 @@ async fn stop(ctx: &Ctx, force: bool) -> Result<(), CliError> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else if !ctx.quiet {
+    ctx.report(&resp, || {
         eprintln!("gygesd stopped");
-    }
-    Ok(())
+    })
 }
 
 async fn status(ctx: &Ctx) -> Result<(), CliError> {
     let conn = ctx.connect().await?;
-    if ctx.json {
-        println!("{}", to_json(&conn.info)?);
-    } else {
-        print!("{}", render_status(&conn.info));
-    }
-    Ok(())
+    ctx.print(&conn.info, || render_status(&conn.info))
 }
 
 /// Human-readable `daemon status` (CLI_SPEC.md §2.1).
@@ -374,16 +361,10 @@ async fn logs(ctx: &Ctx, follow: bool, lines: u32, audit: bool) -> Result<(), Cl
         .await?
         .into_inner();
     loop {
-        let entry = tokio::select! {
-            r = stream.message() => r?,
-            _ = tokio::signal::ctrl_c() => return Err(CliError::Cancelled),
+        let Some(entry) = Ctx::next_or_cancel(&mut stream).await? else {
+            return Ok(());
         };
-        let Some(entry) = entry else { return Ok(()) };
-        if ctx.json {
-            println!("{}", to_json(&entry)?);
-        } else {
-            println!("{}", render_log(&entry));
-        }
+        ctx.print(&entry, || format!("{}\n", render_log(&entry)))?;
     }
 }
 

@@ -109,68 +109,43 @@ pub async fn run(ctx: &Ctx, cmd: TxCmd) -> Result<(), CliError> {
     }
 }
 
-/// The key name shown in prompts: `--key`, else the daemon's default.
-pub(crate) fn shown_key(ctx: &Ctx, conn: &Conn) -> String {
-    if ctx.key.is_empty() {
+/// The key name shown in prompts: `key_id`, else the daemon's default.
+pub(crate) fn shown_key(key_id: &str, conn: &Conn) -> String {
+    if key_id.is_empty() {
         conn.info.default_key.clone()
     } else {
-        ctx.key.clone()
+        key_id.to_string()
     }
 }
 
 async fn send(ctx: &Ctx, args: SendArgs) -> Result<(), CliError> {
-    let mut conn = ctx.connect().await?;
-    let request = |dry_run: bool| SendTransactionRequest {
-        key_id: ctx.key.clone(),
-        to: args.to.clone(),
-        amount: Some(args.amount.to_proto()),
-        memo: args.memo.clone().map(|m| m.0).unwrap_or_default(),
-        via_tor: args.via_tor,
-        dry_run,
-        session_token: Vec::new(),
-        min_confirmations: 0,
-        wait_for_mined: args.wait,
+    let request = |dry_run: bool| {
+        SendOrShield::Send(SendTransactionRequest {
+            key_id: ctx.key.clone(),
+            to: args.to.clone(),
+            amount: Some(args.amount.to_proto()),
+            memo: args.memo.clone().map(|m| m.0).unwrap_or_default(),
+            via_tor: args.via_tor,
+            dry_run,
+            session_token: Vec::new(),
+            min_confirmations: 0,
+            wait_for_mined: args.wait,
+        })
     };
-    // The proposal is approved before anything is signed: when a
-    // confirmation is due, a dry run shows it first and the real send
-    // follows only on a yes (the daemon never waits on a prompt).
-    let mut shown = false;
-    if !args.dry_run && !args.yes {
-        let proposal = dry_run(&mut conn, SendOrShield::Send(request(true))).await?;
-        confirm(ctx, &proposal, "Send")?;
-        shown = true;
-    }
-    let stream = conn
-        .client
-        .send_transaction(request(args.dry_run))
-        .await?
-        .into_inner();
-    let key = shown_key(ctx, &conn);
-    follow(ctx, &mut conn, &key, stream, shown).await
+    run_send(ctx, "Send", args.dry_run, args.yes, request).await
 }
 
 async fn shield(ctx: &Ctx, args: ShieldArgs) -> Result<(), CliError> {
-    let mut conn = ctx.connect().await?;
-    let request = |dry_run: bool| ShieldFundsRequest {
-        key_id: ctx.key.clone(),
-        threshold: i64::try_from(args.threshold.unwrap_or(0)).unwrap_or(i64::MAX),
-        dry_run,
-        session_token: Vec::new(),
-        wait_for_mined: args.wait,
+    let request = |dry_run: bool| {
+        SendOrShield::Shield(ShieldFundsRequest {
+            key_id: ctx.key.clone(),
+            threshold: i64::try_from(args.threshold.unwrap_or(0)).unwrap_or(i64::MAX),
+            dry_run,
+            session_token: Vec::new(),
+            wait_for_mined: args.wait,
+        })
     };
-    let mut shown = false;
-    if !args.dry_run && !args.yes {
-        let proposal = dry_run(&mut conn, SendOrShield::Shield(request(true))).await?;
-        confirm(ctx, &proposal, "Shield")?;
-        shown = true;
-    }
-    let stream = conn
-        .client
-        .shield_funds(request(args.dry_run))
-        .await?
-        .into_inner();
-    let key = shown_key(ctx, &conn);
-    follow(ctx, &mut conn, &key, stream, shown).await
+    run_send(ctx, "Shield", args.dry_run, args.yes, request).await
 }
 
 enum SendOrShield {
@@ -178,13 +153,39 @@ enum SendOrShield {
     Shield(ShieldFundsRequest),
 }
 
-/// Run the request as a dry run and return its proposal.
-async fn dry_run(conn: &mut Conn, req: SendOrShield) -> Result<Proposal, CliError> {
-    let mut stream = match req {
+/// `tx send` / `tx shield`. The proposal is approved before anything is
+/// signed: when a confirmation is due, a dry run shows it first and the
+/// real request follows only on a yes (the daemon never waits on a
+/// prompt).
+async fn run_send(
+    ctx: &Ctx,
+    verb: &str,
+    dry_run: bool,
+    yes: bool,
+    request: impl Fn(bool) -> SendOrShield,
+) -> Result<(), CliError> {
+    let mut conn = ctx.connect().await?;
+    let mut shown = false;
+    if !dry_run && !yes {
+        let proposal = proposal_of(open(&mut conn, request(true)).await?).await?;
+        confirm(ctx, &proposal, verb)?;
+        shown = true;
+    }
+    let stream = open(&mut conn, request(dry_run)).await?;
+    let key = shown_key(&ctx.key, &conn);
+    follow(ctx, &mut conn, &key, stream, shown).await
+}
+
+async fn open(conn: &mut Conn, req: SendOrShield) -> Result<tonic::Streaming<SendEvent>, CliError> {
+    let stream = match req {
         SendOrShield::Send(r) => conn.client.send_transaction(r).await,
         SendOrShield::Shield(r) => conn.client.shield_funds(r).await,
-    }?
-    .into_inner();
+    }?;
+    Ok(stream.into_inner())
+}
+
+/// The proposal a dry run's stream starts with.
+async fn proposal_of(mut stream: tonic::Streaming<SendEvent>) -> Result<Proposal, CliError> {
     while let Some(item) = stream.next().await {
         let ev = item?;
         if let Some(send_event::Event::Proposed(p)) = ev.event {
@@ -219,14 +220,9 @@ async fn follow(
     proposal_shown: bool,
 ) -> Result<(), CliError> {
     loop {
-        let next = tokio::select! {
-            item = stream.next() => item,
-            _ = tokio::signal::ctrl_c() => return Err(CliError::Cancelled),
-        };
-        let Some(item) = next else {
+        let Some(ev) = Ctx::next_or_cancel(&mut stream).await? else {
             return Ok(());
         };
-        let ev = item?;
         if ctx.json {
             println!("{}", to_json(&ev)?);
         }
@@ -253,25 +249,19 @@ async fn follow(
                 satisfy(ctx, conn, key, &req).await?;
             }
             Some(send_event::Event::Signed(s)) => {
-                if !ctx.quiet && !ctx.json {
-                    eprintln!("step {} signed", s.step);
-                }
+                ctx.note(format_args!("step {} signed", s.step));
             }
             Some(send_event::Event::Broadcast(b)) => {
                 if !ctx.json {
                     println!("{}", b.txid);
                 }
-                if !ctx.quiet && !ctx.json {
-                    eprintln!("step {} broadcast", b.step);
-                }
+                ctx.note(format_args!("step {} broadcast", b.step));
             }
             Some(send_event::Event::TexQueued(t)) => {
-                if !ctx.quiet && !ctx.json {
-                    eprintln!(
-                        "tex pending (step 2 of 2): {} then {}",
-                        t.step1_txid, t.step2_txid
-                    );
-                }
+                ctx.note(format_args!(
+                    "tex pending (step 2 of 2): {} then {}",
+                    t.step1_txid, t.step2_txid
+                ));
             }
             Some(send_event::Event::Mined(m)) if !ctx.quiet && !ctx.json => {
                 eprintln!("step {} mined at height {}", m.step, m.height);
@@ -458,13 +448,13 @@ async fn sessions(ctx: &Ctx, args: SessionsArgs) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else {
-        print!("{}", render_sessions(&resp.sessions));
-        print!("{}", render_tex(&resp.tex_transfers));
-    }
-    Ok(())
+    ctx.print(&resp, || {
+        format!(
+            "{}{}",
+            render_sessions(&resp.sessions),
+            render_tex(&resp.tex_transfers)
+        )
+    })
 }
 
 pub fn tex_state_name(s: TexState) -> &'static str {
@@ -552,7 +542,7 @@ const RESUME_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 async fn resume(ctx: &Ctx, txid: String) -> Result<(), CliError> {
     parse_txid_arg(&txid)?;
     let mut conn = ctx.connect().await?;
-    let key = shown_key(ctx, &conn);
+    let key = shown_key(&ctx.key, &conn);
     let request = || ResumeTexTransferRequest {
         key_id: ctx.key.clone(),
         step1_txid: txid.clone(),
@@ -587,9 +577,7 @@ async fn resume(ctx: &Ctx, txid: String) -> Result<(), CliError> {
         },
     )
     .await?;
-    if !ctx.quiet && !ctx.json {
-        eprintln!("building a new step 2…");
-    }
+    ctx.note("building a new step 2…");
     let deadline = tokio::time::Instant::now() + RESUME_WAIT;
     loop {
         let sessions = conn
@@ -687,11 +675,9 @@ async fn abort(ctx: &Ctx, id: String) -> Result<(), CliError> {
                 })
                 .await?
                 .into_inner();
-            if ctx.json {
-                println!("{}", to_json(&entry)?);
-            } else if !ctx.quiet {
+            ctx.report(&entry, || {
                 eprintln!("tex transfer {} aborted", entry.step1_txid);
-            }
+            })?;
             return Ok(());
         }
         _ => {
@@ -707,12 +693,9 @@ async fn abort(ctx: &Ctx, id: String) -> Result<(), CliError> {
         .abort_signing_session(AbortSigningSessionRequest { session_id: id })
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else if !ctx.quiet {
+    ctx.report(&resp, || {
         eprintln!("session {} aborted", resp.session_id);
-    }
-    Ok(())
+    })
 }
 
 #[cfg(test)]

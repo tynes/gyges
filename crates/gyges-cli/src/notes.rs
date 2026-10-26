@@ -8,7 +8,6 @@ use crate::amount::format_zec;
 use crate::balance::pool_name;
 use crate::client::Ctx;
 use crate::exit::CliError;
-use crate::output::to_json;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum PoolArg {
@@ -68,12 +67,7 @@ pub async fn run(ctx: &Ctx, args: NotesArgs) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else {
-        print!("{}", render(&resp));
-    }
-    Ok(())
+    ctx.print(&resp, || render(&resp))
 }
 
 fn flags(n: &Note) -> String {

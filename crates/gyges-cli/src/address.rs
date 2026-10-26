@@ -118,12 +118,7 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
                     },
                 )));
             }
-            if ctx.json {
-                println!("{}", to_json(&resp)?);
-            } else {
-                print!("{}", render_inspection(&resp));
-            }
-            Ok(())
+            ctx.print(&resp, || render_inspection(&resp))
         }
     }
 }

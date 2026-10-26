@@ -19,7 +19,6 @@ use gyges_proto::v1::{
     InspectPcztRequest, InspectPcztResponse, Network, PcztRole, ProvePcztRequest, SignPcztRequest,
     sign_pczt_event,
 };
-use tokio_stream::StreamExt as _;
 
 use crate::amount::{MemoArg, ParsedAmount, parse_amount, parse_memo};
 use crate::balance::pool_name;
@@ -239,12 +238,7 @@ async fn inspect(ctx: &Ctx, args: InspectArgs) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else {
-        print!("{}", render_inspection(&resp));
-    }
-    Ok(())
+    ctx.print(&resp, || render_inspection(&resp))
 }
 
 pub fn role_name(r: PcztRole) -> &'static str {
@@ -314,9 +308,7 @@ pub fn render_inspection(r: &InspectPcztResponse) -> String {
 async fn prove(ctx: &Ctx, args: InOutArgs) -> Result<(), CliError> {
     let bytes = read_pczt(args.file.as_deref())?;
     let mut conn = ctx.connect().await?;
-    if !ctx.quiet && !ctx.json {
-        eprintln!("proving…");
-    }
+    ctx.note("proving…");
     let resp = conn
         .client
         .prove_pczt(ProvePcztRequest {
@@ -326,9 +318,7 @@ async fn prove(ctx: &Ctx, args: InOutArgs) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    if !ctx.quiet && !ctx.json {
-        eprintln!("proven");
-    }
+    ctx.note("proven");
     let pczt = resp.pczt.clone();
     deliver(ctx, args.out.as_deref(), &resp, &pczt)
 }
@@ -339,7 +329,7 @@ async fn sign(ctx: &Ctx, args: SignArgs) -> Result<(), CliError> {
     }
     let bytes = read_pczt(args.io.file.as_deref())?;
     let mut conn = ctx.connect().await?;
-    let key = shown_key(ctx, &conn);
+    let key = shown_key(&ctx.key, &conn);
     let mut stream = conn
         .client
         .sign_pczt(SignPcztRequest {
@@ -350,24 +340,17 @@ async fn sign(ctx: &Ctx, args: SignArgs) -> Result<(), CliError> {
         .await?
         .into_inner();
     loop {
-        let next = tokio::select! {
-            item = stream.next() => item,
-            _ = tokio::signal::ctrl_c() => return Err(CliError::Cancelled),
-        };
-        let Some(item) = next else {
+        let Some(ev) = Ctx::next_or_cancel(&mut stream).await? else {
             return Err(CliError::Other(anyhow::anyhow!(
                 "the daemon ended the signing stream without a signed PCZT"
             )));
         };
-        let ev = item?;
         match ev.event {
             Some(sign_pczt_event::Event::SignatureRequired(req)) => {
                 satisfy(ctx, &mut conn, &key, &req).await?;
             }
             Some(sign_pczt_event::Event::Signed(ref signed)) => {
-                if !ctx.quiet && !ctx.json {
-                    eprintln!("signed");
-                }
+                ctx.note("signed");
                 return deliver(ctx, args.io.out.as_deref(), &ev, signed);
             }
             None => {}
