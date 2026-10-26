@@ -23,6 +23,7 @@ pub mod ext;
 pub mod handoff;
 pub mod history;
 pub mod log;
+pub mod mempool;
 pub mod network;
 pub mod paths;
 pub mod pczt_io;

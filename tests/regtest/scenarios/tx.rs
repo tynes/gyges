@@ -633,6 +633,24 @@ fn addresses_notes_and_history_through_the_binaries() {
     let shield = run.stdout.trim().to_string();
     let v = wait_tx_status(&fx, &shield, "TRANSACTION_STATUS_PENDING");
     assert_eq!(v["source"], "STATUS_SOURCE_NODE");
+    // `sync mempool` forces a pass over the node's mempool, which holds the
+    // shield alone; its Ironwood output is main's note, pending until mined.
+    let run = fx.gyges(&["-k", "main", "sync", "mempool"]).run();
+    assert_eq!(run.code(), 0, "{run:?}");
+    assert_eq!(run.stdout, "scanned 1 transaction, found 1 note\n");
+    let run = fx.gyges(&["-k", "main", "sync", "mempool", "--json"]).run();
+    let v = run.json();
+    assert_eq!(
+        (&v["transactions_scanned"], &v["notes_found"]),
+        (&serde_json::json!(1), &serde_json::json!(1)),
+        "{v}"
+    );
+    let v = fx.gyges(&["-k", "main", "balance", "--json"]).run().json();
+    // Zero amounts are left out of the JSON.
+    assert!(v["total_spendable"].is_null(), "{v}");
+    assert!(v["total_pending"].is_string(), "{v}");
+    let run = fx.gyges(&["-k", "main", "balance"]).run();
+    assert!(run.stdout.contains("PENDING"), "{}", run.stdout);
     n.node.mine(2);
     let v = wait_tx_status(&fx, &shield, "TRANSACTION_STATUS_MINED");
     assert_eq!(v["confirmations"], 2, "{v}");

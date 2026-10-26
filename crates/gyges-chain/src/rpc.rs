@@ -726,6 +726,49 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
         })
     }
 
+    fn mempool_txids(&self) -> BoxFuture<'_, Result<Vec<[u8; 32]>, ChainError>> {
+        Box::pin(async move {
+            let txids: Vec<String> = self
+                .call("getrawmempool", vec![])
+                .await
+                .map_err(|e| self.chain_error("getrawmempool", e))?;
+            txids
+                .iter()
+                .map(|t| parse_display_hash(t))
+                .collect::<Result<_, _>>()
+        })
+    }
+
+    /// Verbosity 1 rather than 0 so that the answer is the same object
+    /// `transaction_status` reads; its `hex` is the raw transaction.
+    fn fetch_transaction(
+        &self,
+        txid: [u8; 32],
+    ) -> BoxFuture<'_, Result<Option<Vec<u8>>, ChainError>> {
+        #[derive(Deserialize)]
+        struct Verbose {
+            hex: String,
+        }
+        Box::pin(async move {
+            match self
+                .call::<Verbose>(
+                    "getrawtransaction",
+                    vec![json!(display_hash(&txid)), json!(1)],
+                )
+                .await
+            {
+                Ok(v) => hex::decode(&v.hex)
+                    .map(Some)
+                    .map_err(|e| ChainError::Rpc(format!("getrawtransaction: bad hex: {e}"))),
+                Err(RpcFailure::Json {
+                    code: RPC_INVALID_ADDRESS_OR_KEY,
+                    ..
+                }) => Ok(None),
+                Err(other) => Err(self.chain_error("getrawtransaction", other)),
+            }
+        })
+    }
+
     fn compact_blocks(
         &self,
         range: Range<BlockHeight>,
