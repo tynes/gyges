@@ -307,16 +307,8 @@ pub fn propose_send(
                         available,
                         required,
                     }) if required > available => {
-                        // `required` is the amount plus the fee. Upstream
-                        // reports what it could select as `available`, but
-                        // reports 0 when the selection would have been
-                        // transparent inputs only, so fall back to the
-                        // wallet's own spendable total there; otherwise a
-                        // transparent-only wallet could never send `max`.
-                        let fee = required.saturating_sub(amount.into_u64());
-                        let have = if available > 0 { available } else { total };
-                        amount = Zatoshis::from_u64(have.saturating_sub(fee))
-                            .map_err(|e| internal("amount", e))?;
+                        let next = next_max(amount.into_u64(), available, required, total);
+                        amount = Zatoshis::from_u64(next).map_err(|e| internal("amount", e))?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -649,12 +641,6 @@ impl Provers {
             p
         })
     }
-
-    /// Build the Orchard keys now (the daemon does this at start so the
-    /// first send does not pay for it).
-    pub fn warm_orchard(&self) {
-        let _ = self.orchard();
-    }
 }
 
 /// What [`prove`] had to prove, for the `Proving` progress events.
@@ -720,6 +706,18 @@ pub fn prove(pczt: Pczt, provers: &Provers) -> Result<Pczt, TxError> {
             .map_err(|e| TxError::Internal(format!("sapling proving failed: {e:?}")))?;
     }
     Ok(prover.finish())
+}
+
+/// The next amount for `max` after a proposal for `amount` fell short:
+/// `required` is the amount plus the fee, and the fee comes off what can be
+/// spent. Upstream reports what it could select as `available`, but 0 when
+/// the selection would have been transparent inputs only, so the wallet's
+/// own spendable `total` stands in there; otherwise a transparent-only
+/// wallet could never send `max`.
+fn next_max(amount: u64, available: u64, required: u64, total: u64) -> u64 {
+    let fee = required.saturating_sub(amount);
+    let have = if available > 0 { available } else { total };
+    have.saturating_sub(fee)
 }
 
 /// Derive the account's spending key from decrypted entropy.
@@ -1813,18 +1811,13 @@ pub fn balance(wallet: &Wallet, min_confirmations: u32) -> Result<BalanceSummary
         });
     };
     // Indexed below in this order.
-    let mut pools: Vec<PoolBalance> = [
-        Pool::Orchard,
-        Pool::Ironwood,
-        Pool::Sapling,
-        Pool::Transparent,
-    ]
-    .into_iter()
-    .map(|pool| PoolBalance {
-        pool,
-        ..Default::default()
-    })
-    .collect();
+    let mut pools: Vec<PoolBalance> = Pool::ALL
+        .into_iter()
+        .map(|pool| PoolBalance {
+            pool,
+            ..Default::default()
+        })
+        .collect();
     for account in summary.account_balances().values() {
         let add = |p: &mut PoolBalance, b: &zcash_client_backend::data_api::Balance| {
             p.spendable += b.spendable_value().into_u64();
@@ -1905,5 +1898,16 @@ mod tests {
     fn confirmations_policy_never_goes_below_one() {
         let _ = confirmations_policy(0);
         let _ = confirmations_policy(10);
+    }
+
+    #[test]
+    fn max_retries_with_the_fee_taken_off_what_can_be_spent() {
+        // 1000 asked, 1100 needed: the fee is 100, off the 900 selectable.
+        assert_eq!(next_max(1000, 900, 1100, 5000), 800);
+        // Transparent-only selection reports nothing available: the
+        // wallet's total stands in.
+        assert_eq!(next_max(1000, 0, 1100, 1000), 900);
+        // A fee above what can be spent leaves nothing to send.
+        assert_eq!(next_max(10, 5, 100, 5), 0);
     }
 }

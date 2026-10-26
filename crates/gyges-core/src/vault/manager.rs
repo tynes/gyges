@@ -454,14 +454,28 @@ mod tests {
         (dir, key, vault, entropy)
     }
 
+    /// Whether `auth` reaches key `k`'s entropy at `t`.
+    fn can_use(vault: &VaultManager, auth: Auth<'_>, t: Instant) -> bool {
+        match vault.with_entropy_at("k", auth, t, |_| ()) {
+            Ok(()) => true,
+            Err(VaultError::Locked) => false,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+
+    /// The wait the right passphrase is refused with at `t`.
+    fn rate_limited(vault: &VaultManager, key: &KeyEntry, t: Instant) -> Duration {
+        match vault.unlock_at(key, pass("pw"), Scope::Daemon, None, t) {
+            Err(VaultError::RateLimited(d)) => d,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn daemon_unlock_is_usable_without_a_token_until_locked_or_expired() {
         let (_d, key, vault, entropy) = setup();
         let t0 = Instant::now();
-        assert!(matches!(
-            vault.with_entropy_at("k", Auth::Daemon, t0, |_| ()),
-            Err(VaultError::Locked)
-        ));
+        assert!(!can_use(&vault, Auth::Daemon, t0));
         let u = vault
             .unlock_at(&key, pass("pw"), Scope::Daemon, None, t0)
             .unwrap();
@@ -477,15 +491,12 @@ mod tests {
         assert_eq!(vault.daemon_unlocks_at(t0)[0].key_id, "k");
 
         // Use refreshed the timer: 10 + 300 s from t0 is still inside.
-        assert!(
-            vault
-                .with_entropy_at("k", Auth::Daemon, t0 + Duration::from_secs(305), |_| ())
-                .is_ok()
-        );
+        assert!(can_use(&vault, Auth::Daemon, t0 + Duration::from_secs(305)));
         // Idle for the full TTL: gone.
-        assert!(matches!(
-            vault.with_entropy_at("k", Auth::Daemon, t0 + Duration::from_secs(700), |_| ()),
-            Err(VaultError::Locked)
+        assert!(!can_use(
+            &vault,
+            Auth::Daemon,
+            t0 + Duration::from_secs(700)
         ));
         assert_eq!(vault.unlock_count(), 0);
 
@@ -500,10 +511,7 @@ mod tests {
             .unwrap();
         assert!(vault.lock("k"));
         assert!(!vault.lock("k"));
-        assert!(matches!(
-            vault.with_entropy_at("k", Auth::Daemon, t0, |_| ()),
-            Err(VaultError::Locked)
-        ));
+        assert!(!can_use(&vault, Auth::Daemon, t0));
     }
 
     #[test]
@@ -517,51 +525,35 @@ mod tests {
             .unwrap();
         let token = u.token.clone().expect("token");
         assert_eq!(token.as_bytes().len(), 32);
-        assert!(
-            vault
-                .with_entropy_at(
-                    "k",
-                    Auth::Token {
-                        conn: a,
-                        token: &token
-                    },
-                    t0,
-                    |_| ()
-                )
-                .is_ok()
-        );
+        assert!(can_use(
+            &vault,
+            Auth::Token {
+                conn: a,
+                token: &token
+            },
+            t0
+        ));
         // Another connection with the stolen token: no.
-        assert!(matches!(
-            vault.with_entropy_at(
-                "k",
-                Auth::Token {
-                    conn: b,
-                    token: &token
-                },
-                t0,
-                |_| ()
-            ),
-            Err(VaultError::Locked)
+        assert!(!can_use(
+            &vault,
+            Auth::Token {
+                conn: b,
+                token: &token
+            },
+            t0
         ));
         // Same connection, wrong token: no.
         let wrong = Token::random();
-        assert!(matches!(
-            vault.with_entropy_at(
-                "k",
-                Auth::Token {
-                    conn: a,
-                    token: &wrong
-                },
-                t0,
-                |_| ()
-            ),
-            Err(VaultError::Locked)
+        assert!(!can_use(
+            &vault,
+            Auth::Token {
+                conn: a,
+                token: &wrong
+            },
+            t0
         ));
         // No token at all: no (it is not daemon-scoped).
-        assert!(matches!(
-            vault.with_entropy_at("k", Auth::Daemon, t0, |_| ()),
-            Err(VaultError::Locked)
-        ));
+        assert!(!can_use(&vault, Auth::Daemon, t0));
         assert!(
             vault.daemon_unlocks_at(t0).is_empty(),
             "not shown as unlocked"
@@ -569,17 +561,13 @@ mod tests {
         // The connection closes: the unlock goes with it.
         vault.connection_closed(a);
         assert_eq!(vault.unlock_count(), 0);
-        assert!(matches!(
-            vault.with_entropy_at(
-                "k",
-                Auth::Token {
-                    conn: a,
-                    token: &token
-                },
-                t0,
-                |_| ()
-            ),
-            Err(VaultError::Locked)
+        assert!(!can_use(
+            &vault,
+            Auth::Token {
+                conn: a,
+                token: &token
+            },
+            t0
         ));
     }
 
@@ -592,20 +580,14 @@ mod tests {
             Err(VaultError::WrongPassphrase)
         ));
         // Immediately after: rate limited for ~1 s, even with the right one.
-        match vault.unlock_at(&key, pass("pw"), Scope::Daemon, None, t0) {
-            Err(VaultError::RateLimited(d)) => assert_eq!(d, Duration::from_secs(1)),
-            other => panic!("{other:?}"),
-        }
+        assert_eq!(rate_limited(&vault, &key, t0), Duration::from_secs(1));
         // After the wait, a second failure doubles the delay.
         let t1 = t0 + Duration::from_secs(1);
         assert!(matches!(
             vault.unlock_at(&key, pass("nope"), Scope::Daemon, None, t1),
             Err(VaultError::WrongPassphrase)
         ));
-        match vault.unlock_at(&key, pass("pw"), Scope::Daemon, None, t1) {
-            Err(VaultError::RateLimited(d)) => assert_eq!(d, Duration::from_secs(2)),
-            other => panic!("{other:?}"),
-        }
+        assert_eq!(rate_limited(&vault, &key, t1), Duration::from_secs(2));
         // Keeps doubling, capped at unlock_backoff_max (8 s here).
         let mut t = t1 + Duration::from_secs(2);
         for expected in [4u64, 8, 8] {
@@ -614,10 +596,7 @@ mod tests {
                     .unlock_at(&key, pass("nope"), Scope::Daemon, None, t)
                     .is_err()
             );
-            match vault.unlock_at(&key, pass("pw"), Scope::Daemon, None, t) {
-                Err(VaultError::RateLimited(d)) => assert_eq!(d, Duration::from_secs(expected)),
-                other => panic!("{other:?}"),
-            }
+            assert_eq!(rate_limited(&vault, &key, t), Duration::from_secs(expected));
             t += Duration::from_secs(expected);
         }
         // Success clears the state.
@@ -629,10 +608,7 @@ mod tests {
                 .unlock_at(&key, pass("nope"), Scope::Daemon, None, t)
                 .is_err()
         );
-        match vault.unlock_at(&key, pass("pw"), Scope::Daemon, None, t) {
-            Err(VaultError::RateLimited(d)) => assert_eq!(d, Duration::from_secs(1)),
-            other => panic!("{other:?}"),
-        }
+        assert_eq!(rate_limited(&vault, &key, t), Duration::from_secs(1));
     }
 
     #[test]

@@ -32,6 +32,7 @@ use zcash_client_backend::data_api::WalletRead as _;
 use zcash_protocol::memo::{Memo, MemoBytes};
 
 use crate::Pool;
+use crate::ext::with_ext;
 use crate::registry::Wallet;
 use crate::tx::{TxError, account_of, internal};
 
@@ -152,8 +153,7 @@ fn read_json<T: serde::de::DeserializeOwned>(
     sql: &str,
     params: impl rusqlite::Params,
 ) -> Result<Vec<T>, TxError> {
-    let json: Option<String> = wallet
-        .transactionally_with_extension(|_wdb, ext| ext.query_row(sql, params, |r| r.get(0)))
+    let json: Option<String> = with_ext(wallet, |ext| ext.query_row(sql, params, |r| r.get(0)))
         .map_err(|e: rusqlite::Error| internal("reading the wallet", e))?;
     match json {
         None => Ok(Vec::new()),

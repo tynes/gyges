@@ -61,3 +61,21 @@ pub(crate) fn with_ext<T, E: From<rusqlite::Error>>(
 ) -> Result<T, E> {
     wallet.transactionally_with_extension(|_wdb, ext| f(ext))
 }
+
+/// `column` of every row that `rest` (`FROM … [WHERE …] ORDER BY …`)
+/// selects, in order. The extension handle answers single rows only, so
+/// the values come back as one `group_concat`.
+pub(crate) fn query_ids(
+    wallet: &mut Wallet,
+    column: &str,
+    rest: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let sql = format!("SELECT group_concat(id, ',') FROM (SELECT {column} AS id {rest})");
+    let joined: Option<String> = with_ext(wallet, |ext| ext.query_row(&sql, [], |r| r.get(0)))?;
+    Ok(joined
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
+}

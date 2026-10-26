@@ -149,11 +149,8 @@ impl KeyEntry {
     /// Derive the account's UFVK from decrypted entropy, for profiles whose
     /// viewing key is not on disk (`signer-only`).
     pub fn derive_ufvk(&self, entropy: &Entropy) -> Result<String, RegistryError> {
-        let account = zip32::AccountId::try_from(self.profile.account_index)
-            .map_err(|_| RegistryError::Invalid("account index out of range".into()))?;
-        let seed = vault::seed_from_entropy(entropy);
-        let usk = UnifiedSpendingKey::from_seed(&self.params, seed.expose_secret(), account)
-            .map_err(|e| RegistryError::Invalid(format!("key derivation failed: {e:?}")))?;
+        let usk = crate::tx::spending_key(&self.params, entropy, self.profile.account_index)
+            .map_err(|e| RegistryError::Invalid(e.to_string()))?;
         Ok(usk.to_unified_full_viewing_key().encode(&self.params))
     }
 
@@ -469,27 +466,7 @@ impl KeyRegistry {
         let dir = self.reserve_dir(key_id)?;
         let result = (|| {
             let fingerprint = self.write_seed(&dir, key_id, entropy, passphrase)?;
-            let profile = KeyProfile {
-                schema_version: profile::SCHEMA_VERSION,
-                key_id: key_id.to_string(),
-                network: self.network,
-                signing_mode: SigningMode::SignerOnly,
-                birthday_height: None,
-                created_at: profile::now_rfc3339(),
-                spend_pools: vec![
-                    Pool::Orchard,
-                    Pool::Ironwood,
-                    Pool::Sapling,
-                    Pool::Transparent,
-                ],
-                receive_pools: Vec::new(),
-                seed_format: Some(SEED_FORMAT_AGE_SCRYPT_V1.into()),
-                seed_fingerprint: Some(fingerprint),
-                device_version: None,
-                account_index: 0,
-                ufvk: None,
-                label,
-            };
+            let profile = self.seeded_profile(key_id, SigningMode::SignerOnly, fingerprint, label);
             self.write_profile(&dir, key_id, &profile)?;
             Ok(KeyEntry {
                 profile,
@@ -499,6 +476,33 @@ impl KeyRegistry {
             })
         })();
         self.finish_create(dir, result)
+    }
+
+    /// The profile of a new key whose seed was just written: spends from
+    /// every pool and receives to none (a signer), account 0.
+    fn seeded_profile(
+        &self,
+        key_id: &str,
+        signing_mode: SigningMode,
+        fingerprint: String,
+        label: Option<String>,
+    ) -> KeyProfile {
+        KeyProfile {
+            schema_version: profile::SCHEMA_VERSION,
+            key_id: key_id.to_string(),
+            network: self.network,
+            signing_mode,
+            birthday_height: None,
+            created_at: profile::now_rfc3339(),
+            spend_pools: Pool::ALL.to_vec(),
+            receive_pools: Vec::new(),
+            seed_format: Some(SEED_FORMAT_AGE_SCRYPT_V1.into()),
+            seed_fingerprint: Some(fingerprint),
+            device_version: None,
+            account_index: 0,
+            ufvk: None,
+            label,
+        }
     }
 
     fn populate_local_seed(
@@ -533,30 +537,16 @@ impl KeyRegistry {
         drop(seed);
 
         let profile = KeyProfile {
-            schema_version: profile::SCHEMA_VERSION,
-            key_id: key_id.to_string(),
-            network: self.network,
-            signing_mode: SigningMode::LocalSeed,
             birthday_height: Some(req.birthday.height),
-            created_at: profile::now_rfc3339(),
             // MVP pools (ROADMAP.md "Pools are data"): Sapling receive-only.
             // After NU6.3 every shielded output the wallet libraries build
             // is Ironwood and the ZIP 318 turnstile keeps value out of
             // Orchard, so Ironwood is both spent from and received to
             // (OVERVIEW.md §4.3).
             spend_pools: vec![Pool::Orchard, Pool::Ironwood, Pool::Transparent],
-            receive_pools: vec![
-                Pool::Orchard,
-                Pool::Ironwood,
-                Pool::Sapling,
-                Pool::Transparent,
-            ],
-            seed_format: Some(SEED_FORMAT_AGE_SCRYPT_V1.into()),
-            seed_fingerprint: Some(fingerprint),
-            device_version: None,
+            receive_pools: Pool::ALL.to_vec(),
             account_index: req.account_index,
-            ufvk: None,
-            label: req.label,
+            ..self.seeded_profile(key_id, SigningMode::LocalSeed, fingerprint, req.label)
         };
         self.write_profile(dir, key_id, &profile)?;
         Ok(KeyEntry {
