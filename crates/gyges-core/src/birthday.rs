@@ -83,9 +83,26 @@ pub async fn resolve(
     let prior = height - 1;
 
     if prior < sapling {
-        // Empty trees by definition. The scanner only checks continuity
-        // between blocks it has scanned itself, so the hash is informational;
-        // take the real one when a node is at hand and zeros otherwise.
+        // Empty trees by definition, so no tree state is needed. The blocks
+        // from `height` up still are: a connected node that has pruned them
+        // makes this a restore below its window like any other (consent, the
+        // fallback endpoint, the best-effort warning). A node that does not
+        // answer leaves that to the scheduler, so a restore at the default
+        // birthday still works offline.
+        if let Some(c) = chain
+            && let Ok(bounds) = c.node_bounds().await
+        {
+            let retained_from = u32::from(bounds.retained_from);
+            if height < retained_from {
+                return Err(BirthdayError::BelowRetention {
+                    height,
+                    retained_from,
+                });
+            }
+        }
+        // The scanner only checks continuity between blocks it has scanned
+        // itself, so the hash is informational; take the real one when a node
+        // is at hand and zeros otherwise.
         let hash = match chain {
             Some(c) => c
                 .block_hash(BlockHeight::from_u32(prior))
@@ -342,5 +359,28 @@ mod tests {
         resolve(Network::Regtest, Some(&chain), Some(1001))
             .await
             .unwrap();
+        // The default (Sapling activation) birthday needs no tree state, but
+        // its blocks are pruned here: below the window all the same.
+        let err = resolve(Network::Regtest, Some(&chain), Some(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BirthdayError::BelowRetention {
+                    height: 1,
+                    retained_from: 800
+                }
+            ),
+            "{err}"
+        );
+        let unpruned = FixedChain {
+            tip: 1000,
+            retained_from: 0,
+        };
+        let r = resolve(Network::Regtest, Some(&unpruned), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(r.height, 1);
     }
 }

@@ -309,9 +309,11 @@ node is connected) and creates a `LOCAL_SEED` profile; on an air-gapped
 daemon it creates a `SIGNER_ONLY` profile instead (no wallet, `birthday_height
 = 0`, empty `ufvk`), which is why it is on the §8 allow-list. `RestoreKey`
 with `birthday_height = 0` uses the network's Sapling activation height; any
-birthday at or below Sapling activation needs no node, any other needs the
-node's tree state at `birthday - 1`, and one below `node.retained_from`
-returns `CONFIRMATION_REQUIRED` until `allow_backfill` is set, then
+birthday at or below Sapling activation needs no node's tree state (and no
+node at all when none answers), any other needs the node's tree state at
+`birthday - 1`. A birthday whose blocks the connected node has pruned (the
+tree state at `birthday - 1` below `node.retained_from`, or for one at
+Sapling activation the birthday block itself) returns `CONFIRMATION_REQUIRED` until `allow_backfill` is set, then
 `FALLBACK_UNAVAILABLE` when no `[fallback_lightwalletd]` endpoint is
 configured or it is marked untrusted. Otherwise the tree state at
 `birthday - 1` comes from the endpoint (its block hash checked against the

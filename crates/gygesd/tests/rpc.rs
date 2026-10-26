@@ -672,18 +672,26 @@ async fn restore_below_the_retention_window_is_refused_in_two_steps() {
     assert!(!running._home.path().join("regtest/keys/old").exists());
 
     // The default birthday (Sapling activation = 1 on regtest) needs no
-    // tree state from the node and is inside no retention window.
-    let ok = c
+    // tree state, but blocks 1..400 are pruned: the same two steps.
+    let genesis = RestoreKeyRequest {
+        key_id: "genesis".into(),
+        mnemonic: known_mnemonic(),
+        passphrase: "pw".into(),
+        ..Default::default()
+    };
+    let err = c.restore_key(genesis.clone()).await.unwrap_err();
+    let detail = GygesError::from_status(&err).unwrap();
+    assert_eq!(detail.reason(), ErrorReason::ConfirmationRequired);
+    assert!(detail.detail.contains("399 blocks"), "{}", detail.detail);
+    let err = c
         .restore_key(RestoreKeyRequest {
-            key_id: "genesis".into(),
-            mnemonic: known_mnemonic(),
-            passphrase: "pw".into(),
-            ..Default::default()
+            allow_backfill: true,
+            ..genesis
         })
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(ok.birthday_height, 1);
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::FallbackUnavailable);
+    assert!(!running._home.path().join("regtest/keys/genesis").exists());
     // At the window's edge: prior state at 400 is served.
     let ok = c
         .restore_key(RestoreKeyRequest {

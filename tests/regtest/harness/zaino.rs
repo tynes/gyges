@@ -75,17 +75,24 @@ fn pinned_dir() -> PathBuf {
 }
 
 /// Download the pinned `.crate`, check its sha256, and `cargo install
-/// --locked` it into [`pinned_dir`]. The build gets its own target
-/// directory, removed afterwards: the CI runner has little disk to spare.
+/// --locked` it into [`pinned_dir`].
+///
+/// The source and the build's target directory live in a temporary
+/// directory outside the repository, removed afterwards. Outside, because
+/// cargo refuses a package unpacked under `target/` ("current package
+/// believes it's in a workspace when it's not"); removed, because the CI
+/// runner has little disk to spare. Only the installed binary lands under
+/// `target/regtest-bin/`, staged beside [`pinned_dir`] so the final rename
+/// stays on one filesystem.
 fn build_pinned() -> anyhow::Result<PathBuf> {
     let v = versions().zainod;
     let dir = pinned_dir();
     let bin = dir.join("bin/zainod");
-    let staging =
-        regtest_bin_dir().join(format!("zainod-{}.{}.build", v.version, std::process::id()));
-    fs::create_dir_all(&staging)?;
+    let work = tempfile::Builder::new().prefix("zainod-build").tempdir()?;
+    let root = regtest_bin_dir().join(format!("zainod-{}.{}.root", v.version, std::process::id()));
+    fs::create_dir_all(regtest_bin_dir())?;
     let result = (|| {
-        let krate = staging.join(format!("zainod-{}.crate", v.version));
+        let krate = work.path().join(format!("zainod-{}.crate", v.version));
         let url = format!(
             "https://static.crates.io/crates/zainod/zainod-{}.crate",
             v.version
@@ -95,14 +102,13 @@ fn build_pinned() -> anyhow::Result<PathBuf> {
             .arg("-xzf")
             .arg(&krate)
             .arg("-C")
-            .arg(&staging)
+            .arg(work.path())
             .status()
             .context("run tar")?;
         if !status.success() {
             bail!("tar failed: {status}");
         }
-        let src = staging.join(format!("zainod-{}", v.version));
-        let root = staging.join("root");
+        let src = work.path().join(format!("zainod-{}", v.version));
         eprintln!(
             "building zainod {} (cargo install --locked, a few minutes)",
             v.version
@@ -113,7 +119,7 @@ fn build_pinned() -> anyhow::Result<PathBuf> {
             .arg(&src)
             .arg("--root")
             .arg(&root)
-            .env("CARGO_TARGET_DIR", staging.join("target"))
+            .env("CARGO_TARGET_DIR", work.path().join("target"))
             .status()
             .context("run cargo install")?;
         if !status.success() {
@@ -129,7 +135,8 @@ fn build_pinned() -> anyhow::Result<PathBuf> {
             Err(e) => Err(e).context(format!("move zainod into {}", dir.display())),
         }
     })();
-    let _ = fs::remove_dir_all(&staging);
+    let _ = fs::remove_dir_all(&root);
+    drop(work);
     result?;
     Ok(bin)
 }
