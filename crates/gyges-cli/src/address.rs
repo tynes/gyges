@@ -79,8 +79,7 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
                 .get_current_address(GetCurrentAddressRequest {
                     key_id: ctx.key.clone(),
                 })
-                .await
-                .map_err(CliError::from_status)?
+                .await?
                 .into_inner();
             print_address(ctx, &info)
         }
@@ -93,8 +92,7 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
                     receivers: a.receivers.iter().map(|r| r.to_proto() as i32).collect(),
                     label: a.label.unwrap_or_default(),
                 })
-                .await
-                .map_err(CliError::from_status)?
+                .await?
                 .into_inner();
             print_address(ctx, &info)
         }
@@ -103,8 +101,7 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
             let resp = conn
                 .client
                 .inspect_address(InspectAddressRequest { address })
-                .await
-                .map_err(CliError::from_status)?
+                .await?
                 .into_inner();
             if !resp.valid {
                 // Exit 6 either way (CLI_SPEC.md §2.4); the terminal also

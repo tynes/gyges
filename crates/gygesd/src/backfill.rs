@@ -29,7 +29,6 @@ use gyges_core::recovery::{self, Placement, Report};
 use gyges_core::sync::{self as core_sync, ScanOutcome, StallReason, SyncError, SyncState};
 use gyges_proto::v1;
 use serde::{Deserialize, Serialize};
-use zcash_client_backend::data_api::chain::BlockCache as _;
 use zcash_client_backend::data_api::scanning::{ScanPriority, ScanRange};
 use zcash_protocol::ShieldedPool;
 use zcash_protocol::consensus::BlockHeight;
@@ -454,14 +453,7 @@ impl Scheduler {
 
         // Fetch what the cache does not already hold.
         let range = ScanRange::from_parts(start..end, ScanPriority::Historic);
-        let have = match self.cache.read(&range).await {
-            Ok(blocks) => blocks.len() as u32,
-            Err(gyges_chain::CacheError::Gap { .. }) => {
-                self.cache.delete(range.clone()).await?;
-                0
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let have = self.cached_prefix(&range).await?;
         if start + have < end {
             gyges_chain::fill_cache(
                 fallback.as_ref(),
@@ -876,11 +868,7 @@ impl Scheduler {
             "the fallback endpoint failed handoff validation against the node ({reason}); \
              set another fallback_lightwalletd.grpc_url to backfill"
         );
-        self.hub().update(key_id, |p| {
-            p.state = SyncState::Stalled(StallReason::UntrustedBackfill);
-            p.detail = detail;
-            p.blocks_per_sec = 0.0;
-        });
+        self.stall(key_id, StallReason::UntrustedBackfill, detail);
     }
 
     /// The endpoint failed to answer (`SyncError::Fallback`): stalled
@@ -888,11 +876,7 @@ impl Scheduler {
     pub(crate) fn stall_fallback(&self, key_id: &str, e: &ChainError) {
         tracing::warn!(key_id, error = %e, "fallback endpoint unavailable; retrying next tick");
         let detail = format!("fallback endpoint unavailable, retrying: {e}");
-        self.hub().update(key_id, |p| {
-            p.state = SyncState::Stalled(StallReason::FallbackUnreachable);
-            p.detail = detail;
-            p.blocks_per_sec = 0.0;
-        });
+        self.stall(key_id, StallReason::FallbackUnreachable, detail);
     }
 }
 

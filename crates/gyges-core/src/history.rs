@@ -33,7 +33,7 @@ use zcash_protocol::memo::{Memo, MemoBytes};
 
 use crate::Pool;
 use crate::registry::Wallet;
-use crate::tx::{TxError, account_of};
+use crate::tx::{TxError, account_of, internal};
 
 /// Bytes of a text memo shown in a note listing (`Note.memo_preview`).
 pub const MEMO_PREVIEW_BYTES: usize = 64;
@@ -108,10 +108,6 @@ pub struct TxRow {
     pub outputs: Vec<TxOutput>,
     /// Position in its block, for ordering.
     pub tx_index: Option<u32>,
-}
-
-fn internal(context: &str, e: impl std::fmt::Display) -> TxError {
-    TxError::Internal(format!("{context}: {e}"))
 }
 
 fn txid_from_hex(s: &str) -> Option<[u8; 32]> {

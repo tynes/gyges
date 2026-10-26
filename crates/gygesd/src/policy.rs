@@ -49,11 +49,6 @@ impl PeerPolicy {
         }
     }
 
-    /// The uid the daemon runs as.
-    pub fn daemon_uid(&self) -> u32 {
-        self.daemon_uid
-    }
-
     pub fn allows(&self, uid: u32) -> bool {
         uid == self.daemon_uid || self.allowed_uids.contains(&uid)
     }

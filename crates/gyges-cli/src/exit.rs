@@ -152,6 +152,12 @@ impl CliError {
     }
 }
 
+impl From<tonic::Status> for CliError {
+    fn from(status: tonic::Status) -> Self {
+        Self::from_status(status)
+    }
+}
+
 impl From<anyhow::Error> for CliError {
     fn from(e: anyhow::Error) -> Self {
         CliError::Other(e)

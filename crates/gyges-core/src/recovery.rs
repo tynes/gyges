@@ -73,13 +73,10 @@ pub fn receivers(
 ) -> Result<Vec<(TransparentAddress, String)>, SyncError> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for account in wallet
-        .get_account_ids()
-        .map_err(|e| SyncError::Wallet(e.to_string()))?
-    {
+    for account in wallet.get_account_ids().map_err(crate::sync::wallet_err)? {
         for addr in wallet
             .get_transparent_receivers(account, true, true)
-            .map_err(|e| SyncError::Wallet(e.to_string()))?
+            .map_err(crate::sync::wallet_err)?
             .into_keys()
         {
             if seen.insert(addr) {

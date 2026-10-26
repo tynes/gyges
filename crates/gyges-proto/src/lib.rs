@@ -56,21 +56,6 @@ pub const fn schema_version() -> &'static str {
 /// Type URL of the one detail every failed Gyges RPC carries (API.md §3).
 pub const GYGES_ERROR_TYPE_URL: &str = "type.googleapis.com/gyges.v1.GygesError";
 
-/// Fully qualified gRPC path of a method, e.g. `/gyges.v1.Gyges/GetInfo`.
-pub const fn method_path(method: &str) -> MethodPath<'_> {
-    MethodPath(method)
-}
-
-/// See [`method_path`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MethodPath<'a>(&'a str);
-
-impl std::fmt::Display for MethodPath<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "/{}/{}", v1::gyges_server::SERVICE_NAME, self.0)
-    }
-}
-
 impl v1::ErrorReason {
     /// The gRPC status code sent alongside this reason, chosen to make sense
     /// to generic gRPC clients. The CLI never dispatches on it (API.md §3).
@@ -269,14 +254,6 @@ mod tests {
     #[test]
     fn schema_version_matches() {
         assert_eq!(schema_version(), format!("{API_MAJOR}.{API_MINOR}"));
-    }
-
-    #[test]
-    fn method_path_is_fully_qualified() {
-        assert_eq!(
-            method_path("GetInfo").to_string(),
-            "/gyges.v1.Gyges/GetInfo"
-        );
     }
 
     #[test]

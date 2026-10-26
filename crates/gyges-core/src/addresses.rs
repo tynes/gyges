@@ -10,10 +10,7 @@
 //! the same receiver also takes Ironwood notes (`zcash_keys` "Ironwood
 //! shares the Orchard receiver"), and a UA has no separate Ironwood item.
 
-use std::collections::HashSet;
-
 use rusqlite::{OptionalExtension as _, named_params};
-use schemerz_rusqlite::RusqliteMigration;
 use uuid::Uuid;
 use zcash_address::unified::{self, Container as _};
 use zcash_address::{ConversionError, ToAddress as _, TryFromAddress, ZcashAddress};
@@ -21,13 +18,13 @@ use zcash_client_backend::data_api::{
     Account as _, AddressSource, WalletRead as _, WalletWrite as _,
 };
 use zcash_client_sqlite::error::SqliteClientError;
-use zcash_client_sqlite::wallet::init::WalletMigrationError;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::{ReceiverRequirement, UnifiedAddressRequest};
 use zcash_protocol::consensus::NetworkType;
 use zip32::DiversifierIndex;
 
 use crate::Pool;
+use crate::ext::ExtTable;
 use crate::registry::Wallet;
 use crate::tx::{TxError, account_of};
 
@@ -363,48 +360,25 @@ const LABELS: &str = "ext_gyges_address_labels";
 
 /// Creates `ext_gyges_address_labels` (DATA_MODEL.md §5.3; the `ext_`
 /// prefix is upstream's rule for application tables, as for §5.1).
-#[derive(Debug)]
-pub struct AddressLabelsMigration;
+pub const LABELS_MIGRATION: ExtTable = ExtTable {
+    id: LABELS_MIGRATION_ID,
+    table: LABELS,
+    description: "Creates the Gyges address labels (ext_gyges_address_labels).",
+    create: create_labels_migration,
+};
 
-impl schemerz::Migration<Uuid> for AddressLabelsMigration {
-    fn id(&self) -> Uuid {
-        LABELS_MIGRATION_ID
-    }
-
-    fn dependencies(&self) -> HashSet<Uuid> {
-        HashSet::new()
-    }
-
-    fn description(&self) -> &'static str {
-        "Creates the Gyges address labels (ext_gyges_address_labels)."
-    }
-}
-
-impl RusqliteMigration for AddressLabelsMigration {
-    type Error = WalletMigrationError;
-
-    fn up(&self, transaction: &rusqlite::Transaction) -> Result<(), WalletMigrationError> {
-        transaction.execute_batch(&format!(
-            "CREATE TABLE {LABELS} (
-                address     TEXT NOT NULL PRIMARY KEY,
-                label       TEXT NOT NULL,
-                created_at  INTEGER NOT NULL
-            );"
-        ))?;
-        Ok(())
-    }
-
-    fn down(&self, transaction: &rusqlite::Transaction) -> Result<(), WalletMigrationError> {
-        transaction.execute_batch(&format!("DROP TABLE {LABELS};"))?;
-        Ok(())
-    }
+fn create_labels_migration() -> String {
+    format!(
+        "CREATE TABLE {LABELS} (
+            address     TEXT NOT NULL PRIMARY KEY,
+            label       TEXT NOT NULL,
+            created_at  INTEGER NOT NULL
+        );"
+    )
 }
 
 fn set_label(wallet: &mut Wallet, address: &str, label: &str) -> Result<(), TxError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0);
+    let now = crate::profile::unix_now();
     wallet
         .transactionally_with_extension(|_wdb, ext| {
             ext.execute(

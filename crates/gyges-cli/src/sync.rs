@@ -3,7 +3,6 @@
 //! Implemented: `status`, `wait`, `run`. `mempool` arrives with the mempool
 //! loop (SYNC.md §7).
 
-use std::ffi::OsString;
 use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
@@ -15,6 +14,7 @@ use tokio_stream::StreamExt as _;
 
 use crate::client::Ctx;
 use crate::exit::CliError;
+use crate::key::Unimplemented;
 use crate::output::to_json;
 
 #[derive(Debug, Subcommand)]
@@ -27,12 +27,6 @@ pub enum SyncCmd {
     Run(RunArgs),
     /// Force one mempool pass.
     Mempool(Unimplemented),
-}
-
-#[derive(Debug, Args)]
-pub struct Unimplemented {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-    _rest: Vec<OsString>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -101,8 +95,7 @@ async fn status(ctx: &Ctx, args: StatusArgs) -> Result<(), CliError> {
     let resp = conn
         .client
         .get_sync_status(GetSyncStatusRequest { key_id })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if ctx.json {
         println!("{}", to_json(&resp)?);
@@ -206,12 +199,7 @@ async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<(), CliError> {
         txid: args.txid.clone().unwrap_or_default(),
         confirmations: args.confirmations.unwrap_or(0),
     };
-    let stream = conn
-        .client
-        .wait_sync(req)
-        .await
-        .map_err(CliError::from_status)?
-        .into_inner();
+    let stream = conn.client.wait_sync(req).await?.into_inner();
     follow(ctx, stream, args.timeout).await
 }
 
@@ -225,8 +213,7 @@ async fn run_sync(ctx: &Ctx, args: RunArgs) -> Result<(), CliError> {
             .get_sync_status(GetSyncStatusRequest {
                 key_id: ctx.key.clone(),
             })
-            .await
-            .map_err(CliError::from_status)?
+            .await?
             .into_inner();
         let scanned_tip = status.keys.first().map_or(0, |k| k.scanned_tip);
         if from <= scanned_tip {
@@ -251,8 +238,7 @@ async fn run_sync(ctx: &Ctx, args: RunArgs) -> Result<(), CliError> {
             force_tor_lwd: args.force_tor_lwd,
             confirm_rewind,
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     follow(ctx, stream, None).await
 }

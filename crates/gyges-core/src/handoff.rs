@@ -162,7 +162,7 @@ pub fn put_subtree_roots(wallet: &mut Wallet, roots: &[SubtreeRoot]) -> Result<(
 pub fn wallet_hash(wallet: &Wallet, height: BlockHeight) -> Result<Option<[u8; 32]>, SyncError> {
     Ok(wallet
         .block_metadata(height)
-        .map_err(|e| SyncError::Wallet(e.to_string()))?
+        .map_err(crate::sync::wallet_err)?
         .map(|m| m.block_hash().0))
 }
 
@@ -177,7 +177,7 @@ pub fn check_trees(
 ) -> Result<Result<(), Mismatch>, SyncError> {
     let Some(meta) = wallet
         .block_metadata(height)
-        .map_err(|e| SyncError::Wallet(e.to_string()))?
+        .map_err(crate::sync::wallet_err)?
     else {
         return Ok(Err(Mismatch::new(
             Check::TreeRoots,

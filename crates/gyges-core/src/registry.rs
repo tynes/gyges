@@ -334,9 +334,9 @@ impl KeyRegistry {
         // Upstream's schema plus Gyges' own `ext_gyges_*` tables, migrated
         // together (DATA_MODEL.md §5).
         let migrator = WalletMigrator::new().with_external_migrations(vec![
-            Box::new(crate::tex::TexQueueMigration),
-            Box::new(crate::sessions::SigningSessionsMigration),
-            Box::new(crate::addresses::AddressLabelsMigration),
+            Box::new(crate::tex::MIGRATION),
+            Box::new(crate::sessions::MIGRATION),
+            Box::new(crate::addresses::LABELS_MIGRATION),
         ]);
         match migrator.init_or_migrate(&mut wallet) {
             Ok(()) => Ok(wallet),
@@ -662,6 +662,22 @@ mod tests {
         resolve(Network::Regtest, None, Some(1)).await.unwrap()
     }
 
+    /// A request with the test passphrase, account 0 and no label.
+    fn req<'a>(
+        key_id: &'a str,
+        entropy: &'a Entropy,
+        birthday: &'a ResolvedBirthday,
+    ) -> NewLocalSeedKey<'a> {
+        NewLocalSeedKey {
+            key_id,
+            entropy,
+            passphrase: pass(),
+            birthday,
+            account_index: 0,
+            label: None,
+        }
+    }
+
     fn zero_entropy() -> Entropy {
         vault::entropy_from_phrase(&("abandon ".repeat(23) + "art")).unwrap()
     }
@@ -677,12 +693,8 @@ mod tests {
         let entropy = zero_entropy();
         let key = reg
             .create_local_seed(NewLocalSeedKey {
-                key_id: "main",
-                entropy: &entropy,
-                passphrase: pass(),
-                birthday: &b,
-                account_index: 0,
                 label: Some("Main".into()),
+                ..req("main", &entropy, &b)
             })
             .unwrap();
         assert_eq!(key.key_id(), "main");
@@ -712,25 +724,11 @@ mod tests {
 
         // Duplicate and invalid ids are refused without touching the disk.
         let err = reg
-            .create_local_seed(NewLocalSeedKey {
-                key_id: "main",
-                entropy: &entropy,
-                passphrase: pass(),
-                birthday: &b,
-                account_index: 0,
-                label: None,
-            })
+            .create_local_seed(req("main", &entropy, &b))
             .unwrap_err();
         assert!(matches!(err, RegistryError::Exists(_)), "{err}");
         let err = reg
-            .create_local_seed(NewLocalSeedKey {
-                key_id: "Main",
-                entropy: &entropy,
-                passphrase: pass(),
-                birthday: &b,
-                account_index: 0,
-                label: None,
-            })
+            .create_local_seed(req("Main", &entropy, &b))
             .unwrap_err();
         assert!(matches!(err, RegistryError::InvalidKeyId(_)), "{err}");
         // Nothing but `main` on disk (checked by count: the host filesystem
@@ -761,24 +759,11 @@ mod tests {
         let reg = KeyRegistry::open(home, Network::Regtest, &config("")).unwrap();
         let b = birthday().await;
         let entropy = zero_entropy();
-        let a = reg
-            .create_local_seed(NewLocalSeedKey {
-                key_id: "a",
-                entropy: &entropy,
-                passphrase: pass(),
-                birthday: &b,
-                account_index: 0,
-                label: None,
-            })
-            .unwrap();
+        let a = reg.create_local_seed(req("a", &entropy, &b)).unwrap();
         let again = reg
             .create_local_seed(NewLocalSeedKey {
-                key_id: "b",
-                entropy: &entropy,
                 passphrase: SecretString::from("other".to_string()),
-                birthday: &b,
-                account_index: 0,
-                label: None,
+                ..req("b", &entropy, &b)
             })
             .unwrap();
         assert_eq!(a.ufvk(), again.ufvk());
@@ -787,14 +772,7 @@ mod tests {
             again.profile().seed_fingerprint
         );
         let other = reg
-            .create_local_seed(NewLocalSeedKey {
-                key_id: "c",
-                entropy: &vault::generate_entropy(),
-                passphrase: pass(),
-                birthday: &b,
-                account_index: 0,
-                label: None,
-            })
+            .create_local_seed(req("c", &vault::generate_entropy(), &b))
             .unwrap();
         assert_ne!(a.ufvk(), other.ufvk());
         assert_eq!(reg.key_ids(), ["a", "b", "c"]);
@@ -898,12 +876,8 @@ mod tests {
         let b = birthday().await;
         let err = reg
             .create_local_seed(NewLocalSeedKey {
-                key_id: "k",
-                entropy: &zero_entropy(),
-                passphrase: pass(),
-                birthday: &b,
                 account_index: u32::MAX,
-                label: None,
+                ..req("k", &zero_entropy(), &b)
             })
             .unwrap_err();
         assert!(matches!(err, RegistryError::Invalid(_)), "{err}");

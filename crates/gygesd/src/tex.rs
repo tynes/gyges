@@ -43,7 +43,7 @@ use zcash_protocol::TxId;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::conn::ConnInfo;
-use crate::keys::{AUDIT_TARGET, registry_error};
+use crate::keys::AUDIT_TARGET;
 use crate::service::{DaemonState, unix_now};
 use crate::tx::{self, tx_error};
 
@@ -126,7 +126,7 @@ pub async fn tick(state: &Arc<DaemonState>, chain: &dyn ChainBackend) {
     }
 }
 
-fn queue_error(e: TexQueueError) -> TxError {
+pub(crate) fn queue_error(e: TexQueueError) -> TxError {
     TxError::Internal(e.to_string())
 }
 
@@ -434,10 +434,7 @@ pub async fn abort_tex_transfer(
     state: Arc<DaemonState>,
     req: AbortTexTransferRequest,
 ) -> Result<TexQueueEntry, Status> {
-    let key = state
-        .registry
-        .resolve(&req.key_id)
-        .map_err(|e| registry_error(e).into_status())?;
+    let key = state.resolve_key(&req.key_id)?;
     let key_id = key.key_id().to_string();
     let id = parse_txid(&req.step1_txid)?;
     let row = load_row(&key, id).await?;
@@ -478,10 +475,7 @@ pub async fn resume_tex_transfer(
     conn: Option<ConnInfo>,
     req: ResumeTexTransferRequest,
 ) -> Result<TexQueueEntry, Status> {
-    let key = state
-        .registry
-        .resolve(&req.key_id)
-        .map_err(|e| registry_error(e).into_status())?;
+    let key = state.resolve_key(&req.key_id)?;
     let key_id = key.key_id().to_string();
     let id = parse_txid(&req.step1_txid)?;
     let row = load_row(&key, id).await?;

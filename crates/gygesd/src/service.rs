@@ -4,10 +4,10 @@
 //! `UNIMPLEMENTED` through the stubs `tonic-prost-build` generates.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use gyges_chain::{ArtiTorLwdBackend, BlockDb, ChainBackend};
 use gyges_core::network::ConsensusParams;
+use gyges_core::registry::KeyEntry;
 use gyges_core::{Config, KeyRegistry, Network, Provers, VaultManager};
 use gyges_proto::v1::gyges_server::Gyges;
 use gyges_proto::v1::{
@@ -28,6 +28,7 @@ use gyges_proto::v1::{
     GetTransactionStatusResponse, InspectAddressRequest, InspectAddressResponse, ListNotesRequest,
     ListNotesResponse, ListTransactionsRequest, ListTransactionsResponse, NewAddressRequest,
 };
+use gyges_proto::v1::{ErrorReason, GygesError};
 use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
@@ -144,6 +145,32 @@ impl DaemonState {
 }
 
 impl DaemonState {
+    /// Resolve a request's key id (empty: the default key).
+    pub(crate) fn resolve_key(&self, key_id: &str) -> Result<Arc<KeyEntry>, Status> {
+        Ok(self
+            .registry
+            .resolve(key_id)
+            .map_err(keys::registry_error)?)
+    }
+
+    /// [`Self::resolve_key`], refusing a profile without a wallet with `why`.
+    pub(crate) fn wallet_key(&self, key_id: &str, why: &str) -> Result<Arc<KeyEntry>, Status> {
+        let key = self.resolve_key(key_id)?;
+        if !key.profile().has_wallet() {
+            return Err(GygesError::new(ErrorReason::InvalidArgument, why)
+                .with_key(key.key_id())
+                .into());
+        }
+        Ok(key)
+    }
+}
+
+/// An `INVALID_ARGUMENT` status with `detail`.
+pub(crate) fn invalid(detail: impl Into<String>) -> Status {
+    GygesError::new(ErrorReason::InvalidArgument, detail).into()
+}
+
+impl DaemonState {
     /// `GetInfo.node` from the backend's last poll (API.md `NodeStatus`).
     /// Air-gapped: not connected, with the reason.
     pub fn node_status(&self) -> NodeStatus {
@@ -187,12 +214,7 @@ pub fn proto_network(network: Network) -> v1::Network {
     }
 }
 
-pub(crate) fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
-}
+pub(crate) use gyges_core::profile::unix_now;
 
 /// The tonic service; cheap to clone.
 #[derive(Clone, Debug)]

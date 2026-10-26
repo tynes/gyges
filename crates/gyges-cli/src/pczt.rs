@@ -211,8 +211,7 @@ async fn create(ctx: &Ctx, args: CreateArgs) -> Result<(), CliError> {
             memo: args.memo.map(|m| m.0).unwrap_or_default(),
             min_confirmations: 0,
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     let Some(bytes) = resp.pczts.first() else {
         return Err(CliError::Other(anyhow::anyhow!(
@@ -238,8 +237,7 @@ async fn inspect(ctx: &Ctx, args: InspectArgs) -> Result<(), CliError> {
             pczt: bytes,
             key_id: ctx.key.clone(),
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if ctx.json {
         println!("{}", to_json(&resp)?);
@@ -326,8 +324,7 @@ async fn prove(ctx: &Ctx, args: InOutArgs) -> Result<(), CliError> {
             session_token: Vec::new(),
             key_id: ctx.key.clone(),
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if !ctx.quiet && !ctx.json {
         eprintln!("proven");
@@ -350,8 +347,7 @@ async fn sign(ctx: &Ctx, args: SignArgs) -> Result<(), CliError> {
             session_token: Vec::new(),
             key_id: ctx.key.clone(),
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     loop {
         let next = tokio::select! {
@@ -363,7 +359,7 @@ async fn sign(ctx: &Ctx, args: SignArgs) -> Result<(), CliError> {
                 "the daemon ended the signing stream without a signed PCZT"
             )));
         };
-        let ev = item.map_err(CliError::from_status)?;
+        let ev = item?;
         match ev.event {
             Some(sign_pczt_event::Event::SignatureRequired(req)) => {
                 satisfy(ctx, &mut conn, &key, &req).await?;
@@ -397,8 +393,7 @@ async fn combine(ctx: &Ctx, args: CombineArgs) -> Result<(), CliError> {
             pczts,
             key_id: ctx.key.clone(),
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     let pczt = resp.pczt.clone();
     deliver(ctx, args.out.as_deref(), &resp, &pczt)
@@ -414,8 +409,7 @@ async fn broadcast(ctx: &Ctx, args: BroadcastArgs) -> Result<(), CliError> {
             via_tor: args.via_tor,
             key_id: ctx.key.clone(),
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if ctx.json {
         println!("{}", to_json(&resp)?);

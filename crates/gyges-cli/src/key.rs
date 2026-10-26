@@ -139,8 +139,7 @@ async fn list(ctx: &Ctx) -> Result<(), CliError> {
     let resp = conn
         .client
         .list_keys(ListKeysRequest {})
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if ctx.json {
         println!("{}", to_json(&resp)?);
@@ -232,8 +231,7 @@ async fn init(ctx: &Ctx, args: InitArgs) -> Result<(), CliError> {
             set_default: args.set_default,
             word_count: 0,
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     drop(passphrase);
     let mnemonic = Zeroizing::new(resp.mnemonic.clone());
@@ -249,15 +247,8 @@ async fn init(ctx: &Ctx, args: InitArgs) -> Result<(), CliError> {
         resp.key_id
     );
     eprintln!();
+    mnemonic_grid(&mnemonic, |line| eprintln!("  {line}"));
     let words: Vec<&str> = mnemonic.split_whitespace().collect();
-    for (i, chunk) in words.chunks(6).enumerate() {
-        let line: Vec<String> = chunk
-            .iter()
-            .enumerate()
-            .map(|(j, w)| format!("{:>2}. {:<10}", i * 6 + j + 1, w))
-            .collect();
-        eprintln!("  {}", line.join(" "));
-    }
     eprintln!();
     if conn.info.airgapped {
         eprintln!("Signer-only profile (air-gapped): no wallet database, no birthday.");
@@ -287,10 +278,7 @@ async fn init(ctx: &Ctx, args: InitArgs) -> Result<(), CliError> {
     if !ctx.quiet {
         eprintln!("key '{}' created; backup verified", resp.key_id);
         if args.set_default {
-            eprintln!(
-                "note: --set-default lasts until the daemon restarts; set default_key = \"{}\" in config.toml to persist it",
-                resp.key_id
-            );
+            note_set_default(&resp.key_id);
         }
     }
     Ok(())
@@ -352,8 +340,7 @@ async fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<(), CliError> {
             set_default: args.set_default,
             allow_backfill,
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     drop(passphrase);
     drop(mnemonic);
@@ -374,10 +361,7 @@ async fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<(), CliError> {
             eprintln!("warning: {w}");
         }
         if args.set_default {
-            eprintln!(
-                "note: --set-default lasts until the daemon restarts; set default_key = \"{}\" in config.toml to persist it",
-                resp.key_id
-            );
+            note_set_default(&resp.key_id);
         }
     }
     Ok(())
@@ -476,15 +460,14 @@ async fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<(), CliError> {
             session_id: String::new(),
             scope: UnlockScope::Daemon as i32,
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     drop(passphrase);
     if ctx.json {
         println!("{}", to_json(&resp)?);
     } else if !ctx.quiet {
         eprintln!(
-            "key '{shown}' unlocked until {} (daemon scope: any process of this user can spend              from it until then; `gyges key lock` ends it early)",
+            "key '{shown}' unlocked until {} (daemon scope: any process of this user can spend from it until then; `gyges key lock` ends it early)",
             format_unix(resp.expires_at)
         );
     }
@@ -503,8 +486,7 @@ async fn lock(ctx: &Ctx, args: LockArgs) -> Result<(), CliError> {
             },
             all: args.all,
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if ctx.json {
         println!("{}", to_json(&resp)?);
@@ -525,8 +507,7 @@ async fn export_ufvk(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
         .export_ufvk(ExportUfvkRequest {
             key_id: args.resolve(ctx),
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if ctx.json {
         println!("{}", to_json(&resp)?);
@@ -559,7 +540,7 @@ async fn export_seed(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
         key_id.clone()
     };
     eprintln!(
-        "This prints the 24 words that control every fund of key '{shown}'. Anyone who sees them          can spend. Make sure nobody is watching your screen."
+        "This prints the 24 words that control every fund of key '{shown}'. Anyone who sees them can spend. Make sure nobody is watching your screen."
     );
     let typed = ctx.prompter.line("Type `reveal seed` to continue")?;
     if typed != "reveal seed" {
@@ -576,11 +557,19 @@ async fn export_seed(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
             passphrase: passphrase.to_string(),
             confirmation: typed,
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     drop(passphrase);
     let mnemonic = Zeroizing::new(resp.mnemonic);
+    mnemonic_grid(&mnemonic, |line| println!("  {line}"));
+    if resp.birthday_height > 0 {
+        println!("birthday height: {}", resp.birthday_height);
+    }
+    Ok(())
+}
+
+/// The 24 words in rows of six, numbered, one `emit` call per row.
+fn mnemonic_grid(mnemonic: &str, mut emit: impl FnMut(&str)) {
     let words: Vec<&str> = mnemonic.split_whitespace().collect();
     for (i, chunk) in words.chunks(6).enumerate() {
         let line: Vec<String> = chunk
@@ -588,12 +577,14 @@ async fn export_seed(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
             .enumerate()
             .map(|(j, w)| format!("{:>2}. {:<10}", i * 6 + j + 1, w))
             .collect();
-        println!("  {}", line.join(" "));
+        emit(&line.join(" "));
     }
-    if resp.birthday_height > 0 {
-        println!("birthday height: {}", resp.birthday_height);
-    }
-    Ok(())
+}
+
+fn note_set_default(key_id: &str) {
+    eprintln!(
+        "note: --set-default lasts until the daemon restarts; set default_key = \"{key_id}\" in config.toml to persist it"
+    );
 }
 
 /// Default restore birthday per network (DATA_MODEL.md §3). Duplicated

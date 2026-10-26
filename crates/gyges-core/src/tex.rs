@@ -14,14 +14,11 @@
 //! The state machine itself (what to broadcast when, and what the node
 //! says) runs in `gygesd::tex`; this module knows nothing about the node.
 
-use std::collections::HashSet;
-
 use rusqlite::{OptionalExtension as _, named_params};
-use schemerz_rusqlite::RusqliteMigration;
 use uuid::Uuid;
-use zcash_client_sqlite::wallet::init::WalletMigrationError;
 
 use crate::TexState;
+use crate::ext::{ExtTable, with_ext};
 use crate::registry::Wallet;
 
 /// The external migration's id (random, fixed forever).
@@ -32,59 +29,38 @@ const TABLE: &str = "ext_gyges_tex_queue";
 /// Creates `ext_gyges_tex_queue`. Registered with
 /// `WalletMigrator::with_external_migrations` by the registry when it opens
 /// a wallet.
-#[derive(Debug)]
-pub struct TexQueueMigration;
+pub const MIGRATION: ExtTable = ExtTable {
+    id: MIGRATION_ID,
+    table: TABLE,
+    description: "Creates the Gyges ZIP 320 queue (ext_gyges_tex_queue).",
+    create: create_table,
+};
 
-impl schemerz::Migration<Uuid> for TexQueueMigration {
-    fn id(&self) -> Uuid {
-        MIGRATION_ID
-    }
-
-    fn dependencies(&self) -> HashSet<Uuid> {
-        // The table references nothing of the wallet schema.
-        HashSet::new()
-    }
-
-    fn description(&self) -> &'static str {
-        "Creates the Gyges ZIP 320 queue (ext_gyges_tex_queue)."
-    }
-}
-
-impl RusqliteMigration for TexQueueMigration {
-    type Error = WalletMigrationError;
-
-    fn up(&self, transaction: &rusqlite::Transaction) -> Result<(), WalletMigrationError> {
-        let states = TexState::ALL
-            .iter()
-            .map(|s| format!("'{}'", s.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        transaction.execute_batch(&format!(
-            "CREATE TABLE {TABLE} (
-                step1_txid       BLOB NOT NULL PRIMARY KEY,
-                step2_txid       BLOB NOT NULL,
-                proposal         BLOB NOT NULL,
-                step1_raw        BLOB NOT NULL,
-                step2_raw        BLOB NOT NULL,
-                ephemeral_addr   TEXT NOT NULL,
-                recipient        TEXT NOT NULL,
-                amount           INTEGER NOT NULL,
-                expiry_height    INTEGER NOT NULL,
-                state            TEXT NOT NULL CHECK (state IN ({states})),
-                created_at       INTEGER NOT NULL,
-                last_attempt_at  INTEGER,
-                attempts         INTEGER NOT NULL DEFAULT 0,
-                last_error       TEXT
-            );
-            CREATE INDEX {TABLE}_state ON {TABLE} (state);"
-        ))?;
-        Ok(())
-    }
-
-    fn down(&self, transaction: &rusqlite::Transaction) -> Result<(), WalletMigrationError> {
-        transaction.execute_batch(&format!("DROP TABLE {TABLE};"))?;
-        Ok(())
-    }
+fn create_table() -> String {
+    let states = TexState::ALL
+        .iter()
+        .map(|s| format!("'{}'", s.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CREATE TABLE {TABLE} (
+            step1_txid       BLOB NOT NULL PRIMARY KEY,
+            step2_txid       BLOB NOT NULL,
+            proposal         BLOB NOT NULL,
+            step1_raw        BLOB NOT NULL,
+            step2_raw        BLOB NOT NULL,
+            ephemeral_addr   TEXT NOT NULL,
+            recipient        TEXT NOT NULL,
+            amount           INTEGER NOT NULL,
+            expiry_height    INTEGER NOT NULL,
+            state            TEXT NOT NULL CHECK (state IN ({states})),
+            created_at       INTEGER NOT NULL,
+            last_attempt_at  INTEGER,
+            attempts         INTEGER NOT NULL DEFAULT 0,
+            last_error       TEXT
+        );
+        CREATE INDEX {TABLE}_state ON {TABLE} (state);"
+    )
 }
 
 /// One ZIP 320 transfer (`TexQueueEntry` on the wire, plus the bytes the
@@ -123,15 +99,6 @@ pub enum TexQueueError {
     BadState(String, String),
     #[error("tex queue: no row for step-1 txid {0}")]
     NotFound(String),
-}
-
-type Ext<'a> = zcash_client_sqlite::ExtensionTransaction<'a>;
-
-fn with_ext<T>(
-    wallet: &mut Wallet,
-    f: impl FnOnce(&Ext<'_>) -> Result<T, TexQueueError>,
-) -> Result<T, TexQueueError> {
-    wallet.transactionally_with_extension(|_wdb, ext| f(ext))
 }
 
 fn read_row(r: &rusqlite::Row<'_>) -> Result<TexRow, rusqlite::Error> {
@@ -224,7 +191,7 @@ pub fn list_ids(wallet: &mut Wallet, states: &[TexState]) -> Result<Vec<[u8; 32]
         .collect::<Vec<_>>()
         .join(", ");
     let joined: Option<String> = with_ext(wallet, |ext| {
-        Ok(ext.query_row(
+        ext.query_row(
             &format!(
                 "SELECT group_concat(hex(step1_txid), ',') FROM \
                  (SELECT step1_txid FROM {TABLE} WHERE state IN ({filter}) \
@@ -232,7 +199,7 @@ pub fn list_ids(wallet: &mut Wallet, states: &[TexState]) -> Result<Vec<[u8; 32]
             ),
             [],
             |r| r.get(0),
-        )?)
+        )
     })?;
     let mut out = Vec::new();
     for h in joined
@@ -279,14 +246,14 @@ pub fn set_state(
     last_error: Option<&str>,
 ) -> Result<(), TexQueueError> {
     let n = with_ext(wallet, |ext| {
-        Ok(ext.execute(
+        ext.execute(
             &format!("UPDATE {TABLE} SET state = :state, last_error = :err WHERE step1_txid = :s1"),
             named_params! {
                 ":state": state.as_str(),
                 ":err": last_error,
                 ":s1": step1_txid.as_slice(),
             },
-        )?)
+        )
     })?;
     if n == 0 {
         return Err(TexQueueError::NotFound(hex::encode(step1_txid)));
@@ -327,7 +294,7 @@ pub fn replace_step2(
     expiry_height: u32,
 ) -> Result<(), TexQueueError> {
     let n = with_ext(wallet, |ext| {
-        Ok(ext.execute(
+        ext.execute(
             &format!(
                 "UPDATE {TABLE} SET step2_txid = :s2, step2_raw = :raw2, expiry_height = :expiry, \
                  state = :state, last_error = NULL WHERE step1_txid = :s1"
@@ -339,7 +306,7 @@ pub fn replace_step2(
                 ":state": TexState::Step1Mined.as_str(),
                 ":s1": step1_txid.as_slice(),
             },
-        )?)
+        )
     })?;
     if n == 0 {
         return Err(TexQueueError::NotFound(hex::encode(step1_txid)));
@@ -367,7 +334,7 @@ mod tests {
         .unwrap()
         .with_transparent_ledger_mode(TransparentLedgerMode::Public);
         WalletMigrator::new()
-            .with_external_migrations(vec![Box::new(TexQueueMigration)])
+            .with_external_migrations(vec![Box::new(MIGRATION)])
             .init_or_migrate(&mut w)
             .unwrap();
         (dir, w)

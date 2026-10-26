@@ -103,7 +103,7 @@ pub enum TxError {
     Internal(String),
 }
 
-fn internal(context: &str, e: impl fmt::Display) -> TxError {
+pub(crate) fn internal(context: &str, e: impl fmt::Display) -> TxError {
     TxError::Internal(format!("{context}: {e}"))
 }
 
@@ -207,9 +207,14 @@ fn change_strategy() -> SingleOutputChangeStrategy<Wallet> {
     )
 }
 
-/// Map an upstream proposal error to ours. The upstream type is generic over
-/// six error parameters, so only its shape is matched.
-fn propose_error<D, C, S, F, Ch, N>(e: WalletApiError<D, C, S, F, Ch, N>) -> TxError
+/// Map an upstream wallet error to ours: `not_synced` is the detail for a
+/// missing anchor, `what` names the step for anything else. The upstream
+/// type is generic over six error parameters, so only its shape is matched.
+fn wallet_api_error<D, C, S, F, Ch, N>(
+    e: WalletApiError<D, C, S, F, Ch, N>,
+    not_synced: &str,
+    what: &str,
+) -> TxError
 where
     WalletApiError<D, C, S, F, Ch, N>: fmt::Display,
 {
@@ -221,11 +226,24 @@ where
             available: available.into_u64(),
             required: required.into_u64(),
         },
-        WalletApiError::ScanRequired => {
-            TxError::NotSynced("no scanned blocks to anchor the transaction on".into())
-        }
-        other => TxError::Internal(format!("proposal failed: {other}")),
+        WalletApiError::ScanRequired => TxError::NotSynced(not_synced.into()),
+        other => TxError::Internal(format!("{what} failed: {other}")),
     }
+}
+
+/// The `NotSynced` detail when a proposal finds nothing to anchor on.
+const NO_SCANNED_BLOCKS: &str = "no scanned blocks to anchor the transaction on";
+
+/// A ZIP 321 request for one payment of `amount` to `recipient`.
+fn single_payment(
+    recipient: zcash_address::ZcashAddress,
+    amount: Zatoshis,
+    memo: Option<MemoBytes>,
+) -> Result<TransactionRequest, TxError> {
+    let payment = Payment::new(recipient, Some(amount), memo, None, None, vec![])
+        .map_err(|e| TxError::InvalidArgument(format!("invalid payment: {e}")))?;
+    TransactionRequest::new(vec![payment])
+        .map_err(|e| TxError::InvalidArgument(format!("invalid payment request: {e}")))
 }
 
 /// `propose_transfer` for one payment. With [`AmountSpec::Max`] the amount
@@ -249,17 +267,7 @@ pub fn propose_send(
     let selector = GreedyInputSelector::<Wallet>::new();
     let strategy = change_strategy();
     let attempt = |wallet: &mut Wallet, amount: Zatoshis| -> Result<SendProposal, TxError> {
-        let payment = Payment::new(
-            recipient.clone(),
-            Some(amount),
-            memo.clone(),
-            None,
-            None,
-            vec![],
-        )
-        .map_err(|e| TxError::InvalidArgument(format!("invalid payment: {e}")))?;
-        let request = TransactionRequest::new(vec![payment])
-            .map_err(|e| TxError::InvalidArgument(format!("invalid payment request: {e}")))?;
+        let request = single_payment(recipient.clone(), amount, memo.clone())?;
         propose_transfer::<_, _, _, _, Infallible>(
             wallet,
             params,
@@ -272,7 +280,7 @@ pub fn propose_send(
             None,
             None,
         )
-        .map_err(propose_error)
+        .map_err(|e| wallet_api_error(e, NO_SCANNED_BLOCKS, "proposal"))
     };
     match amount {
         AmountSpec::Zatoshis(z) => {
@@ -362,7 +370,7 @@ pub fn propose_shield(
         CoinbaseFilter::NonCoinbaseOnly,
         None,
     )
-    .map_err(propose_error)
+    .map_err(|e| wallet_api_error(e, NO_SCANNED_BLOCKS, "proposal"))
 }
 
 /// One proposed input group (`ProposedInput` on the wire).
@@ -430,11 +438,7 @@ pub fn default_expiry(params: &ConsensusParams, target: BlockHeight) -> BlockHei
     target + delta
 }
 
-fn summarize_step<N>(
-    params: &ConsensusParams,
-    proposal: &Proposal<StandardFeeRule, N>,
-    step: &Step<N>,
-) -> StepSummary {
+fn summarize_step<N>(proposal: &Proposal<StandardFeeRule, N>, step: &Step<N>) -> StepSummary {
     let mut inputs: Vec<InputSummary> = Vec::new();
     let mut add_input = |pool: Pool, value: u64| match inputs.iter_mut().find(|i| i.pool == pool) {
         Some(i) => {
@@ -513,7 +517,6 @@ fn summarize_step<N>(
             has_memo: change.memo().is_some(),
         });
     }
-    let _ = params;
     let shielded_pools = [
         ShieldedPool::Sapling,
         ShieldedPool::Orchard,
@@ -539,7 +542,7 @@ pub fn summarize<N>(
     let steps: Vec<StepSummary> = proposal
         .steps()
         .iter()
-        .map(|s| summarize_step(params, proposal, s))
+        .map(|s| summarize_step(proposal, s))
         .collect();
     let total_fee = steps.iter().map(|s| s.fee).sum::<u64>();
     let total_debit = steps
@@ -591,17 +594,7 @@ pub fn build_pczt<N: fmt::Display>(
             pad_to_minimum: None,
         },
     )
-    .map_err(|e| match e {
-        WalletApiError::InsufficientFunds {
-            available,
-            required,
-        } => TxError::InsufficientFunds {
-            available: available.into_u64(),
-            required: required.into_u64(),
-        },
-        WalletApiError::ScanRequired => TxError::NotSynced("no anchor available".into()),
-        other => TxError::Internal(format!("building the PCZT failed: {other}")),
-    })
+    .map_err(|e| wallet_api_error(e, "no anchor available", "building the PCZT"))
 }
 
 /// The proving and verifying keys, built on first use (seconds for Orchard;
@@ -1509,13 +1502,7 @@ pub fn extract_and_store(
         Some(orchard_vk),
     )
     .map_err(|e| TxError::Internal(format!("extracting the transaction failed: {e}")))?;
-    let tx = wallet
-        .get_transaction(txid)
-        .map_err(|e| internal("reading the stored transaction", e))?
-        .ok_or_else(|| TxError::Internal("the extracted transaction was not stored".into()))?;
-    let mut raw = Vec::new();
-    tx.write(&mut raw)
-        .map_err(|e| internal("serialising the transaction", e))?;
+    let (_, raw) = stored_transaction(wallet, txid)?;
     Ok((txid, raw))
 }
 
@@ -1668,17 +1655,7 @@ fn run_create_proposed<N: fmt::Display>(
         proposal,
         Some(expiry),
     )
-    .map_err(|e| match e {
-        WalletApiError::InsufficientFunds {
-            available,
-            required,
-        } => TxError::InsufficientFunds {
-            available: available.into_u64(),
-            required: required.into_u64(),
-        },
-        WalletApiError::ScanRequired => TxError::NotSynced("no anchor available".into()),
-        other => TxError::Internal(format!("building the transactions failed: {other}")),
-    })?;
+    .map_err(|e| wallet_api_error(e, "no anchor available", "building the transactions"))?;
     Ok(txids.into_iter().collect())
 }
 
@@ -1767,17 +1744,7 @@ pub fn build_tex_step2(
     )
     .ok_or_else(|| TxError::Internal("the ephemeral output has no recognised script".into()))?;
 
-    let payment = Payment::new(
-        recipient_addr.to_zcash_address(params),
-        Some(amount),
-        None,
-        None,
-        None,
-        vec![],
-    )
-    .map_err(|e| TxError::InvalidArgument(format!("invalid payment: {e}")))?;
-    let request = TransactionRequest::new(vec![payment])
-        .map_err(|e| TxError::InvalidArgument(format!("invalid payment request: {e}")))?;
+    let request = single_payment(recipient_addr.to_zcash_address(params), amount, None)?;
     let balance = TransactionBalance::new(Vec::new(), fee)
         .map_err(|e| TxError::Internal(format!("balance: {e:?}")))?;
     let ironwood_active = params.is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from(target));
@@ -1837,24 +1804,19 @@ pub fn balance(wallet: &Wallet, min_confirmations: u32) -> Result<BalanceSummary
             ..Default::default()
         });
     };
-    let mut pools = vec![
-        PoolBalance {
-            pool: Pool::Orchard,
-            ..Default::default()
-        },
-        PoolBalance {
-            pool: Pool::Ironwood,
-            ..Default::default()
-        },
-        PoolBalance {
-            pool: Pool::Sapling,
-            ..Default::default()
-        },
-        PoolBalance {
-            pool: Pool::Transparent,
-            ..Default::default()
-        },
-    ];
+    // Indexed below in this order.
+    let mut pools: Vec<PoolBalance> = [
+        Pool::Orchard,
+        Pool::Ironwood,
+        Pool::Sapling,
+        Pool::Transparent,
+    ]
+    .into_iter()
+    .map(|pool| PoolBalance {
+        pool,
+        ..Default::default()
+    })
+    .collect();
     for account in summary.account_balances().values() {
         let add = |p: &mut PoolBalance, b: &zcash_client_backend::data_api::Balance| {
             p.spendable += b.spendable_value().into_u64();
