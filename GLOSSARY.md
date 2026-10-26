@@ -40,7 +40,7 @@ Terms used across `ARCHITECTURE.md`, `CLI_SPEC.md`, `THREAT_MODEL.md` and `OVERV
 
 **lightwalletd / zaino.** Servers that index a Zcash chain and serve `CompactBlock`s, subtree roots and transparent address data to light clients over the `CompactTxStreamer` gRPC service. `lightwalletd` is the original Go implementation; `zaino` is the Rust successor. Gyges uses one only as the archival endpoint for Case B.
 
-**NU5 / NU7.** Zcash network upgrades. NU5 (mainnet block 1,687,104, ZIP 252) activated Orchard and Unified Addresses. NU7 is the upgrade exposed by the Zakura wallet APIs that introduces the Ironwood pool and related changes; its activation heights are set by the node.
+**NU5 / NU6.3.** Zcash network upgrades. NU5 (mainnet block 1,687,104, ZIP 252) activated Orchard and Unified Addresses. NU6.3 introduces the Ironwood pool and the ZIP 318 turnstile (mainnet 3,428,143, regtest height 1; `ARCHITECTURE.md` §1); its activation heights are set by the node. NU7 is a later upgrade; the regtest harness activates only through NU6.3 (`OVERVIEW.md` §4.5).
 
 **Orchard.** The shielded pool introduced by NU5, using the Pallas curve and Halo 2 proofs with no trusted setup. Its proving key can be derived from the full viewing key, so Orchard spends can be *proven* while the vault is locked; only the spend authorising signature needs the spending key (Q-K3). See ZIP 224.
 

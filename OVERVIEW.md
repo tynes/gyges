@@ -264,13 +264,13 @@ Read from `zakura-client-backend` 0.1.0-rc9.1 (`src/tor.rs`, `src/tor/grpc.rs`, 
 - **`GetBlockRange` and `GetSubtreeRoots`:** upstream `sync::run` sends `BlockRange { start, end }` with `end` *inclusive* and `pool_types: []` (the legacy, shielded-only answer: no `vin` / `vout`), collects the whole stream and inserts it into the `BlockCache`; `GetSubtreeRootsArg { start_index, shielded_protocol, max_entries }` (0 = all) streams `SubtreeRoot { root_hash, completing_block_hash, completing_block_height }` and upstream reads `root_hash` with `HashSer::read` directly, so it is the raw node bytes with no reversal. `ShieldedProtocol` has `Ironwood = 2` and `sync::run` seeds all three pools. `TreeState.hash` is display (reversed) hex, as `to_chain_state` expects; the fake serves the same. (Q-Y5)
 - **`z_getsubtreesbyindex` on the node:** `(pool: String, start_index: u16, limit: Option<u16>)`, pool matched exactly against `"sapling"`, `"orchard"`, `"ironwood"` (any other name is a `Misc` error "invalid pool name, must be one of: …"), answering `{"pool", "start_index", "subtrees": [{"root": <hex>, "end_height": N}]}` with the root as `to_bytes()` hex (Sapling) or the node's `encode_hex` (Orchard, Ironwood), no byte reversal, and **no completing block hash** (lightwalletd's `completing_block_hash` has no counterpart). The list is empty for an index the node has not built yet (it rebuilds the index from the tip during initial sync). The handler has no pruning check; whether the state answers for pruned ranges on a pruned node is still the open item of THREAT_MODEL.md §6, for the regtest run of the handoff item. `gyges_chain::SubtreeRoot` therefore carries `end_hash: Option<_>`.
 - `GetTransaction` answers `RawTransaction.height` as 0 for a mempool transaction, `0xffffffffffffffff` for one mined only on a fork, else the main-chain height (the proto comment documents the sentinel mapping from `getrawtransaction`'s `-1`); an unknown txid is NOT_FOUND. That is `ChainBackend::transaction_status` on the lightwalletd route.
-- `GetLightdInfo.chain_name` is `"main"` or `"test"` from lightwalletd; zaino may answer `"regtest"` on regtest, so the backend accepts either for a regtest daemon, like `ZakuraRpcBackend` does for the node. `tonic` reports a dead connection as `Code::Unknown` with the transport error as `source()`; Gyges maps that, `Unavailable`, `DeadlineExceeded`, `Cancelled` and `Aborted` to `ChainError::Unreachable` and drops the connection.
+- `GetLightdInfo.chain_name` is `"main"` or `"test"` from lightwalletd. zaino 0.10.2 answered `"test"` on regtest (§4.5). The backend accepts `"test"` or `"regtest"` for a regtest daemon, like `ZakuraRpcBackend` does for the node. `tonic` reports a dead connection as `Code::Unknown` with the transport error as `source()`; Gyges maps that, `Unavailable`, `DeadlineExceeded`, `Cancelled` and `Aborted` to `ChainError::Unreachable` and drops the connection.
 - `tonic-prost-build`'s `extern_path` maps every proto message onto an existing Rust type, including the request and response types of generated services, so `gyges-chain`'s `build.rs` can generate only the *server* side of `CompactTxStreamer` for the fake over `zcash_client_backend::proto::{compact_formats, service}` types (`generate_default_stubs` makes the unimplemented methods answer UNIMPLEMENTED, server-streaming methods take `BoxStream`). The upstream crate ships no `.proto` files, only the generated modules, so the proto subset in `crates/gyges-chain/proto/` was written from them. (Q-O2)
 
 
-### 4.5 Facts about an archival endpoint for the regtest harness (2026-10-25, research only)
+### 4.5 Facts about an archival endpoint for the regtest harness (2026-10-25)
 
-Gathered for ROADMAP.md M2's sixth item. Nothing below has been run against a node yet.
+Gathered for ROADMAP.md M2's sixth item. The bullets below are research from source and release pages. The smoke test at the end of this section ran them against a real node: an archive `zakurad` v1.6.0 with `zainod` 0.10.2 in front of it.
 
 - **zakura-core publishes no indexer.** The organisation has `common`, `zakura`, `wallet-libraries` and forks of rocksdb, iroh, iroh-quinn and librustzcash. There is no zaino or lightwalletd fork. Zakura's docs send wallet features to Zaino (`docs/contributing.md`, `docs/zcashd-compat.md`). Zakura's own tests use `electriccoinco/lightwalletd` (`docker/docker-compose.lwd.yml`, `crates/zakurad/tests/common/lightwalletd/`). `zakurad` serves the Zebra indexer gRPC (zakura PR #612), and its `getblockchaininfo` reports `pruned` / `pruneheight` (PR #470).
 - **Upstream zaino against `zakurad` v1.6.0: plausible, untested.**
@@ -288,7 +288,74 @@ Gathered for ROADMAP.md M2's sixth item. Nothing below has been run against a no
   - `[storage.database] path`.
 
   It serves plaintext gRPC on loopback; TLS is enforced only for non-private binds.
-- **zaino cannot sit in front of the wallet's pruned node.** Compact blocks and tree states are served from its own LMDB store once indexed. But mined transactions (`GetTransaction`) and subtree roots are fetched from the node every time, which fails below a pruned node's window. So the harness needs a **second, archive-mode `zakurad`** peered with the wallet's pruned one, with zaino in front of the archive node.
+- **zaino cannot sit in front of the wallet's pruned node.** Compact blocks and tree states are served from its own LMDB store once indexed. But mined transactions (`GetTransaction`) and subtree roots are fetched from the node every time, which fails below a pruned node's window. So the harness needs a **second, archive-mode `zakurad`** peered with the wallet's pruned one, with zaino in front of the archive node. (Not exercised by the smoke test, which used an archive node only.)
+
+#### Smoke test: `zainod` 0.10.2 in front of an archive `zakurad` v1.6.0 (2026-10-25, macOS arm64)
+
+**Result: the pairing works.** Every `ArtiTorLwdBackend` call answered, and every answer matched the node's. There are three deviations from the lightwalletd contract that `gyges_chain::lwd` assumes. lightwalletd was therefore not needed.
+
+**Setup.** No harness change; a throwaway example (not committed) drove the backend.
+- **Node:** `zakurad` 1.6.0+gebda15e23ed0, built from the tag. The config is the one `tests/regtest/harness/node.rs` writes (every upgrade through NU6.3 at height 1, cookie auth, `checkpoint_sync = false`), minus the `storage_mode` line: `Archive` is the default. `getblockchaininfo` then reports `pruned: false`.
+- **zaino:** `cargo +1.97.1 install zainod --version 0.10.2 --locked` built in 2 min 10 s.
+- **Config used** (paths shortened):
+
+  ```toml
+  backend = "rpc"
+  network = "Regtest"
+
+  [validator_settings]
+  validator_jsonrpc_listen_address = "127.0.0.1:39232"   # the node's [rpc] listen_addr
+  validator_cookie_path = "<node dir>/cookie/.cookie"
+
+  [grpc_settings]
+  listen_address = "127.0.0.1:39237"                     # plaintext gRPC on loopback
+
+  [storage.database]
+  path = "<zaino dir>/db"
+  ```
+
+  Run as `zainod start --config <file>`.
+- **Chain:** 101 coinbases to the abandon-mnemonic key, then a node restart (miner set to the burn address) and 100 more blocks. Then, through `gygesd`:
+  - `tx shield` of 101 UTXOs into Ironwood (24,065 bytes);
+  - a 1 ZEC Ironwood payment to a second key, sent `--via-tor`;
+  - a 2 ZEC payment to that key's `tm…` receiver.
+
+  Tip 210.
+
+**What worked:**
+- **Startup and adoption.** zaino adopted the node's activation heights ("Adopted activation heights from the validator": Overwinter through NU6.3 at 1). It indexed the 101-block chain and was serving 0.7 s after start. A restart over its existing database took 1.2 s. A new block reached `GetLatestBlock` within about 1 s (five runs: 0.28 s, then 1.0 s each), which fits a polling chain-head service with a ~1 s interval.
+- **`GetLightdInfo`** (1–3 ms):
+  - `vendor "ZingoLabs ZainoD"`, `version "0.10.2"`, `chain_name "test"` (not `"regtest"`);
+  - `consensus_branch_id "37a5165b"`, `upgrade_name "NU6.3"`, `sapling_activation_height 1`;
+  - `zcashd_build "v1.6.0+gebda15e23ed0"`, `zcashd_subversion "/Zakura:1.6.0/"`, `lightwallet_protocol_version "v0.5.0"`.
+
+  `node_bounds` passes the chain check, and its tip height and hash equal the node's.
+- **`block_range(1..211)`**: 210 blocks in under 1 ms; heights, `hash` and `prev_hash` equal `getblockhash`. With `pool_types: []`, zaino answers like lightwalletd: no transparent-only transactions (the coinbases) and no `vin` / `vout`. After dropping those from the node route's blocks (`ZakuraRpcBackend::compact_blocks`), all 210 blocks are equal field for field, including `chain_metadata` and the two `ironwood_actions` (proto tag 9) of each shielded transaction. zaino's `compact_formats.proto` has the same tags as `zakura-client-backend`'s.
+- **`chain_state`** at heights 1, 105, 201–204 and 210: 6 ms each, and equal to `z_gettreestate` through `ZakuraRpcBackend`. That includes a non-empty Ironwood frontier: position 5 after three 2-action transactions.
+- **`raw_transaction` / `transaction_status`**: bytes equal to `getrawtransaction` for a coinbase, the shield, the Ironwood payment and the transparent payment (heights 1, 202, 203, 204). The shield showed height 0 / `InMempool` while unmined.
+- **`address_utxos`**: agrees with the node's `getaddressutxos`.
+  - With 101 coinbases: the same count, and the entries spot-checked are equal (txid, index, value, height).
+  - After the shield: 0 at the key's address, and the single output at the recipient's is identical.
+- **`send_transaction`**: `tx send --via-tor` on regtest with `use_tor = false` reached the node's mempool through zaino. The audit log records `via="fallback"`.
+- **`subtree_roots`** for Sapling, Orchard and Ironwood: empty on both sides. No subtree completes in a few blocks, so root correctness is still untested.
+
+**Deviations** (the first two need code before ROADMAP item 6 relies on them):
+1. **Unknown txid.** `GetTransaction` answers gRPC `Internal`, `RPC error: LegacyRpcError { code: -5, message: "No such mempool or main chain transaction" }`, not `NOT_FOUND`.
+   - `transaction_status` returns `ChainError::Rpc` where it should return `TxStatus::Unknown`.
+   - `raw_transaction` returns an error where it should return `None`. So `gygesd::backfill::place_utxo` retries an output whose transaction the endpoint lacks (`SyncError::Fallback`) instead of discarding it.
+2. **Rejected broadcast.** A `SendTransaction` the node refuses comes back after about 2.5 s as gRPC `Internal`, not as a `SendResponse` with `error_code`. The error text is `InternalServerError: error receiving data from backing node: critical error in backing block source: validator unreachable: <the node's text>`.
+   - `send_transaction` maps it to `ChainError::Rpc`, so a refused `--via-tor` broadcast reaches the user as `INTERNAL` instead of `NODE_REJECTED`.
+   - zaino stays `Ready` afterwards.
+3. **Stale cookie after a node restart.** `zakurad` rotates its cookie on restart and drops a connection that presents the old one: an empty reply, not a 401. So a client that re-reads the cookie only on a 401 never recovers. zaino builds its credentials from the cookie file at start (`zaino-rpc` `auth_from_parts`). zaino logged `validator unavailable: … error sending request` and backed off, with status `RecoverableError`. Still failing at its eighth retry (attempt 8, about a minute in), it was restarted by hand. Meanwhile it kept serving its indexed blocks over gRPC. So the harness must restart zaino after every `Node::restart`.
+
+The `chain_name` `"test"` is already accepted.
+
+**Not covered:**
+- zaino in front of a pruned node;
+- the Tor transport;
+- `pool_types` other than `[]`;
+- Sapling outputs. A Sapling payment from `tx send` failed in Gyges itself: "PCZTs require that ZIP 212 is enforced for outputs". `sapling-crypto` builds PCZT Sapling outputs only once ZIP 212 is `On`, which is Canopy + `ZIP212_GRACE_PERIOD` (32,256 blocks). With Canopy at 1, that is height 32,257, so a Sapling scenario on the real regtest node must mine past it first.
+- Orchard actions (the wallet sends Ironwood).
 
 ---
 
@@ -416,7 +483,7 @@ Grouped by area. Each question is a checkbox; it is checked when a concrete prop
   **Proposed solution.** QR only, confirmed: Keystone's Zcash flow has no USB or file transport, and Zodl (formerly Zashi) scans the device with the phone camera. Two decisions follow. (1) **Use the batch-signing protocol for pure shielded sends.** `zcash-sign-batch` (tag 49205) sends the PCZTs and `zcash-batch-sig-result` (49207) returns only `(pool, action_index, 64-byte signature)` tuples, so the return payload for a typical send is a single QR frame that can be scanned once or even typed. The host applies the signatures to its own proven copy (upstream provides `redact_pczt_for_batch_signer` and `extract_orchard_spend_auth_signatures`), so no multi-frame return and no Combiner. The single-PCZT flow (`zcash-pczt`, 49204, full PCZT back with signatures inserted) is kept only for transactions with transparent inputs, which batch mode rejects: shielding and ZIP 320 Step 2. (2) **Two input paths on the host**: `gyges pczt qr-scan` uses the laptop camera (`gyges-qr` gains a decoder built on a capture crate plus a pure-Rust QR decoder, feeding the `ur` fountain decoder until complete) and is used automatically by `tx send` when a camera is present; `gyges pczt qr-import --from-file frames.txt` or stdin accepts one `ur:…` frame per line as exported by any phone QR app, for headless machines. Positional `qr-import <FRAME>…` stays for single-frame payloads, which with batch mode is the common case. The signing session (Q-K4) records which protocol and path was used.
 - [x] **Q-K3.** Sapling proving needs the proof generation key. Which option?
 
-  **Proposed solution.** Option (b) for seed profiles, option (a) for everything else, implemented through mechanism (c). Concretely: the MVP spends from Orchard and transparent only (matching §7). When Sapling spending is enabled for `LocalEncryptedSeed` profiles, a proposal containing Sapling inputs requires an unlock *before* proving; the daemon then runs the PCZT **Updater** role to insert each Sapling spend's `proof_generation_key` into the PCZT (ZIP 374 defines this field), proves, signs, and drops the key. `KeystoneQr` and `WatchOnly` profiles have `spend_pools` without `sapling` (Q-K1), so the question never arises for them. Air-gapped signing boxes hold the seed, so they can prove Sapling after unlocking; the online watch-only side only creates the PCZT. Rename "proving-only" in `CLI_SPEC.md` to "Orchard proving-only" and state the rule in one place in `ARCHITECTURE.md` §3.2.
+  **Proposed solution.** Option (b) for seed profiles, option (a) for everything else, implemented through mechanism (c). Concretely: the MVP spends from Orchard and transparent only (matching §7). When Sapling spending is enabled for `LocalEncryptedSeed` profiles, a proposal containing Sapling inputs requires an unlock *before* proving; the daemon then runs the PCZT **Updater** role to insert each Sapling spend's `proof_generation_key` into the PCZT (ZIP 374 defines this field), proves, signs, and drops the key. `KeystoneQr` and `WatchOnly` profiles have `spend_pools` without `sapling` (Q-K1), so the question never arises for them. Air-gapped signing boxes hold the seed, so they can prove Sapling after unlocking; the online watch-only side only creates the PCZT. Rename "proving-only" in `CLI_SPEC.md` to "Orchard proving-only" and state the rule in one place in `ARCHITECTURE.md` §3.2. **Revised (§4.3, 2026-10-25):** the MVP spends Orchard, Ironwood and transparent, not Orchard and transparent only (see the revision under Q-D7). Ironwood is spent and received since M1: in `scenarios/node.rs::restore_mine_shield_send_and_reorg_against_the_real_node` `tx shield` lands in Ironwood, the payment to the second key is spent from it, and that key's note is listed as `POOL_IRONWOOD`; `rpc.rs::tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_node` checks the Ironwood balance at each step. The Sapling reasoning above is unchanged.
 
 - [x] **Q-K4.** Where does the Combiner step run after Keystone returns the signed PCZT, and how is it correlated?
 
@@ -509,7 +576,7 @@ Grouped by area. Each question is a checkbox; it is checked when a concrete prop
 - [x] **Write `proto/gyges.proto`** and a short `API.md`. Everything in `CLI_SPEC.md` should map to exactly one RPC, with the typed error detail, `GetInfo`, `StreamLogs`, and the signing-session RPCs from Q-K4. *Done (revision 3); the command-to-RPC table is `API.md` §7.*
 - [x] **Write `THREAT_MODEL.md`** from the Q-S1…S7 and Q-K7 proposals once they have been reviewed. *Draft written (revision 3) ahead of the review so the review has something concrete to mark up. Q-S1…S7 and Q-K7 decided 2026-10-21 (recorded under each question); promoted from draft.*
 - [x] **Correct the factual issues in `ARCHITECTURE.md`** listed in §2.1 (module paths, age/scrypt, Sapling PGK, Combiner step, ZIP numbers, invalid TOML, retention RPC) and add Reorg, Block cache, Daemon lifecycle and per-network layout subsections from the §6 proposals. *Done (revision 3), together with the `CLI_SPEC.md` items in §2.2: `--tex` removed, exit codes, non-interactive rules, amount and memo grammar, `sync wait --until`, `tx sessions/abort/resume`, `key backup/delete`, `daemon install`, `pczt qr-scan` and `qr-import --from-file`.*
-- [x] **Cut an MVP:** local-seed profiles, Orchard+transparent, Case A sync against a local Zakura node, `tx send` to `u1`/`t1`, regtest integration test. Defer Tor backfill, Keystone, ZIP-320 and PIR to later milestones, each with its own design note. *Done: `ROADMAP.md` M1 is the MVP; M2 Tor, M3 ZIP 320, M4 PCZT/air-gapped, M5 Keystone, M6 hardening.*
+- [x] **Cut an MVP:** local-seed profiles, Orchard+transparent, Case A sync against a local Zakura node, `tx send` to `u1`/`t1`, regtest integration test. Defer Tor backfill, Keystone, ZIP-320 and PIR to later milestones, each with its own design note. *(Revised 2026-10-25: the MVP's shielded pool is Ironwood, not Orchard; it spends Orchard, Ironwood and transparent and receives Ironwood, Sapling and transparent, see Q-D7.)* *Done: `ROADMAP.md` M1 is the MVP; M2 Tor, M3 ZIP 320, M4 PCZT/air-gapped, M5 Keystone, M6 hardening.*
 - [x] **Add `README.md`, licence files, CI (`cargo check`, `clippy`, `cargo-deny`)** so the repo is honest about its state and safe to contribute to. *Done (revision 3): `README.md`, `LICENSE-MIT`, `LICENSE-APACHE`, `.github/workflows/ci.yml` (fmt, build `--locked`, clippy `-D warnings`, test, cargo-deny, `protoc` validation, TOML validation of `DATA_MODEL.md`), `deny.toml`, `rustfmt.toml`.*
 
 ### What remains open after revision 3
