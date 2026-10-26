@@ -292,7 +292,8 @@ pub fn propose_send(
             attempt(wallet, z)
         }
         AmountSpec::Max => {
-            let mut amount = spendable_total(wallet, spend_pools, min_confirmations)?;
+            let total = spendable_total(wallet, spend_pools, min_confirmations)?.into_u64();
+            let mut amount = Zatoshis::from_u64(total).map_err(|e| internal("amount", e))?;
             for _ in 0..8 {
                 if amount == Zatoshis::ZERO {
                     return Err(TxError::InsufficientFunds {
@@ -306,8 +307,15 @@ pub fn propose_send(
                         available,
                         required,
                     }) if required > available => {
-                        let short = required - available;
-                        amount = Zatoshis::from_u64(amount.into_u64().saturating_sub(short))
+                        // `required` is the amount plus the fee. Upstream
+                        // reports what it could select as `available`, but
+                        // reports 0 when the selection would have been
+                        // transparent inputs only, so fall back to the
+                        // wallet's own spendable total there; otherwise a
+                        // transparent-only wallet could never send `max`.
+                        let fee = required.saturating_sub(amount.into_u64());
+                        let have = if available > 0 { available } else { total };
+                        amount = Zatoshis::from_u64(have.saturating_sub(fee))
                             .map_err(|e| internal("amount", e))?;
                     }
                     Err(e) => return Err(e),

@@ -20,7 +20,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use gyges_chain::{BlockDb, CacheError, ChainBackend, ChainError, NodeBounds, Source};
+use gyges_chain::{BlockDb, CacheError, ChainBackend, ChainError, NodeBounds, Source, TxStatus};
 use gyges_core::KeyEntry;
 use gyges_core::sync::{
     self as core_sync, FINALITY_DEPTH, KeyProgress, ScanOutcome, StallReason, SyncError, SyncState,
@@ -205,6 +205,9 @@ pub struct Scheduler {
     /// Open Case B sessions per key, loaded from disk on first use
     /// (`crate::backfill`).
     pub(crate) backfills: BTreeMap<String, Option<backfill::Session>>,
+    /// When each key's transaction status work last went to the node
+    /// ([`Self::check_status`]).
+    status_checked: BTreeMap<String, Instant>,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -230,6 +233,7 @@ pub fn spawn(
         started: Instant::now(),
         last_connected: None,
         backfills: BTreeMap::new(),
+        status_checked: BTreeMap::new(),
     };
     tokio::spawn(scheduler.run())
 }
@@ -321,6 +325,7 @@ impl Scheduler {
                 Ok((worked, scanned_tip)) => {
                     did_work |= worked;
                     slowest = Some(slowest.map_or(scanned_tip, |s| s.min(scanned_tip)));
+                    self.check_status(key, scanned_tip).await;
                 }
                 Err(e) => self.report_step_error(key.key_id(), &bounds, e),
             }
@@ -329,6 +334,65 @@ impl Scheduler {
             tracing::warn!(error = %e, "block cache eviction failed");
         }
         did_work
+    }
+
+    /// Ask the node about the key's own transactions whose mined status
+    /// scanning cannot see (a fully transparent send without change; see
+    /// `core_sync::pending_status`) and record the answers, at most once per
+    /// poll interval per key. Runs after the key's scan for the tick, so the
+    /// wallet has a chain tip, and a `Mined` height above the key's scanned
+    /// tip is left queued until the scan reaches it. Never during a backfill:
+    /// `self.chain` is the node, and the fallback endpoint is never asked
+    /// about the wallet's own txids. Failures are logged and retried.
+    async fn check_status(&mut self, key: &Arc<KeyEntry>, scanned_tip: BlockHeight) {
+        let poll = Duration::from_secs(u64::from(
+            self.state.config.zakura_rpc.poll_interval_secs.max(1),
+        ));
+        let key_id = key.key_id().to_string();
+        if self
+            .status_checked
+            .get(&key_id)
+            .is_some_and(|t| t.elapsed() < poll)
+            || self.in_backfill(key)
+        {
+            return;
+        }
+        self.status_checked.insert(key_id.clone(), Instant::now());
+        let txids = match with_wallet(key, |w| core_sync::pending_status(w)).await {
+            Ok(txids) => txids,
+            Err(e) => {
+                tracing::warn!(key_id, error = %e, "cannot read transaction status work");
+                return;
+            }
+        };
+        for txid in txids {
+            let status = match self.chain.transaction_status(txid).await {
+                Ok(status) => status,
+                Err(e) => {
+                    tracing::debug!(key_id, error = %e, "transaction status lookup failed; retrying");
+                    return;
+                }
+            };
+            if let TxStatus::Mined(h) = status
+                && h > scanned_tip
+            {
+                continue;
+            }
+            match with_wallet(key, move |w| core_sync::record_status(w, txid, status)).await {
+                Ok(()) => {
+                    if let TxStatus::Mined(h) = status {
+                        tracing::info!(
+                            key_id,
+                            height = u32::from(h),
+                            "transaction marked mined from the node"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(key_id, error = %e, "cannot record transaction status");
+                }
+            }
+        }
     }
 
     /// Step errors that are not stalls leave the state alone and are

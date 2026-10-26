@@ -210,10 +210,13 @@ land. Passphrase sessions live in daemon memory only (§6.1) and show in
 `ListSigningSessions` with their status; a session that is aborted ends its
 stream with `CANCELLED`. A transaction the node refuses (`NODE_REJECTED`)
 has already been recorded in the wallet as unmined and its inputs stay
-unspendable until its expiry height. `wait_for_mined` relies on the scanner
-recognising the transaction (a change output or a nullifier of ours); a
-fully transparent transaction without change is not recognised yet
-(`OVERVIEW.md` §4.3).
+unspendable until its expiry height. `wait_for_mined` ends once the wallet
+has the transaction's mined height. The scanner finds most transactions (a
+change output or a nullifier of ours). The daemon learns about a fully
+transparent transaction without change from the node: upstream queues it for
+a status lookup, and the scheduler asks `getrawtransaction` and records the
+answer (`OVERVIEW.md` §4.3). The lookup goes to the node only, never to the
+fallback endpoint, and is skipped while a key backfills.
 
 The CLI approves before it signs: without `--yes`, `gyges tx send` runs the
 request as `dry_run` first, prints the proposal, asks, and only then opens

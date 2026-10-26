@@ -558,10 +558,82 @@ pub fn tx_height(wallet: &Wallet, txid: [u8; 32]) -> Result<Option<BlockHeight>,
         .map_err(wallet_err)
 }
 
+/// The wallet's own transactions whose mined status scanning cannot observe
+/// and the node must be asked about: upstream queues one for every sent
+/// transaction with no shielded spend or shielded output of ours (a fully
+/// transparent send without change), and again after a rewind
+/// (`TransactionStatusRead`). Txids in internal byte order.
+///
+/// Only `Public` work is returned: it is what the wallet handle's status
+/// mode authorizes (`registry::open_wallet`). `Private` work would come
+/// from a private ledger policy, which gyges never sets; it is logged and
+/// left queued rather than rerouted to the node.
+pub fn pending_status(wallet: &Wallet) -> Result<Vec<[u8; 32]>, SyncError> {
+    use zcash_client_backend::data_api::status::{
+        TransactionStatusRead as _, TransactionStatusWork,
+    };
+    let work = wallet.transaction_status_work().map_err(wallet_err)?;
+    let mut txids = Vec::with_capacity(work.len());
+    for item in work {
+        match item {
+            TransactionStatusWork::Public(r) => txids.push(*r.txid().as_ref()),
+            TransactionStatusWork::Private(_) => {
+                tracing::warn!(
+                    "private status work left queued: gyges has no private status route"
+                );
+            }
+        }
+    }
+    Ok(txids)
+}
+
+/// Upstream's status for what the node said about one of [`pending_status`]'s
+/// txids. A transaction in the mempool is "not in the main chain"; upstream
+/// keeps it queued until it is conclusively past its expiry, so it is asked
+/// about again later.
+pub fn upstream_status(
+    status: gyges_chain::TxStatus,
+) -> zcash_client_backend::data_api::TransactionStatus {
+    use zcash_client_backend::data_api::TransactionStatus as U;
+    match status {
+        gyges_chain::TxStatus::Mined(h) => U::Mined(h),
+        gyges_chain::TxStatus::InMempool => U::NotInMainChain,
+        gyges_chain::TxStatus::Unknown => U::TxidNotRecognized,
+    }
+}
+
+/// Record what the node said about `txid` (see [`pending_status`]). A
+/// `Mined` status sets the transaction's mined height, which is what
+/// `wait_for_mined`, `sync wait --txid` and `tx list` read.
+pub fn record_status(
+    wallet: &mut Wallet,
+    txid: [u8; 32],
+    status: gyges_chain::TxStatus,
+) -> Result<(), SyncError> {
+    wallet
+        .set_transaction_status(
+            zcash_protocol::TxId::from_bytes(txid),
+            upstream_status(status),
+        )
+        .map_err(wallet_err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use zcash_client_backend::data_api::scanning::ScanPriority;
+
+    #[test]
+    fn node_answers_map_to_upstream_statuses() {
+        use gyges_chain::TxStatus;
+        use zcash_client_backend::data_api::TransactionStatus as U;
+        let h = BlockHeight::from_u32(42);
+        assert_eq!(upstream_status(TxStatus::Mined(h)), U::Mined(h));
+        // Still in the mempool: upstream keeps it queued until it is past
+        // its expiry, so it is asked about again.
+        assert_eq!(upstream_status(TxStatus::InMempool), U::NotInMainChain);
+        assert_eq!(upstream_status(TxStatus::Unknown), U::TxidNotRecognized);
+    }
 
     fn r(start: u32, end: u32, p: ScanPriority) -> ScanRange {
         ScanRange::from_parts(BlockHeight::from_u32(start)..BlockHeight::from_u32(end), p)
