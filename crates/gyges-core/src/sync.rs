@@ -174,6 +174,14 @@ pub enum SyncError {
     /// overflow): the cache holds something the wallet cannot digest.
     #[error("scan: {0}")]
     Scan(String),
+    /// The wallet's note commitment tree refused what a scan tried to
+    /// insert (a frontier or root that conflicts with the leaves it holds,
+    /// a conflicting checkpoint, a full tree): the scanned blocks or the
+    /// prior tree state disagree with the tree. A backfill treats it as
+    /// the endpoint's (`Stalled(UntrustedBackfill)`); on the node it is
+    /// retried like any wallet error. See [`tree_refusal`].
+    #[error("wallet: the commitment tree refused the insertion: {0}")]
+    TreeRefused(String),
     /// `truncate_to_height` has no scanned block at or below the fork point
     /// to truncate to (a reorg at or below the key's first scanned block):
     /// the wallet must be reset to the node's tree state at the fork
@@ -308,7 +316,12 @@ pub fn scan_range(
             });
         }
         Err(ScanChainError::Scan(err)) => return Err(SyncError::Scan(err.to_string())),
-        Err(ScanChainError::Wallet(e)) => return Err(wallet_err(e)),
+        Err(ScanChainError::Wallet(e)) => {
+            return Err(match tree_refusal(&e) {
+                Some(detail) => SyncError::TreeRefused(detail),
+                None => wallet_err(e),
+            });
+        }
         Err(ScanChainError::BlockSource(e)) => return Err(SyncError::Cache(e)),
         Err(other) => return Err(SyncError::Scan(other.to_string())),
     };
@@ -316,6 +329,37 @@ pub fn scan_range(
     Ok(ScanOutcome::Scanned {
         summary,
         transparent_outputs,
+    })
+}
+
+/// Whether `e` is the wallet's note commitment tree refusing data, not
+/// failing to read or write it. The refusals are what the scanned blocks
+/// and prior tree state decide: an insertion that conflicts with a node
+/// the tree holds, lands outside it or overflows it
+/// (`ShardTreeError::Insert`, except `MarkedRetentionInvalid`, which is the
+/// wallet's own call), and a checkpoint that conflicts with the one stored
+/// at its height. Storage errors (a busy or locked database, an unreadable
+/// shard) and queries return `None`: they say nothing about the data and
+/// are retried. Returns the pool and the error, for the key's detail.
+pub fn tree_refusal(e: &SqliteClientError) -> Option<String> {
+    use shardtree::error::{InsertionError, ShardTreeError};
+    use zcash_client_sqlite::wallet::commitment_tree::Error as TreeError;
+    let (pool, error) = match e {
+        SqliteClientError::PutBlocksCommitmentTree { pool, error, .. } => {
+            (Some(gyges_chain::pool_name(*pool)), error)
+        }
+        SqliteClientError::CommitmentTree(error) => (None, error),
+        _ => return None,
+    };
+    let refused = match error {
+        ShardTreeError::Insert(InsertionError::MarkedRetentionInvalid) => false,
+        ShardTreeError::Insert(_) => true,
+        ShardTreeError::Storage(TreeError::CheckpointConflict { .. }) => true,
+        _ => false,
+    };
+    refused.then(|| match pool {
+        Some(pool) => format!("{pool}: {error}"),
+        None => error.to_string(),
     })
 }
 
@@ -529,6 +573,68 @@ mod tests {
             fully_scanned: fully_scanned.map(|h| (BlockHeight::from_u32(h), [0; 32])),
             ranges,
         }
+    }
+
+    #[test]
+    fn only_the_tree_refusing_data_is_a_tree_refusal() {
+        use incrementalmerkletree::{Address, Level};
+        use shardtree::error::{InsertionError, ShardTreeError};
+        use shardtree::store::{Checkpoint, TreeState};
+        use zcash_client_sqlite::wallet::commitment_tree::Error as TreeError;
+        use zcash_protocol::ShieldedPool;
+
+        let put = |error| SqliteClientError::PutBlocksCommitmentTree {
+            pool: ShieldedPool::Ironwood,
+            block_range: BlockHeight::from_u32(13)..BlockHeight::from_u32(24),
+            error,
+        };
+        let conflict = ShardTreeError::Insert(InsertionError::Conflict(Address::from_parts(
+            Level::from(0),
+            0,
+        )));
+        let refused = tree_refusal(&put(conflict)).expect("a conflicting frontier is refused");
+        assert!(refused.starts_with("ironwood: "), "{refused}");
+        for e in [
+            InsertionError::CheckpointOutOfOrder,
+            InsertionError::TreeFull,
+        ] {
+            assert!(tree_refusal(&put(ShardTreeError::Insert(e))).is_some());
+        }
+        let checkpoint = ShardTreeError::Storage(TreeError::CheckpointConflict {
+            checkpoint_id: BlockHeight::from_u32(13),
+            checkpoint: Checkpoint::tree_empty(),
+            extant_tree_state: TreeState::Empty,
+            extant_marks_removed: None,
+        });
+        assert!(tree_refusal(&SqliteClientError::CommitmentTree(checkpoint)).is_some());
+
+        // Retried: the database, not the data.
+        let busy = || {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )
+        };
+        assert!(tree_refusal(&put(ShardTreeError::Storage(TreeError::Query(busy())))).is_none());
+        assert!(
+            tree_refusal(&put(ShardTreeError::Storage(TreeError::Serialization(
+                std::io::Error::other("short read")
+            ))))
+            .is_none()
+        );
+        assert!(
+            tree_refusal(&put(ShardTreeError::Insert(
+                InsertionError::MarkedRetentionInvalid
+            )))
+            .is_none()
+        );
+        assert!(
+            tree_refusal(&put(ShardTreeError::Query(
+                shardtree::error::QueryError::CheckpointPruned
+            )))
+            .is_none()
+        );
+        assert!(tree_refusal(&SqliteClientError::DbError(busy())).is_none());
     }
 
     #[test]
