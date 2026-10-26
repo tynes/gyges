@@ -511,6 +511,18 @@ impl Scheduler {
                     format!("the endpoint's blocks do not scan: {detail}"),
                 )));
             }
+            // The wallet's tree refused the batch's commitments or its
+            // prior frontier. The batch and, below the window, its prior
+            // tree state are the endpoint's, and the tree holds only what
+            // the node or earlier batches put there, which the handoff
+            // would check: the conflict is the endpoint's. Retrying would
+            // fail the same way every tick.
+            Err(SyncError::TreeRefused(detail)) => {
+                return Err(SyncError::Untrusted(Mismatch::new(
+                    Check::TreeRoots,
+                    format!("the wallet's commitment tree refused the endpoint's data: {detail}"),
+                )));
+            }
             Err(e) => return Err(e),
         };
         match outcome {

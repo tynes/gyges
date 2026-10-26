@@ -3780,6 +3780,136 @@ async fn a_fallback_serving_a_fork_is_refused_and_marked_untrusted() {
     running.task.abort();
 }
 
+/// ROADMAP.md M2, the ShardTree item: an endpoint serving the node's blocks
+/// (every hash and tree size right) but a forged tree state at a batch
+/// boundary below the window. The next batch's prior frontier then
+/// disagrees with the leaves the wallet already holds, so `put_blocks`
+/// refuses the insertion. That is the endpoint's data, so the key stalls
+/// with `UntrustedBackfill` instead of retrying the wallet error every tick.
+#[tokio::test]
+async fn a_fallback_whose_tree_state_the_wallet_refuses_is_marked_untrusted() {
+    use gyges_proto::v1::FallbackTrust;
+    let node = FakeNode::start(regtest_params()).await;
+    let (mnemonic, _, shield_height) = chain_with_a_shielded_note(&node).await;
+    node.mine(40);
+    let retained_from = 30;
+    node.set_prune_height(Some(retained_from));
+    let honest = FakeLightwalletd::from_node(&node).await;
+
+    // Same leaf count, other leaves: zero the left and right leaves of the
+    // legacy `CommitmentTree` hex (`01 <left> 01 <right> <parents>`; zero is
+    // a valid Pallas element). Every height from the shield up to the window
+    // lies, so whichever batch boundary falls there is served the forgery;
+    // the birthday's `birthday - 1` stays honest.
+    let forge = |hex: &str| {
+        assert!(hex.starts_with("01"), "a non-empty Ironwood tree: {hex}");
+        let mut out = format!("01{}", "0".repeat(64));
+        let rest = &hex[66..];
+        if let Some(parents) = rest.strip_prefix("01") {
+            out.push_str(&format!("01{}{}", "0".repeat(64), &parents[64..]));
+        } else {
+            out.push_str(rest);
+        }
+        assert_ne!(out, hex);
+        out
+    };
+    let states = (0..=node.tip().0)
+        .map(|h| {
+            let mut ts = node.tree_state(h);
+            if (shield_height..retained_from).contains(&h) {
+                ts.ironwood_tree = forge(&ts.ironwood_tree);
+            }
+            ts
+        })
+        .collect();
+    let liar = FakeLightwalletd::start("test", honest.blocks(), states).await;
+
+    let (node_url, liar_url) = (node.url().to_string(), liar.url().to_string());
+    // Several batches below the window, so a later one takes its prior
+    // tree state from the endpoint after the shield's block is scanned.
+    let config = format!("{TEST_CONFIG}[cache]\nscan_batch = 10\nfetch_batch = 10\n");
+    let running = start_with(&config, |o| {
+        o.zakura_rpc = Some(node_url);
+        o.fallback_lwd = Some(liar_url);
+        o.no_tor = true;
+    })
+    .await;
+    let mut c = client(&running.socket).await;
+    let birthday = 4;
+    c.restore_key(RestoreKeyRequest {
+        key_id: "copy".into(),
+        mnemonic,
+        passphrase: "pw".into(),
+        birthday_height: birthday,
+        allow_backfill: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let stalled = wait_status(&mut c, "copy", "stalled", |k| {
+        k.state() == SyncState::Stalled
+    })
+    .await;
+    assert_eq!(
+        stalled.stall_reason(),
+        gyges_proto::v1::StallReason::FallbackUntrusted,
+        "{stalled:?}"
+    );
+    // Refused while scanning a batch, not at the handoff's root check.
+    assert!(
+        stalled.detail.contains("commitment tree refused"),
+        "{}",
+        stalled.detail
+    );
+    assert!(stalled.detail.contains("ironwood"), "{}", stalled.detail);
+
+    let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
+    assert_eq!(info.fallback.unwrap().trust(), FallbackTrust::Untrusted);
+    assert!(
+        running
+            ._home
+            .path()
+            .join("regtest/fallback_trust.json")
+            .exists()
+    );
+    // Truncated to the block before the backfill (`birthday - 1`): nothing
+    // the endpoint served is left in the wallet, nor in the cache.
+    {
+        let key = running.state.registry.resolve("copy").unwrap();
+        let w = key.wallet().unwrap();
+        assert!(
+            w.block_max_scanned().unwrap().is_none(),
+            "truncated to {}",
+            birthday - 1
+        );
+        assert!(!key.dir().join("backfill.json").exists());
+    }
+    let cache = running.state.block_cache.as_ref().unwrap();
+    assert_eq!(
+        cache
+            .evict_source_below(gyges_chain::Source::TorLwd, BlockHeight::from_u32(u32::MAX))
+            .unwrap(),
+        0
+    );
+    // It stays stalled: the next ticks do not retry the endpoint.
+    let block_ranges = || {
+        liar.calls()
+            .iter()
+            .filter(|m| *m == "GetBlockRange")
+            .count()
+    };
+    let before = block_ranges();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let k = wait_status(&mut c, "copy", "still stalled", |_| true).await;
+    assert_eq!(
+        k.stall_reason(),
+        gyges_proto::v1::StallReason::FallbackUntrusted,
+        "{k:?}"
+    );
+    assert_eq!(block_ranges(), before, "{:?}", liar.calls());
+    running.task.abort();
+}
+
 /// Item 3, the pruning race: the node prunes past a key while it scans
 /// (after the first batch); the key falls back to the endpoint, validates
 /// at `retained_from + k` and finishes on the node.
