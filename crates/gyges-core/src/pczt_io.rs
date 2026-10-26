@@ -67,14 +67,11 @@ pub fn tags_of(pczt: &Pczt) -> Result<Tags, TxError> {
     };
     let key_id = text(TAG_KEY_ID)?;
     let network_name = text(TAG_NETWORK)?;
-    let network = Network::ALL
-        .into_iter()
-        .find(|n| n.name() == network_name)
-        .ok_or_else(|| {
-            TxError::InvalidArgument(format!(
-                "the PCZT names an unknown network `{network_name}`"
-            ))
-        })?;
+    let network: Network = network_name.parse().map_err(|_| {
+        TxError::InvalidArgument(format!(
+            "the PCZT names an unknown network `{network_name}`"
+        ))
+    })?;
     let session_id = text(TAG_SESSION_ID)?;
     if session_id.len() != 32 || !session_id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(TxError::InvalidArgument(

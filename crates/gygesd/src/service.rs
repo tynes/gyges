@@ -4,7 +4,6 @@
 //! `UNIMPLEMENTED` through the stubs `tonic-prost-build` generates.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use gyges_chain::{ArtiTorLwdBackend, BlockDb, ChainBackend};
 use gyges_core::network::ConsensusParams;
@@ -215,12 +214,7 @@ pub fn proto_network(network: Network) -> v1::Network {
     }
 }
 
-pub(crate) fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
-}
+pub(crate) use gyges_core::profile::unix_now;
 
 /// The tonic service; cheap to clone.
 #[derive(Clone, Debug)]

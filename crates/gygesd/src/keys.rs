@@ -7,7 +7,7 @@
 //! never appear in a log line or an error detail.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use age::secrecy::SecretString;
 use gyges_chain::ChainError;
@@ -67,7 +67,7 @@ pub fn summary(entry: &KeyEntry, default_key: &str, unlocks: &[UnlockState]) -> 
         signing_mode: proto_signing_mode(p.signing_mode) as i32,
         is_default: p.key_id == default_key,
         locked: unlock.is_none(),
-        unlock_expires_at: unlock.map_or(0, |u| unix_secs(u.expires_at)),
+        unlock_expires_at: unlock.map_or(0, |u| gyges_core::profile::unix_secs(u.expires_at)),
         birthday_height: p.birthday_height.unwrap_or(0),
         scanned_tip: entry.scanned_tip(),
         spend_pools: p
@@ -97,12 +97,6 @@ pub fn summaries(state: &DaemonState) -> Vec<KeySummary> {
         .iter()
         .map(|e| summary(e, &default, &unlocks))
         .collect()
-}
-
-fn unix_secs(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 /// `VaultError` → typed error.
@@ -488,7 +482,7 @@ pub async fn unlock_key(
             .as_ref()
             .map(|t| t.as_bytes().to_vec())
             .unwrap_or_default(),
-        expires_at: unix_secs(unlocked.expires_at),
+        expires_at: gyges_core::profile::unix_secs(unlocked.expires_at),
         scope: match unlocked.scope {
             Scope::Daemon => UnlockScope::Daemon,
             Scope::Connection(_) => UnlockScope::Connection,

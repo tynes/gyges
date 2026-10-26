@@ -117,10 +117,7 @@ impl SessionHub {
         ttl: Duration,
         summary: v1::Proposal,
     ) -> (String, i64, oneshot::Receiver<UnifiedSpendingKey>) {
-        use rand::Rng as _;
-        let mut id = [0u8; 16];
-        rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut id);
-        let session_id = hex::encode(id);
+        let session_id = gyges_core::pczt_io::new_session_id();
         let (tx, rx) = oneshot::channel();
         let now = unix_now();
         let expires_at = now + i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
