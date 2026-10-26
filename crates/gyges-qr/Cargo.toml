@@ -14,5 +14,8 @@ ur = { workspace = true }
 ur-registry = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+hex = { workspace = true }
+
 [lints]
 workspace = true

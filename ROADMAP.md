@@ -158,7 +158,9 @@ Design note: `SYNC.md` §Case B.
      **Fixed on the way:** a restore at the default (Sapling activation) birthday skipped the below-window path. It needs no tree state, so `birthday::resolve` never compared it with the node's `retained_from`. Against a pruned node it got no consent step, no endpoint check and no best-effort warning, and the scheduler then backfilled anyway. `resolve` now returns `BelowRetention` for it when a connected node has pruned the birthday's block. A node that does not answer still leaves it to the scheduler, so an offline restore at the default birthday works as before. `rpc.rs::restore_below_the_retention_window_is_refused_in_two_steps` now expects the two refusals for it.
 
      Not covered: the handoff's subtree-root comparison runs, but no subtree completes on a chain this size, so both sides are empty. Also not covered are `--via-tor` broadcasts through zaino: they reach only the archive node's mempool, where nothing mines.
-  4. Nightly job through a local Tor network (the workflow's first `schedule:` trigger), the Tor half of this item's heading. Not started.
+  4. Nightly job through a local Tor network (the workflow's first `schedule:` trigger), the Tor half of this item's heading. **Deferred 2026-10-26.** As written it cannot be built without changing upstream: `zcash_client_backend::tor::Client::create_with_timeouts` builds its arti config from `TorClientConfigBuilder::from_directories` alone and keeps the `TorClient` private, so it cannot be given a chutney network's directory authorities. Two ways forward, neither started:
+     - **The real Tor network with a local onion service.** A system `tor` publishes zaino's port as an `.onion` (`HiddenServiceDir`), and the daemon reaches it with `use_tor = true` through upstream's own connector. This needs no production change (`arti-client/onion-service-client` is already enabled by `zakura-client-backend`, and `Config::validate` accepts an `http://` `.onion` URL on regtest), but the job depends on the public network and on onion descriptors publishing in time.
+     - **gyges owns its arti client.** It builds its own `TorClient` with a test-network override and its own copy of upstream's `HttpTcpConnector`, which makes chutney possible but tests a copy of the connector rather than the shipping one.
 
 ## M3 — ZIP 320 (`tex1`) sends
 
@@ -183,7 +185,16 @@ Design note: `ARCHITECTURE.md` §3.3, `DATA_MODEL.md` `gyges_tex_queue`.
 
 Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
 
-- [ ] `gyges-qr`: half-block renderer, fountain encoder/decoder, registry types 49201/49203/49204/49205/49207.
+- [x] `gyges-qr`: half-block renderer, fountain encoder/decoder, registry types 49201/49203/49204/49205/49207. Landed as:
+  - `gyges_qr::{render, render_str, render_frame}`: a QR code (level L, quiet zone) as UTF-8 half blocks, two module rows per line, drawn for a light-on-dark terminal. `render_frame` uppercases a `ur:` frame first so it is encoded in alphanumeric mode.
+  - `gyges_qr::{Frames, Assembler}` over `ur` 0.5.2. A payload that fits one fragment is a single `ur:<type>/<body>` frame; a longer one is fountain-coded (`DEFAULT_FRAGMENT_LEN` 200). The assembler takes frames in any order and either case, reports `(resolved, total)` progress, and refuses a frame of another UR type than the first.
+  - `gyges_qr::{Payload, Accounts, Account}`: `zcash-accounts`, `zcash-unified-full-viewing-key`, `zcash-pczt`, `zcash-sign-batch` and `zcash-batch-sig-result` to and from their CBOR bodies through `ur-registry`'s codecs, so no caller depends on `ur-registry`. 49202 and 49206 are refused. The sign-batch and batch-sig-result bodies are opaque `pczt::roles::signer::batch::{BatchSignRequest, BatchSignResponse}` bytes, which `zakura-pczt` rc7 already provides for the third item, as `zakura-client-backend` rc9.1 provides `redact_pczt_for_batch_signer`.
+  - `gyges_qr::Animation`: the 8 FPS loop, redrawn in place with ANSI cursor movement; a single frame is drawn once.
+  - The CLI's first use: `address current --qr` / `address new --qr` (the code on stderr, the address alone on stdout) and `address qr [ADDRESS]` (the code on stdout; a given address is checked with `InspectAddress` first and refused with exit 6), which used to exit 1 as not implemented.
+
+  Tests: 14 unit tests in `gyges-qr` (TESTING.md §4: the registry tags against `ur-registry`, the 12 KiB fountain round trip at three fragment sizes with frames shuffled and a fifth dropped, every payload type through frames, `ur-registry`'s `zcash-accounts` vector, the refusals, the renderer's shape and alphanumeric mode, the animation), a unit test in `gyges-cli`, and `scenarios/tx.rs::addresses_notes_and_history_through_the_binaries`, which now checks the three QR commands, `-q`, `--json` and the exit-6 refusal.
+
+  Not done: the recorded device fixtures of TESTING.md §4 (they need a Keystone; synthetic round trips stand in); the Redactor test, which moves to the third item; `pczt qr-export`, `sign --qr-out` and `qr-import` (third item); the camera (fourth item); a phone scan. Checked once by hand instead: the rendered text, turned back into pixels as a light-on-dark terminal shows it, decodes with `rqrr` to a 223-character regtest address, and the 15 frames of a 3 KB payload decode and reassemble to its bytes.
 - [ ] `key import-keystone` with required birthday and `device_version` check.
 - [ ] Batch protocol for shielded sends; single-PCZT protocol with Combiner for transparent inputs; signing sessions that survive restarts; `qr-import --from-file` and `--session`.
 - [ ] `qr-scan` camera path.
