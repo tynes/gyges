@@ -2306,6 +2306,7 @@ dependencies = [
  "bip0039",
  "bip32",
  "gyges-chain",
+ "gyges-qr",
  "hex",
  "humantime",
  "humantime-serde",

@@ -219,7 +219,55 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
   - a recorded export from a real device (TESTING.md §4 `accounts.ur`, `firmware_old.ur`), and checking on hardware that v3.0.2 exports `13.0.2`;
   - `key import-ufvk`;
   - the signing itself (third item).
-- [ ] Batch protocol for shielded sends; single-PCZT protocol with Combiner for transparent inputs; signing sessions that survive restarts; `qr-import --from-file` and `--session`.
+- [x] Batch protocol for shielded sends; single-PCZT protocol with Combiner for transparent inputs; signing sessions that survive restarts; `qr-import --from-file` and `--session`. Landed as:
+  - **`gyges_core::keystone`:**
+    - `protocol_for`: batch without transparent inputs, single PCZT with them.
+    - `device_request`, built from the **unproven** PCZT as Zodl does, with the `gyges.*` tags stripped:
+      - batch: upstream's `redact_pczt_for_batch_signer` inside a `BatchSignRequest`, with a 16-byte request id, as `zcash-sign-batch` CBOR;
+      - single PCZT: `redact_pczt_for_signer(Full)` as `zcash-pczt`.
+    - `apply_answer`:
+      - batch: the request id must match, exactly one entry, and each signature goes through `Signer::apply_orchard_spend_auth_signature`, which verifies it;
+      - single PCZT: the Combiner.
+  - **`gyges_core::sessions`:** the Keystone half in its own `ext_gyges_keystone_sessions` table (DATA_MODEL.md §5.2): the proven PCZT, the payload, the request id, the route and the expiry height. Plus `leave_awaiting`, a conditional update that claims a session exactly once and keeps abort and expiry off finished rows.
+  - **`gygesd::keystone`:**
+    - `await_device`, step 5 of the send pipeline for a Keystone key: persist, emit `SignatureRequired`, wait. A client that leaves loses nothing.
+    - `CompleteKeystoneSign`, which runs in order:
+      - an in-memory claim against concurrent completions;
+      - lazy expiry;
+      - the tip against the transaction's expiry (`NOT_SYNCED` before anything is recorded);
+      - the answer;
+      - every signature present;
+      - the Verifier;
+      - the row claim;
+      - extract, record and broadcast.
+    - The waiting stream is told the txid.
+    - `ListSigningSessions` returns the persisted sessions with their payload (new `SigningSession.payload`), and `AbortSigningSession` aborts them.
+  - **`gygesd::tx`:** `tx send` and `tx shield` from a `keystone-qr` key go through it.
+    - The transaction gets a PCZT file's expiry (`target + 1152`) instead of 40 blocks, since a session may wait a day.
+    - A second spend while one session waits is refused with `SIGNATURE_REQUIRED` naming it, since it could pick the same notes.
+    - A `tex1` recipient is refused with `HARDWARE_SIGNER` (THREAT_MODEL.md §6 item 7).
+  - **CLI:**
+    - `tx send` / `tx shield` animate the request on a terminal and read the pasted answer frames.
+    - Otherwise, or with `--qr-out`, they print or write the frames and exit 4.
+    - `pczt qr-export --session` (animated, printed, or `-o`).
+    - `pczt qr-import --session` (positional, `--from-file` or stdin; prints the txid).
+
+  A refused answer leaves the session open for another scan instead of marking it failed (API.md §6.4 records the deviation).
+
+  Tests:
+  - `gyges_core::keystone::emulator` (feature `test-util`) is a device in software. It works from the payload alone, through shuffled, lossy fountain frames, with upstream's signer roles only.
+  - `rpc.rs::keystone_shield_and_send_through_both_protocols`: both protocols, the Redactor checks (TESTING.md §4, moved here from the first item), six refused answers each followed by a successful one, the pending-spend refusal, a double completion, and the balance.
+  - `rpc.rs::a_keystone_session_survives_a_restart_and_expires_with_its_transaction`: abort; client gone plus daemon restart, then completion from the listed payload; expiry.
+  - `scenarios/keystone.rs::keystone_signing_through_the_binaries`: exit 4 with frames, `--qr-out`, `qr-export`, `qr-import` from a file and from arguments, a partial answer, an aborted session.
+  - CLI unit tests of the answer's reassembly.
+  - The item-2 test now expects a Keystone send to wait for the device instead of being refused.
+
+  Not done:
+  - real hardware (the device's acceptance of these exact views and the fields it displays, THREAT_MODEL.md §6 item 7);
+  - the PCZT file flow (`qr-export FILE`, `qr-import` without `--session`, `pczt sign` for a Keystone key, `SIGN_PCZT` sessions);
+  - `tex1` from a Keystone (fifth item);
+  - an automated test of the interactive terminal path;
+  - rebroadcasting a completed session the node refused (it stays `signed` with the node's error).
 - [ ] `qr-scan` camera path.
 - [ ] Verify on hardware: TEX Step 2 signing, which PCZT fields the device displays. Settle the host side first: step 1 of a ZIP 320 send is part of a multi-step proposal, which `create_pczt_from_proposal` refuses, and the `TexQueue` signs with a spending key a Keystone profile does not hold.
 

@@ -205,8 +205,16 @@ the batch protocol rejects transparent inputs.
 Status (ROADMAP.md M1, `TxEngine`): implemented for `LOCAL_SEED` profiles
 with `n = 1`; `Proving` is emitted once per shielded pool with work before
 the proofs and once after. A `WATCH_ONLY` profile answers
-`INVALID_ARGUMENT`, a `KEYSTONE_QR` one `HARDWARE_SIGNER`, until their items
-land. Passphrase sessions live in daemon memory only (§6.1) and show in
+`INVALID_ARGUMENT`. A `KEYSTONE_QR` profile pauses on a Keystone
+`SignatureRequired` (§6, ROADMAP.md M5 third item): the batch kind when the
+transaction has no transparent inputs, the single-PCZT kind otherwise. Its
+transaction gets the expiry of a PCZT file (`target + 1152` blocks, about a
+day), since it waits for a person and a device; a `tex1` recipient is
+refused with `HARDWARE_SIGNER` until the device's handling of ZIP 320 is
+verified (THREAT_MODEL.md §6 item 7); and while one of its Keystone sessions
+awaits the device, another spend from the key is refused with
+`SIGNATURE_REQUIRED` naming that session (a second proposal could pick the
+same notes). Passphrase sessions live in daemon memory only (§6.1) and show in
 `ListSigningSessions` with their status; a session that is aborted ends its
 stream with `CANCELLED`. A transaction the node refuses (`NODE_REJECTED`)
 has already been recorded in the wallet as unmined and its inputs stay
@@ -398,6 +406,12 @@ and so that a Keystone round trip can be completed from a later process.
 
 ### 6.1 Record
 
+*As built:* `ext_gyges_signing_sessions` plus, for Keystone kinds,
+`ext_gyges_keystone_sessions` (DATA_MODEL.md §5.2). The first draft below is
+kept for the fields' meaning; `key_id` is implied by the key's own wallet,
+`proven_pczt`, `request_id` and the payload are in the Keystone table, and
+there is no `failed` status (§6.4).
+
 Persisted in `wallet.sqlite` (table `signing_sessions`, Q-K4):
 
 ```
@@ -422,6 +436,15 @@ created them is gone); Keystone sessions are, and expire after
 as `AWAITING_SIGNATURE` with their `session_id`, in `gyges tx sessions`, and
 can be aborted with `gyges tx abort SESSION_ID`.
 
+*As built (ROADMAP.md M5, third item):* `ListSigningSessions` returns the
+persisted Keystone sessions with their `payload` (the CBOR shown to the
+device), so `gyges pczt qr-export --session ID` can show the frames again
+from another process. A session past `expires_at` is marked expired when it
+is next listed or completed. A stream waiting on a Keystone session that
+expires ends with `SESSION_NOT_FOUND`; there is no fresh session, since a new
+one would need a new scan of the device. A client that disconnects leaves
+the session open.
+
 ### 6.2 Satisfying a session
 
 | `kind` | Client action | Daemon action |
@@ -432,6 +455,24 @@ can be aborted with `gyges tx abort SESSION_ID`.
 
 A session can be satisfied once. A second attempt returns
 `SESSION_NOT_FOUND`.
+
+*As built:* `CompleteKeystoneSign` finds the session in whichever key holds
+it, needs no stream (it works after a restart), and runs these steps in order:
+- refuses a session at or past its transaction's expiry height with
+  `NOT_SYNCED`, and marks it expired, before anything is recorded;
+- applies the answer: for batch, the request id must match and the answer must
+  carry exactly one PCZT entry, and each signature is applied with
+  `Signer::apply_orchard_spend_auth_signature`, which verifies it against the
+  action's randomized key; for single-PCZT, the Combiner;
+- checks that every required signature is present;
+- runs the Verifier;
+- claims the row (`awaiting-signature` → `signed`, conditionally);
+- extracts, records and broadcasts.
+
+Two completions of one session cannot run together: the second gets
+`SESSION_NOT_FOUND`. The stream that created the session, if still open,
+then emits `Signed` and `Broadcast`. The `SIGN_PCZT` purpose is not built:
+`pczt sign` refuses a Keystone key.
 
 ### 6.3 Connection scoping and tokens
 
@@ -474,6 +515,13 @@ output address, value, fee, memo or anchor differs (Q-K7). On failure the
 session is marked `failed` with `last_error`, the response is
 `HARDWARE_SIGNER` (Keystone kinds) or `INTERNAL` (passphrase kinds), and
 nothing is broadcast or stored as a pending transaction.
+
+*As built, deliberately different:* a refused Keystone answer (wrong
+request id, a signature that does not verify, a missing signature, a PCZT
+the Combiner or the Verifier refuses) leaves the session
+`awaiting-signature` with `last_error`, so the user can scan the device
+again; nothing is broadcast or recorded. A failed session would force a new
+proposal and a new scan for what is usually a misread QR code.
 
 ### 6.5 ZIP 320 and sessions
 

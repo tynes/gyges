@@ -19,9 +19,9 @@ mod zaino;
 
 pub use common::{
     FAST_CONFIG, NODE_CONFIG, SPEND_CONFIG, TEX_CONFIG, balance, burn_t_address, burn_tex_address,
-    funded_wallet, keystone_export, mnemonic, parse_tex_txids, regtest, send, shield, spendable,
-    start_daemon, sweep_logs, sync_wait, sync_wait_within, test_key_miner, test_key_transparent,
-    test_key_transparent_address, wait_balance, wait_for_txid, wait_stalled,
+    funded_wallet, keystone_device, keystone_export, mnemonic, parse_tex_txids, regtest, send,
+    shield, spendable, start_daemon, sweep_logs, sync_wait, sync_wait_within, test_key_miner,
+    test_key_transparent, test_key_transparent_address, wait_balance, wait_for_txid, wait_stalled,
 };
 pub use fake::{
     FakeNodeHandle, PASSPHRASE, fund_transparent, pool_spendable, synced_key, tex_row,
@@ -156,6 +156,12 @@ pub struct Cmd {
 impl Cmd {
     pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
         self.cmd.env(key, value);
+        self
+    }
+
+    /// One more argument (a path, say).
+    pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+        self.cmd.arg(arg);
         self
     }
 

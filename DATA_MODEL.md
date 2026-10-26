@@ -218,7 +218,7 @@ State machine: `built → step1_broadcast → step2_broadcast → step1_mined �
 
 ### 5.2 `gyges_signing_sessions` (Q-K4, Q-C4)
 
-**Landed (ROADMAP.md M4, first item) as `gyges_core::sessions`, table `ext_gyges_signing_sessions`** (the `ext_` prefix, as for §5.1), with the columns the file protocol needs; the Keystone columns below join it with M5:
+**Landed (ROADMAP.md M4, first item) as `gyges_core::sessions`, table `ext_gyges_signing_sessions`** (the `ext_` prefix, as for §5.1), with the columns the file protocol needs; Keystone sessions add a table of their own (below):
 
 ```sql
 CREATE TABLE ext_gyges_signing_sessions (
@@ -235,25 +235,23 @@ CREATE TABLE ext_gyges_signing_sessions (
 CREATE INDEX ext_gyges_signing_sessions_status ON ext_gyges_signing_sessions (status, expires_at);
 ```
 
-A row is inserted as `awaiting-signature` by `CreatePczt` (protocol `file`) and moved to `broadcast` by `BroadcastPczt`; a second broadcast of the same session is refused. Passphrase sessions of `tx send` are still memory-only (API.md §6.1). The design below is what the Keystone kinds will add.
+A row is inserted as `awaiting-signature` by `CreatePczt` (protocol `file`) and moved to `broadcast` by `BroadcastPczt`; a second broadcast of the same session is refused. Passphrase sessions of `tx send` are still memory-only (API.md §6.1).
+
+**Keystone sessions (ROADMAP.md M5, third item)** are a row here (protocol `keystone-batch` or `keystone-pczt`) plus their device-side half in a table of their own under the same `session_id`. It is a separate table, not new columns, because an `ext_` migration has no ordering and its `down` drops its table, so an `ALTER` migration could neither be ordered after the `CREATE` nor rolled back safely:
 
 ```sql
-CREATE TABLE gyges_signing_sessions (
-    session_id        BLOB NOT NULL PRIMARY KEY,  -- 16 random bytes
-    protocol          TEXT NOT NULL CHECK (protocol IN ('passphrase', 'keystone-batch', 'keystone-pczt', 'file')),
-    status            TEXT NOT NULL CHECK (status IN ('awaiting-signature', 'signed', 'broadcast', 'aborted', 'expired')),
-    created_at        INTEGER NOT NULL,
-    expires_at        INTEGER NOT NULL,
-    proposal          BLOB NOT NULL,              -- what the Verifier checks against after signing
-    proven_pczt       BLOB NOT NULL,              -- postcard-serialised PCZT after Prover
-    sent_payload_hash BLOB NOT NULL,              -- BLAKE2b-256 of the redacted payload sent to the signer
-    request_id        BLOB,                       -- echoed by zcash-batch-sig-result
-    input_path        TEXT,                       -- 'camera' | 'file' | 'stdin', recorded on completion
-    tex_step1_txid    BLOB,                       -- links to ext_gyges_tex_queue when the session is a ZIP 320 send
-    last_error        TEXT
+CREATE TABLE ext_gyges_keystone_sessions (
+    session_id    TEXT NOT NULL PRIMARY KEY,   -- = ext_gyges_signing_sessions.session_id
+    purpose       TEXT NOT NULL CHECK (purpose IN ('send', 'sign-pczt')),  -- 'send' only so far
+    pczt          BLOB NOT NULL,               -- the proven, unsigned PCZT the device's answer is applied to
+    payload       BLOB NOT NULL,               -- the CBOR shown to the device (zcash-sign-batch or zcash-pczt), for `pczt qr-export --session`
+    request_id    BLOB,                        -- 16 random bytes, echoed by zcash-batch-sig-result
+    via_tor       INTEGER NOT NULL,            -- broadcast through the fallback endpoint
+    expiry_height INTEGER NOT NULL             -- the transaction's nExpiryHeight; completing at or past it is refused
 );
-CREATE INDEX gyges_signing_sessions_status ON gyges_signing_sessions (status, expires_at);
 ```
+
+Both rows are inserted in one transaction. A completion moves the row from `awaiting-signature` to `signed` with a conditional update, which is how a session is claimed exactly once, then to `broadcast` with the txid. A node refusal leaves it `signed` with `last_error`. A refused device answer leaves it `awaiting-signature` with `last_error`, so the user can scan again. Abort and expiry also update only a row still awaiting. The first draft's `sent_payload_hash`, `input_path` and `tex_step1_txid` were not needed: the payload itself is kept, the input path is the CLI's business, and Keystone keys cannot pay `tex1` recipients yet.
 
 The connection-scoped unlock token from Q-S1 is **not** stored here: it lives only in daemon memory and dies with the connection.
 

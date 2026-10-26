@@ -4,8 +4,10 @@
 //!
 //! Implemented: `create`, `inspect`, `prove`, `sign`, `combine` and
 //! `broadcast`. The key is read from the file's `gyges.key_id`; `--key` is
-//! an assertion the daemon checks (`KEY_MISMATCH`, exit 6). The QR commands
-//! (`qr-export`, `qr-scan`, `qr-import`) wait for ROADMAP.md M5.
+//! an assertion the daemon checks (`KEY_MISMATCH`, exit 6). `qr-export
+//! --session` and `qr-import --session` show and complete a Keystone
+//! signing session (`crate::keystone`); the same for PCZT files, and the
+//! camera (`qr-scan`), wait for later M5 items.
 //!
 //! With `--json` every command prints its RPC response (the PCZT bytes as
 //! base64 inside it) on stdout and writes the file only when `-o` is given.
@@ -42,12 +44,40 @@ pub enum PcztCmd {
     Combine(CombineArgs),
     /// Verify against the proposal stored at `create`, then extract and send to the node.
     Broadcast(BroadcastArgs),
-    /// Animate a PCZT as `ur:zcash-pczt` frames (ROADMAP.md M5).
-    QrExport(Unimplemented),
+    /// Show a pending Keystone signing session's request as an animated QR code (or its frames).
+    QrExport(QrExportArgs),
     /// Read a Keystone's answer from the camera (ROADMAP.md M5).
     QrScan(Unimplemented),
-    /// Read a Keystone's answer from frames (ROADMAP.md M5).
-    QrImport(Unimplemented),
+    /// Complete a Keystone signing session with the device's answer frames.
+    QrImport(QrImportArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct QrExportArgs {
+    /// A PCZT file (not supported yet: a file must be redacted for the device first; use --session).
+    pub file: Option<PathBuf>,
+    /// The pending Keystone session whose request to show (`gyges tx sessions` lists them).
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
+    /// Frames per second of the animation.
+    #[arg(long, value_name = "N", default_value_t = gyges_qr::DEFAULT_FPS)]
+    pub fps: u32,
+    /// Write the frames here, one per line, instead of animating them.
+    #[arg(short, long, value_name = "FILE")]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct QrImportArgs {
+    /// The Keystone session the answer completes (required for now).
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
+    /// Read the frames from this file, one per line, instead of stdin.
+    #[arg(long, value_name = "FRAMES_FILE", conflicts_with = "frames")]
+    pub from_file: Option<PathBuf>,
+    /// The answer's frames (a batch answer is usually one).
+    #[arg(value_name = "UR_FRAME")]
+    pub frames: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -117,9 +147,9 @@ pub async fn run(ctx: &Ctx, cmd: PcztCmd) -> Result<(), CliError> {
         PcztCmd::Sign(args) => sign(ctx, args).await,
         PcztCmd::Combine(args) => combine(ctx, args).await,
         PcztCmd::Broadcast(args) => broadcast(ctx, args).await,
-        PcztCmd::QrExport(_) => Err(CliError::NotImplemented("pczt qr-export")),
+        PcztCmd::QrExport(args) => qr_export(ctx, args).await,
         PcztCmd::QrScan(_) => Err(CliError::NotImplemented("pczt qr-scan")),
-        PcztCmd::QrImport(_) => Err(CliError::NotImplemented("pczt qr-import")),
+        PcztCmd::QrImport(args) => qr_import(ctx, args).await,
     }
 }
 
@@ -402,6 +432,108 @@ async fn broadcast(ctx: &Ctx, args: BroadcastArgs) -> Result<(), CliError> {
             eprintln!("broadcast");
         }
     }
+    Ok(())
+}
+
+/// `--session` is required for now: a PCZT file is not redacted for the
+/// device (THREAT_MODEL.md §5 row 9), so only daemon sessions are shown.
+fn session_arg(session: Option<String>, what: &'static str) -> Result<String, CliError> {
+    session.ok_or(CliError::NotImplemented(what))
+}
+
+/// The pending Keystone session `session_id`, from any key.
+async fn pending_session(
+    ctx: &Ctx,
+    session_id: &str,
+) -> Result<gyges_proto::v1::SigningSession, CliError> {
+    let mut conn = ctx.connect().await?;
+    let all = conn
+        .client
+        .list_signing_sessions(gyges_proto::v1::ListSigningSessionsRequest {
+            key_id: String::new(),
+            include_finished: false,
+        })
+        .await?
+        .into_inner();
+    all.sessions
+        .into_iter()
+        .find(|s| s.session_id == session_id && !s.payload.is_empty())
+        .ok_or_else(|| {
+            CliError::Daemon(
+                GygesError::new(
+                    ErrorReason::SessionNotFound,
+                    "no Keystone signing session awaiting the device has this id (`gyges tx sessions` lists them)",
+                )
+                .with_session(session_id),
+            )
+        })
+}
+
+/// `pczt qr-export --session ID`: the request again, animated on a
+/// terminal, else (or with `-o`) as frames one per line.
+async fn qr_export(ctx: &Ctx, args: QrExportArgs) -> Result<(), CliError> {
+    if args.file.is_some() {
+        return Err(CliError::NotImplemented(
+            "pczt qr-export FILE (use --session)",
+        ));
+    }
+    let session_id = session_arg(args.session, "pczt qr-export without --session")?;
+    let session = pending_session(ctx, &session_id).await?;
+    let frames = crate::keystone::frames(session.kind(), &session.payload)?;
+    if let Some(path) = &args.out {
+        let lines = crate::keystone::frame_lines(frames)?;
+        std::fs::write(path, lines.join("\n") + "\n")?;
+        ctx.note(format_args!(
+            "{} frame(s) written to {}",
+            lines.len(),
+            path.display()
+        ));
+        return Ok(());
+    }
+    if ctx.json {
+        let lines = crate::keystone::frame_lines(frames)?;
+        let v = serde_json::json!({ "session_id": session_id, "frames": lines });
+        println!("{}", to_json(&v)?);
+        return Ok(());
+    }
+    if !crate::keystone::can_animate(ctx) {
+        for line in crate::keystone::frame_lines(frames)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    eprintln!("Scan this QR code with the Keystone, then press Enter.");
+    crate::keystone::animate_until_enter(frames, args.fps.max(1)).await
+}
+
+/// `pczt qr-import --session ID`: the device's answer from positional
+/// frames, `--from-file` or stdin, through `CompleteKeystoneSign`; prints
+/// the broadcast txid.
+async fn qr_import(ctx: &Ctx, args: QrImportArgs) -> Result<(), CliError> {
+    let session_id = session_arg(args.session, "pczt qr-import without --session")?;
+    let session = pending_session(ctx, &session_id).await?;
+    let (_, answer) = crate::keystone::ur_types(session.kind())?;
+    let text = if !args.frames.is_empty() {
+        args.frames.join("\n")
+    } else if let Some(path) = &args.from_file {
+        std::fs::read_to_string(path)?
+    } else {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        s
+    };
+    let cbor = crate::keystone::assemble(text.lines(), answer)?;
+    let resp = crate::keystone::complete(ctx, &session_id, cbor).await?;
+    if ctx.json {
+        println!("{}", to_json(&resp)?);
+        return Ok(());
+    }
+    for txid in crate::keystone::txids(&resp) {
+        println!("{txid}");
+    }
+    ctx.note(format_args!(
+        "session {session_id} signed on the Keystone and broadcast"
+    ));
     Ok(())
 }
 

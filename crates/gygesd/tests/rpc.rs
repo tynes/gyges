@@ -952,19 +952,27 @@ async fn a_keystone_import_is_the_seeds_account_and_builds_pczts_for_the_device(
         .unwrap();
     assert!(inputs > 0);
 
-    // Nothing is signed on the host.
-    let err = collect_events(
-        c.send_transaction(SendTransactionRequest {
+    // Nothing is signed on the host: a send waits for the device (here the
+    // single-PCZT protocol, since the funds are transparent), and the key
+    // cannot be unlocked.
+    let mut s = c
+        .clone()
+        .send_transaction(SendTransactionRequest {
             key_id: "ks".into(),
             to: t_recipient(),
             amount: zats(100_000_000),
             ..Default::default()
         })
-        .await,
-    )
+        .await
+        .unwrap()
+        .into_inner();
+    let req = until_signature_required(&mut s).await;
+    assert_eq!(req.kind(), SignatureKind::KeystoneSinglePczt);
+    c.abort_signing_session(AbortSigningSessionRequest {
+        session_id: req.session_id,
+    })
     .await
-    .unwrap_err();
-    assert_eq!(reason(&err), ErrorReason::HardwareSigner, "{err:?}");
+    .unwrap();
     let err = c
         .unlock_key(UnlockKeyRequest {
             key_id: "ks".into(),
@@ -1179,6 +1187,550 @@ async fn keystone_import_refusals_and_account_choice() {
         .await
         .unwrap_err();
     assert_eq!(reason(&err), ErrorReason::KeyExists, "{err:?}");
+    running.task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// An emulated Keystone (ROADMAP.md M5, third item)
+// ---------------------------------------------------------------------------
+
+/// The spending key a Keystone paired with [`keystone_export`] holds for
+/// `account`.
+fn keystone_usk(account: u32) -> zcash_keys::keys::UnifiedSpendingKey {
+    use secrecy::ExposeSecret as _;
+    let entropy = gyges_core::vault::entropy_from_phrase(&known_mnemonic()).unwrap();
+    let seed = gyges_core::vault::seed_from_entropy(&entropy);
+    zcash_keys::keys::UnifiedSpendingKey::from_seed(
+        &Network::Regtest.consensus_params(),
+        seed.expose_secret(),
+        zip32::AccountId::try_from(account).unwrap(),
+    )
+    .unwrap()
+}
+
+fn keystone_fingerprint() -> zip32::fingerprint::SeedFingerprint {
+    use secrecy::ExposeSecret as _;
+    let entropy = gyges_core::vault::entropy_from_phrase(&known_mnemonic()).unwrap();
+    let seed = gyges_core::vault::seed_from_entropy(&entropy);
+    zip32::fingerprint::SeedFingerprint::from_seed(seed.expose_secret()).unwrap()
+}
+
+/// `cbor` carried through a camera: fountain frames of `ur_type`, shuffled,
+/// a fifth dropped, reassembled.
+fn through_camera(ur_type: &'static str, cbor: &[u8]) -> Vec<u8> {
+    let mut frames = gyges_qr::Frames::new(ur_type, cbor, 120).unwrap();
+    let n = frames.fragment_count();
+    let mut sent: Vec<String> = (0..3 * n).map(|_| frames.next_frame().unwrap()).collect();
+    let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+    for i in (1..sent.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        sent.swap(i, (x % (i as u64 + 1)) as usize);
+    }
+    sent.truncate(sent.len() * 4 / 5);
+    let mut asm = gyges_qr::Assembler::new();
+    for f in &sent {
+        if asm.is_complete() {
+            break;
+        }
+        asm.receive(f).unwrap();
+    }
+    while !asm.is_complete() {
+        asm.receive(&frames.next_frame().unwrap()).unwrap();
+    }
+    asm.message().unwrap().unwrap().1
+}
+
+/// The emulated device holding `account`'s key.
+fn keystone_device(account: u32) -> gyges_core::keystone::emulator::Device {
+    gyges_core::keystone::emulator::Device {
+        usk: keystone_usk(account),
+        fingerprint: keystone_fingerprint(),
+        coin_type: 1,
+    }
+}
+
+/// The device's batch signatures for a request that came through the
+/// camera.
+fn keystone_batch_signatures(
+    payload: &[u8],
+    account: u32,
+) -> (Vec<u8>, Vec<Vec<pczt::roles::signer::SpendAuthSignature>>) {
+    let cbor = through_camera(gyges_qr::ur_types::ZCASH_SIGN_BATCH, payload);
+    gyges_core::keystone::emulator::batch_signatures(&keystone_device(account), &cbor)
+}
+
+use gyges_core::keystone::emulator::{batch_answer, pczt_answer};
+
+/// The device's signed PCZT for a single-PCZT request that came through
+/// the camera.
+fn keystone_signed_pczt(payload: &[u8]) -> Vec<u8> {
+    let cbor = through_camera(gyges_qr::ur_types::ZCASH_PCZT, payload);
+    gyges_core::keystone::emulator::signed_pczt(&keystone_device(0), &cbor)
+}
+
+/// What a correctly working device answers.
+fn keystone_answer(req: &gyges_proto::v1::SignatureRequired) -> Vec<u8> {
+    match req.kind() {
+        SignatureKind::KeystoneBatch => {
+            let (id, sigs) = keystone_batch_signatures(&req.payload, 0);
+            batch_answer(id, sigs)
+        }
+        SignatureKind::KeystoneSinglePczt => pczt_answer(keystone_signed_pczt(&req.payload)),
+        other => panic!("not a Keystone kind: {other:?}"),
+    }
+}
+
+/// TESTING.md §4's Redactor test, on what the device is actually shown: no
+/// `gyges.*` tag, no witness, no existing signature in the batch view, and
+/// every output's value as the approved proposal has it (the batch view
+/// after `resolve_fields`, since it compacts what can be recomputed).
+fn assert_device_view(req: &gyges_proto::v1::SignatureRequired) {
+    let mut view = match req.kind() {
+        SignatureKind::KeystoneBatch => {
+            let gyges_qr::Payload::SignBatch { data, .. } = gyges_qr::Payload::from_cbor(
+                gyges_qr::ur_types::ZCASH_SIGN_BATCH,
+                req.payload.clone(),
+            )
+            .unwrap() else {
+                unreachable!()
+            };
+            let r = pczt::roles::signer::batch::BatchSignRequest::parse(&data).unwrap();
+            assert_eq!(r.pczts().len(), 1);
+            r.pczts()[0].clone()
+        }
+        _ => {
+            let gyges_qr::Payload::Pczt(bytes) =
+                gyges_qr::Payload::from_cbor(gyges_qr::ur_types::ZCASH_PCZT, req.payload.clone())
+                    .unwrap()
+            else {
+                unreachable!()
+            };
+            pczt::Pczt::parse(&bytes).unwrap()
+        }
+    };
+    assert!(
+        !view
+            .global()
+            .proprietary()
+            .keys()
+            .any(|k| k.starts_with("gyges.")),
+        "{:?}",
+        view.global().proprietary().keys().collect::<Vec<_>>()
+    );
+    for bundle in [view.orchard(), view.ironwood()] {
+        for a in bundle.actions() {
+            assert!(
+                a.spend().witness().is_none(),
+                "a witness reached the device"
+            );
+            if req.kind() == SignatureKind::KeystoneBatch {
+                assert!(
+                    a.spend().spend_auth_sig().is_none(),
+                    "an existing signature reached the device"
+                );
+            }
+        }
+    }
+    if req.kind() == SignatureKind::KeystoneBatch {
+        view.resolve_fields().unwrap();
+    }
+    let mut shown: Vec<u64> = Vec::new();
+    for bundle in [view.orchard(), view.ironwood()] {
+        shown.extend(
+            bundle
+                .actions()
+                .iter()
+                .filter_map(|a| *a.output().value())
+                .filter(|v| *v > 0),
+        );
+    }
+    shown.extend(view.transparent().outputs().iter().map(|o| *o.value()));
+    shown.sort_unstable();
+    let summary = req.summary.as_ref().unwrap();
+    let mut approved: Vec<u64> = summary.steps[0]
+        .outputs
+        .iter()
+        .map(|o| o.value as u64)
+        .filter(|v| *v > 0)
+        .collect();
+    approved.sort_unstable();
+    assert_eq!(
+        shown, approved,
+        "the device must be shown every output value"
+    );
+}
+
+/// Read a send stream up to its `SignatureRequired`.
+async fn until_signature_required(
+    s: &mut tonic::Streaming<SendEvent>,
+) -> gyges_proto::v1::SignatureRequired {
+    while let Some(ev) = s.next().await {
+        if let Some(send_event::Event::SignatureRequired(r)) = ev.unwrap().event {
+            return r;
+        }
+    }
+    panic!("the stream ended without SignatureRequired");
+}
+
+async fn complete(
+    c: &mut GygesClient<Channel>,
+    session_id: &str,
+    payload: Vec<u8>,
+) -> Result<gyges_proto::v1::CompleteKeystoneSignResponse, tonic::Status> {
+    c.complete_keystone_sign(gyges_proto::v1::CompleteKeystoneSignRequest {
+        session_id: session_id.into(),
+        payload,
+    })
+    .await
+    .map(tonic::Response::into_inner)
+}
+
+async fn keystone_sessions(
+    c: &mut GygesClient<Channel>,
+    include_finished: bool,
+) -> Vec<gyges_proto::v1::SigningSession> {
+    c.list_signing_sessions(ListSigningSessionsRequest {
+        key_id: "ks".into(),
+        include_finished,
+    })
+    .await
+    .unwrap()
+    .into_inner()
+    .sessions
+}
+
+/// A daemon on `node` with the Keystone key `ks` (the known mnemonic's
+/// account 0) holding `z` zatoshis on a transparent receiver.
+async fn funded_keystone(node: &FakeNode, z: u64) -> (Running, GygesClient<Channel>) {
+    let (running, mut c) = start_on(node, ONE_CONF_CONFIG).await;
+    let (frames, _) = keystone_export(&[0], Some("13.2.0"));
+    c.import_keystone(keystone_req("ks", &frames, 1))
+        .await
+        .unwrap();
+    wait_spendable(&mut c, "ks").await;
+    fund(node, &running.state, &mut c, "ks", z).await;
+    (running, c)
+}
+
+/// ROADMAP.md M5, third item, the happy path and every refused answer.
+/// Shielding (transparent inputs) goes by the single-PCZT protocol, a
+/// shielded send by the batch protocol; the device is shown a redacted,
+/// unproven PCZT; the stream resumes once `CompleteKeystoneSign` arrives
+/// from another connection; each refused answer leaves the session
+/// awaiting, and the right one still completes it; a second completion is
+/// `SESSION_NOT_FOUND`; the balance moves.
+#[tokio::test]
+async fn keystone_shield_and_send_through_both_protocols() {
+    let node = mined_node(10).await;
+    let (running, mut c) = funded_keystone(&node, 300_000_000).await;
+    let mut other = client(&running.socket).await;
+
+    // Shield: single PCZT.
+    let mut s = c
+        .shield_funds(ShieldFundsRequest {
+            key_id: "ks".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let req = until_signature_required(&mut s).await;
+    assert_eq!(req.kind(), SignatureKind::KeystoneSinglePczt);
+    assert_eq!(req.key_id, "ks");
+    let summary = req.summary.clone().unwrap();
+    assert!(
+        summary.expiry_height >= summary.anchor_height + gygesd::roles::PCZT_EXPIRY_BLOCKS,
+        "a Keystone send gets a day to be signed: {summary:?}"
+    );
+    assert_device_view(&req);
+    let listed = keystone_sessions(&mut other, false).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].session_id, req.session_id);
+    assert_eq!(listed[0].payload, req.payload);
+    assert_eq!(
+        listed[0].status(),
+        gyges_proto::v1::SessionStatus::AwaitingSignature
+    );
+
+    // A second spend while this one waits is refused, naming it.
+    let err = collect_events(
+        c.clone()
+            .send_transaction(SendTransactionRequest {
+                key_id: "ks".into(),
+                to: t_recipient(),
+                amount: zats(10_000),
+                ..Default::default()
+            })
+            .await,
+    )
+    .await
+    .unwrap_err();
+    let e = GygesError::from_status(&err).unwrap();
+    assert_eq!(e.reason(), ErrorReason::SignatureRequired, "{}", e.detail);
+    assert_eq!(e.session_id, req.session_id);
+
+    // A PCZT with one output value changed: the Combiner refuses it.
+    let signed = keystone_signed_pczt(&req.payload);
+    let change = summary.steps[0].outputs[0].value as u64;
+    let tampered = {
+        // The value occurs more than once in a PCZT; one changed copy is
+        // a device that lies about one field.
+        let (from, to) = (varint(change), varint(change - 1));
+        assert_eq!(from.len(), to.len());
+        let at = (0..=signed.len() - from.len())
+            .find(|&i| signed[i..i + from.len()] == from[..])
+            .expect("the value is in the PCZT");
+        let mut t = signed.clone();
+        t[at..at + to.len()].copy_from_slice(&to);
+        t
+    };
+    let err = complete(&mut other, &req.session_id, pczt_answer(tampered))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::HardwareSigner, "{err:?}");
+    let listed = keystone_sessions(&mut other, false).await;
+    assert!(!listed[0].last_error.is_empty(), "{listed:?}");
+    // A batch answer to a single-PCZT session.
+    let err = complete(
+        &mut other,
+        &req.session_id,
+        batch_answer(vec![0; 16], vec![vec![]]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::HardwareSigner, "{err:?}");
+    // The device's real answer completes it; the stream resumes.
+    let done = complete(&mut other, &req.session_id, pczt_answer(signed))
+        .await
+        .unwrap();
+    let Some(gyges_proto::v1::complete_keystone_sign_response::Result::Broadcast(txids)) =
+        done.result
+    else {
+        panic!("{done:?}")
+    };
+    let rest: Vec<SendEvent> = s.map(|e| e.unwrap()).collect().await;
+    assert_eq!(event_names(&rest), ["signed", "broadcast"], "{rest:?}");
+    assert_eq!(broadcast_txid(&rest), txids.txids[0]);
+    let err = complete(&mut other, &req.session_id, keystone_answer(&req))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::SessionNotFound, "{err:?}");
+    node.mine(1);
+    wait_spendable(&mut c, "ks").await;
+    let b = balance(&mut c, "ks").await;
+    let shielded = balance_of(&b, gyges_proto::v1::Pool::Ironwood).0;
+    assert!(shielded > 299_000_000, "{b:?}");
+
+    // Send from the shielded funds: batch.
+    let mut s = c
+        .send_transaction(SendTransactionRequest {
+            key_id: "ks".into(),
+            to: t_recipient(),
+            amount: zats(100_000_000),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let req = until_signature_required(&mut s).await;
+    assert_eq!(req.kind(), SignatureKind::KeystoneBatch);
+    assert_device_view(&req);
+    let (id, sigs) = keystone_batch_signatures(&req.payload, 0);
+    assert!(!sigs[0].is_empty());
+    // Refused, each leaving the session awaiting: another request id; a
+    // signature that does not verify (one bit off, as a signature over
+    // another transaction or by another key would); a missing signature;
+    // two entries.
+    let mut wrong_id = id.clone();
+    wrong_id[0] ^= 1;
+    let corrupt: Vec<Vec<_>> = vec![
+        sigs[0]
+            .iter()
+            .map(|s| {
+                let mut bytes = *s.signature();
+                bytes[0] ^= 1;
+                pczt::roles::signer::SpendAuthSignature::from_parts(
+                    s.value_pool(),
+                    s.action_index(),
+                    bytes,
+                )
+            })
+            .collect(),
+    ];
+    for (what, answer, needle) in [
+        (
+            "request id",
+            batch_answer(wrong_id, sigs.clone()),
+            "another request",
+        ),
+        (
+            "bad signature",
+            batch_answer(id.clone(), corrupt),
+            "does not verify",
+        ),
+        ("missing", batch_answer(id.clone(), vec![vec![]]), "missing"),
+        (
+            "two entries",
+            batch_answer(id.clone(), vec![sigs[0].clone(), sigs[0].clone()]),
+            "2 PCZT entries",
+        ),
+    ] {
+        let err = complete(&mut other, &req.session_id, answer)
+            .await
+            .expect_err(what);
+        let e = GygesError::from_status(&err).unwrap();
+        assert_eq!(
+            e.reason(),
+            ErrorReason::HardwareSigner,
+            "{what}: {}",
+            e.detail
+        );
+        assert!(
+            e.detail.contains(needle),
+            "{what}: {needle:?} not in {:?}",
+            e.detail
+        );
+    }
+    let done = complete(&mut other, &req.session_id, batch_answer(id, sigs))
+        .await
+        .unwrap();
+    assert_eq!(
+        done.session.unwrap().status(),
+        gyges_proto::v1::SessionStatus::Completed
+    );
+    let rest: Vec<SendEvent> = s.map(|e| e.unwrap()).collect().await;
+    assert_eq!(event_names(&rest), ["signed", "broadcast"], "{rest:?}");
+    node.mine(1);
+    wait_spendable(&mut c, "ks").await;
+    let after = balance_of(
+        &balance(&mut c, "ks").await,
+        gyges_proto::v1::Pool::Ironwood,
+    )
+    .0;
+    assert!(
+        after < shielded - 100_000_000 && after > shielded - 101_000_000,
+        "{after}"
+    );
+    assert!(keystone_sessions(&mut other, false).await.is_empty());
+    assert_eq!(keystone_sessions(&mut other, true).await.len(), 2);
+    running.task.abort();
+}
+
+/// A Keystone session outlives everything but its own expiry: an abort
+/// ends the waiting stream with `CANCELLED`; a client that leaves after
+/// `SignatureRequired` and a daemon restart lose nothing, and the session
+/// completes from the listed payload alone; once the chain passes the
+/// transaction's expiry height, completing it is refused before anything
+/// is recorded.
+#[tokio::test]
+async fn a_keystone_session_survives_a_restart_and_expires_with_its_transaction() {
+    let node = mined_node(10).await;
+    let (running, mut c) = funded_keystone(&node, 300_000_000).await;
+    let shield = || ShieldFundsRequest {
+        key_id: "ks".into(),
+        ..Default::default()
+    };
+
+    // Abort.
+    let mut s = c.clone().shield_funds(shield()).await.unwrap().into_inner();
+    let req = until_signature_required(&mut s).await;
+    let aborted = c
+        .abort_signing_session(AbortSigningSessionRequest {
+            session_id: req.session_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(aborted.status(), gyges_proto::v1::SessionStatus::Aborted);
+    let err = s.next().await.expect("an end").unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::Cancelled, "{err:?}");
+    let err = complete(&mut c, &req.session_id, keystone_answer(&req))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::SessionNotFound, "{err:?}");
+
+    // The client leaves, the daemon restarts.
+    let mut s = c.clone().shield_funds(shield()).await.unwrap().into_inner();
+    let req = until_signature_required(&mut s).await;
+    drop(s);
+    c.shutdown(ShutdownRequest { graceful: true })
+        .await
+        .unwrap();
+    let Running {
+        _home: home, task, ..
+    } = running;
+    tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("shutdown within 30 s")
+        .unwrap()
+        .unwrap();
+    let running = start_in(home, |o| o.zakura_rpc = Some(node.url().to_string())).await;
+    let mut c = client(&running.socket).await;
+    let listed = keystone_sessions(&mut c, false).await;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let pending = &listed[0];
+    assert_eq!(pending.session_id, req.session_id);
+    assert_eq!(pending.payload, req.payload);
+    // Completed from what the list shows, by a process that never saw the
+    // stream.
+    let again = gyges_proto::v1::SignatureRequired {
+        kind: pending.kind,
+        payload: pending.payload.clone(),
+        ..Default::default()
+    };
+    let done = complete(&mut c, &pending.session_id, keystone_answer(&again))
+        .await
+        .unwrap();
+    assert!(done.result.is_some(), "{done:?}");
+    node.mine(1);
+    wait_spendable(&mut c, "ks").await;
+    assert!(
+        balance_of(
+            &balance(&mut c, "ks").await,
+            gyges_proto::v1::Pool::Ironwood
+        )
+        .0 > 0
+    );
+
+    // Expiry: a send left pending while the chain passes its expiry.
+    let mut s = c
+        .clone()
+        .send_transaction(SendTransactionRequest {
+            key_id: "ks".into(),
+            to: t_recipient(),
+            amount: zats(10_000_000),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let req = until_signature_required(&mut s).await;
+    drop(s);
+    let expiry = req.summary.as_ref().unwrap().expiry_height;
+    let (tip, _) = node.tip();
+    node.mine(expiry - tip);
+    wait_spendable(&mut c, "ks").await;
+    let err = complete(&mut c, &req.session_id, keystone_answer(&req))
+        .await
+        .unwrap_err();
+    let e = GygesError::from_status(&err).unwrap();
+    assert_eq!(e.reason(), ErrorReason::NotSynced, "{}", e.detail);
+    assert!(e.detail.contains("can no longer be mined"), "{}", e.detail);
+    let all = keystone_sessions(&mut c, true).await;
+    let row = all.iter().find(|r| r.session_id == req.session_id).unwrap();
+    assert_eq!(
+        row.status(),
+        gyges_proto::v1::SessionStatus::Expired,
+        "{row:?}"
+    );
+    // Nothing was recorded: the funds are still spendable.
+    let b = balance(&mut c, "ks").await;
+    assert!(
+        balance_of(&b, gyges_proto::v1::Pool::Ironwood).0 > 290_000_000,
+        "{b:?}"
+    );
     running.task.abort();
 }
 

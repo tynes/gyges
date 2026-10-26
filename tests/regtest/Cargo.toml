@@ -32,6 +32,10 @@ path = "scenarios/tx.rs"
 name = "pczt"
 path = "scenarios/pczt.rs"
 
+[[test]]
+name = "keystone"
+path = "scenarios/keystone.rs"
+
 # Against the pinned real zakurad (TESTING.md §3 rows 1–4); skips itself
 # where no node binary is available.
 [[test]]
@@ -55,7 +59,7 @@ sha2 = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }  # JSON-RPC to zakurad from the sync harness
 # The fake-node helpers in harness/fake.rs (shared by the scenarios).
 gyges-chain = { workspace = true, features = ["test-util"] }
-gyges-core = { workspace = true }
+gyges-core = { workspace = true, features = ["test-util"] }
 zcash_client_backend = { workspace = true }
 zcash_client_sqlite = { workspace = true }
 transparent = { workspace = true }

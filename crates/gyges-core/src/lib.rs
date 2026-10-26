@@ -22,6 +22,7 @@ pub mod config;
 pub mod ext;
 pub mod handoff;
 pub mod history;
+pub mod keystone;
 pub mod log;
 pub mod mempool;
 pub mod network;

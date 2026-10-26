@@ -50,6 +50,7 @@ orchard = { workspace = true }
 pczt = { workspace = true }
 proptest = { workspace = true }
 gyges-chain = { workspace = true, features = ["test-util"] }
+gyges-core = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }  # service_fn in the policy-layer tests
 tempfile = { workspace = true }
 serde_json = { workspace = true }
