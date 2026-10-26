@@ -257,6 +257,7 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
   Tests:
   - `gyges_core::keystone::emulator` (feature `test-util`) is a device in software. It works from the payload alone, through shuffled, lossy fountain frames, with upstream's signer roles only.
   - `rpc.rs::keystone_shield_and_send_through_both_protocols`: both protocols, the Redactor checks (TESTING.md §4, moved here from the first item), six refused answers each followed by a successful one, the pending-spend refusal, a double completion, and the balance.
+  - `rpc.rs::the_device_never_sees_gyges_tags`: both views of a tagged `pczt create` PCZT. A send's PCZT carries no tags, so the test above cannot show the stripping.
   - `rpc.rs::a_keystone_session_survives_a_restart_and_expires_with_its_transaction`: abort; client gone plus daemon restart, then completion from the listed payload; expiry.
   - `scenarios/keystone.rs::keystone_signing_through_the_binaries`: exit 4 with frames, `--qr-out`, `qr-export`, `qr-import` from a file and from arguments, a partial answer, an aborted session.
   - CLI unit tests of the answer's reassembly.

@@ -392,8 +392,11 @@ Consequences:
   `upstream_proposal` is the base64 of the upstream
   `zcash_client_backend::proto::proposal::Proposal` for consumers that want
   note-level detail.
-- Commands with no RPC (`address qr ADDRESS`, `pczt qr-export`) print
-  `{"schema_version": …, "ok": true}` and the rendered frames on stderr.
+- `address qr` (which checks the address with `InspectAddress`) prints
+  `{"schema_version", "address", "qr"}`; `pczt qr-export --session` (which
+  reads the session with `ListSigningSessions`) prints
+  `{"schema_version", "session_id", "frames"}`. Both are as built in M5;
+  the first draft had them print `{"ok": true}` with the frames on stderr.
 
 ---
 
@@ -471,7 +474,11 @@ it, needs no stream (it works after a restart), and runs these steps in order:
 
 Two completions of one session cannot run together: the second gets
 `SESSION_NOT_FOUND`. The stream that created the session, if still open,
-then emits `Signed` and `Broadcast`. The `SIGN_PCZT` purpose is not built:
+then emits `Signed` and `Broadcast`. If the node refuses the broadcast, the
+transaction is already in the wallet as unmined (as for any send, §4.1) and
+its inputs stay unspendable until its expiry height. For a Keystone send that
+height is about a day away (`target + 1152`), and no rebroadcast of a
+completed session exists yet, so the funds wait that long. The `SIGN_PCZT` purpose is not built:
 `pczt sign` refuses a Keystone key.
 
 ### 6.3 Connection scoping and tokens

@@ -1337,18 +1337,34 @@ fn assert_device_view(req: &gyges_proto::v1::SignatureRequired) {
         view.resolve_fields().unwrap();
     }
     let mut shown: Vec<u64> = Vec::new();
+    let mut addresses: Vec<String> = Vec::new();
     for bundle in [view.orchard(), view.ironwood()] {
-        shown.extend(
-            bundle
-                .actions()
-                .iter()
-                .filter_map(|a| *a.output().value())
-                .filter(|v| *v > 0),
+        for a in bundle.actions() {
+            if let Some(v) = a.output().value().filter(|v| *v > 0) {
+                assert!(
+                    a.output().recipient().is_some(),
+                    "an output of value {v} reached the device without its recipient"
+                );
+                shown.push(v);
+            }
+            addresses.extend(a.output().user_address().clone());
+        }
+    }
+    for o in view.transparent().outputs() {
+        shown.push(*o.value());
+        addresses.extend(o.user_address().clone());
+    }
+    shown.sort_unstable();
+    // Every payment's address, as the user approved it, is there for the
+    // device to display.
+    let summary = req.summary.as_ref().unwrap();
+    for out in summary.steps[0].outputs.iter().filter(|o| !o.is_change) {
+        assert!(
+            addresses.contains(&out.address),
+            "the payment to {} reached the device without its address: {addresses:?}",
+            out.address
         );
     }
-    shown.extend(view.transparent().outputs().iter().map(|o| *o.value()));
-    shown.sort_unstable();
-    let summary = req.summary.as_ref().unwrap();
     let mut approved: Vec<u64> = summary.steps[0]
         .outputs
         .iter()
@@ -1412,6 +1428,46 @@ async fn funded_keystone(node: &FakeNode, z: u64) -> (Running, GygesClient<Chann
     wait_spendable(&mut c, "ks").await;
     fund(node, &running.state, &mut c, "ks", z).await;
     (running, c)
+}
+
+/// The Redactor on a PCZT that carries the `gyges.*` tags (`pczt create`
+/// writes them; a send's PCZT has none): neither device view keeps any.
+#[tokio::test]
+async fn the_device_never_sees_gyges_tags() {
+    let node = mined_node(10).await;
+    let (running, mut c) = funded_keystone(&node, 300_000_000).await;
+    let created = c
+        .create_pczt(gyges_proto::v1::CreatePcztRequest {
+            key_id: "ks".into(),
+            to: t_recipient(),
+            amount: zats(100_000_000),
+            memo: Vec::new(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let tagged = pczt::Pczt::parse(&created.pczts[0]).unwrap();
+    assert!(
+        tagged
+            .global()
+            .proprietary()
+            .keys()
+            .any(|k| k.starts_with("gyges.")),
+        "the fixture must carry the tags"
+    );
+    for protocol in [
+        gyges_core::sessions::Protocol::KeystoneBatch,
+        gyges_core::sessions::Protocol::KeystonePczt,
+    ] {
+        let view = gyges_core::keystone::device_view(&tagged, protocol);
+        let keys: Vec<&String> = view.global().proprietary().keys().collect();
+        assert!(
+            !keys.iter().any(|k| k.starts_with("gyges.")),
+            "{protocol:?}: {keys:?}"
+        );
+    }
+    running.task.abort();
 }
 
 /// ROADMAP.md M5, third item, the happy path and every refused answer.

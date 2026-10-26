@@ -533,11 +533,27 @@ pub async fn complete_keystone_sign(
         ));
     }
     let provers = state.provers.clone();
-    let (txid, raw) = with_wallet(&key, move |w| {
+    let extracted = with_wallet(&key, move |w| {
         core_tx::extract_and_store(w, verified, &provers)
     })
-    .await
-    .map_err(err)?;
+    .await;
+    let (txid, raw) = match extracted {
+        Ok(t) => t,
+        Err(e) => {
+            // Claimed but not recorded: say so on the row and to the stream,
+            // which would otherwise wait for an answer that already came.
+            let error = tx_error(e, &key_id).with_session(&session_id);
+            let text = error.detail.clone();
+            let sid = session_id.clone();
+            let _ = with_wallet(&key, move |w| {
+                sessions::set_state(w, &sid, SessionState::Signed, None, Some(&text))
+                    .map_err(session_error)
+            })
+            .await;
+            state.keystone.notify(&session_id, Err(error.clone()));
+            return Err(error.into_status());
+        }
+    };
     tracing::info!(target: AUDIT_TARGET, key_id, event = "sign", via = "keystone");
     let raw_txid = *txid.as_ref();
     if let Err(e) = route.send(&chain, raw, &key_id).await {
