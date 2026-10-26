@@ -11,19 +11,26 @@
 
 #![forbid(unsafe_code)]
 
+mod common;
 mod fake;
 mod node;
+mod process;
 mod zaino;
 
+pub use common::{
+    FAST_CONFIG, NODE_CONFIG, SPEND_CONFIG, TEX_CONFIG, balance, burn_t_address, burn_tex_address,
+    funded_wallet, mnemonic, parse_tex_txids, regtest, send, shield, spendable, start_daemon,
+    sweep_logs, sync_wait, sync_wait_within, test_key_miner, test_key_transparent,
+    test_key_transparent_address, wait_balance, wait_for_txid, wait_stalled,
+};
 pub use fake::{
-    FAST_CONFIG, FakeNodeHandle, PASSPHRASE, SPEND_CONFIG, TEX_CONFIG, fund_transparent,
-    pool_spendable, synced_key, transparent_receivers, wait_spendable, wait_tex_state,
+    FakeNodeHandle, PASSPHRASE, fund_transparent, pool_spendable, synced_key, tex_row,
+    transparent_receivers, wait_spendable, wait_tex_state,
 };
 pub use node::{
-    BURN_MINER_ADDRESS, FINALITY_DEPTH, MIN_TX_RETENTION, Node, NodeOpts, pinned_tag,
-    zakurad_binary,
+    BURN_MINER_ADDRESS, FINALITY_DEPTH, MIN_TX_RETENTION, Node, NodeOpts, zakurad_binary,
 };
-pub use zaino::{Fallback, Zaino, zainod_binary};
+pub use zaino::{Fallback, Zaino, fallback_section, zainod_binary};
 
 use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt as _;
@@ -34,6 +41,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
 
+use crate::process::{KeptDir, env_bin, kill, log_tail, profile_dir, wait_or_kill, wait_ready};
+
 /// Where a built binary lives, building both binaries on first use.
 pub fn binary(name: &str) -> PathBuf {
     let env = match name {
@@ -41,8 +50,8 @@ pub fn binary(name: &str) -> PathBuf {
         "gyges" => "GYGES_CLI_BIN",
         other => panic!("unknown binary {other}"),
     };
-    if let Some(p) = std::env::var_os(env).filter(|p| !p.is_empty()) {
-        return PathBuf::from(p);
+    if let Some(p) = env_bin(env) {
+        return p;
     }
     let target_dir = build_binaries();
     let candidate = target_dir.join(name);
@@ -59,13 +68,7 @@ pub fn binary(name: &str) -> PathBuf {
 fn build_binaries() -> &'static Path {
     static TARGET: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     TARGET.get_or_init(|| {
-        let exe = std::env::current_exe().expect("current_exe");
-        // target/<profile>/deps/<test>-<hash> -> target/<profile>/
-        let target_dir = exe
-            .parent()
-            .and_then(Path::parent)
-            .expect("target dir")
-            .to_path_buf();
+        let target_dir = profile_dir();
         let mut cmd = Command::new(env!("CARGO"));
         cmd.args(["build", "--quiet", "-p", "gygesd", "-p", "gyges-cli"]);
         if target_dir.file_name().is_some_and(|p| p == "release") {
@@ -96,9 +99,41 @@ impl Run {
     }
 
     /// Parse stdout as one JSON object.
+    #[track_caller]
     pub fn json(&self) -> serde_json::Value {
         serde_json::from_str(self.stdout.trim())
             .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {:?}", self.stdout))
+    }
+
+    /// Parse each stdout line as a JSON object (a `--json` stream).
+    #[track_caller]
+    pub fn json_lines(&self) -> Vec<serde_json::Value> {
+        self.stdout
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l:?}")))
+            .collect()
+    }
+
+    /// Assert that stdout contains `needle`.
+    #[track_caller]
+    pub fn stdout_has(&self, needle: &str) -> &Self {
+        assert!(
+            self.stdout.contains(needle),
+            "{needle:?} not on stdout: {}",
+            self.stdout
+        );
+        self
+    }
+
+    /// Assert that stderr contains `needle`.
+    #[track_caller]
+    pub fn stderr_has(&self, needle: &str) -> &Self {
+        assert!(
+            self.stderr.contains(needle),
+            "{needle:?} not on stderr: {}",
+            self.stderr
+        );
+        self
     }
 
     fn from(output: Output) -> Self {
@@ -144,13 +179,35 @@ impl Cmd {
         }
         Run::from(child.wait_with_output().expect("collect output"))
     }
+
+    /// Run, asserting exit code `want`.
+    #[track_caller]
+    pub fn code(self, want: i32) -> Run {
+        let run = self.run();
+        assert_eq!(run.code(), want, "{run:?}");
+        run
+    }
+
+    /// Run, asserting success.
+    #[track_caller]
+    pub fn ok(self) -> Run {
+        self.code(0)
+    }
+
+    /// [`Cmd::ok`], with the tail of the log at `log` (a node's) in the
+    /// failure message.
+    #[track_caller]
+    pub fn ok_with_log(self, log: &Path) -> Run {
+        let run = self.run();
+        assert_eq!(run.code(), 0, "{run:?}\n{}", log_tail(log));
+        run
+    }
 }
 
 /// A temporary `GYGES_HOME` with, optionally, a daemon running in it.
 #[derive(Debug)]
 pub struct Fixture {
-    home: Option<tempfile::TempDir>,
-    home_path: PathBuf,
+    home: KeptDir,
     network: &'static str,
     daemon: Option<Child>,
 }
@@ -158,27 +215,21 @@ pub struct Fixture {
 impl Fixture {
     /// A fresh, empty home for `network`; no daemon yet.
     pub fn new(network: &'static str) -> Self {
-        let home = tempfile::tempdir().expect("tempdir");
+        let home = KeptDir::new("home").expect("tempdir");
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let home_path = home.path().to_path_buf();
         Self {
-            home: Some(home),
-            home_path,
+            home,
             network,
             daemon: None,
         }
     }
 
     pub fn home(&self) -> &Path {
-        &self.home_path
-    }
-
-    pub fn network(&self) -> &'static str {
-        self.network
+        self.home.path()
     }
 
     pub fn network_dir(&self) -> PathBuf {
-        self.home_path.join(self.network)
+        self.home().join(self.network)
     }
 
     pub fn socket(&self) -> PathBuf {
@@ -204,7 +255,7 @@ impl Fixture {
         let mut cmd = Command::new(binary("gygesd"));
         cmd.args(["--foreground", "--network", self.network])
             .args(extra)
-            .env("GYGES_HOME", &self.home_path)
+            .env("GYGES_HOME", self.home())
             .env_remove("RUST_LOG")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -215,23 +266,22 @@ impl Fixture {
     /// Start a daemon in the foreground and wait until its socket accepts.
     pub fn start_daemon(&mut self, extra: &[&str]) -> anyhow::Result<()> {
         assert!(self.daemon.is_none(), "daemon already started");
-        let mut child = self.daemon_command(extra).spawn().context("spawn gygesd")?;
+        let child = self.daemon_command(extra).spawn().context("spawn gygesd")?;
         let socket = self.socket();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Some(status) = child.try_wait()? {
-                bail!("gygesd exited during startup: {status}");
-            }
-            if UnixStream::connect(&socket).is_ok() {
-                self.daemon = Some(child);
-                return Ok(());
-            }
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                bail!("gygesd did not open {} in time", socket.display());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let child = wait_ready(
+            "gygesd",
+            child,
+            None,
+            Duration::from_secs(20),
+            Duration::from_millis(20),
+            || {
+                UnixStream::connect(&socket)
+                    .map(drop)
+                    .map_err(|e| format!("{}: {e}", socket.display()))
+            },
+        )?;
+        self.daemon = Some(child);
+        Ok(())
     }
 
     /// Run `gygesd --foreground` to completion (for startup refusals), with
@@ -239,9 +289,9 @@ impl Fixture {
     pub fn run_daemon_to_exit(&self, extra: &[&str]) -> Run {
         let mut cmd = self.daemon_command(extra);
         cmd.stderr(Stdio::piped()).stdout(Stdio::piped());
-        let child = cmd.spawn().expect("spawn gygesd");
-        let output = wait_with_timeout(child, Duration::from_secs(20));
-        Run::from(output)
+        let mut child = cmd.spawn().expect("spawn gygesd");
+        wait_or_kill(&mut child, Duration::from_secs(20));
+        Run::from(child.wait_with_output().expect("collect output"))
     }
 
     /// Pid of the daemon this fixture started.
@@ -267,7 +317,7 @@ impl Fixture {
             cmd.arg("--network").arg(network);
         }
         cmd.args(args)
-            .env("GYGES_HOME", &self.home_path)
+            .env("GYGES_HOME", self.home())
             .env("GYGES_DAEMON_BIN", binary("gygesd"))
             .env_remove("GYGES_SOCKET")
             .env_remove("GYGES_NETWORK")
@@ -283,9 +333,7 @@ impl Fixture {
     pub fn passphrase_file(&self, passphrase: &str) -> PathBuf {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = self
-            .home_path
-            .join(format!("pw-{}-{n}", std::process::id()));
+        let path = self.home().join(format!("pw-{}-{n}", std::process::id()));
         std::fs::write(&path, format!("{passphrase}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         path
@@ -301,8 +349,7 @@ impl Fixture {
     /// `start_daemon` works again afterwards.
     pub fn kill_daemon(&mut self) {
         if let Some(mut child) = self.daemon.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill(&mut child);
         }
     }
 
@@ -311,35 +358,21 @@ impl Fixture {
         let Some(mut child) = self.daemon.take() else {
             bail!("no daemon started")
         };
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = child.try_wait()? {
-                return Ok(status);
-            }
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                bail!("gygesd still running after {timeout:?}");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_or_kill(&mut child, timeout)
+            .with_context(|| format!("gygesd still running after {timeout:?}"))
     }
 
-    /// Keep the directory for inspection and return its path.
-    pub fn keep(&mut self) -> PathBuf {
-        if let Some(home) = self.home.take() {
-            return home.keep();
-        }
-        self.home_path.clone()
+    /// `gyges daemon stop`, which must succeed, then wait for the process.
+    #[track_caller]
+    pub fn stop_daemon(&mut self) {
+        self.gyges(&["daemon", "stop"]).ok();
+        self.wait_daemon(Duration::from_secs(60)).unwrap();
     }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.kill_daemon();
-        if std::env::var_os("GYGES_TEST_KEEP").is_some() {
-            let path = self.keep();
-            eprintln!("GYGES_TEST_KEEP: left {}", path.display());
-        }
     }
 }
 
@@ -394,19 +427,4 @@ pub fn tamper_value(bytes: &[u8], old: u64, new: u64) -> Vec<u8> {
     let mut out = bytes.to_vec();
     out[hits[0]..hits[0] + to.len()].copy_from_slice(&to);
     out
-}
-
-fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().expect("collect output"),
-            Ok(None) if Instant::now() > deadline => {
-                let _ = child.kill();
-                return child.wait_with_output().expect("collect output");
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => panic!("wait: {e}"),
-        }
-    }
 }

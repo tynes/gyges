@@ -5,12 +5,7 @@
 
 use std::os::unix::fs::PermissionsExt as _;
 
-use gyges_regtest::Fixture;
-
-/// 23×abandon + art: the all-zero-entropy BIP 39 vector.
-fn known_mnemonic() -> String {
-    "abandon ".repeat(23) + "art\n"
-}
+use gyges_regtest::{Fixture, mnemonic};
 
 fn fast_scrypt(fx: &Fixture) {
     fx.write_config("[vault]\nscrypt_work_factor = 10\n");
@@ -21,11 +16,8 @@ fn list_is_empty_on_a_fresh_home() {
     let mut fx = Fixture::new("regtest");
     fast_scrypt(&fx);
     fx.start_daemon(&[]).unwrap();
-    let run = fx.gyges(&["key", "list"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(run.stdout.contains("no keys"), "{}", run.stdout);
-    let run = fx.gyges(&["key", "list", "--json"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    fx.gyges(&["key", "list"]).ok().stdout_has("no keys");
+    let run = fx.gyges(&["key", "list", "--json"]).ok();
     assert_eq!(run.json()["schema_version"], "0.1");
     assert!(
         run.json().get("keys").is_none(),
@@ -40,14 +32,13 @@ fn init_needs_a_terminal_or_the_scripted_form() {
     fx.start_daemon(&["--airgapped"]).unwrap();
 
     // No TTY, no passphrase source: exit 4 before any RPC.
-    let run = fx.gyges(&["key", "init", "--id", "main"]).run();
-    assert_eq!(run.code(), 4, "{run:?}");
-    assert!(run.stderr.contains("--passphrase-fd"), "{}", run.stderr);
+    fx.gyges(&["key", "init", "--id", "main"])
+        .code(4)
+        .stderr_has("--passphrase-fd");
     assert!(!fx.key_dir("main").exists());
 
     // --json without a passphrase source is still interactive-only.
-    let run = fx.gyges(&["key", "init", "--id", "main", "--json"]).run();
-    assert_eq!(run.code(), 4, "{run:?}");
+    let run = fx.gyges(&["key", "init", "--id", "main", "--json"]).code(4);
     assert_eq!(
         run.json()["error"]["reason"],
         "ERROR_REASON_CONFIRMATION_REQUIRED"
@@ -64,8 +55,7 @@ fn scripted_init_on_an_airgapped_daemon_creates_a_signer_only_key() {
     let run = fx
         .gyges(&["key", "init", "--id", "main", "--json"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .ok();
     let json = run.json();
     assert_eq!(json["key_id"], "main");
     assert_eq!(
@@ -98,20 +88,17 @@ fn scripted_init_on_an_airgapped_daemon_creates_a_signer_only_key() {
     assert_eq!(profile["seed_format"], "age-scrypt-v1");
     assert_eq!(profile["network"], "regtest");
 
-    let run = fx.gyges(&["key", "list"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(run.stdout.contains("main"), "{}", run.stdout);
-    assert!(run.stdout.contains("signer-only"), "{}", run.stdout);
-    assert!(run.stdout.contains("locked"), "{}", run.stdout);
-    let run = fx.gyges(&["daemon", "status"]).run();
-    assert!(run.stdout.contains("main"), "{}", run.stdout);
+    let run = fx.gyges(&["key", "list"]).ok();
+    run.stdout_has("main");
+    run.stdout_has("signer-only");
+    run.stdout_has("locked");
+    fx.gyges(&["daemon", "status"]).run().stdout_has("main");
 
     // Same id again: exit 6, KEY_EXISTS.
     let run = fx
         .gyges(&["key", "init", "--id", "main", "--json"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 6, "{run:?}");
+        .code(6);
     assert_eq!(run.json()["error"]["reason"], "ERROR_REASON_KEY_EXISTS");
     assert_eq!(run.json()["error"]["key_id"], "main");
 
@@ -140,12 +127,9 @@ fn scripted_init_on_an_airgapped_daemon_creates_a_signer_only_key() {
     }
 
     // Survives a restart: the key is listed by the next daemon.
-    let run = fx.gyges(&["daemon", "stop"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    fx.wait_daemon(std::time::Duration::from_secs(10)).unwrap();
+    fx.stop_daemon();
     fx.start_daemon(&["--airgapped"]).unwrap();
-    let run = fx.gyges(&["key", "list", "--json"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    let run = fx.gyges(&["key", "list", "--json"]).ok();
     assert_eq!(run.json()["keys"][0]["key_id"], "main");
     assert_eq!(
         run.json()["keys"][0]["signing_mode"],
@@ -162,8 +146,7 @@ fn init_without_a_node_is_exit_7() {
     let run = fx
         .gyges(&["key", "init", "--id", "main", "--json"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 7, "{run:?}");
+        .code(7);
     assert_eq!(
         run.json()["error"]["reason"],
         "ERROR_REASON_NODE_UNREACHABLE"
@@ -181,9 +164,8 @@ fn restore_from_stdin_with_the_default_birthday() {
     let run = fx
         .gyges(&["key", "restore", "--id", "r", "--stdin", "--json"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .stdin(known_mnemonic())
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .stdin(mnemonic() + "\n")
+        .ok();
     let json = run.json();
     assert_eq!(json["key_id"], "r");
     assert_eq!(json["birthday_height"], 1, "regtest Sapling activation");
@@ -191,7 +173,7 @@ fn restore_from_stdin_with_the_default_birthday() {
         json["ufvk"].as_str().unwrap().starts_with("uviewregtest1"),
         "{json}"
     );
-    assert!(run.stderr.contains("no --birthday"), "{}", run.stderr);
+    run.stderr_has("no --birthday");
     let dir = fx.key_dir("r");
     for f in ["profile.json", "seed.age", "wallet.sqlite"] {
         let mode = std::fs::metadata(dir.join(f)).unwrap().permissions().mode() & 0o777;
@@ -219,9 +201,8 @@ fn restore_from_stdin_with_the_default_birthday() {
             "--json",
         ])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .stdin(known_mnemonic())
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .stdin(mnemonic() + "\n")
+        .ok();
     assert_eq!(run.json()["ufvk"], json["ufvk"]);
 
     // A later birthday needs the node: exit 7, nothing created.
@@ -237,9 +218,8 @@ fn restore_from_stdin_with_the_default_birthday() {
             "--json",
         ])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .stdin(known_mnemonic())
-        .run();
-    assert_eq!(run.code(), 7, "{run:?}");
+        .stdin(mnemonic() + "\n")
+        .code(7);
     assert_eq!(
         run.json()["error"]["reason"],
         "ERROR_REASON_NODE_UNREACHABLE"
@@ -247,18 +227,15 @@ fn restore_from_stdin_with_the_default_birthday() {
     assert!(!fx.key_dir("later").exists());
 
     // Bad words are refused client-side (count) and daemon-side (checksum).
-    let run = fx
-        .gyges(&["key", "restore", "--id", "x", "--stdin", "--json"])
+    fx.gyges(&["key", "restore", "--id", "x", "--stdin", "--json"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
         .stdin("abandon abandon\n")
-        .run();
-    assert_eq!(run.code(), 6, "{run:?}");
+        .code(6);
     let run = fx
         .gyges(&["key", "restore", "--id", "x", "--stdin", "--json"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
         .stdin("abandon ".repeat(23) + "abandon\n")
-        .run();
-    assert_eq!(run.code(), 6, "{run:?}");
+        .code(6);
     assert_eq!(
         run.json()["error"]["reason"],
         "ERROR_REASON_INVALID_ARGUMENT"
@@ -267,9 +244,8 @@ fn restore_from_stdin_with_the_default_birthday() {
     // Without a passphrase source and without a TTY: exit 4, no RPC.
     let run = fx
         .gyges(&["key", "restore", "--id", "y", "--stdin", "--json"])
-        .stdin(known_mnemonic())
-        .run();
-    assert_eq!(run.code(), 4, "{run:?}");
+        .stdin(mnemonic() + "\n")
+        .code(4);
     assert_eq!(run.json()["error"]["reason"], "ERROR_REASON_VAULT_LOCKED");
 }
 
@@ -279,24 +255,16 @@ fn a_wide_key_file_refuses_the_next_start() {
     fast_scrypt(&fx);
     fx.start_daemon(&["--airgapped"]).unwrap();
     let pw = fx.passphrase_file("pw");
-    let run = fx
-        .gyges(&["key", "init", "--id", "main", "--json"])
+    fx.gyges(&["key", "init", "--id", "main", "--json"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    fx.gyges(&["daemon", "stop"]).run();
-    fx.wait_daemon(std::time::Duration::from_secs(10)).unwrap();
+        .ok();
+    fx.stop_daemon();
 
     let seed = fx.key_dir("main").join("seed.age");
     std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o644)).unwrap();
     let run = fx.run_daemon_to_exit(&["--airgapped"]);
     assert_ne!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stderr
-            .contains(&format!("chmod 600 {}", seed.display())),
-        "{}",
-        run.stderr
-    );
+    run.stderr_has(&format!("chmod 600 {}", seed.display()));
 }
 
 #[test]
@@ -308,14 +276,12 @@ fn unlock_lock_and_export_through_the_cli() {
     let run = fx
         .gyges(&["key", "restore", "--id", "main", "--stdin", "-q", "--json"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .stdin(known_mnemonic())
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .stdin(mnemonic() + "\n")
+        .ok();
     let ufvk = run.json()["ufvk"].as_str().unwrap().to_string();
 
     // export-ufvk needs no unlock for a local-seed key; --key is honoured.
-    let run = fx.gyges(&["-k", "main", "key", "export-ufvk"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    let run = fx.gyges(&["-k", "main", "key", "export-ufvk"]).ok();
     assert_eq!(run.stdout.trim(), ufvk);
     let run = fx
         .gyges(&["key", "export-ufvk", "--id", "main", "--json"])
@@ -323,13 +289,14 @@ fn unlock_lock_and_export_through_the_cli() {
     assert_eq!(run.json()["ufvk"], ufvk);
     assert_eq!(run.json()["birthday_height"], 1);
     // No default key configured: an empty id is exit 6.
-    let run = fx.gyges(&["key", "export-ufvk"]).run();
-    assert_eq!(run.code(), 6, "{run:?}");
-    assert!(run.stderr.contains("no default key"), "{}", run.stderr);
+    fx.gyges(&["key", "export-ufvk"])
+        .code(6)
+        .stderr_has("no default key");
 
     // Unlock without a passphrase source and no terminal: exit 4, VAULT_LOCKED.
-    let run = fx.gyges(&["key", "unlock", "--id", "main", "--json"]).run();
-    assert_eq!(run.code(), 4, "{run:?}");
+    let run = fx
+        .gyges(&["key", "unlock", "--id", "main", "--json"])
+        .code(4);
     assert_eq!(run.json()["error"]["reason"], "ERROR_REASON_VAULT_LOCKED");
 
     // Wrong passphrase: exit 4, then rate limited on the next try.
@@ -337,18 +304,15 @@ fn unlock_lock_and_export_through_the_cli() {
     let run = fx
         .gyges(&["key", "unlock", "--id", "main", "--json"])
         .env("GYGES_PASSPHRASE_FILE", &bad)
-        .run();
-    assert_eq!(run.code(), 4, "{run:?}");
+        .code(4);
     assert_eq!(
         run.json()["error"]["reason"],
         "ERROR_REASON_INVALID_PASSPHRASE"
     );
-    let run = fx
-        .gyges(&["key", "unlock", "--id", "main"])
+    fx.gyges(&["key", "unlock", "--id", "main"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 4, "{run:?}");
-    assert!(run.stderr.contains("retry in"), "{}", run.stderr);
+        .code(4)
+        .stderr_has("retry in");
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
     let run = fx
@@ -362,39 +326,30 @@ fn unlock_lock_and_export_through_the_cli() {
             "--json",
         ])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 0, "{run:?}");
+        .ok();
     assert_eq!(run.json()["scope"], "UNLOCK_SCOPE_DAEMON");
     assert!(run.json().get("session_token").is_none(), "{}", run.stdout);
-    let run = fx.gyges(&["key", "list"]).run();
-    assert!(run.stdout.contains("UNLOCKED until"), "{}", run.stdout);
-    let run = fx.gyges(&["daemon", "status"]).run();
-    assert!(run.stdout.contains("UNLOCKED"), "{}", run.stdout);
+    fx.gyges(&["key", "list"])
+        .run()
+        .stdout_has("UNLOCKED until");
+    fx.gyges(&["daemon", "status"]).run().stdout_has("UNLOCKED");
 
-    let run = fx.gyges(&["key", "lock", "--all", "--json"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
+    let run = fx.gyges(&["key", "lock", "--all", "--json"]).ok();
     assert_eq!(run.json()["locked_key_ids"][0], "main");
     let run = fx.gyges(&["key", "list", "--json"]).run();
     assert_eq!(run.json()["keys"][0]["locked"], true);
-    let run = fx.gyges(&["key", "lock", "--id", "main"]).run();
-    assert_eq!(run.code(), 0, "{run:?}");
-    assert!(
-        run.stderr.contains("nothing was unlocked"),
-        "{}",
-        run.stderr
-    );
+    fx.gyges(&["key", "lock", "--id", "main"])
+        .ok()
+        .stderr_has("nothing was unlocked");
 
     // export-seed: never JSON (exit 6), never without a terminal (exit 4).
-    let run = fx
-        .gyges(&["key", "export-seed", "--id", "main", "--json"])
-        .run();
-    assert_eq!(run.code(), 6, "{run:?}");
+    fx.gyges(&["key", "export-seed", "--id", "main", "--json"])
+        .code(6);
     let run = fx
         .gyges(&["key", "export-seed", "--id", "main"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
-        .run();
-    assert_eq!(run.code(), 4, "{run:?}");
-    assert!(run.stderr.contains("terminal"), "{}", run.stderr);
+        .code(4);
+    run.stderr_has("terminal");
     assert!(
         !run.stdout.contains("abandon"),
         "no words without a terminal"

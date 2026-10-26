@@ -17,15 +17,20 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Child, Command};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+
+use crate::process::{
+    KeptDir, download_verified, env_bin, free_port, kill, log_tail, move_into_place,
+    regtest_bin_dir, spawn_logged, untar, wait_or_kill, wait_ready,
+};
 
 /// `tests/regtest/versions.toml`.
 pub const VERSIONS: &str = include_str!("../versions.toml");
@@ -60,20 +65,13 @@ pub(crate) fn versions() -> Versions {
     toml::from_str(VERSIONS).expect("versions.toml parses")
 }
 
-/// The release tag the harness pins.
-pub fn pinned_tag() -> String {
-    versions().zakurad.tag
-}
-
 /// Where `zakurad` is, or `None` when this platform has no pinned binary and
 /// `ZAKURAD_BIN` is unset. On Linux a failed download is a panic, not a
 /// skip, so CI cannot pass by accident.
 pub fn zakurad_binary() -> Option<PathBuf> {
     static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
     BIN.get_or_init(|| {
-        if let Some(p) = std::env::var_os("ZAKURAD_BIN").filter(|p| !p.is_empty()) {
-            let p = PathBuf::from(p);
-            assert!(p.is_file(), "ZAKURAD_BIN={} is not a file", p.display());
+        if let Some(p) = env_bin("ZAKURAD_BIN") {
             return Some(p);
         }
         if cfg!(target_os = "linux") {
@@ -83,43 +81,6 @@ pub fn zakurad_binary() -> Option<PathBuf> {
         }
     })
     .clone()
-}
-
-/// `target/regtest-bin/`, beside the profile directory the tests run from.
-pub(crate) fn regtest_bin_dir() -> PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    // target/<profile>/deps/<test>-<hash> -> target/
-    let target = exe
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .expect("target dir");
-    target.join("regtest-bin")
-}
-
-/// Download `url` to `dest` and check its sha256 against `expected`; a
-/// mismatch removes the file.
-pub(crate) fn download_verified(url: &str, dest: &Path, expected: &str) -> anyhow::Result<()> {
-    eprintln!("downloading {url}");
-    let status = Command::new("curl")
-        .args(["-fsSL", "--retry", "3", "-o"])
-        .arg(dest)
-        .arg(url)
-        .status()
-        .context("run curl")?;
-    if !status.success() {
-        bail!("curl {url} failed: {status}");
-    }
-    let bytes = fs::read(dest)?;
-    let digest = {
-        use sha2::Digest as _;
-        hex::encode(sha2::Sha256::digest(&bytes))
-    };
-    if digest != expected {
-        let _ = fs::remove_file(dest);
-        bail!("{url}: sha256 {digest}, versions.toml expects {expected}");
-    }
-    Ok(())
 }
 
 fn download_pinned() -> anyhow::Result<PathBuf> {
@@ -155,35 +116,12 @@ fn download_pinned() -> anyhow::Result<PathBuf> {
         std::process::id()
     ));
     fs::create_dir_all(&staging)?;
-    let status = Command::new("tar")
-        .arg("-xzf")
-        .arg(&tmp)
-        .arg("-C")
-        .arg(&staging)
-        .status()
-        .context("run tar")?;
-    if !status.success() {
-        bail!("tar failed: {status}");
-    }
+    untar(&tmp, &staging)?;
     let _ = fs::remove_file(&tmp);
     if !staging.join("bin/zakurad").is_file() {
         bail!("{archive} has no bin/zakurad");
     }
-    // Another test process may have raced us to the same directory: keep
-    // whichever copy is complete.
-    match fs::rename(&staging, &dir) {
-        Ok(()) => {}
-        Err(_) if bin.is_file() => {
-            let _ = fs::remove_dir_all(&staging);
-        }
-        Err(e) => {
-            let _ = fs::remove_dir_all(&staging);
-            return Err(e).context(format!(
-                "move the extracted node into place at {}",
-                dir.display()
-            ));
-        }
-    }
+    move_into_place(&staging, &dir, &bin)?;
     Ok(bin)
 }
 
@@ -214,19 +152,13 @@ impl Default for NodeOpts {
 /// `GYGES_TEST_KEEP` is set.
 #[derive(Debug)]
 pub struct Node {
-    dir: Option<tempfile::TempDir>,
-    dir_path: PathBuf,
+    dir: KeptDir,
     child: Option<Child>,
     opts: NodeOpts,
     rpc_port: u16,
     p2p_port: u16,
     zakura_port: u16,
     client: reqwest::blocking::Client,
-}
-
-pub(crate) fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
-    l.local_addr().unwrap().port()
 }
 
 impl Node {
@@ -245,14 +177,12 @@ impl Node {
 
     /// Start a node from an empty state.
     pub fn start(opts: NodeOpts) -> anyhow::Result<Self> {
-        let dir = tempfile::tempdir()?;
-        let dir_path = dir.path().to_path_buf();
+        let dir = KeptDir::new("node")?;
         for sub in ["state", "cookie", "identity"] {
-            fs::create_dir_all(dir_path.join(sub))?;
+            fs::create_dir_all(dir.path().join(sub))?;
         }
         let mut node = Self {
-            dir: Some(dir),
-            dir_path,
+            dir,
             child: None,
             opts,
             rpc_port: free_port(),
@@ -268,7 +198,7 @@ impl Node {
 
     /// Where the node backs up its non-finalized blocks, one file per hash.
     fn backup_dir(&self) -> PathBuf {
-        self.dir_path.join("state/non_finalized_state/regtest")
+        self.dir.path().join("state/non_finalized_state/regtest")
     }
 
     /// Block until every non-finalized block of the best chain (the newest
@@ -306,16 +236,16 @@ impl Node {
     }
 
     fn config_path(&self) -> PathBuf {
-        self.dir_path.join("zakura.toml")
+        self.dir.path().join("zakura.toml")
     }
 
     /// The node's log (stdout and stderr).
     pub fn log_path(&self) -> PathBuf {
-        self.dir_path.join("zakurad.log")
+        self.dir.path().join("zakurad.log")
     }
 
     pub fn cookie_path(&self) -> PathBuf {
-        self.dir_path.join("cookie/.cookie")
+        self.dir.path().join("cookie/.cookie")
     }
 
     pub fn url(&self) -> String {
@@ -332,7 +262,7 @@ impl Node {
     }
 
     fn write_config(&self) -> anyhow::Result<()> {
-        let d = self.dir_path.display();
+        let d = self.dir.path().display();
         let storage = if self.opts.archive {
             String::new()
         } else {
@@ -400,54 +330,40 @@ use_color = false
     fn spawn(&mut self, min_tip: u32) -> anyhow::Result<()> {
         assert!(self.child.is_none(), "node already running");
         self.write_config()?;
-        let log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.log_path())?;
         let bin = zakurad_binary().context("no zakurad binary")?;
-        let child = Command::new(&bin)
-            .arg("-c")
-            .arg(self.config_path())
-            .arg("start")
-            .current_dir(&self.dir_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .with_context(|| format!("spawn {}", bin.display()))?;
+        let child = spawn_logged(
+            Command::new(&bin)
+                .arg("-c")
+                .arg(self.config_path())
+                .arg("start")
+                .current_dir(self.dir.path()),
+            &self.log_path(),
+        )?;
+        let log = self.log_path();
+        let child = wait_ready(
+            "zakurad",
+            child,
+            Some(&log),
+            Duration::from_secs(90),
+            Duration::from_millis(100),
+            || {
+                let tip = self
+                    .rpc("getblock", json!(["0", 1]))
+                    .and_then(|_| self.rpc("getblockcount", json!([])))
+                    .map_err(|e| format!("{e:#}"))?;
+                match tip.as_u64() {
+                    Some(h) if h >= u64::from(min_tip) => Ok(()),
+                    _ => Err(format!("tip {tip}, waiting for {min_tip}")),
+                }
+            },
+        )?;
         self.child = Some(child);
-        let deadline = Instant::now() + Duration::from_secs(90);
-        loop {
-            if let Some(status) = self.child.as_mut().unwrap().try_wait()? {
-                self.child = None;
-                bail!(
-                    "zakurad exited during startup: {status}\n{}",
-                    self.log_tail()
-                );
-            }
-            if self.cookie_path().is_file()
-                && self.rpc("getblock", json!(["0", 1])).is_ok()
-                && self
-                    .rpc("getblockcount", json!([]))
-                    .ok()
-                    .and_then(|v| v.as_u64())
-                    .is_some_and(|h| h >= u64::from(min_tip))
-            {
-                return Ok(());
-            }
-            if Instant::now() > deadline {
-                bail!("zakurad did not answer RPC in time\n{}", self.log_tail());
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        Ok(())
     }
 
     /// The last lines of the node's log, for failure messages.
     pub fn log_tail(&self) -> String {
-        let text = fs::read_to_string(self.log_path()).unwrap_or_default();
-        let lines: Vec<&str> = text.lines().collect();
-        let start = lines.len().saturating_sub(30);
-        lines[start..].join("\n")
+        log_tail(&self.log_path())
     }
 
     /// One JSON-RPC call; `Err` carries the node's error object or the
@@ -472,57 +388,39 @@ use_color = false
         Ok(resp["result"].clone())
     }
 
+    /// One JSON-RPC call that must succeed, its result deserialized.
+    #[track_caller]
+    pub fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> T {
+        self.rpc(method, params)
+            .and_then(|v| Ok(serde_json::from_value(v)?))
+            .unwrap_or_else(|e| panic!("{method}: {e:#}"))
+    }
+
     /// `generate n`: the hashes of the new blocks.
     pub fn mine(&self, n: u32) -> Vec<String> {
-        let v = self.rpc("generate", json!([n])).expect("generate");
-        v.as_array()
-            .expect("array of hashes")
-            .iter()
-            .map(|h| h.as_str().unwrap().to_string())
-            .collect()
+        self.call("generate", json!([n]))
     }
 
     pub fn tip_height(&self) -> u32 {
-        u32::try_from(
-            self.rpc("getblockcount", json!([]))
-                .expect("getblockcount")
-                .as_u64()
-                .unwrap(),
-        )
-        .unwrap()
+        self.call("getblockcount", json!([]))
     }
 
     pub fn block_hash(&self, height: u32) -> String {
-        self.rpc("getblockhash", json!([height]))
-            .expect("getblockhash")
-            .as_str()
-            .unwrap()
-            .to_string()
+        self.call("getblockhash", json!([height]))
     }
 
     pub fn invalidate_block(&self, hash: &str) {
-        self.rpc("invalidateblock", json!([hash]))
-            .expect("invalidateblock");
+        self.call::<Value>("invalidateblock", json!([hash]));
     }
 
     /// Txids in the mempool.
     pub fn mempool(&self) -> Vec<String> {
-        self.rpc("getrawmempool", json!([]))
-            .expect("getrawmempool")
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t.as_str().unwrap().to_string())
-            .collect()
+        self.call("getrawmempool", json!([]))
     }
 
     /// Raw transaction hex, from the chain or the mempool.
     pub fn raw_transaction(&self, txid: &str) -> String {
-        self.rpc("getrawtransaction", json!([txid, 0]))
-            .expect("getrawtransaction")
-            .as_str()
-            .unwrap()
-            .to_string()
+        self.call("getrawtransaction", json!([txid, 0]))
     }
 
     /// Height the transaction is mined at, if it is.
@@ -537,9 +435,7 @@ use_color = false
     /// `getblockchaininfo.pruneheight`: the lowest height whose block body
     /// the node still stores (0 for an archive node or before any pruning).
     pub fn prune_height(&self) -> u32 {
-        let info = self
-            .rpc("getblockchaininfo", json!([]))
-            .expect("getblockchaininfo");
+        let info: Value = self.call("getblockchaininfo", json!([]));
         info["pruneheight"]
             .as_u64()
             .map_or(0, |h| u32::try_from(h).unwrap())
@@ -547,11 +443,7 @@ use_color = false
 
     /// `getblock(h, 0)`: the serialized block as hex.
     pub fn raw_block(&self, height: u32) -> String {
-        self.rpc("getblock", json!([height.to_string(), 0]))
-            .expect("getblock")
-            .as_str()
-            .unwrap()
-            .to_string()
+        self.call("getblock", json!([height.to_string(), 0]))
     }
 
     /// `submitblock`: the node answers `null` for a block it accepted and a
@@ -565,19 +457,15 @@ use_color = false
     }
 
     pub fn send_raw_transaction(&self, hex: &str) -> anyhow::Result<String> {
-        Ok(self
-            .rpc("sendrawtransaction", json!([hex]))?
-            .as_str()
-            .unwrap()
-            .to_string())
+        Ok(serde_json::from_value(
+            self.rpc("sendrawtransaction", json!([hex]))?,
+        )?)
     }
 
     /// What the coinbase of `height` paid to the transparent pool (zatoshis),
     /// read from `getblock(h, 1).valuePools`.
     pub fn coinbase_value(&self, height: u32) -> u64 {
-        let block = self
-            .rpc("getblock", json!([height.to_string(), 1]))
-            .expect("getblock");
+        let block: Value = self.call("getblock", json!([height.to_string(), 1]));
         block["valuePools"]
             .as_array()
             .unwrap()
@@ -593,19 +481,7 @@ use_color = false
             return;
         };
         let _ = self.rpc("stop", json!([]));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() > deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                Err(_) => return,
-            }
-        }
+        wait_or_kill(&mut child, Duration::from_secs(10));
     }
 
     /// Stop and start again with new options over the same chain and ports
@@ -636,14 +512,6 @@ use_color = false
             }
         }
     }
-
-    /// Keep the directory for inspection and return its path.
-    pub fn keep(&mut self) -> PathBuf {
-        if let Some(dir) = self.dir.take() {
-            return dir.keep();
-        }
-        self.dir_path.clone()
-    }
 }
 
 /// How many times [`Node::restart`] starts the node before giving up on the
@@ -656,12 +524,7 @@ const HANDOFF_RACE: &str = "genesis apply handoff failed: illegal sync lifecycle
 impl Drop for Node {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if std::env::var_os("GYGES_TEST_KEEP").is_some() {
-            let path = self.keep();
-            eprintln!("GYGES_TEST_KEEP: left node at {}", path.display());
+            kill(&mut child);
         }
     }
 }
