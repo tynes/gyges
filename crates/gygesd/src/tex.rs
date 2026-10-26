@@ -126,7 +126,7 @@ pub(crate) fn queue_error(e: TexQueueError) -> TxError {
 
 /// Why one row could not be driven this pass; retried next pass.
 #[derive(Debug, thiserror::Error)]
-enum DriveError {
+pub(crate) enum DriveError {
     #[error("{0}")]
     Wallet(#[from] TxError),
     #[error("{0}")]
@@ -150,7 +150,7 @@ async fn mark_mined(key: &Arc<KeyEntry>, txid: [u8; 32], height: BlockHeight) {
     }
 }
 
-async fn set_state(
+pub(crate) async fn set_state(
     key: &Arc<KeyEntry>,
     id: [u8; 32],
     state: TexState,
@@ -182,29 +182,30 @@ async fn record_attempt(
 }
 
 /// What one broadcast attempt came to.
-enum Offered {
+pub(crate) enum Offered {
     Accepted,
     /// The node explained its refusal (`last_error` carries the text).
     Refused(String),
 }
 
-/// Hand `raw` to the node and record the attempt on the row.
-async fn offer(
+/// What the queue logs for a step it broadcast.
+const BY_QUEUE: &str = "tex step broadcast by the queue";
+
+/// Hand `raw` to the node and record the attempt on the row; an accepted
+/// step is logged as `logged`.
+pub(crate) async fn offer(
     chain: &dyn ChainBackend,
     key: &Arc<KeyEntry>,
     id: [u8; 32],
     raw: Vec<u8>,
     step: u32,
+    logged: &str,
 ) -> Result<Offered, DriveError> {
     match chain.send_raw_transaction(raw).await {
         Ok(_) => {
             record_attempt(key, id, None).await?;
             tracing::info!(target: AUDIT_TARGET, key_id = key.key_id(), event = "broadcast");
-            tracing::info!(
-                key_id = key.key_id(),
-                step,
-                "tex step broadcast by the queue"
-            );
+            tracing::info!(key_id = key.key_id(), step, "{logged}");
             Ok(Offered::Accepted)
         }
         Err(ChainError::Rejected(text)) if already_known(&text) => {
@@ -275,7 +276,7 @@ async fn drive(
                     );
                 }
                 TxStatus::Unknown => {
-                    offer(chain, key, id, row.step2_raw.clone(), 2).await?;
+                    offer(chain, key, id, row.step2_raw.clone(), 2, BY_QUEUE).await?;
                 }
                 TxStatus::Mined(_) => unreachable!("handled above"),
             }
@@ -292,7 +293,7 @@ async fn drive(
                 }
                 TxStatus::Unknown => {
                     if let Offered::Accepted =
-                        offer(chain, key, id, row.step2_raw.clone(), 2).await?
+                        offer(chain, key, id, row.step2_raw.clone(), 2, BY_QUEUE).await?
                     {
                         set_state(key, id, TexState::Step2Broadcast, None).await?;
                     }
@@ -315,11 +316,11 @@ async fn drive(
                 tracing::warn!(key_id = key.key_id(), "zip 320 transfer expired unmined");
                 return Ok(());
             }
-            match offer(chain, key, id, row.step1_raw.clone(), 1).await? {
+            match offer(chain, key, id, row.step1_raw.clone(), 1, BY_QUEUE).await? {
                 Offered::Accepted => {
                     set_state(key, id, TexState::Step1Broadcast, None).await?;
                     if let Offered::Accepted =
-                        offer(chain, key, id, row.step2_raw.clone(), 2).await?
+                        offer(chain, key, id, row.step2_raw.clone(), 2, BY_QUEUE).await?
                     {
                         set_state(key, id, TexState::Step2Broadcast, None).await?;
                     }

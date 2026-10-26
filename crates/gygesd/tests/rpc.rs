@@ -5288,3 +5288,72 @@ async fn restore_below_the_window_recovers_transparent_outputs_and_discards_fabr
     assert_eq!(k.transparent_best_effort_below, 30);
     running.task.abort();
 }
+
+/// A node that answers a ZIP 320 send's broadcasts with "already in
+/// mempool" has the transactions: the send goes on as for an accepted
+/// broadcast (as the queue does), and the queue later finds both steps
+/// missing, offers them again and sees them mined.
+#[tokio::test]
+async fn zip320_send_treats_already_known_as_accepted() {
+    use gyges_proto::v1::TexState;
+    let _ = test_hub();
+    let node = FakeNode::start(regtest_params()).await;
+    node.mine(10);
+    let url = node.url().to_string();
+    let running = start_with(
+        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n\
+         [policy]\nmin_confirmations = 1\n[tex]\nrebroadcast_interval = \"1s\"\n",
+        |o| o.zakura_rpc = Some(url),
+    )
+    .await;
+    let mut c = client(&running.socket).await;
+    init_key(&mut c, "known").await;
+    wait_spendable(&mut c, "known").await;
+    let receiver = transparent_receiver(&running.state, "known");
+    node.mine_with_payments(&[(receiver, 300_000_000)]);
+    node.mine(1);
+    wait_spendable(&mut c, "known").await;
+    unlock_daemon(&mut c, "known").await;
+    let shield = collect_events(
+        c.shield_funds(ShieldFundsRequest {
+            key_id: "known".into(),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    let _ = broadcast_txid(&shield);
+    node.mine(2);
+    wait_spendable(&mut c, "known").await;
+
+    let tex_addr =
+        zcash_keys::address::Address::Tex([0x42; 20]).encode(&Network::Regtest.consensus_params());
+    node.set_reject_broadcasts(Some("transaction already in mempool".into()));
+    let events = send_with_session(
+        &mut c,
+        SendTransactionRequest {
+            key_id: "known".into(),
+            to: tex_addr,
+            amount: zats(50_000_000),
+            ..Default::default()
+        },
+        "pw",
+    )
+    .await
+    .unwrap();
+    let names = event_names(&events);
+    assert!(
+        names.ends_with(&["broadcast", "tex_queued", "broadcast"]),
+        "{names:?}"
+    );
+    let (s1, _) = tex_queued(&events);
+    let row = wait_tex_state(&mut c, &s1, TexState::Step2Broadcast).await;
+    assert!(row.last_error.is_empty(), "{row:?}");
+
+    node.set_reject_broadcasts(None);
+    wait_in_mempool(&node, &s1).await;
+    node.mine(1);
+    wait_tex_state(&mut c, &s1, TexState::Step2Mined).await;
+    running.task.abort();
+}

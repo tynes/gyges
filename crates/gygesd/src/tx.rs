@@ -44,7 +44,7 @@ use zcash_protocol::value::Zatoshis;
 use crate::conn::ConnInfo;
 use crate::keys::{AUDIT_TARGET, proto_pool, vault_error};
 use crate::service::{DaemonState, invalid, unix_now};
-use crate::tex::queue_error;
+use crate::tex::{self, DriveError, Offered, queue_error};
 
 /// The server-streaming response type for `SendTransaction` / `ShieldFunds`.
 pub type SendStream = tonic::codegen::BoxStream<SendEvent>;
@@ -1149,35 +1149,30 @@ async fn tex_pipeline(
     let step1_hex = built.step1_txid.to_string();
     let step2_hex = built.step2_txid.to_string();
 
+    // Both steps go through the queue's broadcast, so a node that already
+    // has a step counts as having taken it, as it does for the queue.
+    let drive = |e: DriveError| match e {
+        DriveError::Wallet(e) => err(e),
+        DriveError::Node(e) => broadcast_error(e, &key_id).into_status(),
+    };
+    let offer = |raw, step| tex::offer(chain.as_ref(), key, id, raw, step, "transaction broadcast");
+
     // Step 1: a refusal fails the transfer (nothing left the shielded pool).
-    let now = unix_now();
-    match chain.send_raw_transaction(built.step1_raw).await {
-        Ok(_) => {
-            with_wallet(key, move |w| {
-                core_tex::record_attempt(w, id, now, None).map_err(queue_error)?;
-                core_tex::set_state(w, id, TexState::Step1Broadcast, None).map_err(queue_error)
-            })
-            .await
-            .map_err(err)?;
-            tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast");
-            tracing::info!(key_id, step = 1, "transaction broadcast");
+    let refused = match offer(built.step1_raw, 1).await {
+        Ok(Offered::Accepted) => None,
+        Ok(Offered::Refused(text)) => {
+            let _ = tex::set_state(key, id, TexState::Failed, Some(text.clone())).await;
+            Some(DriveError::Node(ChainError::Rejected(text)))
         }
-        Err(e) => {
-            let text = e.to_string();
-            let rejected = matches!(e, ChainError::Rejected(_));
-            let _ = with_wallet(key, move |w| {
-                core_tex::record_attempt(w, id, now, Some(&text)).map_err(queue_error)?;
-                if rejected {
-                    core_tex::set_state(w, id, TexState::Failed, Some(&text))
-                        .map_err(queue_error)?;
-                }
-                Ok(())
-            })
-            .await;
-            state.tex.wake();
-            return Err(broadcast_error(e, &key_id).into_status());
-        }
+        Err(e) => Some(e),
+    };
+    if let Some(e) = refused {
+        state.tex.wake();
+        return Err(drive(e));
     }
+    tex::set_state(key, id, TexState::Step1Broadcast, None)
+        .await
+        .map_err(drive)?;
     emit_broadcast(tx, 1, step1_hex.clone()).await?;
     emit(
         tx,
@@ -1191,30 +1186,16 @@ async fn tex_pipeline(
     // Step 2: offered at once; a node that does not chain mempool
     // transactions refuses it now and takes it from the queue once step 1
     // is mined.
-    let now = unix_now();
-    match chain.send_raw_transaction(built.step2_raw).await {
-        Ok(_) => {
-            with_wallet(key, move |w| {
-                core_tex::record_attempt(w, id, now, None).map_err(queue_error)?;
-                core_tex::set_state(w, id, TexState::Step2Broadcast, None).map_err(queue_error)
-            })
+    if let Ok(Offered::Accepted) = offer(built.step2_raw, 2).await {
+        tex::set_state(key, id, TexState::Step2Broadcast, None)
             .await
-            .map_err(err)?;
-            tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast");
-            tracing::info!(key_id, step = 2, "transaction broadcast");
-            emit_broadcast(tx, 2, step2_hex.clone()).await?;
-        }
-        Err(e) => {
-            let text = e.to_string();
-            let _ = with_wallet(key, move |w| {
-                core_tex::record_attempt(w, id, now, Some(&text)).map_err(queue_error)
-            })
-            .await;
-            tracing::warn!(
-                key_id,
-                "the node did not take zip 320 step 2 yet; the queue retries once step 1 is mined"
-            );
-        }
+            .map_err(drive)?;
+        emit_broadcast(tx, 2, step2_hex.clone()).await?;
+    } else {
+        tracing::warn!(
+            key_id,
+            "the node did not take zip 320 step 2 yet; the queue retries once step 1 is mined"
+        );
     }
     state.tex.wake();
     state.sync.wake();
