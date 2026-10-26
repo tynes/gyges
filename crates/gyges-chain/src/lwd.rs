@@ -308,7 +308,8 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
     }
 
     /// `GetLightdInfo`: refuse an endpoint for another chain. lightwalletd
-    /// reports `"main"` or `"test"`; zaino on regtest reports `"regtest"`.
+    /// reports `"main"` or `"test"`, and zaino 0.10.2 reports `"test"` on
+    /// regtest too (OVERVIEW.md §4.5); `"regtest"` is accepted as well.
     async fn check_endpoint(
         &self,
         client: &mut CompactTxStreamerClient<Channel>,
@@ -672,7 +673,8 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
 
     /// `GetTransaction(txid)`: the raw bytes and the height the endpoint
     /// reports (0 for its mempool, `u64::MAX` for a fork); `None` when it
-    /// does not have the transaction.
+    /// does not have the transaction (lightwalletd's NOT_FOUND, or zaino's
+    /// `Internal` carrying the node's -5, see [`zaino_tx_not_found`]).
     pub async fn raw_transaction(
         &self,
         txid: [u8; 32],
@@ -691,6 +693,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                     Ok(Some((raw.data, raw.height)))
                 }
                 Err(s) if s.code() == Code::NotFound => Ok(None),
+                Err(s) if s.code() == Code::Internal && zaino_tx_not_found(s.message()) => Ok(None),
                 Err(s) => Err(self.status_error("GetTransaction", s)),
             }
         })
@@ -701,7 +704,9 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
     /// --via-tor`, `broadcast_via_tor`). lightwalletd answers the node's
     /// `sendrawtransaction` result: `error_code` 0 with the txid in
     /// `error_message`, or the node's rejection code and text, which is
-    /// passed through as [`ChainError::Rejected`].
+    /// passed through as [`ChainError::Rejected`]. zaino answers a refusal
+    /// as `Internal` instead; [`zaino_rejection`] picks the node's text out
+    /// of it.
     async fn send_transaction(&self, raw: &[u8]) -> Result<[u8; 32], ChainError> {
         let raw = raw.to_vec();
         self.call(|mut client| async move {
@@ -711,7 +716,13 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                     height: 0,
                 })
                 .await
-                .map_err(|s| self.status_error("SendTransaction", s))?
+                .map_err(|s| match s.code() {
+                    Code::Internal => match zaino_rejection(s.message()) {
+                        Some(text) => ChainError::Rejected(text.to_string()),
+                        None => self.status_error("SendTransaction", s),
+                    },
+                    _ => self.status_error("SendTransaction", s),
+                })?
                 .into_inner();
             if resp.error_code != 0 {
                 return Err(ChainError::Rejected(format!(
@@ -740,6 +751,66 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         })
         .await
     }
+}
+
+/// Whether a zaino `Internal` answer to `GetTransaction` is the node's
+/// "no such transaction" (OVERVIEW.md §4.5, deviation 1). zaino 0.10.2
+/// passes the node's JSON-RPC error through as
+/// `RPC error: LegacyRpcError { code: -5, message: "No such mempool or main chain transaction" }`
+/// where lightwalletd answers NOT_FOUND. Both the code and the text must
+/// match. With the node down zaino answers `Internal` too, with a transport
+/// text, and that stays an error.
+fn zaino_tx_not_found(message: &str) -> bool {
+    message
+        .split_once("LegacyRpcError { code: ")
+        .and_then(|(_, rest)| rest.split_once(','))
+        .is_some_and(|(code, rest)| {
+            code.trim() == "-5" && rest.contains("No such mempool or main chain transaction")
+        })
+}
+
+/// The node's own text when a zaino `Internal` answer to `SendTransaction`
+/// is the node refusing the transaction (OVERVIEW.md §4.5, deviation 2);
+/// `None` when zaino could not reach or authenticate to the node.
+///
+/// zaino 0.10.2 drops the node's JSON-RPC code and keeps one of two shapes
+/// after its `InternalServerError: error receiving data from backing node:
+/// critical error in backing block source:` wrapper:
+/// * `validator rejected the query: <text>`: the node answered -22
+///   (malformed) or -25 to -27 (refused). Always a rejection.
+/// * `validator unreachable: <text>`: every other failure. zaino prints a
+///   node's JSON-RPC error as the node's message alone, but any other
+///   failure as one of `zaino-rpc`'s own error texts (`http error: …` for a
+///   stopped node or a stale cookie, `http status …`, and so on), or as a
+///   bare failure kind. So `<text>` is the node's rejection exactly when it
+///   is none of those. zakurad answers a mempool refusal (a duplicate, say)
+///   with -1, which takes this path after about 2.5 s of zaino retries.
+///
+/// zaino also retries -1 and -28 as "work queue full" and "warming up". A
+/// node answering those comes out as a rejection here, which is what
+/// [`crate::ZakuraRpcBackend`] does with every JSON-RPC error on the direct
+/// route.
+fn zaino_rejection(message: &str) -> Option<&str> {
+    if let Some((_, text)) = message.split_once("validator rejected the query: ") {
+        return Some(text);
+    }
+    let (_, text) = message.split_once("validator unreachable: ")?;
+    /// `zaino_rpc::RpcError`'s texts other than a node's JSON-RPC error.
+    const TRANSPORT: [&str; 6] = [
+        "http error: ",
+        "json error: ",
+        "http status ",
+        "work queue full after ",
+        "null result without error",
+        "response body exceeded ",
+    ];
+    let text = text.trim();
+    let transport = TRANSPORT.iter().any(|p| text.starts_with(p))
+        // `zaino_source::FailureMode`'s names, printed when there is no text.
+        || matches!(text, "" | "Connection" | "Timeout" | "Auth" | "Parse")
+        || text.starts_with("HttpStatus(")
+        || text.starts_with("RpcError(");
+    (!transport).then_some(text)
 }
 
 fn height_of(height: u64, method: &str) -> Result<BlockHeight, ChainError> {
@@ -796,8 +867,8 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ArtiTorLwdBackend<P
 
     /// `GetTransaction(txid)`: lightwalletd reports `height` 0 for the
     /// mempool, `u64::MAX` for a transaction mined only on a fork, else the
-    /// main-chain height (OVERVIEW.md §4.4); NOT_FOUND is
-    /// [`TxStatus::Unknown`].
+    /// main-chain height (OVERVIEW.md §4.4); NOT_FOUND (zaino: `Internal`
+    /// with the node's -5) is [`TxStatus::Unknown`].
     fn transaction_status(&self, txid: [u8; 32]) -> BoxFuture<'_, Result<TxStatus, ChainError>> {
         Box::pin(async move {
             Ok(match self.raw_transaction(txid).await? {
@@ -1184,6 +1255,100 @@ mod tests {
             be.transaction_status([0x55; 32]).await.unwrap(),
             TxStatus::Unknown
         );
+    }
+
+    /// zaino 0.10.2's answers, verbatim from the runs in OVERVIEW.md §4.5.
+    const ZAINO_UNKNOWN_TXID: &str = r#"RPC error: LegacyRpcError { code: -5, message: "No such mempool or main chain transaction" }"#;
+    const ZAINO_DUPLICATE: &str = "InternalServerError: error receiving data from backing node: critical error in backing block source: validator unreachable: any transaction with the same effects will be rejected from the mempool until a chain reset: transaction was committed to the best chain";
+    const ZAINO_MALFORMED: &str = "InternalServerError: error receiving data from backing node: critical error in backing block source: validator rejected the query: malformed transaction: parse error: bad tx header";
+    /// A stopped node, and a restarted one zaino holds a stale cookie for:
+    /// the same text.
+    const ZAINO_NODE_DOWN: &str = "InternalServerError: error receiving data from backing node: critical error in backing block source: validator unreachable: http error: error sending request for url (http://127.0.0.1:41232/)";
+
+    #[test]
+    fn zaino_answers_are_told_apart() {
+        assert!(zaino_tx_not_found(ZAINO_UNKNOWN_TXID));
+        assert!(!zaino_tx_not_found(ZAINO_NODE_DOWN));
+        assert!(!zaino_tx_not_found(
+            r#"RPC error: LegacyRpcError { code: -50, message: "No such mempool or main chain transaction" }"#
+        ));
+        assert!(!zaino_tx_not_found(
+            r#"RPC error: LegacyRpcError { code: -5, message: "Invalid address" }"#
+        ));
+
+        assert_eq!(
+            zaino_rejection(ZAINO_DUPLICATE),
+            Some(
+                "any transaction with the same effects will be rejected from the mempool until a chain reset: transaction was committed to the best chain"
+            )
+        );
+        assert_eq!(
+            zaino_rejection(ZAINO_MALFORMED),
+            Some("malformed transaction: parse error: bad tx header")
+        );
+        assert_eq!(zaino_rejection(ZAINO_NODE_DOWN), None);
+        assert_eq!(zaino_rejection(ZAINO_UNKNOWN_TXID), None);
+        let wrap = |t: &str| {
+            format!(
+                "InternalServerError: error receiving data from backing node: critical error in backing block source: validator unreachable: {t}"
+            )
+        };
+        for transport in [
+            "http status 401",
+            "http status 503",
+            "json error: expected value at line 1 column 1",
+            "work queue full after 5 attempts",
+            "null result without error",
+            "response body exceeded 1048576 bytes",
+            "Connection",
+            "Timeout",
+            "Auth",
+            "HttpStatus(502)",
+            "",
+        ] {
+            assert_eq!(zaino_rejection(&wrap(transport)), None, "{transport:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn zaino_internal_answers_map_like_lightwalletd_ones() {
+        let node = FakeNode::start(regtest_params()).await;
+        node.mine(2);
+        let lwd = FakeLightwalletd::from_node(&node).await;
+        lwd.set_zaino_errors(true);
+        let be = backend(&lwd);
+
+        // Unknown txid: not an error.
+        assert!(be.raw_transaction([0x77; 32]).await.unwrap().is_none());
+        assert_eq!(
+            be.transaction_status([0x55; 32]).await.unwrap(),
+            TxStatus::Unknown
+        );
+        let mined = node.block(2).unwrap().txids[0];
+        assert_eq!(
+            be.transaction_status(mined).await.unwrap(),
+            TxStatus::Mined(h(2))
+        );
+
+        // The node refused the broadcast: its text, as a rejection.
+        let raw = node.block(2).unwrap().tx_raw[0].clone();
+        lwd.set_reject_broadcasts(Some("transaction was committed to the best chain".into()));
+        let err = be.send_raw_transaction(raw.clone()).await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Rejected(m) if m == "transaction was committed to the best chain"),
+            "{err}"
+        );
+
+        // zaino cannot reach its node: not a rejection.
+        lwd.set_reject_broadcasts(Some(
+            "http error: error sending request for url (http://127.0.0.1:41232/)".into(),
+        ));
+        let err = be.send_raw_transaction(raw).await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Rpc(m) if m.contains("validator unreachable: http error")),
+            "{err}"
+        );
+        assert!(lwd.broadcasts().is_empty());
     }
 
     #[tokio::test]

@@ -4570,8 +4570,11 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
 /// backfilled blocks there carry no transparent outputs, so nothing else
 /// finds it). Two fabricated outputs are discarded: one whose transaction
 /// the endpoint does not have, one claiming an output index its transaction
-/// lacks. The restore warns that transparent history below the window is
-/// best-effort, and `GetInfo` repeats it for the key.
+/// lacks. The endpoint answers errors as zaino does, so the missing
+/// transaction comes back as `Internal` with the node's -5 rather than
+/// NOT_FOUND, and is still discarded rather than retried (OVERVIEW.md §4.5,
+/// deviation 1). The restore warns that transparent history below the
+/// window is best-effort, and `GetInfo` repeats it for the key.
 #[tokio::test(flavor = "multi_thread")]
 async fn restore_below_the_window_recovers_transparent_outputs_and_discards_fabricated_ones() {
     use gyges_chain::testing::FakeUtxo;
@@ -4635,6 +4638,7 @@ async fn restore_below_the_window_recovers_transparent_outputs_and_discards_fabr
         value_zat: 500_000_000,
         ..real.clone()
     });
+    lwd.set_zaino_errors(true);
 
     let (node_url, lwd_url) = (node.url().to_string(), lwd.url().to_string());
     let running = start_with(ONE_CONF_CONFIG, |o| {
