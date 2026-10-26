@@ -114,8 +114,11 @@ impl v1::GygesError {
         self
     }
 
-    /// Encode this error as the single detail of a gRPC status with `code`.
-    pub fn into_status_with_code(self, code: tonic::Code) -> tonic::Status {
+    /// Encode this error as the single detail of a gRPC status whose code
+    /// follows [`v1::ErrorReason::grpc_code`]. (The generated `reason()`
+    /// accessor yields `Unspecified` for values this build does not know.)
+    pub fn into_status(self) -> tonic::Status {
+        let code = self.reason().grpc_code();
         let message = self.detail.clone();
         let any = prost_types::Any {
             type_url: GYGES_ERROR_TYPE_URL.to_string(),
@@ -127,14 +130,6 @@ impl v1::GygesError {
             details: vec![any],
         };
         tonic::Status::with_details(code, message, envelope.encode_to_vec().into())
-    }
-
-    /// Encode this error as a gRPC status whose code follows
-    /// [`v1::ErrorReason::grpc_code`]. (The generated `reason()` accessor
-    /// yields `Unspecified` for values this build does not know.)
-    pub fn into_status(self) -> tonic::Status {
-        let code = self.reason().grpc_code();
-        self.into_status_with_code(code)
     }
 
     /// Decode the `GygesError` detail from a failed RPC, if the status carries

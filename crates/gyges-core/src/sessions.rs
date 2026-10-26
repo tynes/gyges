@@ -13,7 +13,7 @@
 use rusqlite::{OptionalExtension as _, named_params};
 use uuid::Uuid;
 
-use crate::ext::{ExtTable, with_ext};
+use crate::ext::{ExtTable, query_ids, with_ext};
 use crate::registry::Wallet;
 
 /// The external migration's id (random, fixed forever).
@@ -237,31 +237,17 @@ pub fn set_state(
 }
 
 /// Every row, newest first; only those awaiting a signature unless
-/// `include_finished`. The extension handle answers single rows only, so
-/// the ids come back as one `group_concat` and the rows one by one.
+/// `include_finished`.
 pub fn list(wallet: &mut Wallet, include_finished: bool) -> Result<Vec<SessionRow>, SessionError> {
     let filter = if include_finished {
         String::new()
     } else {
         " WHERE status = 'awaiting-signature'".to_string()
     };
-    let joined: Option<String> = with_ext(wallet, |ext| {
-        ext.query_row(
-            &format!(
-                "SELECT group_concat(session_id, ',') FROM \
-                 (SELECT session_id FROM {TABLE}{filter} ORDER BY created_at DESC, session_id)"
-            ),
-            [],
-            |r| r.get(0),
-        )
-    })?;
+    let rest = format!("FROM {TABLE}{filter} ORDER BY created_at DESC, session_id");
     let mut rows = Vec::new();
-    for id in joined
-        .unwrap_or_default()
-        .split(',')
-        .filter(|s| !s.is_empty())
-    {
-        if let Some(row) = get(wallet, id)? {
+    for id in query_ids(wallet, "session_id", &rest)? {
+        if let Some(row) = get(wallet, &id)? {
             rows.push(row);
         }
     }

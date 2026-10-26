@@ -12,7 +12,7 @@ use crate::amount::format_zec;
 use crate::balance::pool_name;
 use crate::client::Ctx;
 use crate::exit::CliError;
-use crate::output::{format_unix, to_json};
+use crate::output::format_unix;
 use crate::tx::tex_state_name;
 
 #[derive(Debug, Clone, Args)]
@@ -44,12 +44,7 @@ pub async fn list(ctx: &Ctx, args: ListArgs) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else {
-        print!("{}", render_list(&resp));
-    }
-    Ok(())
+    ctx.print(&resp, || render_list(&resp))
 }
 
 pub async fn status(ctx: &Ctx, args: StatusArgs) -> Result<(), CliError> {
@@ -66,12 +61,7 @@ pub async fn status(ctx: &Ctx, args: StatusArgs) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else {
-        println!("{}", render_status(&resp));
-    }
-    Ok(())
+    ctx.print(&resp, || format!("{}\n", render_status(&resp)))
 }
 
 /// The CLI spelling of a status (CLI_SPEC.md §2.5).

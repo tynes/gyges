@@ -13,7 +13,6 @@ use tokio_stream::StreamExt as _;
 
 use crate::client::Ctx;
 use crate::exit::CliError;
-use crate::output::to_json;
 
 #[derive(Debug, Subcommand)]
 pub enum SyncCmd {
@@ -94,15 +93,12 @@ async fn mempool(ctx: &Ctx) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else if !ctx.quiet {
+    ctx.report(&resp, || {
         println!(
             "{}",
             render_mempool(resp.transactions_scanned, resp.notes_found)
         );
-    }
-    Ok(())
+    })
 }
 
 fn render_mempool(transactions: u32, notes: u32) -> String {
@@ -126,12 +122,7 @@ async fn status(ctx: &Ctx, args: StatusArgs) -> Result<(), CliError> {
         .get_sync_status(GetSyncStatusRequest { key_id })
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else {
-        print!("{}", render_status(&resp.keys));
-    }
-    Ok(())
+    ctx.print(&resp, || render_status(&resp.keys))
 }
 
 /// The state word of CLI_SPEC.md §2.3: `initializing`, `scanning`,
@@ -307,15 +298,12 @@ async fn follow(
                 return Err(CliError::Daemon(err));
             }
         };
-        match next {
+        match next.transpose()? {
             None => return Ok(()),
-            Some(Err(status)) => return Err(CliError::from_status(status)),
-            Some(Ok(p)) => {
-                if ctx.json {
-                    println!("{}", to_json(&p)?);
-                } else if !ctx.quiet {
+            Some(p) => {
+                ctx.report(&p, || {
                     eprintln!("{}", progress_line(&p));
-                }
+                })?;
                 let done = p.done;
                 last = Some(p);
                 if done {

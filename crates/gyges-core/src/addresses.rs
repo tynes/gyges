@@ -24,7 +24,7 @@ use zcash_protocol::consensus::NetworkType;
 use zip32::DiversifierIndex;
 
 use crate::Pool;
-use crate::ext::ExtTable;
+use crate::ext::{ExtTable, with_ext};
 use crate::registry::Wallet;
 use crate::tx::{TxError, account_of};
 
@@ -379,32 +379,30 @@ fn create_labels_migration() -> String {
 
 fn set_label(wallet: &mut Wallet, address: &str, label: &str) -> Result<(), TxError> {
     let now = crate::profile::unix_now();
-    wallet
-        .transactionally_with_extension(|_wdb, ext| {
-            ext.execute(
-                &format!(
-                    "INSERT INTO {LABELS} (address, label, created_at) \
+    with_ext(wallet, |ext| {
+        ext.execute(
+            &format!(
+                "INSERT INTO {LABELS} (address, label, created_at) \
                      VALUES (:address, :label, :now) \
                      ON CONFLICT (address) DO UPDATE SET label = excluded.label"
-                ),
-                named_params! {":address": address, ":label": label, ":now": now},
-            )
-        })
-        .map(|_| ())
-        .map_err(|e: rusqlite::Error| TxError::Internal(format!("storing the label: {e}")))
+            ),
+            named_params! {":address": address, ":label": label, ":now": now},
+        )
+    })
+    .map(|_| ())
+    .map_err(|e: rusqlite::Error| TxError::Internal(format!("storing the label: {e}")))
 }
 
 fn label_of(wallet: &mut Wallet, address: &str) -> Result<Option<String>, TxError> {
-    wallet
-        .transactionally_with_extension(|_wdb, ext| {
-            ext.query_row(
-                &format!("SELECT label FROM {LABELS} WHERE address = :address"),
-                named_params! {":address": address},
-                |r| r.get(0),
-            )
-            .optional()
-        })
-        .map_err(|e: rusqlite::Error| TxError::Internal(format!("reading the label: {e}")))
+    with_ext(wallet, |ext| {
+        ext.query_row(
+            &format!("SELECT label FROM {LABELS} WHERE address = :address"),
+            named_params! {":address": address},
+            |r| r.get(0),
+        )
+        .optional()
+    })
+    .map_err(|e: rusqlite::Error| TxError::Internal(format!("reading the label: {e}")))
 }
 
 #[cfg(test)]

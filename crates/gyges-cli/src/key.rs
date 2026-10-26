@@ -141,12 +141,7 @@ async fn list(ctx: &Ctx) -> Result<(), CliError> {
         .list_keys(ListKeysRequest {})
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else {
-        print!("{}", render_list(&resp.keys));
-    }
-    Ok(())
+    ctx.print(&resp, || render_list(&resp.keys))
 }
 
 /// Human-readable `key list`.
@@ -344,9 +339,7 @@ async fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<(), CliError> {
         .into_inner();
     drop(passphrase);
     drop(mnemonic);
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else if !ctx.quiet {
+    ctx.report(&resp, || {
         eprintln!(
             "key '{}' restored with birthday {}{}",
             resp.key_id,
@@ -363,8 +356,7 @@ async fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<(), CliError> {
         if args.set_default {
             note_set_default(&resp.key_id);
         }
-    }
-    Ok(())
+    })
 }
 
 /// Ask (or `--yes`) when the birthday is below the node's retention height
@@ -440,11 +432,7 @@ pub(crate) fn endpoint_notes(url: &str, use_tor: bool) -> Vec<String> {
 async fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<(), CliError> {
     let mut conn = ctx.connect().await?;
     let key_id = args.key.resolve(ctx);
-    let shown = if key_id.is_empty() {
-        conn.info.default_key.clone()
-    } else {
-        key_id.clone()
-    };
+    let shown = crate::tx::shown_key(&key_id, &conn);
     let passphrase = ctx
         .prompter
         .passphrase(&format!("Enter passphrase to unlock key '{shown}'"), false)?;
@@ -463,15 +451,12 @@ async fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<(), CliError> {
         .await?
         .into_inner();
     drop(passphrase);
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else if !ctx.quiet {
+    ctx.report(&resp, || {
         eprintln!(
             "key '{shown}' unlocked until {} (daemon scope: any process of this user can spend from it until then; `gyges key lock` ends it early)",
             format_unix(resp.expires_at)
         );
-    }
-    Ok(())
+    })
 }
 
 async fn lock(ctx: &Ctx, args: LockArgs) -> Result<(), CliError> {
@@ -488,16 +473,13 @@ async fn lock(ctx: &Ctx, args: LockArgs) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else if !ctx.quiet {
+    ctx.report(&resp, || {
         if resp.locked_key_ids.is_empty() {
             eprintln!("nothing was unlocked");
         } else {
             eprintln!("locked: {}", resp.locked_key_ids.join(", "));
         }
-    }
-    Ok(())
+    })
 }
 
 async fn export_ufvk(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
@@ -509,12 +491,7 @@ async fn export_ufvk(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else {
-        println!("{}", resp.ufvk);
-    }
-    Ok(())
+    ctx.print(&resp, || format!("{}\n", resp.ufvk))
 }
 
 /// `key export-seed` (OVERVIEW.md Q-S4): terminal only, never `--json`, the
@@ -534,11 +511,7 @@ async fn export_seed(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
     }
     let mut conn = ctx.connect().await?;
     let key_id = args.resolve(ctx);
-    let shown = if key_id.is_empty() {
-        conn.info.default_key.clone()
-    } else {
-        key_id.clone()
-    };
+    let shown = crate::tx::shown_key(&key_id, &conn);
     eprintln!(
         "This prints the 24 words that control every fund of key '{shown}'. Anyone who sees them can spend. Make sure nobody is watching your screen."
     );

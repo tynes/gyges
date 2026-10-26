@@ -18,7 +18,7 @@ use rusqlite::{OptionalExtension as _, named_params};
 use uuid::Uuid;
 
 use crate::TexState;
-use crate::ext::{ExtTable, with_ext};
+use crate::ext::{ExtTable, query_ids, with_ext};
 use crate::registry::Wallet;
 
 /// The external migration's id (random, fixed forever).
@@ -178,9 +178,7 @@ pub fn get(wallet: &mut Wallet, step1_txid: [u8; 32]) -> Result<Option<TexRow>, 
     })
 }
 
-/// The step-1 txids of every row in one of `states`, oldest first. The
-/// extension handle answers single rows only, so the ids come back as one
-/// `group_concat`.
+/// The step-1 txids of every row in one of `states`, oldest first.
 pub fn list_ids(wallet: &mut Wallet, states: &[TexState]) -> Result<Vec<[u8; 32]>, TexQueueError> {
     if states.is_empty() {
         return Ok(Vec::new());
@@ -190,23 +188,9 @@ pub fn list_ids(wallet: &mut Wallet, states: &[TexState]) -> Result<Vec<[u8; 32]
         .map(|s| format!("'{}'", s.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
-    let joined: Option<String> = with_ext(wallet, |ext| {
-        ext.query_row(
-            &format!(
-                "SELECT group_concat(hex(step1_txid), ',') FROM \
-                 (SELECT step1_txid FROM {TABLE} WHERE state IN ({filter}) \
-                  ORDER BY created_at, step1_txid)"
-            ),
-            [],
-            |r| r.get(0),
-        )
-    })?;
+    let rest = format!("FROM {TABLE} WHERE state IN ({filter}) ORDER BY created_at, step1_txid");
     let mut out = Vec::new();
-    for h in joined
-        .unwrap_or_default()
-        .split(',')
-        .filter(|s| !s.is_empty())
-    {
+    for h in query_ids(wallet, "hex(step1_txid)", &rest)? {
         let bytes = hex::decode(h).map_err(|e| {
             TexQueueError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
                 0,

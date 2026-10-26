@@ -73,6 +73,16 @@ pub enum Pool {
     Ironwood,
 }
 
+impl Pool {
+    /// Every pool, in the order a new profile lists them.
+    pub const ALL: [Pool; 4] = [
+        Pool::Orchard,
+        Pool::Ironwood,
+        Pool::Sapling,
+        Pool::Transparent,
+    ];
+}
+
 /// States of a `tex_queue` row (Q-T1, Q-T2; DATA_MODEL.md §5.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

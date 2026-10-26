@@ -7,7 +7,6 @@ use gyges_proto::v1::{GetBalanceRequest, GetBalanceResponse, Pool};
 use crate::amount::format_zec;
 use crate::client::Ctx;
 use crate::exit::CliError;
-use crate::output::to_json;
 
 #[derive(Debug, Clone, Args)]
 pub struct BalanceArgs {
@@ -26,12 +25,7 @@ pub async fn run(ctx: &Ctx, args: BalanceArgs) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else {
-        print!("{}", render(&resp));
-    }
-    Ok(())
+    ctx.print(&resp, || render(&resp))
 }
 
 pub fn pool_name(pool: Pool) -> &'static str {

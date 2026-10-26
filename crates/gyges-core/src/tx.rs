@@ -307,16 +307,8 @@ pub fn propose_send(
                         available,
                         required,
                     }) if required > available => {
-                        // `required` is the amount plus the fee. Upstream
-                        // reports what it could select as `available`, but
-                        // reports 0 when the selection would have been
-                        // transparent inputs only, so fall back to the
-                        // wallet's own spendable total there; otherwise a
-                        // transparent-only wallet could never send `max`.
-                        let fee = required.saturating_sub(amount.into_u64());
-                        let have = if available > 0 { available } else { total };
-                        amount = Zatoshis::from_u64(have.saturating_sub(fee))
-                            .map_err(|e| internal("amount", e))?;
+                        let next = next_max(amount.into_u64(), available, required, total);
+                        amount = Zatoshis::from_u64(next).map_err(|e| internal("amount", e))?;
                     }
                     Err(e) => return Err(e),
                 }
@@ -649,12 +641,6 @@ impl Provers {
             p
         })
     }
-
-    /// Build the Orchard keys now (the daemon does this at start so the
-    /// first send does not pay for it).
-    pub fn warm_orchard(&self) {
-        let _ = self.orchard();
-    }
 }
 
 /// What [`prove`] had to prove, for the `Proving` progress events.
@@ -720,6 +706,18 @@ pub fn prove(pczt: Pczt, provers: &Provers) -> Result<Pczt, TxError> {
             .map_err(|e| TxError::Internal(format!("sapling proving failed: {e:?}")))?;
     }
     Ok(prover.finish())
+}
+
+/// The next amount for `max` after a proposal for `amount` fell short:
+/// `required` is the amount plus the fee, and the fee comes off what can be
+/// spent. Upstream reports what it could select as `available`, but 0 when
+/// the selection would have been transparent inputs only, so the wallet's
+/// own spendable `total` stands in there; otherwise a transparent-only
+/// wallet could never send `max`.
+fn next_max(amount: u64, available: u64, required: u64, total: u64) -> u64 {
+    let fee = required.saturating_sub(amount);
+    let have = if available > 0 { available } else { total };
+    have.saturating_sub(fee)
 }
 
 /// Derive the account's spending key from decrypted entropy.
@@ -1177,40 +1175,30 @@ pub fn check_change(pczt: Pczt, owner: &Owner) -> Result<Pczt, TxError> {
 
 /// What the Verifier checks a signed PCZT against: the approved proposal,
 /// reduced to the outputs a transaction must carry.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Stored as JSON in `ext_gyges_signing_sessions.expected`, the 43-byte
+/// addresses as arrays of numbers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Expected {
     /// `(scriptPubKey, value)` of every transparent payment and change.
     pub transparent_outputs: Vec<(Vec<u8>, u64)>,
     /// `(raw Orchard address, value)` of every Orchard-protocol payment,
     /// whether the proposal routes it through the Orchard or the Ironwood
     /// bundle (both pay the unified address's Orchard receiver).
+    #[serde(with = "address_pairs")]
     pub orchard_payments: Vec<([u8; 43], u64)>,
     /// Value of Orchard-protocol change, as a total (the change address is
     /// the wallet's internal one, which the PCZT carries but the proposal
     /// does not; [`verify`] checks each change output's owner instead).
     pub orchard_change: u64,
     /// `(raw Sapling address, value)` of every Sapling payment.
+    #[serde(with = "address_pairs")]
     pub sapling_payments: Vec<([u8; 43], u64)>,
     pub sapling_change: u64,
     pub fee: u64,
     /// `nExpiryHeight` must be in `[min_target, expiry]`.
     pub min_target_height: u32,
     pub expiry_height: u32,
-}
-
-/// `Expected` on disk (`ext_gyges_signing_sessions.expected`): the same
-/// fields with the fixed-size arrays as byte vectors, since serde has no
-/// 43-byte arrays.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ExpectedWire {
-    transparent_outputs: Vec<(Vec<u8>, u64)>,
-    orchard_payments: Vec<(Vec<u8>, u64)>,
-    orchard_change: u64,
-    sapling_payments: Vec<(Vec<u8>, u64)>,
-    sapling_change: u64,
-    fee: u64,
-    min_target_height: u32,
-    expiry_height: u32,
 }
 
 impl Expected {
@@ -1287,52 +1275,45 @@ impl Expected {
 
     /// For the signing sessions table.
     pub fn to_json(&self) -> Vec<u8> {
-        let wire = ExpectedWire {
-            transparent_outputs: self.transparent_outputs.clone(),
-            orchard_payments: self
-                .orchard_payments
-                .iter()
-                .map(|(a, v)| (a.to_vec(), *v))
-                .collect(),
-            orchard_change: self.orchard_change,
-            sapling_payments: self
-                .sapling_payments
-                .iter()
-                .map(|(a, v)| (a.to_vec(), *v))
-                .collect(),
-            sapling_change: self.sapling_change,
-            fee: self.fee,
-            min_target_height: self.min_target_height,
-            expiry_height: self.expiry_height,
-        };
-        serde_json::to_vec(&wire).expect("plain data serialises")
+        serde_json::to_vec(self).expect("plain data serialises")
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, TxError> {
-        let wire: ExpectedWire = serde_json::from_slice(bytes)
-            .map_err(|e| TxError::Internal(format!("stored proposal is unreadable: {e}")))?;
-        let arr = |v: Vec<u8>| -> Result<[u8; 43], TxError> {
-            <[u8; 43]>::try_from(v)
-                .map_err(|_| TxError::Internal("stored proposal has a malformed address".into()))
-        };
-        Ok(Expected {
-            transparent_outputs: wire.transparent_outputs,
-            orchard_payments: wire
-                .orchard_payments
-                .into_iter()
-                .map(|(a, v)| Ok((arr(a)?, v)))
-                .collect::<Result<_, TxError>>()?,
-            orchard_change: wire.orchard_change,
-            sapling_payments: wire
-                .sapling_payments
-                .into_iter()
-                .map(|(a, v)| Ok((arr(a)?, v)))
-                .collect::<Result<_, TxError>>()?,
-            sapling_change: wire.sapling_change,
-            fee: wire.fee,
-            min_target_height: wire.min_target_height,
-            expiry_height: wire.expiry_height,
+        serde_json::from_slice(bytes).map_err(|e| {
+            TxError::Internal(if e.to_string().starts_with(address_pairs::MALFORMED) {
+                address_pairs::MALFORMED.into()
+            } else {
+                format!("stored proposal is unreadable: {e}")
+            })
         })
+    }
+}
+
+/// `(raw 43-byte address, value)` pairs for serde, which has no 43-byte
+/// arrays: the address goes as a sequence of numbers.
+mod address_pairs {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) const MALFORMED: &str = "stored proposal has a malformed address";
+
+    pub(super) fn serialize<S: Serializer>(v: &[([u8; 43], u64)], s: S) -> Result<S::Ok, S::Error> {
+        let pairs: Vec<(&[u8], u64)> = v.iter().map(|(a, n)| (&a[..], *n)).collect();
+        pairs.serialize(s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<([u8; 43], u64)>, D::Error> {
+        Vec::<(Vec<u8>, u64)>::deserialize(d)?
+            .into_iter()
+            .map(|(a, n)| {
+                Ok((
+                    <[u8; 43]>::try_from(a).map_err(|_| D::Error::custom(MALFORMED))?,
+                    n,
+                ))
+            })
+            .collect()
     }
 }
 
@@ -1813,18 +1794,13 @@ pub fn balance(wallet: &Wallet, min_confirmations: u32) -> Result<BalanceSummary
         });
     };
     // Indexed below in this order.
-    let mut pools: Vec<PoolBalance> = [
-        Pool::Orchard,
-        Pool::Ironwood,
-        Pool::Sapling,
-        Pool::Transparent,
-    ]
-    .into_iter()
-    .map(|pool| PoolBalance {
-        pool,
-        ..Default::default()
-    })
-    .collect();
+    let mut pools: Vec<PoolBalance> = Pool::ALL
+        .into_iter()
+        .map(|pool| PoolBalance {
+            pool,
+            ..Default::default()
+        })
+        .collect();
     for account in summary.account_balances().values() {
         let add = |p: &mut PoolBalance, b: &zcash_client_backend::data_api::Balance| {
             p.spendable += b.spendable_value().into_u64();
@@ -1905,5 +1881,49 @@ mod tests {
     fn confirmations_policy_never_goes_below_one() {
         let _ = confirmations_policy(0);
         let _ = confirmations_policy(10);
+    }
+
+    fn expected_sample() -> Expected {
+        let mut addr = [0u8; 43];
+        addr[0] = 7;
+        addr[42] = 9;
+        Expected {
+            transparent_outputs: vec![(vec![0x76, 0xa9], 5)],
+            orchard_payments: vec![(addr, 10)],
+            orchard_change: 3,
+            sapling_payments: vec![([1; 43], 4)],
+            sapling_change: 2,
+            fee: 1,
+            min_target_height: 100,
+            expiry_height: 140,
+        }
+    }
+
+    /// `Expected` as `ext_gyges_signing_sessions.expected` stores it: rows
+    /// written by earlier releases must read back, and new ones must be
+    /// written the same way.
+    const EXPECTED_JSON: &str = r#"{"transparent_outputs":[[[118,169],5]],"orchard_payments":[[[7,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9],10]],"orchard_change":3,"sapling_payments":[[[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],4]],"sapling_change":2,"fee":1,"min_target_height":100,"expiry_height":140}"#;
+
+    #[test]
+    fn stored_expected_json_is_stable() {
+        let exp = expected_sample();
+        assert_eq!(String::from_utf8(exp.to_json()).unwrap(), EXPECTED_JSON);
+        assert_eq!(Expected::from_json(EXPECTED_JSON.as_bytes()).unwrap(), exp);
+        // A 42-byte address is refused with the same text as before.
+        let short = EXPECTED_JSON.replacen("[[[7,0,", "[[[", 1);
+        let err = Expected::from_json(short.as_bytes()).unwrap_err();
+        assert_eq!(err.to_string(), "stored proposal has a malformed address");
+        assert!(Expected::from_json(b"{}").is_err());
+    }
+
+    #[test]
+    fn max_retries_with_the_fee_taken_off_what_can_be_spent() {
+        // 1000 asked, 1100 needed: the fee is 100, off the 900 selectable.
+        assert_eq!(next_max(1000, 900, 1100, 5000), 800);
+        // Transparent-only selection reports nothing available: the
+        // wallet's total stands in.
+        assert_eq!(next_max(1000, 0, 1100, 1000), 900);
+        // A fee above what can be spent leaves nothing to send.
+        assert_eq!(next_max(10, 5, 100, 5), 0);
     }
 }
