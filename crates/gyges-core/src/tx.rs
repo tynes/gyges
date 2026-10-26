@@ -1175,40 +1175,30 @@ pub fn check_change(pczt: Pczt, owner: &Owner) -> Result<Pczt, TxError> {
 
 /// What the Verifier checks a signed PCZT against: the approved proposal,
 /// reduced to the outputs a transaction must carry.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Stored as JSON in `ext_gyges_signing_sessions.expected`, the 43-byte
+/// addresses as arrays of numbers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Expected {
     /// `(scriptPubKey, value)` of every transparent payment and change.
     pub transparent_outputs: Vec<(Vec<u8>, u64)>,
     /// `(raw Orchard address, value)` of every Orchard-protocol payment,
     /// whether the proposal routes it through the Orchard or the Ironwood
     /// bundle (both pay the unified address's Orchard receiver).
+    #[serde(with = "address_pairs")]
     pub orchard_payments: Vec<([u8; 43], u64)>,
     /// Value of Orchard-protocol change, as a total (the change address is
     /// the wallet's internal one, which the PCZT carries but the proposal
     /// does not; [`verify`] checks each change output's owner instead).
     pub orchard_change: u64,
     /// `(raw Sapling address, value)` of every Sapling payment.
+    #[serde(with = "address_pairs")]
     pub sapling_payments: Vec<([u8; 43], u64)>,
     pub sapling_change: u64,
     pub fee: u64,
     /// `nExpiryHeight` must be in `[min_target, expiry]`.
     pub min_target_height: u32,
     pub expiry_height: u32,
-}
-
-/// `Expected` on disk (`ext_gyges_signing_sessions.expected`): the same
-/// fields with the fixed-size arrays as byte vectors, since serde has no
-/// 43-byte arrays.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ExpectedWire {
-    transparent_outputs: Vec<(Vec<u8>, u64)>,
-    orchard_payments: Vec<(Vec<u8>, u64)>,
-    orchard_change: u64,
-    sapling_payments: Vec<(Vec<u8>, u64)>,
-    sapling_change: u64,
-    fee: u64,
-    min_target_height: u32,
-    expiry_height: u32,
 }
 
 impl Expected {
@@ -1285,52 +1275,45 @@ impl Expected {
 
     /// For the signing sessions table.
     pub fn to_json(&self) -> Vec<u8> {
-        let wire = ExpectedWire {
-            transparent_outputs: self.transparent_outputs.clone(),
-            orchard_payments: self
-                .orchard_payments
-                .iter()
-                .map(|(a, v)| (a.to_vec(), *v))
-                .collect(),
-            orchard_change: self.orchard_change,
-            sapling_payments: self
-                .sapling_payments
-                .iter()
-                .map(|(a, v)| (a.to_vec(), *v))
-                .collect(),
-            sapling_change: self.sapling_change,
-            fee: self.fee,
-            min_target_height: self.min_target_height,
-            expiry_height: self.expiry_height,
-        };
-        serde_json::to_vec(&wire).expect("plain data serialises")
+        serde_json::to_vec(self).expect("plain data serialises")
     }
 
     pub fn from_json(bytes: &[u8]) -> Result<Self, TxError> {
-        let wire: ExpectedWire = serde_json::from_slice(bytes)
-            .map_err(|e| TxError::Internal(format!("stored proposal is unreadable: {e}")))?;
-        let arr = |v: Vec<u8>| -> Result<[u8; 43], TxError> {
-            <[u8; 43]>::try_from(v)
-                .map_err(|_| TxError::Internal("stored proposal has a malformed address".into()))
-        };
-        Ok(Expected {
-            transparent_outputs: wire.transparent_outputs,
-            orchard_payments: wire
-                .orchard_payments
-                .into_iter()
-                .map(|(a, v)| Ok((arr(a)?, v)))
-                .collect::<Result<_, TxError>>()?,
-            orchard_change: wire.orchard_change,
-            sapling_payments: wire
-                .sapling_payments
-                .into_iter()
-                .map(|(a, v)| Ok((arr(a)?, v)))
-                .collect::<Result<_, TxError>>()?,
-            sapling_change: wire.sapling_change,
-            fee: wire.fee,
-            min_target_height: wire.min_target_height,
-            expiry_height: wire.expiry_height,
+        serde_json::from_slice(bytes).map_err(|e| {
+            TxError::Internal(if e.to_string().starts_with(address_pairs::MALFORMED) {
+                address_pairs::MALFORMED.into()
+            } else {
+                format!("stored proposal is unreadable: {e}")
+            })
         })
+    }
+}
+
+/// `(raw 43-byte address, value)` pairs for serde, which has no 43-byte
+/// arrays: the address goes as a sequence of numbers.
+mod address_pairs {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) const MALFORMED: &str = "stored proposal has a malformed address";
+
+    pub(super) fn serialize<S: Serializer>(v: &[([u8; 43], u64)], s: S) -> Result<S::Ok, S::Error> {
+        let pairs: Vec<(&[u8], u64)> = v.iter().map(|(a, n)| (&a[..], *n)).collect();
+        pairs.serialize(s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<([u8; 43], u64)>, D::Error> {
+        Vec::<(Vec<u8>, u64)>::deserialize(d)?
+            .into_iter()
+            .map(|(a, n)| {
+                Ok((
+                    <[u8; 43]>::try_from(a).map_err(|_| D::Error::custom(MALFORMED))?,
+                    n,
+                ))
+            })
+            .collect()
     }
 }
 
