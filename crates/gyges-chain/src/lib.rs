@@ -316,11 +316,16 @@ pub fn display_hash(internal: &[u8]) -> String {
 /// The inverse of [`display_hash`]: a 64-character hex string in display
 /// order to 32 internal-order bytes.
 pub fn parse_display_hash(hex_str: &str) -> Result<[u8; 32], ChainError> {
-    let bytes = hex::decode(hex_str.trim())
-        .map_err(|e| ChainError::Rpc(format!("hash is not hex: {e}")))?;
-    let mut out = bytes32(&bytes, "hash")?;
+    let mut out = hex32(hex_str, "hash")?;
     out.reverse();
     Ok(out)
+}
+
+/// 64 hex characters (as sent, not reversed) to 32 bytes.
+pub(crate) fn hex32(hex_str: &str, what: impl fmt::Display) -> Result<[u8; 32], ChainError> {
+    let bytes = hex::decode(hex_str.trim())
+        .map_err(|e| ChainError::Rpc(format!("{what} is not hex: {e}")))?;
+    bytes32(&bytes, what)
 }
 
 /// Exactly 32 bytes, else [`ChainError::Rpc`] saying `"{what} has N bytes,
@@ -350,6 +355,15 @@ pub(crate) fn check_chain_name(
         )));
     }
     Ok(network)
+}
+
+/// The chain name a node reports for `network`: zakurad v1.6.0 says
+/// `"test"` on regtest as well.
+pub(crate) fn chain_name(network: NetworkType) -> &'static str {
+    match network {
+        NetworkType::Main => "main",
+        NetworkType::Test | NetworkType::Regtest => "test",
+    }
 }
 
 /// The innermost message of `e`'s source chain: transport errors wrap the

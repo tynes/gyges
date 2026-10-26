@@ -33,13 +33,13 @@ use zcash_client_backend::data_api::chain::ChainState;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
 use zcash_protocol::ShieldedPool;
-use zcash_protocol::consensus::{BlockHeight, NetworkType, NetworkUpgrade, Parameters};
+use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
 use crate::compact::{self, TreeSizes};
 use crate::{
     BoxFuture, ChainBackend, ChainError, NodeBounds, NodeStatus, Source, StatusCell, SubtreeRoot,
-    TxStatus, bytes32, check_chain_name, display_hash, innermost_error, parse_display_hash,
-    pool_name,
+    TxStatus, chain_name, check_chain_name, display_hash, hex32, innermost_error,
+    parse_display_hash, pool_name,
 };
 
 /// TCP connect bound; the node is local, so anything slower is "down".
@@ -216,6 +216,14 @@ impl Trees {
             ironwood: clamp(self.ironwood, "ironwood")?,
         })
     }
+}
+
+/// `getrawtransaction(txid, 1)`: `height` is -1 (or absent) in the mempool.
+#[derive(Deserialize)]
+struct VerboseTx {
+    #[serde(default)]
+    height: Option<i64>,
+    hex: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -459,6 +467,20 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
     /// `getblock(height, verbosity)`: the raw block as hex (0) or the
     /// [`BlockObject`] (1); [`ChainError::BlockUnavailable`] when the node
     /// has no body for it.
+    /// `getrawtransaction(txid, 1)`; `None` for a txid the node has neither
+    /// mined nor in its mempool (code -5).
+    async fn raw_tx_verbose(&self, txid: [u8; 32]) -> Result<Option<VerboseTx>, ChainError> {
+        let params = vec![json!(display_hash(&txid)), json!(1)];
+        match self.call("getrawtransaction", params).await {
+            Ok(v) => Ok(Some(v)),
+            Err(RpcFailure::Json {
+                code: RPC_INVALID_ADDRESS_OR_KEY,
+                ..
+            }) => Ok(None),
+            Err(other) => Err(self.chain_error("getrawtransaction", other)),
+        }
+    }
+
     async fn getblock<T: DeserializeOwned>(
         &self,
         height: BlockHeight,
@@ -532,10 +554,7 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
             }
         };
         let state = TreeState {
-            network: match self.params.network_type() {
-                NetworkType::Main => "main".into(),
-                _ => "test".into(),
-            },
+            network: chain_name(self.params.network_type()).into(),
             height: u64::from(obj.height),
             hash: obj.hash,
             time: obj.time,
@@ -584,10 +603,7 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
             .into_iter()
             .enumerate()
             .map(|(i, st)| {
-                let bytes = hex::decode(st.root.trim()).map_err(|e| {
-                    ChainError::Rpc(format!("z_getsubtreesbyindex: root is not hex: {e}"))
-                })?;
-                let root = bytes32(&bytes, "z_getsubtreesbyindex: root")?;
+                let root = hex32(&st.root, "z_getsubtreesbyindex: root")?;
                 Ok(SubtreeRoot {
                     pool,
                     index: start_index + i as u32,
@@ -697,32 +713,16 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
     /// and the "no such mempool or main chain transaction" error (code -5)
     /// otherwise.
     fn transaction_status(&self, txid: [u8; 32]) -> BoxFuture<'_, Result<TxStatus, ChainError>> {
-        #[derive(Deserialize)]
-        struct Verbose {
-            #[serde(default)]
-            height: Option<i64>,
-        }
         Box::pin(async move {
-            match self
-                .call::<Verbose>(
-                    "getrawtransaction",
-                    vec![json!(display_hash(&txid)), json!(1)],
-                )
-                .await
-            {
-                Ok(v) => Ok(match v.height {
-                    Some(h) if h >= 0 => TxStatus::Mined(BlockHeight::from_u32(
-                        u32::try_from(h)
-                            .map_err(|_| ChainError::Rpc("height out of range".into()))?,
-                    )),
-                    _ => TxStatus::InMempool,
-                }),
-                Err(RpcFailure::Json {
-                    code: RPC_INVALID_ADDRESS_OR_KEY,
-                    ..
-                }) => Ok(TxStatus::Unknown),
-                Err(other) => Err(self.chain_error("getrawtransaction", other)),
-            }
+            let Some(v) = self.raw_tx_verbose(txid).await? else {
+                return Ok(TxStatus::Unknown);
+            };
+            Ok(match v.height {
+                Some(h) if h >= 0 => TxStatus::Mined(BlockHeight::from_u32(
+                    u32::try_from(h).map_err(|_| ChainError::Rpc("height out of range".into()))?,
+                )),
+                _ => TxStatus::InMempool,
+            })
         })
     }
 
@@ -745,27 +745,16 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
         &self,
         txid: [u8; 32],
     ) -> BoxFuture<'_, Result<Option<Vec<u8>>, ChainError>> {
-        #[derive(Deserialize)]
-        struct Verbose {
-            hex: String,
-        }
         Box::pin(async move {
-            match self
-                .call::<Verbose>(
-                    "getrawtransaction",
-                    vec![json!(display_hash(&txid)), json!(1)],
-                )
-                .await
-            {
-                Ok(v) => hex::decode(&v.hex)
-                    .map(Some)
-                    .map_err(|e| ChainError::Rpc(format!("getrawtransaction: bad hex: {e}"))),
-                Err(RpcFailure::Json {
-                    code: RPC_INVALID_ADDRESS_OR_KEY,
-                    ..
-                }) => Ok(None),
-                Err(other) => Err(self.chain_error("getrawtransaction", other)),
-            }
+            let Some(v) = self.raw_tx_verbose(txid).await? else {
+                return Ok(None);
+            };
+            let hex = v
+                .hex
+                .ok_or_else(|| ChainError::Rpc("getrawtransaction: no hex".into()))?;
+            hex::decode(hex)
+                .map(Some)
+                .map_err(|e| ChainError::Rpc(format!("getrawtransaction: bad hex: {e}")))
         })
     }
 

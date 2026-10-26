@@ -279,10 +279,6 @@ pub fn height_push(height: u32) -> Vec<u8> {
     }
 }
 
-/// Hex of an empty `CommitmentTree` as `write_commitment_tree` emits it:
-/// no left leaf, no right leaf, zero parents.
-pub const EMPTY_TREE_HEX: &str = "000000";
-
 struct State {
     chain_name: &'static str,
     params: DynParams,
@@ -329,6 +325,24 @@ impl State {
 
     fn pruned(&self, height: u32) -> bool {
         height != 0 && self.prune_height.is_some_and(|p| height < p)
+    }
+
+    /// A raw block (`getblock(h, 0)`) was served: count down the scripted
+    /// prune and hold.
+    fn raw_block_served(&mut self) {
+        if let Some((n, height)) = self.prune_after_raw {
+            if n <= 1 {
+                self.prune_after_raw = None;
+                self.prune_height = Some(height);
+            } else {
+                self.prune_after_raw = Some((n - 1, height));
+            }
+        }
+        if let Some(n) = self.hold_after_raw
+            && n > 0
+        {
+            self.hold_after_raw = Some(n - 1);
+        }
     }
 
     fn append(&mut self, payments: &[(TransparentAddress, u64)]) -> BuiltBlock {
@@ -457,12 +471,7 @@ impl Drop for FakeNode {
 impl FakeNode {
     /// Start listening on a loopback port with a genesis block (height 0).
     pub async fn start<P: Parameters + Clone + Send + Sync + 'static>(params: P) -> Self {
-        // Like zakurad v1.6.0: regtest also reports "test".
-        let chain_name = match params.network_type() {
-            zcash_protocol::consensus::NetworkType::Main => "main",
-            zcash_protocol::consensus::NetworkType::Test
-            | zcash_protocol::consensus::NetworkType::Regtest => "test",
-        };
+        let chain_name = crate::chain_name(params.network_type());
         let params = DynParams::new(params);
         let genesis =
             BlockSpec::new(BlockHeight::from_u32(0), [0; 32], 1_700_000_000).build(&params);
@@ -728,40 +737,7 @@ async fn handle(
         }
     }
 
-    let mut outcome = dispatch(&st, &method, &params);
-    if method == "getblock"
-        && params.get(1).and_then(Value::as_u64) == Some(0)
-        && outcome.is_ok()
-        && let Some((n, height)) = st.prune_after_raw
-    {
-        if n <= 1 {
-            st.prune_after_raw = None;
-            st.prune_height = Some(height);
-        } else {
-            st.prune_after_raw = Some((n - 1, height));
-        }
-    }
-    if method == "getblock"
-        && params.get(1).and_then(Value::as_u64) == Some(0)
-        && outcome.is_ok()
-        && let Some(n) = st.hold_after_raw
-        && n > 0
-    {
-        st.hold_after_raw = Some(n - 1);
-    }
-    if let Ok(Value::Object(obj)) = &outcome
-        && let Some(Value::String(txid_hex)) = obj.get("__accept__")
-    {
-        let raw = params
-            .first()
-            .and_then(Value::as_str)
-            .and_then(|h| hex::decode(h).ok())
-            .expect("decoded once already");
-        let mut txid = [0u8; 32];
-        txid.copy_from_slice(&hex::decode(txid_hex).expect("hex"));
-        st.mempool.push((txid, raw));
-        outcome = Ok(obj["txid"].clone());
-    }
+    let outcome = dispatch(&mut st, &method, &params);
     drop(st);
     let body = match outcome {
         Ok(result) => json!({ "result": result, "error": Value::Null, "id": id }),
@@ -787,26 +763,12 @@ fn plain(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
 
 type RpcResult = Result<Value, (i64, String)>;
 
-/// Zebra takes `hash_or_height` as a string; accept a number as well.
-fn height_param(st: &State, v: Option<&Value>) -> Result<u32, (i64, String)> {
+/// Zebra takes `hash_or_height` as a string; the backend sends heights.
+fn height_param(v: Option<&Value>) -> Result<u32, (i64, String)> {
     let v = v.ok_or((-32602, "missing hash_or_height".to_string()))?;
-    if let Some(n) = v.as_u64() {
-        return u32::try_from(n).map_err(|_| (-8, "Block not found".into()));
-    }
-    let s = v.as_str().ok_or((-8, "Block not found".to_string()))?;
-    if let Ok(n) = s.parse::<u32>() {
-        return Ok(n);
-    }
-    if s.len() == 64 {
-        let shown = s.to_ascii_lowercase();
-        return st
-            .blocks
-            .iter()
-            .find(|(_, b)| display_hash(&b.hash) == shown)
-            .map(|(h, _)| *h)
-            .ok_or((-8, "Block not found".into()));
-    }
-    Err((-8, "Block not found".into()))
+    v.as_str()
+        .and_then(|s| s.parse().ok())
+        .ok_or((-8, "Block not found".into()))
 }
 
 /// `getblockchaininfo.upgrades` as zakurad renders it: every upgrade the
@@ -830,7 +792,7 @@ fn upgrades(st: &State, tip: u32) -> Value {
     Value::Object(map)
 }
 
-fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
+fn dispatch(st: &mut State, method: &str, params: &[Value]) -> RpcResult {
     let (tip, tip_hash) = st.tip();
     match method {
         "getblockchaininfo" => {
@@ -874,7 +836,7 @@ fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
             Ok(json!(display_hash(&st.blocks[&h].hash)))
         }
         "getblock" => {
-            let h = height_param(st, params.first())?;
+            let h = height_param(params.first())?;
             let verbosity = params.get(1).and_then(Value::as_u64).unwrap_or(1);
             let Some(block) = st.blocks.get(&h) else {
                 return Err((-8, "Block not found".into()));
@@ -884,7 +846,9 @@ fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
                     if st.pruned(h) {
                         return Err((-8, "Block not found".into()));
                     }
-                    Ok(json!(hex::encode(&block.raw)))
+                    let raw = json!(hex::encode(&block.raw));
+                    st.raw_block_served();
+                    Ok(raw)
                 }
                 1 => {
                     let mut trees = serde_json::Map::new();
@@ -923,7 +887,7 @@ fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
             }
         }
         "z_gettreestate" => {
-            let h = height_param(st, params.first())?;
+            let h = height_param(params.first())?;
             let Some(block) = st.blocks.get(&h) else {
                 return Err((-8, "the requested block is not in the main chain".into()));
             };
@@ -967,8 +931,8 @@ fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
             if st.mempool.iter().any(|(id, _)| *id == txid) {
                 return Err((-27, "transaction already in mempool".into()));
             }
-            // `dispatch` takes `&State`; the caller applies the mutation.
-            Ok(json!({ "__accept__": hex::encode(txid), "txid": display_hash(&txid) }))
+            st.mempool.push((txid, raw));
+            Ok(json!(display_hash(&txid)))
         }
         "z_getsubtreesbyindex" => {
             let pool = params
@@ -1049,23 +1013,6 @@ mod tests {
         assert_eq!(height_push(128), vec![0x02, 0x80, 0x00]);
         assert_eq!(height_push(1000), vec![0x02, 0xe8, 0x03]);
         assert_eq!(height_push(2_650_000), vec![0x03, 0x90, 0x6f, 0x28]);
-    }
-
-    #[test]
-    fn empty_tree_hex_is_an_empty_frontier() {
-        let state = zcash_client_backend::proto::service::TreeState {
-            network: "test".into(),
-            height: 3,
-            hash: "00".repeat(32),
-            time: 0,
-            sapling_tree: EMPTY_TREE_HEX.into(),
-            orchard_tree: EMPTY_TREE_HEX.into(),
-            ironwood_tree: String::new(),
-        };
-        let cs = state.to_chain_state().unwrap();
-        assert!(cs.final_sapling_tree().value().is_none());
-        assert!(cs.final_orchard_tree().value().is_none());
-        assert!(cs.final_ironwood_tree().value().is_none());
     }
 
     #[test]
