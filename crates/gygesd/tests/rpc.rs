@@ -916,17 +916,10 @@ async fn connection_unlock_dies_with_its_connection_and_shutdown_zeroizes() {
 
     // Closing the connection drops it.
     drop(c);
-    for _ in 0..200 {
-        if running.state.vault.unlock_count() == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        running.state.vault.unlock_count(),
-        0,
-        "unlock outlived its connection"
-    );
+    eventually("the unlock to end with its connection", || {
+        running.state.vault.unlock_count() == 0
+    })
+    .await;
 
     // A daemon unlock survives the connection but not the daemon.
     let mut c = client(&running.socket).await;
@@ -1462,25 +1455,10 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
     // WaitSync fails fast, and the key recovers when the window widens.
     node.mine(5);
     node.set_prune_height(Some(18));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let stalled = loop {
-        let st = c
-            .get_sync_status(GetSyncStatusRequest {
-                key_id: "main".into(),
-            })
-            .await
-            .unwrap()
-            .into_inner();
-        let k = st.keys[0].clone();
-        if k.state() == SyncState::Stalled {
-            break k;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "never stalled: {k:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    let stalled = wait_status(&mut c, "main", "stalled", |k| {
+        k.state() == SyncState::Stalled
+    })
+    .await;
     assert_eq!(
         stalled.stall_reason(),
         gyges_proto::v1::StallReason::PrunedPastScanTip
@@ -1511,25 +1489,10 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
     // the key leaves STALLED on its own. (WaitSync on a stalled key fails
     // at once by design, so wait for the state to clear first.)
     node.set_prune_height(None);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let st = c
-            .get_sync_status(GetSyncStatusRequest {
-                key_id: "main".into(),
-            })
-            .await
-            .unwrap()
-            .into_inner();
-        if st.keys[0].state() != SyncState::Stalled {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "still stalled: {:?}",
-            st.keys[0]
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    wait_status(&mut c, "main", "unstalled", |k| {
+        k.state() != SyncState::Stalled
+    })
+    .await;
     let status = wait_spendable(&mut c, "main").await;
     assert_eq!(status.scanned_tip, 19, "{status:?}");
 
@@ -1563,24 +1526,15 @@ async fn offline_node_keeps_keys_initializing_then_stalls_after_the_grace() {
     .await
     .unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    let stalled = loop {
-        let st = c
-            .get_sync_status(GetSyncStatusRequest::default())
-            .await
-            .unwrap()
-            .into_inner();
-        let k = st.keys[0].clone();
+    // Initializing (IDLE) on every pass until the grace runs out.
+    let stalled = wait_status(&mut c, "r", "stalled", |k| {
         if k.state() == SyncState::Stalled {
-            break k;
+            return true;
         }
         assert_eq!(k.state(), SyncState::Idle, "{k:?}");
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "never stalled: {k:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
+        false
+    })
+    .await;
     assert_eq!(
         stalled.stall_reason(),
         gyges_proto::v1::StallReason::NodeUnreachable
@@ -1616,15 +1570,37 @@ fn batch_ranges(key_id: &'static str) -> Arc<std::sync::Mutex<Vec<(u32, u32)>>> 
     out
 }
 
+/// Run `f` every `every` until it returns `Ok`, for at most `timeout`. An
+/// `Err` carries what was seen instead, for the panic message.
+async fn poll_until<T, D: std::fmt::Debug>(
+    what: &str,
+    timeout: Duration,
+    every: Duration,
+    mut f: impl AsyncFnMut() -> Result<T, D>,
+) -> T {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let seen = match f().await {
+            Ok(v) => return v,
+            Err(seen) => seen,
+        };
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}; last seen {seen:?}"
+        );
+        tokio::time::sleep(every).await;
+    }
+}
+
 /// Wait until `f` holds, polling every 20 ms for at most 30 s.
 async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
-    for _ in 0..1500 {
-        if f() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for {what}");
+    poll_until(
+        what,
+        Duration::from_secs(30),
+        Duration::from_millis(20),
+        async || if f() { Ok(()) } else { Err(()) },
+    )
+    .await;
 }
 
 /// Small batches, so a 300-block chain is thirty of them.
@@ -2547,14 +2523,21 @@ async fn the_mempool_loop_shows_an_unmined_payment_as_pending() {
     let (node, running, mut c) = sender_and_recipient(ONE_CONF_CONFIG).await;
     pay_bob_unmined(&node, &mut c, AMOUNT).await;
 
-    let mut b = bob_balance(&mut c).await;
-    for _ in 0..300 {
-        if b.total_pending == AMOUNT {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        b = bob_balance(&mut c).await;
-    }
+    let every = Duration::from_millis(50);
+    let b = poll_until(
+        "bob's pending payment",
+        Duration::from_secs(15),
+        every,
+        async || {
+            let b = bob_balance(&mut c).await;
+            if b.total_pending == AMOUNT {
+                Ok(b)
+            } else {
+                Err(b)
+            }
+        },
+    )
+    .await;
     assert_eq!((b.total_spendable, b.total_pending), (0, AMOUNT), "{b:?}");
 
     // A forced pass rescans the whole mempool; `bob` has one note there.
@@ -2596,7 +2579,11 @@ async fn scan_mempool_forces_a_pass_when_the_loop_is_off() {
     let config = format!("{ONE_CONF_CONFIG}[mempool]\nscan = false\n");
     let (node, running, mut c) = sender_and_recipient(&config).await;
     pay_bob_unmined(&node, &mut c, AMOUNT).await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Two whole scheduler ticks begun after the payment reached the
+    // mempool: with the loop on, the second would have found it.
+    let sync = &running.state.sync;
+    let need = sync.ticks().0 + 2;
+    eventually("two more scheduler ticks", || sync.ticks().1 >= need).await;
     let b = bob_balance(&mut c).await;
     assert_eq!((b.total_spendable, b.total_pending), (0, 0), "{b:?}");
 
@@ -2634,47 +2621,52 @@ async fn wait_tex(
     what: &str,
     ok: impl Fn(&gyges_proto::v1::TexQueueEntry) -> bool,
 ) -> gyges_proto::v1::TexQueueEntry {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let what = format!("the tex row to reach {what}");
     let mut last = None;
-    loop {
-        let resp = c
-            .list_signing_sessions(ListSigningSessionsRequest {
+    poll_until(
+        &what,
+        Duration::from_secs(90),
+        Duration::from_millis(200),
+        async || {
+            let req = ListSigningSessionsRequest {
                 key_id: String::new(),
                 include_finished: true,
-            })
-            .await
-            .unwrap()
-            .into_inner();
-        if let Some(row) = resp
-            .tex_transfers
-            .iter()
-            .find(|r| r.step1_txid == step1_txid)
-        {
-            if ok(row) {
-                return row.clone();
+            };
+            let resp = c.list_signing_sessions(req).await.unwrap().into_inner();
+            if let Some(row) = resp
+                .tex_transfers
+                .into_iter()
+                .find(|r| r.step1_txid == step1_txid)
+            {
+                if ok(&row) {
+                    return Ok(row);
+                }
+                last = Some(row);
             }
-            last = Some(row.clone());
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "tex row never reached {what}; last seen {last:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+            Err(last.clone())
+        },
+    )
+    .await
 }
 
 /// Wait until the fake node's mempool holds `txid`.
 async fn wait_in_mempool(node: &FakeNode, txid: &str) {
     let want = gyges_chain::parse_display_hash(txid).unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !node.mempool().contains(&want) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{txid} never reached the mempool: {:?}",
-            node.mempool()
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let what = format!("{txid} to reach the mempool");
+    poll_until(
+        &what,
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        async || {
+            let pool = node.mempool();
+            if pool.contains(&want) {
+                Ok(())
+            } else {
+                Err(pool)
+            }
+        },
+    )
+    .await;
 }
 
 /// The mined transaction `txid` from the fake node's block at `height`.
@@ -2903,18 +2895,11 @@ async fn zip320_sends_through_the_fake_node() {
     // unreachable (it now wants a cookie the daemon does not send), a
     // finished transfer still has nothing to resume, not NODE_UNREACHABLE.
     let chain = state.chain.clone().expect("networked daemon");
-    let wait_connected = |want: bool| {
-        let chain = chain.clone();
-        async move {
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
-            while gyges_chain::ChainBackend::status(chain.as_ref()).connected != want {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "node never connected={want}"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
+    let wait_connected = async |want: bool| {
+        eventually(&format!("node connected={want}"), || {
+            gyges_chain::ChainBackend::status(chain.as_ref()).connected == want
+        })
+        .await
     };
     node.set_cookie(Some("rotated".into()));
     wait_connected(false).await;
@@ -3928,25 +3913,15 @@ async fn wait_status(
     what: &str,
     done: impl Fn(&gyges_proto::v1::KeySyncStatus) -> bool,
 ) -> gyges_proto::v1::KeySyncStatus {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let st = c
-            .get_sync_status(GetSyncStatusRequest {
-                key_id: key_id.into(),
-            })
-            .await
-            .unwrap()
-            .into_inner();
-        let k = st.keys[0].clone();
-        if done(&k) {
-            return k;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "never {what}: {k:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let every = Duration::from_millis(50);
+    poll_until(what, Duration::from_secs(60), every, async || {
+        let req = GetSyncStatusRequest {
+            key_id: key_id.into(),
+        };
+        let k = c.get_sync_status(req).await.unwrap().into_inner().keys[0].clone();
+        if done(&k) { Ok(k) } else { Err(k) }
+    })
+    .await
 }
 
 /// Mine a chain with one shielding transaction in it (so that the backfill
