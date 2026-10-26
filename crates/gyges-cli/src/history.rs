@@ -42,8 +42,7 @@ pub async fn list(ctx: &Ctx, args: ListArgs) -> Result<(), CliError> {
             limit: args.limit.unwrap_or(0),
             before_txid: args.before.unwrap_or_default(),
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if ctx.json {
         println!("{}", to_json(&resp)?);
@@ -65,8 +64,7 @@ pub async fn status(ctx: &Ctx, args: StatusArgs) -> Result<(), CliError> {
             txid: args.txid,
             via_pir: false,
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if ctx.json {
         println!("{}", to_json(&resp)?);

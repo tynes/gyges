@@ -187,7 +187,7 @@ pub enum SyncError {
     },
 }
 
-fn wallet_err(e: impl std::fmt::Display) -> SyncError {
+pub(crate) fn wallet_err(e: impl std::fmt::Display) -> SyncError {
     SyncError::Wallet(e.to_string())
 }
 

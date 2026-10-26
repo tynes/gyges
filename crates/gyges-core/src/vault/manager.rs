@@ -21,7 +21,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use age::secrecy::SecretString;
-use secrecy::ExposeSecret as _;
 
 use super::{Entropy, VaultError};
 use crate::config::VaultConfig;
@@ -421,13 +420,10 @@ impl Inner {
     }
 }
 
-/// `entropy` as the caller would see it through [`VaultManager::with_entropy`].
-pub fn expose(entropy: &Entropy) -> &[u8; 32] {
-    entropy.expose_secret()
-}
-
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret as _;
+
     use super::*;
     use crate::config::Config;
     use crate::network::Network;
@@ -473,7 +469,7 @@ mod tests {
         assert_eq!(u.scope, Scope::Daemon);
         let seen = vault
             .with_entropy_at("k", Auth::Daemon, t0 + Duration::from_secs(10), |e| {
-                *expose(e)
+                *e.expose_secret()
             })
             .unwrap();
         assert_eq!(&seen, entropy.expose_secret());

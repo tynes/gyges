@@ -213,8 +213,7 @@ async fn stop(ctx: &Ctx, force: bool) -> Result<(), CliError> {
     let resp = conn
         .client
         .shutdown(ShutdownRequest { graceful: !force })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     // Wait for the socket to go away (the listener, then the file the
     // daemon unlinks on its way out) so that `stop && start` works in
@@ -372,12 +371,11 @@ async fn logs(ctx: &Ctx, follow: bool, lines: u32, audit: bool) -> Result<(), Cl
             audit,
             ..Default::default()
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     loop {
         let entry = tokio::select! {
-            r = stream.message() => r.map_err(CliError::from_status)?,
+            r = stream.message() => r?,
             _ = tokio::signal::ctrl_c() => return Err(CliError::Cancelled),
         };
         let Some(entry) = entry else { return Ok(()) };

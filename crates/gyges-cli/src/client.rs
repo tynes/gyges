@@ -69,11 +69,7 @@ impl Ctx {
             Err(e) => return Err(CliError::Other(e.into())),
         };
         let mut client = GygesClient::new(channel);
-        let info = client
-            .get_info(GetInfoRequest {})
-            .await
-            .map_err(CliError::from_status)?
-            .into_inner();
+        let info = client.get_info(GetInfoRequest {}).await?.into_inner();
         check_handshake(&info, self.network, self.quiet)?;
         Ok(Conn { client, info })
     }

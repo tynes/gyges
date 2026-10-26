@@ -24,8 +24,7 @@ pub async fn run(ctx: &Ctx, args: BalanceArgs) -> Result<(), CliError> {
             key_id: ctx.key.clone(),
             min_confirmations: args.min_conf.unwrap_or(0),
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if ctx.json {
         println!("{}", to_json(&resp)?);

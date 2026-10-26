@@ -10,13 +10,10 @@
 //! an external migration and reached only through
 //! `transactionally_with_extension`.
 
-use std::collections::HashSet;
-
 use rusqlite::{OptionalExtension as _, named_params};
-use schemerz_rusqlite::RusqliteMigration;
 use uuid::Uuid;
-use zcash_client_sqlite::wallet::init::WalletMigrationError;
 
+use crate::ext::{ExtTable, with_ext};
 use crate::registry::Wallet;
 
 /// The external migration's id (random, fixed forever).
@@ -25,48 +22,28 @@ pub const MIGRATION_ID: Uuid = Uuid::from_u128(0x2c9b_41e7_8d05_4f6a_b3d2_7e18_c
 const TABLE: &str = "ext_gyges_signing_sessions";
 
 /// Creates `ext_gyges_signing_sessions`.
-#[derive(Debug)]
-pub struct SigningSessionsMigration;
+pub const MIGRATION: ExtTable = ExtTable {
+    id: MIGRATION_ID,
+    table: TABLE,
+    description: "Creates the Gyges signing sessions table (ext_gyges_signing_sessions).",
+    create: create_migration,
+};
 
-impl schemerz::Migration<Uuid> for SigningSessionsMigration {
-    fn id(&self) -> Uuid {
-        MIGRATION_ID
-    }
-
-    fn dependencies(&self) -> HashSet<Uuid> {
-        HashSet::new()
-    }
-
-    fn description(&self) -> &'static str {
-        "Creates the Gyges signing sessions table (ext_gyges_signing_sessions)."
-    }
-}
-
-impl RusqliteMigration for SigningSessionsMigration {
-    type Error = WalletMigrationError;
-
-    fn up(&self, transaction: &rusqlite::Transaction) -> Result<(), WalletMigrationError> {
-        transaction.execute_batch(&format!(
-            "CREATE TABLE {TABLE} (
-                session_id   TEXT NOT NULL PRIMARY KEY,
-                protocol     TEXT NOT NULL CHECK (protocol IN ('passphrase', 'keystone-batch', 'keystone-pczt', 'file')),
-                status       TEXT NOT NULL CHECK (status IN ('awaiting-signature', 'signed', 'broadcast', 'aborted', 'expired')),
-                created_at   INTEGER NOT NULL,
-                expires_at   INTEGER NOT NULL,
-                proposal     BLOB NOT NULL,
-                expected     BLOB NOT NULL,
-                txid         BLOB,
-                last_error   TEXT
-            );
-            CREATE INDEX {TABLE}_status ON {TABLE} (status, expires_at);"
-        ))?;
-        Ok(())
-    }
-
-    fn down(&self, transaction: &rusqlite::Transaction) -> Result<(), WalletMigrationError> {
-        transaction.execute_batch(&format!("DROP TABLE {TABLE};"))?;
-        Ok(())
-    }
+fn create_migration() -> String {
+    format!(
+        "CREATE TABLE {TABLE} (
+            session_id   TEXT NOT NULL PRIMARY KEY,
+            protocol     TEXT NOT NULL CHECK (protocol IN ('passphrase', 'keystone-batch', 'keystone-pczt', 'file')),
+            status       TEXT NOT NULL CHECK (status IN ('awaiting-signature', 'signed', 'broadcast', 'aborted', 'expired')),
+            created_at   INTEGER NOT NULL,
+            expires_at   INTEGER NOT NULL,
+            proposal     BLOB NOT NULL,
+            expected     BLOB NOT NULL,
+            txid         BLOB,
+            last_error   TEXT
+        );
+        CREATE INDEX {TABLE}_status ON {TABLE} (status, expires_at);"
+    )
 }
 
 /// Where a session stands.
@@ -162,15 +139,6 @@ pub enum SessionError {
     BadColumn(String, &'static str, String),
     #[error("signing sessions: no row for session {0}")]
     NotFound(String),
-}
-
-type Ext<'a> = zcash_client_sqlite::ExtensionTransaction<'a>;
-
-fn with_ext<T>(
-    wallet: &mut Wallet,
-    f: impl FnOnce(&Ext<'_>) -> Result<T, SessionError>,
-) -> Result<T, SessionError> {
-    wallet.transactionally_with_extension(|_wdb, ext| f(ext))
 }
 
 fn read_row(r: &rusqlite::Row<'_>) -> Result<SessionRow, SessionError> {
@@ -278,14 +246,14 @@ pub fn list(wallet: &mut Wallet, include_finished: bool) -> Result<Vec<SessionRo
         " WHERE status = 'awaiting-signature'".to_string()
     };
     let joined: Option<String> = with_ext(wallet, |ext| {
-        Ok(ext.query_row(
+        ext.query_row(
             &format!(
                 "SELECT group_concat(session_id, ',') FROM \
                  (SELECT session_id FROM {TABLE}{filter} ORDER BY created_at DESC, session_id)"
             ),
             [],
             |r| r.get(0),
-        )?)
+        )
     })?;
     let mut rows = Vec::new();
     for id in joined

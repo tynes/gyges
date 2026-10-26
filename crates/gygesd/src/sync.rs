@@ -37,7 +37,6 @@ use zcash_client_backend::data_api::scanning::{ScanPriority, ScanRange};
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::backfill;
-use crate::keys::registry_error;
 use crate::node;
 use crate::service::DaemonState;
 
@@ -383,11 +382,29 @@ impl Scheduler {
             retained_from,
             "key stalled: pruned past scan tip"
         );
+        self.stall(key_id, StallReason::PrunedPastScanTip, detail);
+    }
+
+    /// Mark `key_id` stalled for `reason`.
+    pub(crate) fn stall(&self, key_id: &str, reason: StallReason, detail: String) {
         self.hub().update(key_id, |p| {
-            p.state = SyncState::Stalled(StallReason::PrunedPastScanTip);
+            p.state = SyncState::Stalled(reason);
             p.detail = detail;
             p.blocks_per_sec = 0.0;
         });
+    }
+
+    /// How many leading blocks of `range` the cache already holds. A gap
+    /// inside the range drops it from the cache, so the caller refetches.
+    pub(crate) async fn cached_prefix(&self, range: &ScanRange) -> Result<u32, SyncError> {
+        match self.cache.read(range).await {
+            Ok(blocks) => Ok(blocks.len() as u32),
+            Err(CacheError::Gap { .. }) => {
+                self.cache.delete(range.clone()).await?;
+                Ok(0)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Per-tick reorg detector on the shared cache (SYNC.md §4.3 step 1,
@@ -644,14 +661,7 @@ impl Scheduler {
     /// cache already holds.
     async fn ensure_cached(&self, range: &ScanRange, bounds: &NodeBounds) -> Result<(), SyncError> {
         let Range { start, end } = range.block_range().clone();
-        let have = match self.cache.read(range).await {
-            Ok(blocks) => blocks.len() as u32,
-            Err(CacheError::Gap { .. }) => {
-                self.cache.delete(range.clone()).await?;
-                0
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let have = self.cached_prefix(range).await?;
         let fetch_batch = self.state.config.cache.fetch_batch.max(1);
         let mut next = start + have;
         while next < end {
@@ -879,19 +889,7 @@ pub fn to_proto(p: &KeyProgress) -> KeySyncStatus {
 /// Resolve a request's key to one that has a wallet (sync is meaningless
 /// for `signer-only`).
 fn resolve_synced_key(state: &DaemonState, key_id: &str) -> Result<Arc<KeyEntry>, Status> {
-    let key = state
-        .registry
-        .resolve(key_id)
-        .map_err(|e| registry_error(e).into_status())?;
-    if !key.profile().has_wallet() {
-        return Err(GygesError::new(
-            ErrorReason::InvalidArgument,
-            "a signer-only profile has no wallet to synchronise",
-        )
-        .with_key(key.key_id())
-        .into_status());
-    }
-    Ok(key)
+    state.wallet_key(key_id, "a signer-only profile has no wallet to synchronise")
 }
 
 fn progress_of(state: &DaemonState, key_id: &str) -> KeyProgress {

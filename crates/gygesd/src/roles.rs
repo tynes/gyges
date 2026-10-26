@@ -37,7 +37,7 @@ use tonic::Status;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::conn::ConnInfo;
-use crate::keys::{AUDIT_TARGET, proto_pool, registry_error};
+use crate::keys::{AUDIT_TARGET, proto_pool};
 use crate::service::{DaemonState, proto_network, unix_now};
 use crate::tx::{self, Purpose, blocking, obtain_key, proto_proposal, tx_error, with_wallet};
 
@@ -348,35 +348,14 @@ pub async fn broadcast_pczt(
     req: BroadcastPcztRequest,
 ) -> Result<BroadcastPcztResponse, Status> {
     let (pczt, tags) = parse_and_check(&state, &req.pczt, &req.key_id)?;
-    let key = state
-        .registry
-        .resolve(&tags.key_id)
-        .map_err(|e| registry_error(e).into_status())?;
+    let key = state.wallet_key(
+        &tags.key_id,
+        "a signer-only profile has no wallet; broadcast from the daemon that created the PCZT",
+    )?;
     let key_id = key.key_id().to_string();
     let typed = |reason, detail: String| GygesError::new(reason, detail).with_key(&key_id);
     let err = |e: TxError| tx_error(e, &key_id).into_status();
-    if !key.profile().has_wallet() {
-        return Err(typed(
-            ErrorReason::InvalidArgument,
-            "a signer-only profile has no wallet; broadcast from the daemon that created the PCZT"
-                .into(),
-        )
-        .into_status());
-    }
-    let Some(chain) = state.chain.clone() else {
-        return Err(typed(
-            ErrorReason::Airgapped,
-            "an air-gapped daemon cannot broadcast".into(),
-        )
-        .into_status());
-    };
-    if !chain.status().connected {
-        return Err(typed(
-            ErrorReason::NodeUnreachable,
-            "the node is not connected; the transaction could not be broadcast".into(),
-        )
-        .into_status());
-    }
+    let chain = tx::connected_chain(&state, &key_id)?;
     let route = tx::broadcast_route(&state, req.via_tor, &key_id)?;
 
     // What the file is missing is named before the Verifier judges it.

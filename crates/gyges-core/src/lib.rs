@@ -19,6 +19,7 @@
 pub mod addresses;
 pub mod birthday;
 pub mod config;
+pub mod ext;
 pub mod handoff;
 pub mod history;
 pub mod log;

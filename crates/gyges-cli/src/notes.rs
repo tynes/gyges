@@ -66,8 +66,7 @@ pub async fn run(ctx: &Ctx, args: NotesArgs) -> Result<(), CliError> {
             pool: args.pool.map_or(Pool::Unspecified, PoolArg::to_proto) as i32,
             spent: args.filter() as i32,
         })
-        .await
-        .map_err(CliError::from_status)?
+        .await?
         .into_inner();
     if ctx.json {
         println!("{}", to_json(&resp)?);
