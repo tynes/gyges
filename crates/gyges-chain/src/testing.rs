@@ -35,7 +35,7 @@ use transparent::bundle::{Authorized, Bundle, OutPoint, TxIn, TxOut};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
 use zcash_primitives::block::{BlockHash, BlockHeaderData};
-use zcash_primitives::merkle_tree::write_commitment_tree;
+use zcash_primitives::merkle_tree::{HashSer, write_commitment_tree};
 use zcash_primitives::transaction::{
     Authorized as TxAuthorized, Transaction, TransactionData, TxVersion,
 };
@@ -381,18 +381,19 @@ impl State {
                     .expect("ironwood tree not full");
             }
         }
-        let encode = |tree: &CommitmentTree<_, 32>| {
-            let mut out = Vec::new();
-            write_commitment_tree(tree, &mut out).expect("serialise");
-            hex::encode(out)
-        };
-        let s = {
-            let mut out = Vec::new();
-            write_commitment_tree(&sapling, &mut out).expect("serialise");
-            hex::encode(out)
-        };
-        (s, encode(&orchard), encode(&ironwood))
+        (
+            encode_tree(&sapling),
+            encode_tree(&orchard),
+            encode_tree(&ironwood),
+        )
     }
+}
+
+/// A legacy `CommitmentTree` as `finalState` hex.
+fn encode_tree<H: HashSer>(tree: &CommitmentTree<H, 32>) -> String {
+    let mut out = Vec::new();
+    write_commitment_tree(tree, &mut out).expect("serialise");
+    hex::encode(out)
 }
 
 /// Type-erased `Parameters` (the trait requires `Sized`, so no `dyn`), so
@@ -833,14 +834,14 @@ fn dispatch(st: &State, method: &str, params: &[Value]) -> RpcResult {
                 1 => {
                     let mut trees = serde_json::Map::new();
                     if let Some(s) = st.tree_sizes_at(h) {
-                        if s.sapling > 0 {
-                            trees.insert("sapling".into(), json!({ "size": s.sapling }));
-                        }
-                        if s.orchard > 0 {
-                            trees.insert("orchard".into(), json!({ "size": s.orchard }));
-                        }
-                        if s.ironwood > 0 {
-                            trees.insert("ironwood".into(), json!({ "size": s.ironwood }));
+                        for (pool, size) in [
+                            ("sapling", s.sapling),
+                            ("orchard", s.orchard),
+                            ("ironwood", s.ironwood),
+                        ] {
+                            if size > 0 {
+                                trees.insert(pool.into(), json!({ "size": size }));
+                            }
                         }
                     }
                     let mut obj = json!({

@@ -21,10 +21,9 @@
 
 use std::fmt;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 use serde::Deserialize;
@@ -38,19 +37,20 @@ use zcash_protocol::consensus::{BlockHeight, NetworkType, NetworkUpgrade, Parame
 
 use crate::compact::{self, TreeSizes};
 use crate::{
-    BoxFuture, ChainBackend, ChainError, NodeBounds, NodeStatus, Route, SubtreeRoot, TxStatus,
-    display_hash, parse_display_hash, pool_name,
+    BoxFuture, ChainBackend, ChainError, NodeBounds, NodeStatus, Source, StatusCell, SubtreeRoot,
+    TxStatus, bytes32, check_chain_name, display_hash, innermost_error, parse_display_hash,
+    pool_name,
 };
 
 /// TCP connect bound; the node is local, so anything slower is "down".
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Whole-request bound; a 2 MB block as hex over loopback takes milliseconds.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Concurrent `getblock` pairs in flight inside one [`compact_blocks`]
 /// call.
 ///
 /// [`compact_blocks`]: ChainBackend::compact_blocks
-pub const DEFAULT_CONCURRENCY: usize = 8;
+const DEFAULT_CONCURRENCY: usize = 8;
 
 /// JSON-RPC error code zcashd and Zebra use for "no such block".
 const RPC_INVALID_PARAMETER: i64 = -8;
@@ -64,7 +64,7 @@ pub struct ZakuraRpcBackend<P> {
     cookie_path: Option<PathBuf>,
     params: P,
     next_id: AtomicU64,
-    status: RwLock<NodeStatus>,
+    status: StatusCell,
     concurrency: usize,
 }
 
@@ -107,7 +107,7 @@ struct RpcErrorObject {
 
 /// `getblockchaininfo`, the fields Gyges reads (unknown ones are ignored).
 #[derive(Clone, Debug, Deserialize)]
-pub struct BlockchainInfo {
+struct BlockchainInfo {
     pub chain: String,
     pub blocks: u32,
     pub bestblockhash: String,
@@ -124,15 +124,13 @@ pub struct BlockchainInfo {
 
 /// One entry of `getblockchaininfo.upgrades`.
 #[derive(Clone, Debug, Deserialize)]
-pub struct UpgradeInfo {
-    pub activationheight: u32,
-    #[serde(default)]
-    pub status: String,
+struct UpgradeInfo {
+    activationheight: u32,
 }
 
 /// The network upgrades whose activation heights are compared with the
 /// node's: every one `zcash_protocol` knows.
-pub const UPGRADES: [NetworkUpgrade; 11] = [
+pub(crate) const UPGRADES: [NetworkUpgrade; 11] = [
     NetworkUpgrade::Overwinter,
     NetworkUpgrade::Sapling,
     NetworkUpgrade::Blossom,
@@ -147,7 +145,7 @@ pub const UPGRADES: [NetworkUpgrade; 11] = [
 ];
 
 /// `getblockchaininfo.upgrades` key for an upgrade.
-pub fn branch_key(nu: NetworkUpgrade) -> String {
+pub(crate) fn branch_key(nu: NetworkUpgrade) -> String {
     format!("{:08x}", u32::from(nu.branch_id()))
 }
 
@@ -168,24 +166,18 @@ impl BlockchainInfo {
 
 /// `getblock(h, 1)`, the fields Gyges reads.
 #[derive(Clone, Debug, Deserialize)]
-pub struct BlockObject {
-    pub hash: String,
-    #[serde(default)]
-    pub height: Option<u32>,
-    #[serde(default)]
-    pub time: Option<i64>,
+struct BlockObject {
+    hash: String,
     /// Txids in display order (verbosity 1).
     #[serde(default)]
-    pub tx: Vec<String>,
+    tx: Vec<String>,
     #[serde(default)]
-    pub trees: Trees,
-    #[serde(default)]
-    pub previousblockhash: Option<String>,
+    trees: Trees,
 }
 
 /// `getblock(h, 1).trees`; a pool is omitted while its tree is empty.
 #[derive(Clone, Debug, Default, Deserialize)]
-pub struct Trees {
+struct Trees {
     #[serde(default)]
     pub sapling: Option<TreeSize>,
     #[serde(default)]
@@ -197,7 +189,7 @@ pub struct Trees {
 /// Zebra serialises a tree size as `{"size": N}`; accept a bare number too.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(untagged)]
-pub enum TreeSize {
+enum TreeSize {
     Object { size: u64 },
     Bare(u64),
 }
@@ -292,20 +284,16 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
             cookie_path,
             params,
             next_id: AtomicU64::new(1),
-            status: RwLock::new(NodeStatus::default()),
+            status: StatusCell::default(),
             concurrency: DEFAULT_CONCURRENCY,
         })
     }
 
     /// Bound the concurrent `getblock` fetches (default
-    /// [`DEFAULT_CONCURRENCY`]).
+    /// `DEFAULT_CONCURRENCY`).
     pub fn with_concurrency(mut self, n: usize) -> Self {
         self.concurrency = n.max(1);
         self
-    }
-
-    pub fn url(&self) -> &str {
-        &self.url
     }
 
     /// `(user, password)` from the cookie file, re-read on every call because
@@ -403,25 +391,8 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
         }
     }
 
-    fn record(&self, outcome: &Result<(NodeBounds, bool), ChainError>) {
-        let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
-        status.last_polled = Some(SystemTime::now());
-        match outcome {
-            Ok((bounds, pruned)) => {
-                status.connected = true;
-                status.bounds = Some(bounds.clone());
-                status.pruned = *pruned;
-                status.last_error.clear();
-            }
-            Err(e) => {
-                status.connected = false;
-                status.last_error = e.to_string();
-            }
-        }
-    }
-
     /// `getblockchaininfo`, verbatim.
-    pub async fn get_blockchain_info(&self) -> Result<BlockchainInfo, ChainError> {
+    async fn get_blockchain_info(&self) -> Result<BlockchainInfo, ChainError> {
         let info: BlockchainInfo = self
             .call("getblockchaininfo", vec![])
             .await
@@ -429,17 +400,11 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
         // Zakura reports "test" for regtest as well as testnet (verified
         // against v1.6.0), so the name only separates mainnet from the rest;
         // the activation heights below tell testnet and regtest apart.
-        let (network, accepted): (&str, &[&str]) = match self.params.network_type() {
-            NetworkType::Main => ("mainnet", &["main"]),
-            NetworkType::Test => ("testnet", &["test"]),
-            NetworkType::Regtest => ("regtest", &["test", "regtest"]),
-        };
-        if !accepted.contains(&info.chain.as_str()) {
-            return Err(ChainError::Rpc(format!(
-                "the node at {} serves chain \"{}\", this daemon is for {network}",
-                self.url, info.chain
-            )));
-        }
+        let network = check_chain_name(
+            &self.params,
+            &info.chain,
+            format_args!("the node at {}", self.url),
+        )?;
         self.check_upgrades(&info, network)?;
         Ok(info)
     }
@@ -480,7 +445,7 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
     }
 
     /// `getblockhash(height)`, internal byte order.
-    pub async fn get_block_hash(&self, height: BlockHeight) -> Result<[u8; 32], ChainError> {
+    async fn get_block_hash(&self, height: BlockHeight) -> Result<[u8; 32], ChainError> {
         let hash: String = self
             .call("getblockhash", vec![json!(u32::from(height))])
             .await
@@ -491,31 +456,17 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
         parse_display_hash(&hash)
     }
 
-    /// `getblock(height, 0)`: the raw block, or
-    /// [`ChainError::BlockUnavailable`] when the node has no body for it.
-    pub async fn get_raw_block(&self, height: BlockHeight) -> Result<Vec<u8>, ChainError> {
-        let hex_str: String = self
-            .call(
-                "getblock",
-                vec![json!(u32::from(height).to_string()), json!(0)],
-            )
-            .await
-            .map_err(|e| match e {
-                RpcFailure::Json {
-                    code: RPC_INVALID_PARAMETER,
-                    ..
-                } => ChainError::BlockUnavailable { height },
-                other => self.chain_error("getblock", other),
-            })?;
-        hex::decode(hex_str.trim())
-            .map_err(|e| ChainError::Rpc(format!("getblock({height}, 0) is not hex: {e}")))
-    }
-
-    /// `getblock(height, 1)`: hash, txids and tree sizes.
-    pub async fn get_block_object(&self, height: BlockHeight) -> Result<BlockObject, ChainError> {
+    /// `getblock(height, verbosity)`: the raw block as hex (0) or the
+    /// [`BlockObject`] (1); [`ChainError::BlockUnavailable`] when the node
+    /// has no body for it.
+    async fn getblock<T: DeserializeOwned>(
+        &self,
+        height: BlockHeight,
+        verbosity: u8,
+    ) -> Result<T, ChainError> {
         self.call(
             "getblock",
-            vec![json!(u32::from(height).to_string()), json!(1)],
+            vec![json!(u32::from(height).to_string()), json!(verbosity)],
         )
         .await
         .map_err(|e| match e {
@@ -527,57 +478,9 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
         })
     }
 
-    /// `sendrawtransaction(hex)`; the node answers the txid as display hex.
-    /// A JSON-RPC error is the node's rejection and is passed through
-    /// verbatim as [`ChainError::Rejected`]; transport failures stay
-    /// [`ChainError::Unreachable`].
-    pub async fn send_raw_transaction(&self, raw: &[u8]) -> Result<[u8; 32], ChainError> {
-        let txid: String = self
-            .call("sendrawtransaction", vec![json!(hex::encode(raw))])
-            .await
-            .map_err(|e| match e {
-                RpcFailure::Json { code, message } => {
-                    ChainError::Rejected(format!("{message} (code {code})"))
-                }
-                other => self.chain_error("sendrawtransaction", other),
-            })?;
-        parse_display_hash(&txid)
-    }
-
-    /// `getrawtransaction(txid, 1)`. The node answers `height = -1` (or no
-    /// height) for a mempool transaction, the block height for a mined one,
-    /// and the "no such mempool or main chain transaction" error (code -5)
-    /// otherwise.
-    pub async fn transaction_status(&self, txid: [u8; 32]) -> Result<TxStatus, ChainError> {
-        #[derive(Deserialize)]
-        struct Verbose {
-            #[serde(default)]
-            height: Option<i64>,
-        }
-        match self
-            .call::<Verbose>(
-                "getrawtransaction",
-                vec![json!(display_hash(&txid)), json!(1)],
-            )
-            .await
-        {
-            Ok(v) => Ok(match v.height {
-                Some(h) if h >= 0 => TxStatus::Mined(BlockHeight::from_u32(
-                    u32::try_from(h).map_err(|_| ChainError::Rpc("height out of range".into()))?,
-                )),
-                _ => TxStatus::InMempool,
-            }),
-            Err(RpcFailure::Json {
-                code: RPC_INVALID_ADDRESS_OR_KEY,
-                ..
-            }) => Ok(TxStatus::Unknown),
-            Err(other) => Err(self.chain_error("getrawtransaction", other)),
-        }
-    }
-
     /// `z_gettreestate(height)` as the `ChainState` an account born at
     /// `height + 1` starts from.
-    pub async fn get_tree_state(&self, height: BlockHeight) -> Result<ChainState, ChainError> {
+    async fn get_tree_state(&self, height: BlockHeight) -> Result<ChainState, ChainError> {
         let obj: TreeStateObject = match self
             .call("z_gettreestate", vec![json!(u32::from(height).to_string())])
             .await
@@ -650,7 +553,7 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
     /// index it has built, pruned bodies or not, because the commitment
     /// tree is consensus state (SYNC.md §5.2, **needs verification** on a
     /// pruned node). `limit` 0 means all.
-    pub async fn get_subtrees_by_index(
+    async fn get_subtrees_by_index(
         &self,
         pool: ShieldedPool,
         start_index: u32,
@@ -684,12 +587,7 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
                 let bytes = hex::decode(st.root.trim()).map_err(|e| {
                     ChainError::Rpc(format!("z_getsubtreesbyindex: root is not hex: {e}"))
                 })?;
-                let root = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-                    ChainError::Rpc(format!(
-                        "z_getsubtreesbyindex: root has {} bytes, expected 32",
-                        bytes.len()
-                    ))
-                })?;
+                let root = bytes32(&bytes, "z_getsubtreesbyindex: root")?;
                 Ok(SubtreeRoot {
                     pool,
                     index: start_index + i as u32,
@@ -704,9 +602,13 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
     /// One compact block: `getblock(h, 0)` parsed with `zcash_primitives`,
     /// cross-checked against `getblock(h, 1)`'s hash and txids, carrying
     /// that object's tree sizes.
-    pub async fn compact_block(&self, height: BlockHeight) -> Result<CompactBlock, ChainError> {
-        let (raw, obj) =
-            tokio::try_join!(self.get_raw_block(height), self.get_block_object(height))?;
+    async fn compact_block(&self, height: BlockHeight) -> Result<CompactBlock, ChainError> {
+        let raw = async {
+            let hex_str: String = self.getblock(height, 0).await?;
+            hex::decode(hex_str.trim())
+                .map_err(|e| ChainError::Rpc(format!("getblock({height}, 0) is not hex: {e}")))
+        };
+        let (raw, obj) = tokio::try_join!(raw, self.getblock::<BlockObject>(height, 1))?;
         let sizes = obj.trees.sizes()?;
         let block = compact::from_raw(&self.params, height, &raw, Some(sizes))
             .map_err(|e| ChainError::Rpc(e.to_string()))?;
@@ -736,12 +638,7 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
 /// `reqwest`'s connect errors wrap the OS error several layers deep; the
 /// innermost message ("Connection refused") is the useful one.
 fn connect_error_text(e: &reqwest::Error) -> String {
-    let mut cur: &dyn std::error::Error = e;
-    let mut last = e.to_string();
-    while let Some(next) = cur.source() {
-        last = next.to_string();
-        cur = next;
-    }
+    let last = innermost_error(e);
     if e.is_timeout() {
         format!("timed out ({last})")
     } else {
@@ -750,8 +647,8 @@ fn connect_error_text(e: &reqwest::Error) -> String {
 }
 
 impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P> {
-    fn route(&self) -> Route {
-        Route::ZakuraRpc
+    fn source(&self) -> Source {
+        Source::Node
     }
 
     fn node_bounds(&self) -> BoxFuture<'_, Result<NodeBounds, ChainError>> {
@@ -760,16 +657,12 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
                 Ok(info) => info.bounds().map(|b| (b, info.pruned)),
                 Err(e) => Err(e),
             };
-            self.record(&outcome);
-            outcome.map(|(b, _)| b)
+            self.status.record(outcome)
         })
     }
 
     fn status(&self) -> NodeStatus {
-        self.status
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.status.get()
     }
 
     fn chain_state(&self, height: BlockHeight) -> BoxFuture<'_, Result<ChainState, ChainError>> {
@@ -780,12 +673,57 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
         Box::pin(self.get_block_hash(height))
     }
 
+    /// `sendrawtransaction(hex)`; the node answers the txid as display hex.
+    /// A JSON-RPC error is the node's rejection and is passed through
+    /// verbatim as [`ChainError::Rejected`]; transport failures stay
+    /// [`ChainError::Unreachable`].
     fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<[u8; 32], ChainError>> {
-        Box::pin(async move { self.send_raw_transaction(&raw).await })
+        Box::pin(async move {
+            let txid: String = self
+                .call("sendrawtransaction", vec![json!(hex::encode(raw))])
+                .await
+                .map_err(|e| match e {
+                    RpcFailure::Json { code, message } => {
+                        ChainError::Rejected(format!("{message} (code {code})"))
+                    }
+                    other => self.chain_error("sendrawtransaction", other),
+                })?;
+            parse_display_hash(&txid)
+        })
     }
 
+    /// `getrawtransaction(txid, 1)`. The node answers `height = -1` (or no
+    /// height) for a mempool transaction, the block height for a mined one,
+    /// and the "no such mempool or main chain transaction" error (code -5)
+    /// otherwise.
     fn transaction_status(&self, txid: [u8; 32]) -> BoxFuture<'_, Result<TxStatus, ChainError>> {
-        Box::pin(self.transaction_status(txid))
+        #[derive(Deserialize)]
+        struct Verbose {
+            #[serde(default)]
+            height: Option<i64>,
+        }
+        Box::pin(async move {
+            match self
+                .call::<Verbose>(
+                    "getrawtransaction",
+                    vec![json!(display_hash(&txid)), json!(1)],
+                )
+                .await
+            {
+                Ok(v) => Ok(match v.height {
+                    Some(h) if h >= 0 => TxStatus::Mined(BlockHeight::from_u32(
+                        u32::try_from(h)
+                            .map_err(|_| ChainError::Rpc("height out of range".into()))?,
+                    )),
+                    _ => TxStatus::InMempool,
+                }),
+                Err(RpcFailure::Json {
+                    code: RPC_INVALID_ADDRESS_OR_KEY,
+                    ..
+                }) => Ok(TxStatus::Unknown),
+                Err(other) => Err(self.chain_error("getrawtransaction", other)),
+            }
+        })
     }
 
     fn compact_blocks(
@@ -822,31 +760,11 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
     }
 }
 
-/// Expand `~` the way `gyges_core::paths::expand_tilde` does, for callers
-/// that hand a raw config string to [`ZakuraRpcBackend::new`].
-pub fn cookie_path_from_config(value: &str) -> Option<PathBuf> {
-    let v = value.trim();
-    if v.is_empty() {
-        return None;
-    }
-    Some(if let Some(rest) = v.strip_prefix("~/") {
-        std::env::var_os("HOME")
-            .map(|h| Path::new(&h).join(rest))
-            .unwrap_or_else(|| PathBuf::from(v))
-    } else {
-        PathBuf::from(v)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeNode, regtest_params};
+    use crate::testing::{FakeNode, h, regtest_params};
     use transparent::address::TransparentAddress;
-
-    fn h(n: u32) -> BlockHeight {
-        BlockHeight::from_u32(n)
-    }
 
     fn backend(node: &FakeNode) -> ZakuraRpcBackend<zcash_protocol::local_consensus::LocalNetwork> {
         ZakuraRpcBackend::new(node.url(), None, regtest_params()).unwrap()
@@ -885,18 +803,6 @@ mod tests {
         assert_eq!(t.sizes().unwrap(), TreeSizes::default());
         let t: Trees = serde_json::from_value(json!({"sapling": {"size": u64::MAX}})).unwrap();
         assert!(t.sizes().is_err());
-    }
-
-    #[test]
-    fn cookie_path_expands_tilde_and_empty_is_none() {
-        assert_eq!(cookie_path_from_config(""), None);
-        assert_eq!(cookie_path_from_config(" "), None);
-        assert_eq!(
-            cookie_path_from_config("/tmp/x"),
-            Some(PathBuf::from("/tmp/x"))
-        );
-        let p = cookie_path_from_config("~/.cache/zakura/.cookie").unwrap();
-        assert!(!p.to_string_lossy().starts_with('~') || std::env::var_os("HOME").is_none());
     }
 
     #[tokio::test]

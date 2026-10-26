@@ -37,12 +37,13 @@ use std::fmt;
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
+use std::sync::RwLock;
 use std::time::SystemTime;
 
 use zcash_client_backend::data_api::chain::{ChainState, CommitmentTreeRoot};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_protocol::ShieldedPool;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, NetworkType, Parameters};
 
 pub use cache::{BlockDb, CacheError, Source};
 pub use compact::{CompactError, TransparentOutput, TreeSizes};
@@ -87,21 +88,36 @@ pub struct NodeStatus {
     pub last_polled: Option<SystemTime>,
 }
 
-/// Which route a key is currently scanning through.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Route {
-    /// Case A: local `zakurad` JSON-RPC, `scanned_tip + 1 >= retained_from`.
-    ZakuraRpc,
-    /// Case B: archival lightwalletd over Tor, below `retained_from`.
-    TorLightwalletd,
-}
+/// A backend's [`NodeStatus`], refreshed by every bounds poll.
+#[derive(Debug, Default)]
+pub(crate) struct StatusCell(RwLock<NodeStatus>);
 
-impl Route {
-    /// How blocks fetched through this route are tagged in the cache.
-    pub const fn source(self) -> Source {
-        match self {
-            Route::ZakuraRpc => Source::Node,
-            Route::TorLightwalletd => Source::TorLwd,
+impl StatusCell {
+    pub(crate) fn get(&self) -> NodeStatus {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Record a poll's outcome (the bounds and whether the source is
+    /// pruned) and hand back the bounds. A failure keeps the last bounds.
+    pub(crate) fn record(
+        &self,
+        outcome: Result<(NodeBounds, bool), ChainError>,
+    ) -> Result<NodeBounds, ChainError> {
+        let mut status = self.0.write().unwrap_or_else(|e| e.into_inner());
+        status.last_polled = Some(SystemTime::now());
+        match outcome {
+            Ok((bounds, pruned)) => {
+                status.connected = true;
+                status.bounds = Some(bounds.clone());
+                status.pruned = pruned;
+                status.last_error.clear();
+                Ok(bounds)
+            }
+            Err(e) => {
+                status.connected = false;
+                status.last_error = e.to_string();
+                Err(e)
+            }
         }
     }
 }
@@ -210,9 +226,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `zcash_client_backend`'s `BlockSource` / `BlockCache` over the shared
 /// [`BlockDb`]; this trait is how the cache gets filled ([`fill_cache`]).
 pub trait ChainBackend: Send + Sync + fmt::Debug {
-    /// Which route this backend is, hence how its blocks are tagged in the
-    /// cache ([`Route::source`]).
-    fn route(&self) -> Route;
+    /// Where this backend's blocks come from, hence how they are tagged in
+    /// the cache.
+    fn source(&self) -> Source;
 
     /// `getblockchaininfo`, reduced to what the scheduler needs. Also
     /// refreshes [`ChainBackend::status`].
@@ -277,18 +293,50 @@ pub fn display_hash(internal: &[u8]) -> String {
 /// The inverse of [`display_hash`]: a 64-character hex string in display
 /// order to 32 internal-order bytes.
 pub fn parse_display_hash(hex_str: &str) -> Result<[u8; 32], ChainError> {
-    let mut bytes = hex::decode(hex_str.trim())
+    let bytes = hex::decode(hex_str.trim())
         .map_err(|e| ChainError::Rpc(format!("hash is not hex: {e}")))?;
-    if bytes.len() != 32 {
+    let mut out = bytes32(&bytes, "hash")?;
+    out.reverse();
+    Ok(out)
+}
+
+/// Exactly 32 bytes, else [`ChainError::Rpc`] saying `"{what} has N bytes,
+/// expected 32"`.
+pub(crate) fn bytes32(bytes: &[u8], what: impl fmt::Display) -> Result<[u8; 32], ChainError> {
+    <[u8; 32]>::try_from(bytes)
+        .map_err(|_| ChainError::Rpc(format!("{what} has {} bytes, expected 32", bytes.len())))
+}
+
+/// Refuse a source that serves another chain than `params`' and return
+/// this daemon's network name. A node or lightwalletd reports `"main"` or
+/// `"test"` (`"test"` for regtest as well); zaino on regtest reports
+/// `"regtest"`. `who` starts the error text.
+pub(crate) fn check_chain_name(
+    params: &impl Parameters,
+    reported: &str,
+    who: impl fmt::Display,
+) -> Result<&'static str, ChainError> {
+    let (network, accepted): (&'static str, &[&str]) = match params.network_type() {
+        NetworkType::Main => ("mainnet", &["main"]),
+        NetworkType::Test => ("testnet", &["test"]),
+        NetworkType::Regtest => ("regtest", &["test", "regtest"]),
+    };
+    if !accepted.contains(&reported) {
         return Err(ChainError::Rpc(format!(
-            "hash has {} bytes, expected 32",
-            bytes.len()
+            "{who} serves chain \"{reported}\", this daemon is for {network}"
         )));
     }
-    bytes.reverse();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
+    Ok(network)
+}
+
+/// The innermost message of `e`'s source chain: transport errors wrap the
+/// useful OS error ("Connection refused") several layers deep.
+pub(crate) fn innermost_error(e: &dyn std::error::Error) -> String {
+    let mut cur = e;
+    while let Some(next) = cur.source() {
+        cur = next;
+    }
+    cur.to_string()
 }
 
 /// Compile-time proof that the upstream module paths cited in the design
@@ -335,8 +383,6 @@ mod tests {
         assert!(root(ShieldedPool::Ironwood, [0; 32]).orchard().is_some());
         assert!(root(ShieldedPool::Orchard, [0xff; 32]).orchard().is_none());
         assert!(root(ShieldedPool::Orchard, [0; 32]).sapling().is_none());
-        assert_eq!(Route::TorLightwalletd.source(), Source::TorLwd);
-        assert_eq!(Route::ZakuraRpc.source(), Source::Node);
         assert_eq!(pool_name(ShieldedPool::Ironwood), "ironwood");
     }
 

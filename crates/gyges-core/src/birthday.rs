@@ -173,8 +173,8 @@ impl FixedChain {
 }
 
 impl ChainBackend for FixedChain {
-    fn route(&self) -> gyges_chain::Route {
-        gyges_chain::Route::ZakuraRpc
+    fn source(&self) -> gyges_chain::Source {
+        gyges_chain::Source::Node
     }
 
     fn subtree_roots(

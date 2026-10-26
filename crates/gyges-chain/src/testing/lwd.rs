@@ -149,9 +149,8 @@ impl FakeLightwalletd {
     /// the transparent fields stripped (lightwalletd's legacy answer), and
     /// the tree state at every height. Reports `"test"` like the node.
     pub async fn from_node(node: &FakeNode) -> Self {
-        let (blocks, tree_states) = snapshot(node);
-        let lwd = Self::start("test", blocks, tree_states).await;
-        lwd.snapshot_transparent(node);
+        let lwd = Self::start("test", vec![], vec![]).await;
+        lwd.resync(node);
         lwd
     }
 
@@ -200,12 +199,6 @@ impl FakeLightwalletd {
     /// Report `utxo` from `GetAddressUtxos` too (a lying endpoint).
     pub fn inject_utxo(&self, utxo: FakeUtxo) {
         self.lock().utxos.push(utxo);
-    }
-
-    /// Serve `raw` as the transaction `txid` at `height` from
-    /// `GetTransaction` (a lying endpoint).
-    pub fn inject_transaction(&self, txid: [u8; 32], raw: Vec<u8>, height: u32) {
-        self.lock().transactions.insert(txid, (raw, height));
     }
 
     /// What `GetAddressUtxos` currently reports.
