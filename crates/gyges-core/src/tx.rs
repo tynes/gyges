@@ -1900,6 +1900,39 @@ mod tests {
         let _ = confirmations_policy(10);
     }
 
+    fn expected_sample() -> Expected {
+        let mut addr = [0u8; 43];
+        addr[0] = 7;
+        addr[42] = 9;
+        Expected {
+            transparent_outputs: vec![(vec![0x76, 0xa9], 5)],
+            orchard_payments: vec![(addr, 10)],
+            orchard_change: 3,
+            sapling_payments: vec![([1; 43], 4)],
+            sapling_change: 2,
+            fee: 1,
+            min_target_height: 100,
+            expiry_height: 140,
+        }
+    }
+
+    /// `Expected` as `ext_gyges_signing_sessions.expected` stores it: rows
+    /// written by earlier releases must read back, and new ones must be
+    /// written the same way.
+    const EXPECTED_JSON: &str = r#"{"transparent_outputs":[[[118,169],5]],"orchard_payments":[[[7,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9],10]],"orchard_change":3,"sapling_payments":[[[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],4]],"sapling_change":2,"fee":1,"min_target_height":100,"expiry_height":140}"#;
+
+    #[test]
+    fn stored_expected_json_is_stable() {
+        let exp = expected_sample();
+        assert_eq!(String::from_utf8(exp.to_json()).unwrap(), EXPECTED_JSON);
+        assert_eq!(Expected::from_json(EXPECTED_JSON.as_bytes()).unwrap(), exp);
+        // A 42-byte address is refused with the same text as before.
+        let short = EXPECTED_JSON.replacen("[[[7,0,", "[[[", 1);
+        let err = Expected::from_json(short.as_bytes()).unwrap_err();
+        assert_eq!(err.to_string(), "stored proposal has a malformed address");
+        assert!(Expected::from_json(b"{}").is_err());
+    }
+
     #[test]
     fn max_retries_with_the_fee_taken_off_what_can_be_spent() {
         // 1000 asked, 1100 needed: the fee is 100, off the 900 selectable.
