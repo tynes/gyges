@@ -411,8 +411,8 @@ fn wait_tx_status(fx: &Fixture, txid: &str, status: &str) -> serde_json::Value {
 /// `gyges address current/new/qr/inspect`, `gyges notes`, `gyges tx list`
 /// and `gyges tx status` through the binaries against the fake node, in
 /// both renderings: the M1 commands a user needs to receive, look at what
-/// arrived and follow a transaction, plus the not-implemented `--qr` /
-/// `--pir` exits and the exit-6 inspection of a bad address.
+/// arrived and follow a transaction, plus the QR codes, the
+/// not-implemented `--pir` exit and the exit-6 inspection of a bad address.
 #[test]
 fn addresses_notes_and_history_through_the_binaries() {
     let (n, fx, pw) = synced_key(10, SPEND_CONFIG);
@@ -431,16 +431,26 @@ fn addresses_notes_and_history_through_the_binaries() {
     assert_eq!(v["schema_version"], "0.1");
     assert_eq!(v["receivers"][0]["pool"], "POOL_ORCHARD", "{v}");
 
-    for args in [
-        &["-k", "main", "address", "current", "--qr"][..],
-        &["-k", "main", "address", "new", "--qr"],
-        &["-k", "main", "address", "qr"],
-        &["address", "qr", "u1x"],
-    ] {
-        let run = fx.gyges(args).run();
-        assert_eq!(run.code(), 1, "{args:?}: {run:?}");
-        run.stderr_has("not implemented");
-    }
+    // `--qr`: the address alone on stdout still, the code on stderr.
+    let run = fx.gyges(&["-k", "main", "address", "current", "--qr"]).ok();
+    assert_eq!(run.stdout.trim(), current, "{run:?}");
+    assert!(is_qr(&run.stderr), "{run:?}");
+    let run = fx
+        .gyges(&["-q", "-k", "main", "address", "current", "--qr"])
+        .ok();
+    assert!(run.stderr.is_empty(), "-q hides the code: {run:?}");
+    // `address qr`: the code on stdout, the address under it.
+    let run = fx.gyges(&["-k", "main", "address", "qr"]).ok();
+    assert!(is_qr(&run.stdout), "{run:?}");
+    assert_eq!(run.stdout.lines().last(), Some(current.as_str()), "{run:?}");
+    let run = fx.gyges(&["address", "qr", &current, "--json"]).run();
+    let v = run.json();
+    assert_eq!(v["address"], current.as_str());
+    assert!(is_qr(v["qr"].as_str().unwrap()), "{v}");
+    // A mistyped address is refused, never rendered.
+    let run = fx.gyges(&["address", "qr", "u1x"]).run();
+    assert_eq!(run.code(), 6, "{run:?}");
+    assert!(!run.stdout.contains('█'), "{run:?}");
 
     let run = fx
         .gyges(&[
@@ -582,4 +592,17 @@ fn addresses_notes_and_history_through_the_binaries() {
         &fx.network_dir().join("logs"),
         &[&current, &fresh_addr, &shield, "shop"],
     );
+}
+
+/// At least a version 1 code (21 modules, two per line, plus the quiet
+/// zone) of half-block lines.
+fn is_qr(s: &str) -> bool {
+    let rows: Vec<&str> = s
+        .lines()
+        .filter(|l| !l.is_empty() && l.chars().all(|c| " █▀▄".contains(c)))
+        .collect();
+    rows.len() >= 15
+        && rows
+            .iter()
+            .all(|r| r.chars().count() == rows[0].chars().count())
 }

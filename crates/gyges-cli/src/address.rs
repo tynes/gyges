@@ -3,8 +3,10 @@
 //! to stdout alone, so `$(gyges address current)` works; its receivers,
 //! diversifier index and label go to stderr (quiet with `-q`).
 //!
-//! `--qr` and `address qr` exit 1 as not implemented until `gyges-qr`
-//! renders codes (ROADMAP.md M5); they fail before any RPC is sent.
+//! `--qr` adds a half-block QR code of the address on stderr, so stdout
+//! stays the address alone; `address qr` prints the code on stdout, for
+//! the current address or one given (checked with `InspectAddress` first,
+//! so a mistyped address is never rendered).
 
 use clap::{Args, Subcommand, ValueEnum};
 use gyges_proto::v1::{
@@ -23,7 +25,7 @@ pub enum AddressCmd {
     Current(CurrentArgs),
     /// Derive a fresh diversified unified address.
     New(NewArgs),
-    /// Static QR code for the current address or ADDRESS (not implemented yet).
+    /// Static QR code for the current address or ADDRESS.
     Qr { address: Option<String> },
     /// Parse any Zcash address: checksum, network, receivers, ZIP 320.
     Inspect { address: String },
@@ -31,7 +33,7 @@ pub enum AddressCmd {
 
 #[derive(Debug, Clone, Args)]
 pub struct CurrentArgs {
-    /// Render a QR code in the terminal (not implemented yet).
+    /// Also render a QR code of the address in the terminal (stderr).
     #[arg(long)]
     pub qr: bool,
 }
@@ -62,17 +64,14 @@ pub struct NewArgs {
     /// Label stored with the address in the key's wallet.
     #[arg(long, value_name = "TEXT")]
     pub label: Option<String>,
-    /// Render a QR code in the terminal (not implemented yet).
+    /// Also render a QR code of the address in the terminal (stderr).
     #[arg(long)]
     pub qr: bool,
 }
 
 pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
     match cmd {
-        AddressCmd::Current(a) if a.qr => Err(CliError::NotImplemented("address current --qr")),
-        AddressCmd::New(a) if a.qr => Err(CliError::NotImplemented("address new --qr")),
-        AddressCmd::Qr { .. } => Err(CliError::NotImplemented("address qr")),
-        AddressCmd::Current(_) => {
+        AddressCmd::Current(a) => {
             let mut conn = ctx.connect().await?;
             let info = conn
                 .client
@@ -81,7 +80,50 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
                 })
                 .await?
                 .into_inner();
-            print_address(ctx, &info)
+            print_address(ctx, &info, a.qr)
+        }
+        AddressCmd::Qr { address } => {
+            let mut conn = ctx.connect().await?;
+            let address = match address {
+                Some(address) => {
+                    let resp = conn
+                        .client
+                        .inspect_address(InspectAddressRequest {
+                            address: address.clone(),
+                        })
+                        .await?
+                        .into_inner();
+                    if !resp.valid {
+                        return Err(CliError::Daemon(GygesError::new(
+                            ErrorReason::InvalidArgument,
+                            if resp.error.is_empty() {
+                                "not a valid address".to_string()
+                            } else {
+                                resp.error
+                            },
+                        )));
+                    }
+                    address
+                }
+                None => {
+                    conn.client
+                        .get_current_address(GetCurrentAddressRequest {
+                            key_id: ctx.key.clone(),
+                        })
+                        .await?
+                        .into_inner()
+                        .address
+                }
+            };
+            let qr = qr_code(&address)?;
+            if ctx.json {
+                let v = serde_json::json!({ "address": address, "qr": qr });
+                println!("{}", to_json(&v)?);
+            } else {
+                print!("{qr}");
+                println!("{address}");
+            }
+            Ok(())
         }
         AddressCmd::New(a) => {
             let mut conn = ctx.connect().await?;
@@ -94,7 +136,7 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
                 })
                 .await?
                 .into_inner();
-            print_address(ctx, &info)
+            print_address(ctx, &info, a.qr)
         }
         AddressCmd::Inspect { address } => {
             let mut conn = ctx.connect().await?;
@@ -123,16 +165,25 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
     }
 }
 
-fn print_address(ctx: &Ctx, info: &AddressInfo) -> Result<(), CliError> {
+/// The address on stdout (or `AddressInfo` with `--json`); the details,
+/// and the QR code when asked for, on stderr unless `-q`.
+fn print_address(ctx: &Ctx, info: &AddressInfo, qr: bool) -> Result<(), CliError> {
     if ctx.json {
         println!("{}", to_json(info)?);
-        return Ok(());
+    } else {
+        println!("{}", info.address);
+        if !ctx.quiet {
+            eprint!("{}", render_details(info));
+        }
     }
-    println!("{}", info.address);
-    if !ctx.quiet {
-        eprint!("{}", render_details(info));
+    if qr && !ctx.quiet {
+        eprint!("{}", qr_code(&info.address)?);
     }
     Ok(())
+}
+
+fn qr_code(address: &str) -> Result<String, CliError> {
+    gyges_qr::render_str(address).map_err(|e| CliError::Other(e.into()))
 }
 
 fn receiver_line(r: &Receiver) -> String {
@@ -224,6 +275,16 @@ mod tests {
         assert!(s.contains("sapling") && s.contains("zs1y"), "{s}");
         assert!(s.contains("diversifier index: 7"), "{s}");
         assert!(s.contains("savings"), "{s}");
+    }
+
+    #[test]
+    fn a_unified_address_fits_one_code() {
+        // A regtest UA with Orchard, Sapling and transparent receivers is
+        // the longest address the CLI renders.
+        let ua = format!("uregtest1{}", "q".repeat(250));
+        let qr = qr_code(&ua).unwrap();
+        assert!(qr.lines().count() > 20, "{qr}");
+        assert!(qr.chars().all(|c| " \n█▀▄".contains(c)));
     }
 
     #[test]

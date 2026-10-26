@@ -2364,6 +2364,7 @@ dependencies = [
 name = "gyges-qr"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "qrcode",
  "thiserror 2.0.21",
  "ur",
