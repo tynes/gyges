@@ -195,7 +195,30 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
   Tests: 14 unit tests in `gyges-qr` (TESTING.md §4: the registry tags against `ur-registry`, the 12 KiB fountain round trip at three fragment sizes with frames shuffled and a fifth dropped, every payload type through frames, `ur-registry`'s `zcash-accounts` vector, the refusals, the renderer's shape and alphanumeric mode, the animation), a unit test in `gyges-cli`, and `scenarios/tx.rs::addresses_notes_and_history_through_the_binaries`, which now checks the three QR commands, `-q`, `--json` and the exit-6 refusal.
 
   Not done: the recorded device fixtures of TESTING.md §4 (they need a Keystone; synthetic round trips stand in); the Redactor test, which moves to the third item; `pczt qr-export`, `sign --qr-out` and `qr-import` (third item); the camera (fourth item); a phone scan. Checked once by hand instead: the rendered text, turned back into pixels as a light-on-dark terminal shows it, decodes with `rqrr` to a 223-character regtest address, and the 15 frames of a 3 KB payload decode and reassemble to its bytes.
-- [ ] `key import-keystone` with required birthday and `device_version` check.
+- [x] `key import-keystone` with required birthday and `device_version` check. Landed as:
+  - `ImportKeystone` (`gygesd::keys::import_keystone`). It accepts only `ur:zcash-accounts`, one or more frames, reassembled with `gyges_qr::Assembler`. A lone UFVK, as a `ur:zcash-unified-full-viewing-key` or a bare `uview1…`, carries no seed fingerprint, so the device could never recognise its key; it is refused with `INVALID_ARGUMENT` and a pointer to `import-ufvk`. Every check runs before the birthday is resolved and before anything is written:
+    - the account (`account_index`, or the only one listed);
+    - a 32-byte seed fingerprint;
+    - a UFVK for this network with an Orchard component;
+    - the firmware.
+
+    Then the birthday goes through `resolve_import_birthday`, the below-window path now shared with `RestoreKey`. Birthday 0 means NU5 activation. The proto gained `allow_backfill`, `allow_unknown_firmware`, `backfill_blocks`, `warnings`, `account_index` and `account_name`.
+  - `KeyRegistry::create_keystone`: `import_account_ufvk` as a spending account with `Zip32Derivation(seed fingerprint, account)`, no `seed.age`, and spend and receive pools Orchard, Ironwood and transparent. `pczt create` now works for `keystone-qr` keys (nothing is signed there); `tx send`, `tx shield` and `pczt sign` still answer `HARDWARE_SIGNER` until the third item.
+  - `gyges_qr::firmware`: the floor and its numbering. Zodl requires v3.0.2 for Ironwood, and the pairing QR reports the raw `SOFTWARE_VERSION_MAJOR`, 10 above what the device's About screen shows (keystone3-firmware PR #2138, `version.h`), so the floor is `13.0.2`. A version below it is `HARDWARE_SIGNER` (exit 9), with both forms in the message. An export without a version, or with one that does not parse, is `CONFIRMATION_REQUIRED` (exit 4) unless `allow_unknown_firmware`, which records `"unknown"` and returns a warning. The `3.0.0` and `3.0.2` tags already report their version, so a device that reports none is older than the floor, and the message says so. OVERVIEW.md §4.1 records the sources.
+  - `gyges key import-keystone`: frames from `--ur` (repeatable) or stdin, `--birthday` (or a confirmed NU5 default; exit 4 without a terminal), `--account`, `--allow-unknown-firmware`, `--yes` and `--set-default`. Before any question it checks the payload type and the firmware locally, then asks for backfill consent as `key restore` does.
+
+  Tests:
+  - `rpc.rs::a_keystone_import_is_the_seeds_account_and_builds_pczts_for_the_device`. The abandon mnemonic is restored as `local-seed` and imported from a device-shaped export (no Sapling item). Both keys have the same seed fingerprint and both see one transparent payment. `export-ufvk` has no Sapling item. Every transparent input of a `pczt create` from the Keystone key carries a BIP 44 derivation naming the device's fingerprint and account 0. `tx send` is `HARDWARE_SIGNER` and `key unlock` is refused.
+  - `rpc.rs::keystone_import_refusals_and_account_choice`. Twelve refusals, each leaving no key directory. Then the second account of a two-account, multi-frame export; an unknown version allowed; and the taken id.
+  - `scenarios/keys.rs::import_keystone_through_the_binaries`: exits 6, 9 and 4, with a UFVK UR and an incomplete export refused before any question; stdin and `--ur`; `key list`; the key syncing; `address current` and `address new` (Orchard and transparent receivers); and a daemon restart that reloads the seedless profile.
+  - Unit tests of the version parser and messages.
+
+  Found on the way: the two wallets' default addresses differ. Without a Sapling item the first diversifier index is valid, while a seed's default address is at the first index valid for Sapling, so the Keystone key and the restored seed hand out different first addresses, as Zodl does. They watch the same range of transparent indices.
+
+  Not done:
+  - a recorded export from a real device (TESTING.md §4 `accounts.ur`, `firmware_old.ur`), and checking on hardware that v3.0.2 exports `13.0.2`;
+  - `key import-ufvk`;
+  - the signing itself (third item).
 - [ ] Batch protocol for shielded sends; single-PCZT protocol with Combiner for transparent inputs; signing sessions that survive restarts; `qr-import --from-file` and `--session`.
 - [ ] `qr-scan` camera path.
 - [ ] Verify on hardware: TEX Step 2 signing, which PCZT fields the device displays. Settle the host side first: step 1 of a ZIP 320 send is part of a multi-step proposal, which `create_pczt_from_proposal` refuses, and the `TexQueue` signs with a spending key a Keystone profile does not hold.

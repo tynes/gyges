@@ -15,14 +15,14 @@ use gyges_proto::v1::{
     BroadcastPcztResponse, CombinePcztRequest, CombinePcztResponse, CreatePcztRequest,
     CreatePcztResponse, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest,
     ExportUfvkResponse, FallbackStatus, GetBalanceRequest, GetBalanceResponse, GetInfoRequest,
-    GetInfoResponse, GetSyncStatusRequest, GetSyncStatusResponse, InitKeyRequest, InitKeyResponse,
-    InspectPcztRequest, InspectPcztResponse, ListKeysRequest, ListKeysResponse,
-    ListSigningSessionsRequest, ListSigningSessionsResponse, LockKeyRequest, LockKeyResponse,
-    NodeStatus, ProvePcztRequest, ProvePcztResponse, RestoreKeyRequest, RestoreKeyResponse,
-    ResumeTexTransferRequest, RunSyncRequest, ScanMempoolRequest, ScanMempoolResponse,
-    SendTransactionRequest, ShieldFundsRequest, ShutdownRequest, ShutdownResponse, SignPcztRequest,
-    SigningSession, StreamLogsRequest, TexQueueEntry, UnlockKeyRequest, UnlockKeyResponse,
-    WaitSyncRequest,
+    GetInfoResponse, GetSyncStatusRequest, GetSyncStatusResponse, ImportKeystoneRequest,
+    ImportKeystoneResponse, InitKeyRequest, InitKeyResponse, InspectPcztRequest,
+    InspectPcztResponse, ListKeysRequest, ListKeysResponse, ListSigningSessionsRequest,
+    ListSigningSessionsResponse, LockKeyRequest, LockKeyResponse, NodeStatus, ProvePcztRequest,
+    ProvePcztResponse, RestoreKeyRequest, RestoreKeyResponse, ResumeTexTransferRequest,
+    RunSyncRequest, ScanMempoolRequest, ScanMempoolResponse, SendTransactionRequest,
+    ShieldFundsRequest, ShutdownRequest, ShutdownResponse, SignPcztRequest, SigningSession,
+    StreamLogsRequest, TexQueueEntry, UnlockKeyRequest, UnlockKeyResponse, WaitSyncRequest,
 };
 use gyges_proto::v1::{
     AddressInfo, GetCurrentAddressRequest, GetTransactionStatusRequest,
@@ -446,6 +446,15 @@ impl Gyges for GygesService {
         request: Request<RestoreKeyRequest>,
     ) -> Result<Response<RestoreKeyResponse>, Status> {
         keys::restore_key(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn import_keystone(
+        &self,
+        request: Request<ImportKeystoneRequest>,
+    ) -> Result<Response<ImportKeystoneResponse>, Status> {
+        keys::import_keystone(self.state.clone(), request.into_inner())
             .await
             .map(Response::new)
     }

@@ -15,11 +15,11 @@ use gyges_proto::v1::gyges_client::GygesClient;
 use gyges_proto::v1::{
     AbortSigningSessionRequest, ErrorReason, ExportSeedRequest, ExportUfvkRequest,
     GetBalanceRequest, GetBalanceResponse, GetInfoRequest, GetSyncStatusRequest, GygesError,
-    InitKeyRequest, InitKeyResponse, ListKeysRequest, ListSigningSessionsRequest, LockKeyRequest,
-    Proposal, RestoreKeyRequest, RunSyncRequest, SendEvent, SendTransactionRequest, SessionStatus,
-    ShieldFundsRequest, ShutdownRequest, SignatureKind, SigningMode, StreamLogsRequest,
-    SyncProgress, SyncState, SyncTarget, UnlockKeyRequest, UnlockScope, WaitSyncRequest,
-    send_event,
+    ImportKeystoneRequest, InitKeyRequest, InitKeyResponse, ListKeysRequest,
+    ListSigningSessionsRequest, LockKeyRequest, Proposal, RestoreKeyRequest, RunSyncRequest,
+    SendEvent, SendTransactionRequest, SessionStatus, ShieldFundsRequest, ShutdownRequest,
+    SignatureKind, SigningMode, StreamLogsRequest, SyncProgress, SyncState, SyncTarget,
+    UnlockKeyRequest, UnlockScope, WaitSyncRequest, send_event,
 };
 use gygesd::{Daemon, DaemonState, LogHub, Options};
 use tokio_stream::StreamExt as _;
@@ -739,6 +739,446 @@ async fn restore_below_the_retention_window_is_refused_in_two_steps() {
         .unwrap()
         .into_inner();
     assert_eq!(ok.birthday_height, 401);
+    running.task.abort();
+}
+
+/// The Keystone pairing export of [`known_mnemonic`]'s accounts, as the
+/// device shows it: each UFVK with its Orchard and transparent items only
+/// (the device's UFVK has no Sapling component), the ZIP 32 seed
+/// fingerprint, and `device_version`. Returns the frames, one per line, and
+/// the fingerprint.
+fn keystone_export(accounts: &[u32], device_version: Option<&str>) -> (String, [u8; 32]) {
+    keystone_export_with(accounts, device_version, Network::Regtest)
+}
+
+fn keystone_export_with(
+    accounts: &[u32],
+    device_version: Option<&str>,
+    network: Network,
+) -> (String, [u8; 32]) {
+    use secrecy::ExposeSecret as _;
+    use zcash_address::unified::{Container as _, Encoding as _, Fvk, Ufvk};
+    let entropy = gyges_core::vault::entropy_from_phrase(&known_mnemonic()).unwrap();
+    let seed = gyges_core::vault::seed_from_entropy(&entropy);
+    let params = network.consensus_params();
+    let accounts = accounts
+        .iter()
+        .map(|&index| {
+            let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+                &params,
+                seed.expose_secret(),
+                zip32::AccountId::try_from(index).unwrap(),
+            )
+            .unwrap();
+            let full = usk.to_unified_full_viewing_key().encode(&params);
+            let (net, ufvk) = Ufvk::decode(&full).unwrap();
+            let items: Vec<Fvk> = ufvk
+                .items()
+                .into_iter()
+                .filter(|i| !matches!(i, Fvk::Sapling(_)))
+                .collect();
+            gyges_qr::Account {
+                ufvk: Ufvk::try_from_items(items).unwrap().encode(&net),
+                index,
+                name: Some(format!("Keystone {index}")),
+            }
+        })
+        .collect();
+    let fp = zip32::fingerprint::SeedFingerprint::from_seed(seed.expose_secret())
+        .unwrap()
+        .to_bytes();
+    let payload = gyges_qr::Payload::Accounts(gyges_qr::Accounts {
+        seed_fingerprint: fp.to_vec(),
+        accounts,
+        device_version: device_version.map(Into::into),
+    });
+    (frames_of(&payload, gyges_qr::DEFAULT_FRAGMENT_LEN), fp)
+}
+
+/// Every frame a camera would see in two loops of `payload`'s animation,
+/// one per line.
+fn frames_of(payload: &gyges_qr::Payload, fragment_len: usize) -> String {
+    let mut frames = payload.frames(fragment_len).unwrap();
+    let n = if frames.is_single() {
+        1
+    } else {
+        2 * frames.fragment_count()
+    };
+    (0..n)
+        .map(|_| frames.next_frame().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn keystone_req(key_id: &str, payload: &str, birthday_height: u32) -> ImportKeystoneRequest {
+    ImportKeystoneRequest {
+        key_id: key_id.into(),
+        payload: payload.into(),
+        birthday_height,
+        ..Default::default()
+    }
+}
+
+/// ROADMAP.md M5, second item. The same seed restored as `local-seed` and
+/// imported from its Keystone export is the same account: same seed
+/// fingerprint and account index, the same payment seen by both. The
+/// Keystone key has no Sapling receiver, spends Orchard, Ironwood and
+/// transparent, builds PCZTs whose inputs name the device's seed and
+/// account (what the device needs to sign them), and refuses to sign or
+/// unlock on the host.
+#[tokio::test]
+async fn a_keystone_import_is_the_seeds_account_and_builds_pczts_for_the_device() {
+    let node = mined_node(10).await;
+    let (running, mut c) = start_on(&node, ONE_CONF_CONFIG).await;
+    c.restore_key(restore_req("seed", 1)).await.unwrap();
+    let (frames, fp) = keystone_export(&[0], Some("13.2.0"));
+    let resp = c
+        .import_keystone(keystone_req("ks", &frames, 1))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.key_id, "ks");
+    assert_eq!(resp.seed_fingerprint, hex::encode(fp));
+    assert_eq!(resp.device_version, "13.2.0");
+    assert_eq!(resp.account_index, 0);
+    assert_eq!(resp.account_name, "Keystone 0");
+    assert_eq!(resp.birthday_height, 1);
+    assert!(resp.warnings.is_empty(), "{:?}", resp.warnings);
+    use gyges_proto::v1::Pool;
+    let pools = vec![
+        Pool::Orchard as i32,
+        Pool::Ironwood as i32,
+        Pool::Transparent as i32,
+    ];
+    assert_eq!(resp.spend_pools, pools);
+
+    let keys = c
+        .list_keys(ListKeysRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .keys;
+    let seed = keys.iter().find(|k| k.key_id == "seed").unwrap();
+    let ks = keys.iter().find(|k| k.key_id == "ks").unwrap();
+    assert_eq!(ks.signing_mode(), SigningMode::KeystoneQr);
+    assert_eq!(ks.device_version, "13.2.0");
+    assert_eq!(ks.seed_fingerprint, seed.seed_fingerprint);
+    assert_eq!(
+        (ks.spend_pools.clone(), ks.receive_pools.clone()),
+        (pools.clone(), pools)
+    );
+    let profile = running
+        .state
+        .registry
+        .resolve("ks")
+        .unwrap()
+        .profile()
+        .clone();
+    assert_eq!(profile.account_index, 0);
+    assert_eq!(profile.seed_format, None);
+    assert!(
+        !running
+            ._home
+            .path()
+            .join("regtest/keys/ks/seed.age")
+            .exists()
+    );
+
+    // The exported UFVK is the device's: no Sapling item.
+    let ufvk = c
+        .export_ufvk(ExportUfvkRequest {
+            key_id: "ks".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .ufvk;
+    assert_eq!(ufvk, resp.ufvk);
+    {
+        use zcash_address::unified::{Container as _, Encoding as _, Fvk, Ufvk};
+        let (_, u) = Ufvk::decode(&ufvk).unwrap();
+        assert!(u.items().iter().any(|i| matches!(i, Fvk::Orchard(_))));
+        assert!(!u.items().iter().any(|i| matches!(i, Fvk::Sapling(_))));
+    }
+
+    // One payment to the Keystone key's transparent receiver is the
+    // restored key's too. (Their default addresses differ: without a
+    // Sapling item the first diversifier index is valid, while the seed's
+    // default is the first index valid for Sapling. Both wallets track the
+    // same range of BIP 44 indices.)
+    let paid = transparent_receiver(&running.state, "ks");
+    assert!(transparent_receivers(&running.state, "seed").contains(&paid));
+    fund(&node, &running.state, &mut c, "ks", 300_000_000).await;
+    wait_spendable(&mut c, "seed").await;
+    let (ks_bal, seed_bal) = (balance(&mut c, "ks").await, balance(&mut c, "seed").await);
+    assert_eq!(balance_of(&ks_bal, Pool::Transparent).0, 300_000_000);
+    assert_eq!(
+        balance_of(&ks_bal, Pool::Transparent),
+        balance_of(&seed_bal, Pool::Transparent)
+    );
+
+    // `pczt create` works, and every transparent input names the device's
+    // seed fingerprint and account 0 in its BIP 44 derivation.
+    let created = c
+        .create_pczt(gyges_proto::v1::CreatePcztRequest {
+            key_id: "ks".into(),
+            to: t_recipient(),
+            amount: zats(100_000_000),
+            memo: Vec::new(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let pczt = pczt::Pczt::parse(&created.pczts[0]).unwrap();
+    let seed_fp = zip32::fingerprint::SeedFingerprint::from_bytes(fp);
+    let coin = bip32::ChildNumber(1 | bip32::ChildNumber::HARDENED_FLAG);
+    let mut inputs = 0;
+    pczt::roles::verifier::Verifier::new(pczt)
+        .with_transparent::<std::convert::Infallible, _>(|bundle| {
+            for input in bundle.inputs() {
+                inputs += 1;
+                let fields = input
+                    .bip32_derivation()
+                    .values()
+                    .find_map(|d| d.extract_bip_44_fields(&seed_fp, coin));
+                assert!(
+                    matches!(fields, Some((account, _, _)) if account == zip32::AccountId::ZERO),
+                    "{fields:?}"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(inputs > 0);
+
+    // Nothing is signed on the host.
+    let err = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            key_id: "ks".into(),
+            to: t_recipient(),
+            amount: zats(100_000_000),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::HardwareSigner, "{err:?}");
+    let err = c
+        .unlock_key(UnlockKeyRequest {
+            key_id: "ks".into(),
+            passphrase: "pw".into(),
+            scope: UnlockScope::Daemon as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("no seed"), "{err:?}");
+    running.task.abort();
+}
+
+/// Every refusal of `ImportKeystone` leaves nothing on disk: the wrong
+/// payload (exit 6), the device's content refused (exit 9), an unknown
+/// firmware version without the flag and a birthday below the node's
+/// window without consent (exit 4). Then a multi-frame export of two
+/// accounts, the second one chosen, and an unknown version allowed.
+#[tokio::test]
+async fn keystone_import_refusals_and_account_choice() {
+    let running = start(|o| {
+        o.chain = Some(Arc::new(FixedChain {
+            tip: 500,
+            retained_from: 400,
+        }));
+    })
+    .await;
+    let mut c = client(&running.socket).await;
+    let keys_dir = running._home.path().join("regtest/keys");
+    let (good, _) = keystone_export(&[0], Some("13.2.0"));
+    let ufvk = |p: &str| -> String {
+        let mut asm = gyges_qr::Assembler::new();
+        for f in p.lines() {
+            asm.receive(f).unwrap();
+        }
+        match gyges_qr::Payload::from_assembler(&asm).unwrap().unwrap() {
+            gyges_qr::Payload::Accounts(a) => a.accounts[0].ufvk.clone(),
+            _ => unreachable!(),
+        }
+    };
+    let bare = ufvk(&good);
+    let lone = frames_of(
+        &gyges_qr::Payload::Ufvk(gyges_qr::Account {
+            ufvk: bare.clone(),
+            index: 0,
+            name: None,
+        }),
+        200,
+    );
+    let (old, _) = keystone_export(&[0], Some("13.0.1"));
+    let (silent, _) = keystone_export(&[0], None);
+    let (mainnet, _) = keystone_export_with(&[0], Some("13.2.0"), Network::Mainnet);
+    let (two, _) = keystone_export(&[0, 1], Some("13.2.0-C"));
+    assert!(
+        two.lines().count() > 1,
+        "two accounts should take several frames"
+    );
+    let first_frame = two.lines().next().unwrap().to_string();
+    let short_fp = frames_of(
+        &gyges_qr::Payload::Accounts(gyges_qr::Accounts {
+            seed_fingerprint: vec![0xd1; 16],
+            accounts: vec![gyges_qr::Account {
+                ufvk: bare.clone(),
+                index: 0,
+                name: None,
+            }],
+            device_version: Some("13.2.0".into()),
+        }),
+        400,
+    );
+
+    let cases: Vec<(&str, ImportKeystoneRequest, ErrorReason, &str)> = vec![
+        (
+            "empty",
+            keystone_req("k", "", 450),
+            ErrorReason::InvalidArgument,
+            "no ur:zcash-accounts",
+        ),
+        (
+            "bare ufvk",
+            keystone_req("k", &bare, 450),
+            ErrorReason::InvalidArgument,
+            "import-ufvk",
+        ),
+        (
+            "ufvk ur",
+            keystone_req("k", &lone, 450),
+            ErrorReason::InvalidArgument,
+            "seed fingerprint",
+        ),
+        (
+            "psbt",
+            keystone_req(
+                "k",
+                "ur:crypto-psbt/hdcxlkahssqzwfvslofzoxwkrewngotktbmwjkwdcmnefsaaehrlolkskncnktlbaypkvoonhknt",
+                450,
+            ),
+            ErrorReason::InvalidArgument,
+            "expected ur:zcash-accounts",
+        ),
+        (
+            "one of many frames",
+            keystone_req("k", &first_frame, 450),
+            ErrorReason::InvalidArgument,
+            "incomplete",
+        ),
+        (
+            "old firmware",
+            keystone_req("k", &old, 450),
+            ErrorReason::HardwareSigner,
+            "13.0.1 (v3.0.1 on the device)",
+        ),
+        (
+            "no version",
+            keystone_req("k", &silent, 450),
+            ErrorReason::ConfirmationRequired,
+            "--allow-unknown-firmware",
+        ),
+        (
+            "mainnet key",
+            keystone_req("k", &mainnet, 450),
+            ErrorReason::HardwareSigner,
+            "not a regtest viewing key",
+        ),
+        (
+            "short fingerprint",
+            keystone_req("k", &short_fp, 450),
+            ErrorReason::HardwareSigner,
+            "16 bytes",
+        ),
+        (
+            "missing account",
+            ImportKeystoneRequest {
+                account_index: 3,
+                ..keystone_req("k", &two, 450)
+            },
+            ErrorReason::InvalidArgument,
+            "lists account 0, 1",
+        ),
+        // NU5 is height 1 on regtest: 399 blocks below the window.
+        (
+            "default birthday",
+            keystone_req("k", &good, 0),
+            ErrorReason::ConfirmationRequired,
+            "399 blocks",
+        ),
+        (
+            "no fallback",
+            ImportKeystoneRequest {
+                allow_backfill: true,
+                ..keystone_req("k", &good, 0)
+            },
+            ErrorReason::FallbackUnavailable,
+            "fallback",
+        ),
+    ];
+    for (what, req, want, needle) in cases {
+        let err = c.import_keystone(req).await.expect_err(what);
+        let e = GygesError::from_status(&err).unwrap();
+        assert_eq!(e.reason(), want, "{what}: {}", e.detail);
+        assert!(
+            e.detail.contains(needle),
+            "{what}: {needle:?} not in {:?}",
+            e.detail
+        );
+        assert!(!keys_dir.join("k").exists(), "{what} left a key directory");
+    }
+
+    // The second account of a fountain-coded export.
+    let resp = c
+        .import_keystone(ImportKeystoneRequest {
+            account_index: 1,
+            ..keystone_req("second", &two, 450)
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        (resp.account_index, resp.account_name.as_str()),
+        (1, "Keystone 1")
+    );
+    assert_eq!(resp.device_version, "13.2.0-C");
+    assert_eq!(
+        running
+            .state
+            .registry
+            .resolve("second")
+            .unwrap()
+            .profile()
+            .account_index,
+        1
+    );
+    // An unknown version, allowed: recorded as such, with a warning.
+    let resp = c
+        .import_keystone(ImportKeystoneRequest {
+            allow_unknown_firmware: true,
+            ..keystone_req("silent", &silent, 450)
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.device_version, "unknown");
+    assert!(
+        resp.warnings.iter().any(|w| w.contains("v3.0.2")),
+        "{:?}",
+        resp.warnings
+    );
+    // The id is taken now.
+    let err = c
+        .import_keystone(keystone_req("second", &two, 450))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::KeyExists, "{err:?}");
     running.task.abort();
 }
 

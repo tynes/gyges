@@ -11,20 +11,23 @@ use std::time::Duration;
 
 use age::secrecy::SecretString;
 use gyges_chain::ChainError;
-use gyges_core::registry::NewLocalSeedKey;
+use gyges_core::registry::{NewKeystoneKey, NewLocalSeedKey};
 use gyges_core::vault::VaultError;
 use gyges_core::vault::manager::{Auth, Scope, UnlockState};
 use gyges_core::{
-    BirthdayError, KeyEntry, RegistryError, ResolvedBirthday, SigningMode, birthday, vault,
+    BirthdayError, KeyEntry, Network, RegistryError, ResolvedBirthday, SigningMode, birthday, vault,
 };
 use gyges_proto::v1::{
     self, ErrorReason, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest,
-    ExportUfvkResponse, GygesError, InitKeyRequest, InitKeyResponse, KeySummary, LockKeyRequest,
-    LockKeyResponse, RestoreKeyRequest, RestoreKeyResponse, UnlockKeyRequest, UnlockKeyResponse,
-    UnlockScope,
+    ExportUfvkResponse, GygesError, ImportKeystoneRequest, ImportKeystoneResponse, InitKeyRequest,
+    InitKeyResponse, KeySummary, LockKeyRequest, LockKeyResponse, RestoreKeyRequest,
+    RestoreKeyResponse, UnlockKeyRequest, UnlockKeyResponse, UnlockScope,
 };
+use gyges_qr::{Assembler, Payload};
 use tonic::Status;
+use zcash_keys::keys::UnifiedFullViewingKey;
 use zeroize::Zeroizing;
+use zip32::fingerprint::SeedFingerprint;
 
 use crate::conn::ConnInfo;
 use crate::service::{DaemonState, invalid};
@@ -346,27 +349,8 @@ pub async fn restore_key(
     } else {
         req.birthday_height
     };
-    let mut backfill_blocks = 0;
-    let mut warnings = Vec::new();
-    let birthday = match birthday::resolve(state.network, state.chain.as_deref(), Some(requested))
-        .await
-    {
-        Ok(b) => b,
-        Err(BirthdayError::BelowRetention {
-            height,
-            retained_from,
-        }) => {
-            let (b, n) = below_retention(&state, height, retained_from, req.allow_backfill).await?;
-            backfill_blocks = n;
-            warnings.push(format!(
-                "transparent history below height {} comes from the fallback endpoint and is \
-                     best-effort: an output it leaves out cannot be detected (SYNC.md §5.3)",
-                retained_from
-            ));
-            b
-        }
-        Err(other) => return Err(birthday_error(other).into_status()),
-    };
+    let (birthday, backfill_blocks, warnings) =
+        resolve_import_birthday(&state, requested, req.allow_backfill).await?;
 
     let key_id = req.key_id.clone();
     let height = birthday.height;
@@ -378,6 +362,258 @@ pub async fn restore_key(
         ufvk: entry.ufvk().unwrap_or_default(),
         backfill_blocks,
         warnings,
+    })
+}
+
+/// The birthday of a key whose history is known to exist (`RestoreKey`,
+/// `ImportKeystone`): inside the node's window from the node, below it
+/// through [`below_retention`], with the best-effort warning. Returns the
+/// birthday, the blocks the backfill fetches, and the warnings.
+async fn resolve_import_birthday(
+    state: &DaemonState,
+    requested: u32,
+    allow_backfill: bool,
+) -> Result<(ResolvedBirthday, u32, Vec<String>), Status> {
+    match birthday::resolve(state.network, state.chain.as_deref(), Some(requested)).await {
+        Ok(b) => Ok((b, 0, Vec::new())),
+        Err(BirthdayError::BelowRetention {
+            height,
+            retained_from,
+        }) => {
+            let (b, n) = below_retention(state, height, retained_from, allow_backfill)
+                .await
+                .map_err(GygesError::into_status)?;
+            let warning = format!(
+                "transparent history below height {retained_from} comes from the fallback \
+                 endpoint and is best-effort: an output it leaves out cannot be detected \
+                 (SYNC.md §5.3)"
+            );
+            Ok((b, n, vec![warning]))
+        }
+        Err(other) => Err(birthday_error(other).into_status()),
+    }
+}
+
+/// `ImportKeystone` (ARCHITECTURE.md §3.4): a `keystone-qr` profile from the
+/// device's `ur:zcash-accounts` export. Every check of the export runs
+/// before the birthday is resolved and before anything is written, so a
+/// refused export touches neither the node nor the disk.
+pub async fn import_keystone(
+    state: Arc<DaemonState>,
+    req: ImportKeystoneRequest,
+) -> Result<ImportKeystoneResponse, Status> {
+    require_key_id(&req.key_id)?;
+    let export = check_accounts_export(
+        state.network,
+        &req.payload,
+        req.account_index,
+        req.allow_unknown_firmware,
+    )
+    .map_err(GygesError::into_status)?;
+
+    let requested = if req.birthday_height == 0 {
+        state.network.nu5_activation_height()
+    } else {
+        req.birthday_height
+    };
+    let (birthday, backfill_blocks, mut warnings) =
+        resolve_import_birthday(&state, requested, req.allow_backfill).await?;
+    warnings.extend(export.warning.clone());
+
+    let key_id = req.key_id.clone();
+    let height = birthday.height;
+    let st = state.clone();
+    let (id, ex) = (key_id.clone(), export.clone());
+    let entry = tokio::task::spawn_blocking(move || {
+        st.registry.create_keystone(NewKeystoneKey {
+            key_id: &id,
+            ufvk: &ex.ufvk,
+            seed_fingerprint: ex.seed_fingerprint,
+            account_index: ex.account_index,
+            device_version: ex.device_version.clone(),
+            birthday: &birthday,
+            label: ex.name.clone(),
+        })
+    })
+    .await
+    .map_err(|e| Status::internal(e.to_string()))?
+    .map_err(registry_error)?;
+    maybe_set_default(&state, &key_id, req.set_default);
+    tracing::info!(
+        key_id,
+        account = u32::from(export.account_index),
+        device_version = %export.device_version,
+        birthday = height,
+        "Keystone account imported"
+    );
+    let profile = entry.profile();
+    Ok(ImportKeystoneResponse {
+        key_id,
+        seed_fingerprint: profile.seed_fingerprint.clone().unwrap_or_default(),
+        device_version: export.device_version,
+        ufvk: entry.ufvk().unwrap_or_default(),
+        spend_pools: profile
+            .spend_pools
+            .iter()
+            .map(|p| proto_pool(*p) as i32)
+            .collect(),
+        birthday_height: height,
+        backfill_blocks,
+        warnings,
+        account_index: u32::from(export.account_index),
+        account_name: export.name.unwrap_or_default(),
+    })
+}
+
+/// A `zcash-accounts` export that passed every check.
+#[derive(Clone)]
+struct AccountsExport {
+    ufvk: UnifiedFullViewingKey,
+    seed_fingerprint: SeedFingerprint,
+    account_index: zip32::AccountId,
+    /// As reported, or `"unknown"`.
+    device_version: String,
+    name: Option<String>,
+    /// For an unknown firmware version imported anyway.
+    warning: Option<String>,
+}
+
+/// Decode and check an `ImportKeystone` payload. `INVALID_ARGUMENT` (exit 6)
+/// when it is not a complete `ur:zcash-accounts` export or names an account
+/// it does not list; `HARDWARE_SIGNER` (exit 9) when it decodes but the
+/// device's content is refused; `CONFIRMATION_REQUIRED` (exit 4) for an
+/// unknown firmware version without `allow_unknown_firmware`.
+fn check_accounts_export(
+    network: Network,
+    payload: &str,
+    account_index: u32,
+    allow_unknown_firmware: bool,
+) -> Result<AccountsExport, GygesError> {
+    let bad = |detail: String| GygesError::new(ErrorReason::InvalidArgument, detail);
+    let device = |detail: String| GygesError::new(ErrorReason::HardwareSigner, detail);
+    let not_accounts = |what: &str| {
+        bad(format!(
+            "{what} carries no seed fingerprint, so the Keystone could not recognise its key in a \
+             PCZT; export the accounts from the device (Connect Software Wallet) and pass the \
+             ur:zcash-accounts QR, or use `key import-ufvk` for a watch-only key"
+        ))
+    };
+
+    let frames: Vec<&str> = payload.split_whitespace().collect();
+    let Some(first) = frames.first() else {
+        return Err(bad("no ur:zcash-accounts frame given".into()));
+    };
+    if first.to_ascii_lowercase().starts_with("uview") {
+        return Err(not_accounts("a bare UFVK"));
+    }
+    let mut asm = Assembler::new();
+    for f in &frames {
+        asm.receive(f)
+            .map_err(|e| bad(format!("not a Keystone accounts export: {e}")))?;
+    }
+    match asm.ur_type() {
+        Some(gyges_qr::ur_types::ZCASH_ACCOUNTS) => {}
+        Some(gyges_qr::ur_types::ZCASH_UNIFIED_FULL_VIEWING_KEY) => {
+            return Err(not_accounts("ur:zcash-unified-full-viewing-key"));
+        }
+        other => {
+            return Err(bad(format!(
+                "expected ur:zcash-accounts, got ur:{}",
+                other.unwrap_or("?")
+            )));
+        }
+    }
+    if !asm.is_complete() {
+        let (resolved, total) = asm.progress();
+        return Err(bad(format!(
+            "the accounts export is incomplete ({resolved} of {total} fragments); pass every frame"
+        )));
+    }
+    let accounts = match Payload::from_assembler(&asm) {
+        Ok(Some(Payload::Accounts(a))) => a,
+        Ok(_) => return Err(bad("the accounts export is incomplete".into())),
+        Err(e) => return Err(device(format!("the accounts export does not decode: {e}"))),
+    };
+
+    let fp: [u8; 32] = accounts
+        .seed_fingerprint
+        .as_slice()
+        .try_into()
+        .map_err(|_| {
+            device(format!(
+                "the export's seed fingerprint is {} bytes, not the 32 of ZIP 32",
+                accounts.seed_fingerprint.len()
+            ))
+        })?;
+    let seed_fingerprint = SeedFingerprint::from_bytes(fp);
+
+    let mut indices: Vec<u32> = accounts.accounts.iter().map(|a| a.index).collect();
+    indices.sort_unstable();
+    if indices.windows(2).any(|w| w[0] == w[1]) {
+        return Err(device("the export lists an account index twice".into()));
+    }
+    let account = match accounts.accounts.as_slice() {
+        [] => return Err(device("the export lists no accounts".into())),
+        [only] if account_index == 0 || only.index == account_index => only,
+        list => list
+            .iter()
+            .find(|a| a.index == account_index)
+            .ok_or_else(|| {
+                let have: Vec<String> = indices.iter().map(u32::to_string).collect();
+                bad(format!(
+                    "account {account_index} is not in the export, which lists account {}; pass \
+                     --account",
+                    have.join(", ")
+                ))
+            })?,
+    };
+    let index = zip32::AccountId::try_from(account.index)
+        .map_err(|_| device(format!("account index {} is out of range", account.index)))?;
+    let ufvk =
+        UnifiedFullViewingKey::decode(&network.consensus_params(), &account.ufvk).map_err(|e| {
+            device(format!(
+                "account {}'s UFVK is not a {} viewing key: {e}",
+                account.index,
+                network.name()
+            ))
+        })?;
+    if ufvk.orchard().is_none() {
+        return Err(device(format!(
+            "account {}'s UFVK has no Orchard component, which every Keystone account has",
+            account.index
+        )));
+    }
+
+    use gyges_qr::firmware::{self, FirmwareCheck};
+    let reported = accounts.device_version.as_deref();
+    let (device_version, warning) = match firmware::check(reported) {
+        FirmwareCheck::Supported(_) => (reported.unwrap_or_default().to_string(), None),
+        FirmwareCheck::TooOld(v) => return Err(device(firmware::too_old_message(v))),
+        FirmwareCheck::Unknown if allow_unknown_firmware => (
+            reported.unwrap_or("unknown").to_string(),
+            Some(format!(
+                "{}; it was imported anyway (--allow-unknown-firmware)",
+                firmware::unknown_message(reported)
+            )),
+        ),
+        FirmwareCheck::Unknown => {
+            return Err(GygesError::new(
+                ErrorReason::ConfirmationRequired,
+                format!(
+                    "{}; update it and export again, or pass --allow-unknown-firmware to import \
+                     it anyway",
+                    firmware::unknown_message(reported)
+                ),
+            ));
+        }
+    };
+    Ok(AccountsExport {
+        ufvk,
+        seed_fingerprint,
+        account_index: index,
+        device_version,
+        name: account.name.clone(),
+        warning,
     })
 }
 

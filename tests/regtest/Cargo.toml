@@ -66,6 +66,9 @@ zcash_protocol = { workspace = true }  # LocalNetwork, for the client harness/za
 zcash_keys = { workspace = true }
 bip0039 = { workspace = true }
 zip32 = { workspace = true }
+# The Keystone pairing export harness/common.rs builds for `key import-keystone`.
+gyges-qr = { workspace = true }
+zcash_address = { workspace = true }
 
 [lints]
 workspace = true

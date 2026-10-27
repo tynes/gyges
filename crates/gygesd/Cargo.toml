@@ -19,10 +19,12 @@ path = "src/main.rs"
 gyges-proto = { workspace = true }
 gyges-core = { workspace = true }
 gyges-chain = { workspace = true }
+gyges-qr = { workspace = true }
 prost = { workspace = true }
 zcash_client_backend = { workspace = true }
 zcash_protocol = { workspace = true }
 zcash_keys = { workspace = true }
+zip32 = { workspace = true }
 pczt = { workspace = true }
 age = { workspace = true }
 rand = { workspace = true }
@@ -53,6 +55,9 @@ tempfile = { workspace = true }
 serde_json = { workspace = true }
 transparent = { workspace = true }
 zcash_primitives = { workspace = true }  # decoding the mined ZIP 320 transactions in the tests
+zcash_address = { workspace = true }  # a Keystone-shaped UFVK (no Sapling item) in the import tests
+bip32 = { workspace = true }  # ChildNumber, reading a PCZT input's BIP 44 path
+secrecy = { workspace = true }  # the test seed's bytes
 
 [lints]
 workspace = true

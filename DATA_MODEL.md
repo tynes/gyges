@@ -142,7 +142,7 @@ Rules:
 | `receive_pools` | list | all with a wallet | Default receivers for `address new` |
 | `seed_format` | string | `local-seed`, `signer-only` | `age-scrypt-v1` today |
 | `seed_fingerprint` | hex | `local-seed`, `keystone-qr`, `signer-only` | ZIP 32 seed fingerprint |
-| `device_version` | string | `keystone-qr` | From `zcash-accounts`; minimum enforced at import |
+| `device_version` | string | `keystone-qr` | From `zcash-accounts`, as the pairing QR reports it (raw `MAJOR.MINOR.BUILD`, `13.2.0` for the device's v3.2.0); minimum 13.0.2 enforced at import; `"unknown"` when the device reported none and the user passed `--allow-unknown-firmware` |
 | `account_index` | int | all | ZIP 32 account; `0` unless imported otherwise |
 | `ufvk` | string | `keystone-qr`, `watch-only` | Also stored in `wallet.sqlite`; kept here so a profile is readable without SQLite |
 | `label` | string | all | Optional |
@@ -150,8 +150,8 @@ Rules:
 Mode examples (fields that differ from the `local-seed` example above):
 
 ```json
-{ "signing_mode": "keystone-qr", "spend_pools": ["orchard", "transparent"],
-  "receive_pools": ["orchard", "transparent"], "device_version": "2.1.0",
+{ "signing_mode": "keystone-qr", "spend_pools": ["orchard", "ironwood", "transparent"],
+  "receive_pools": ["orchard", "ironwood", "transparent"], "device_version": "13.2.0",
   "ufvk": "uview1…", "birthday_height": 1687104 }
 ```
 

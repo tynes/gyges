@@ -2,10 +2,12 @@
 //! §2.2, THREAT_MODEL.md §5 rows for `seed.age` and the permission sweep).
 //! No node is involved: `key init` therefore needs `--airgapped`
 //! (signer-only) and `key restore` works only with the default birthday.
+//! `key import-keystone` runs against the fake node, which resolves the
+//! birthday.
 
 use std::os::unix::fs::PermissionsExt as _;
 
-use gyges_regtest::{Fixture, mnemonic};
+use gyges_regtest::{FAST_CONFIG, FakeNodeHandle, Fixture, keystone_export, mnemonic};
 
 fn fast_scrypt(fx: &Fixture) {
     fx.write_config("[vault]\nscrypt_work_factor = 10\n");
@@ -354,4 +356,148 @@ fn unlock_lock_and_export_through_the_cli() {
         !run.stdout.contains("abandon"),
         "no words without a terminal"
     );
+}
+
+/// `key import-keystone` (ROADMAP.md M5, second item): the exit codes of
+/// its refusals, each leaving no key behind, then an import from stdin and
+/// one from `--ur` with an unknown firmware version allowed, `key list`, and
+/// the new key syncing.
+#[test]
+fn import_keystone_through_the_binaries() {
+    let n = FakeNodeHandle::start(10);
+    let mut fx = Fixture::new("regtest");
+    fx.write_config(FAST_CONFIG);
+    fx.start_daemon(&["--zakura-rpc", n.url()]).unwrap();
+    let good = keystone_export(Some("13.2.0"));
+    let old = keystone_export(Some("13.0.1"));
+    let silent = keystone_export(None);
+    let import = |extra: &[&str]| {
+        let mut args = vec!["key", "import-keystone", "--id", "ks"];
+        args.extend_from_slice(extra);
+        args.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+    };
+    let run = |args: Vec<String>| {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        fx.gyges(&refs)
+    };
+    let keys = fx.home().join("regtest/keys");
+
+    // 6: not an accounts export.
+    run(import(&["--birthday", "1", "--ur", "uview1qqqq"]))
+        .code(6)
+        .stderr_has("import-ufvk");
+    // 9: firmware below v3.0.2, in both numberings.
+    run(import(&["--birthday", "1", "--ur", &old]))
+        .code(9)
+        .stderr_has("13.0.1 (v3.0.1 on the device)");
+    // 4: no version and no flag; no birthday and no terminal.
+    run(import(&["--birthday", "1", "--ur", &silent]))
+        .code(4)
+        .stderr_has("--allow-unknown-firmware");
+    run(import(&["--ur", &good]))
+        .code(4)
+        .stderr_has("--birthday");
+    // 6 before any question, with no --birthday: a lone UFVK as a UR, and
+    // one frame of a multi-frame export.
+    let lone = gyges_qr::Payload::Ufvk(gyges_qr::Account {
+        ufvk: "uview1qqqq".into(),
+        index: 0,
+        name: None,
+    })
+    .frames(gyges_qr::DEFAULT_FRAGMENT_LEN)
+    .unwrap()
+    .next_frame()
+    .unwrap();
+    run(import(&["--ur", &lone]))
+        .code(6)
+        .stderr_has("import-ufvk");
+    assert!(good.lines().count() > 1, "the export should span frames");
+    run(import(&["--ur", good.lines().next().unwrap()]))
+        .code(6)
+        .stderr_has("incomplete");
+    assert!(!keys.join("ks").exists());
+
+    // The frames on stdin, one per line.
+    let v = run(import(&["--birthday", "1", "--json"]))
+        .stdin(good.clone())
+        .ok()
+        .json();
+    assert_eq!(v["key_id"], "ks");
+    assert_eq!(v["device_version"], "13.2.0");
+    assert_eq!(v["account_name"], "Keystone");
+    assert_eq!(v["seed_fingerprint"].as_str().unwrap().len(), 64);
+
+    // `--ur`, an unknown version allowed: the human summary and warning.
+    fx.gyges(&[
+        "key",
+        "import-keystone",
+        "--id",
+        "ks2",
+        "--birthday",
+        "1",
+        "--allow-unknown-firmware",
+        "--ur",
+        &silent,
+    ])
+    .ok()
+    .stderr_has("key 'ks2' imported from the Keystone: account 0 \"Keystone\"")
+    .stderr_has("firmware unknown")
+    .stderr_has("warning: the Keystone does not report its firmware version");
+
+    let list = fx.gyges(&["key", "list", "--json"]).ok().json();
+    let ks = list["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key_id"] == "ks")
+        .unwrap()
+        .clone();
+    assert_eq!(ks["signing_mode"], "SIGNING_MODE_KEYSTONE_QR", "{ks}");
+    assert_eq!(ks["device_version"], "13.2.0");
+    fx.gyges(&["key", "list"]).ok().stdout_has("keystone-qr");
+    let wait = |fx: &Fixture| {
+        fx.gyges(&[
+            "-k",
+            "ks",
+            "sync",
+            "wait",
+            "--until",
+            "spendable",
+            "--timeout",
+            "30s",
+        ])
+        .ok();
+    };
+    wait(&fx);
+
+    // Addresses: Orchard and transparent receivers, never Sapling.
+    let run = fx.gyges(&["-k", "ks", "address", "current"]).ok();
+    assert!(run.stdout.trim().starts_with("uregtest1"), "{run:?}");
+    assert!(!run.stderr.contains("sapling"), "{run:?}");
+    let v = fx
+        .gyges(&["-k", "ks", "address", "new", "--json"])
+        .ok()
+        .json();
+    let pools: Vec<&str> = v["receivers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["pool"].as_str().unwrap())
+        .collect();
+    assert_eq!(pools, ["POOL_ORCHARD", "POOL_TRANSPARENT"], "{v}");
+
+    // A restart loads the seedless profile and keeps syncing it.
+    fx.stop_daemon();
+    fx.start_daemon(&["--zakura-rpc", n.url()]).unwrap();
+    let list = fx.gyges(&["key", "list", "--json"]).ok().json();
+    let ks = list["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key_id"] == "ks")
+        .unwrap()
+        .clone();
+    assert_eq!(ks["signing_mode"], "SIGNING_MODE_KEYSTONE_QR", "{ks}");
+    assert_eq!(ks["device_version"], "13.2.0");
+    wait(&fx);
 }
