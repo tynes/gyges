@@ -19,6 +19,7 @@ mod daemon;
 mod exit;
 mod history;
 mod key;
+mod keystone;
 mod notes;
 mod output;
 mod pczt;

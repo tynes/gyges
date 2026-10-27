@@ -12,17 +12,18 @@ use gyges_core::{Config, KeyRegistry, Network, Provers, VaultManager};
 use gyges_proto::v1::gyges_server::Gyges;
 use gyges_proto::v1::{
     self, AbortSigningSessionRequest, AbortTexTransferRequest, ApiVersion, BroadcastPcztRequest,
-    BroadcastPcztResponse, CombinePcztRequest, CombinePcztResponse, CreatePcztRequest,
-    CreatePcztResponse, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest,
-    ExportUfvkResponse, FallbackStatus, GetBalanceRequest, GetBalanceResponse, GetInfoRequest,
-    GetInfoResponse, GetSyncStatusRequest, GetSyncStatusResponse, ImportKeystoneRequest,
-    ImportKeystoneResponse, InitKeyRequest, InitKeyResponse, InspectPcztRequest,
-    InspectPcztResponse, ListKeysRequest, ListKeysResponse, ListSigningSessionsRequest,
-    ListSigningSessionsResponse, LockKeyRequest, LockKeyResponse, NodeStatus, ProvePcztRequest,
-    ProvePcztResponse, RestoreKeyRequest, RestoreKeyResponse, ResumeTexTransferRequest,
-    RunSyncRequest, ScanMempoolRequest, ScanMempoolResponse, SendTransactionRequest,
-    ShieldFundsRequest, ShutdownRequest, ShutdownResponse, SignPcztRequest, SigningSession,
-    StreamLogsRequest, TexQueueEntry, UnlockKeyRequest, UnlockKeyResponse, WaitSyncRequest,
+    BroadcastPcztResponse, CombinePcztRequest, CombinePcztResponse, CompleteKeystoneSignRequest,
+    CompleteKeystoneSignResponse, CreatePcztRequest, CreatePcztResponse, ExportSeedRequest,
+    ExportSeedResponse, ExportUfvkRequest, ExportUfvkResponse, FallbackStatus, GetBalanceRequest,
+    GetBalanceResponse, GetInfoRequest, GetInfoResponse, GetSyncStatusRequest,
+    GetSyncStatusResponse, ImportKeystoneRequest, ImportKeystoneResponse, InitKeyRequest,
+    InitKeyResponse, InspectPcztRequest, InspectPcztResponse, ListKeysRequest, ListKeysResponse,
+    ListSigningSessionsRequest, ListSigningSessionsResponse, LockKeyRequest, LockKeyResponse,
+    NodeStatus, ProvePcztRequest, ProvePcztResponse, RestoreKeyRequest, RestoreKeyResponse,
+    ResumeTexTransferRequest, RunSyncRequest, ScanMempoolRequest, ScanMempoolResponse,
+    SendTransactionRequest, ShieldFundsRequest, ShutdownRequest, ShutdownResponse, SignPcztRequest,
+    SigningSession, StreamLogsRequest, TexQueueEntry, UnlockKeyRequest, UnlockKeyResponse,
+    WaitSyncRequest,
 };
 use gyges_proto::v1::{
     AddressInfo, GetCurrentAddressRequest, GetTransactionStatusRequest,
@@ -66,6 +67,9 @@ pub struct DaemonState {
     /// Passphrase signing sessions awaiting `UnlockKey { session_id }`
     /// (API.md §6).
     pub sessions: SessionHub,
+    /// Keystone sessions: the streams waiting on them and the ones being
+    /// completed (the sessions themselves are in each key's wallet).
+    pub keystone: Arc<crate::keystone::KeystoneHub>,
     /// The ZIP 320 queue's wake-up (ARCHITECTURE.md §3.3).
     pub tex: TexHub,
     /// Proving and verifying keys, built on first use.
@@ -103,6 +107,7 @@ impl DaemonState {
             block_cache,
             sync: SyncHub::default(),
             sessions: SessionHub::default(),
+            keystone: Arc::default(),
             tex: TexHub::default(),
             provers: Arc::new(Provers::new()),
             logs,
@@ -333,6 +338,8 @@ impl Gyges for GygesService {
     ) -> Result<Response<ListSigningSessionsResponse>, Status> {
         let req = request.into_inner();
         let mut resp = tx::list_signing_sessions(&self.state, &req)?;
+        resp.sessions
+            .extend(crate::keystone::list(&self.state, &req.key_id, req.include_finished).await);
         resp.tex_transfers = tex::list(&self.state, &req.key_id, req.include_finished).await;
         Ok(Response::new(resp))
     }
@@ -360,7 +367,20 @@ impl Gyges for GygesService {
         &self,
         request: Request<AbortSigningSessionRequest>,
     ) -> Result<Response<SigningSession>, Status> {
-        tx::abort_signing_session(&self.state, request.into_inner()).map(Response::new)
+        let req = request.into_inner();
+        if let Some(session) = crate::keystone::abort(&self.state, &req.session_id).await? {
+            return Ok(Response::new(session));
+        }
+        tx::abort_signing_session(&self.state, req).map(Response::new)
+    }
+
+    async fn complete_keystone_sign(
+        &self,
+        request: Request<CompleteKeystoneSignRequest>,
+    ) -> Result<Response<CompleteKeystoneSignResponse>, Status> {
+        crate::keystone::complete_keystone_sign(self.state.clone(), request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn get_sync_status(

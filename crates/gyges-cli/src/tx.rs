@@ -69,6 +69,9 @@ pub struct SendArgs {
     /// Keep the stream open until the transaction is mined.
     #[arg(long)]
     pub wait: bool,
+    /// Keystone keys: write the request's UR frames here (one per line) and exit 4 instead of animating them.
+    #[arg(long, value_name = "FILE")]
+    pub qr_out: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -85,6 +88,9 @@ pub struct ShieldArgs {
     /// Keep the stream open until the transaction is mined.
     #[arg(long)]
     pub wait: bool,
+    /// Keystone keys: write the request's UR frames here (one per line) and exit 4 instead of animating them.
+    #[arg(long, value_name = "FILE")]
+    pub qr_out: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -132,7 +138,15 @@ async fn send(ctx: &Ctx, args: SendArgs) -> Result<(), CliError> {
             wait_for_mined: args.wait,
         })
     };
-    run_send(ctx, "Send", args.dry_run, args.yes, request).await
+    run_send(
+        ctx,
+        "Send",
+        args.dry_run,
+        args.yes,
+        args.qr_out.as_deref(),
+        request,
+    )
+    .await
 }
 
 async fn shield(ctx: &Ctx, args: ShieldArgs) -> Result<(), CliError> {
@@ -145,7 +159,15 @@ async fn shield(ctx: &Ctx, args: ShieldArgs) -> Result<(), CliError> {
             wait_for_mined: args.wait,
         })
     };
-    run_send(ctx, "Shield", args.dry_run, args.yes, request).await
+    run_send(
+        ctx,
+        "Shield",
+        args.dry_run,
+        args.yes,
+        args.qr_out.as_deref(),
+        request,
+    )
+    .await
 }
 
 enum SendOrShield {
@@ -162,6 +184,7 @@ async fn run_send(
     verb: &str,
     dry_run: bool,
     yes: bool,
+    qr_out: Option<&std::path::Path>,
     request: impl Fn(bool) -> SendOrShield,
 ) -> Result<(), CliError> {
     let mut conn = ctx.connect().await?;
@@ -173,7 +196,7 @@ async fn run_send(
     }
     let stream = open(&mut conn, request(dry_run)).await?;
     let key = shown_key(&ctx.key, &conn);
-    follow(ctx, &mut conn, &key, stream, shown).await
+    follow(ctx, &mut conn, &key, stream, shown, qr_out).await
 }
 
 async fn open(conn: &mut Conn, req: SendOrShield) -> Result<tonic::Streaming<SendEvent>, CliError> {
@@ -218,6 +241,7 @@ async fn follow(
     key: &str,
     mut stream: tonic::Streaming<SendEvent>,
     proposal_shown: bool,
+    qr_out: Option<&std::path::Path>,
 ) -> Result<(), CliError> {
     loop {
         let Some(ev) = Ctx::next_or_cancel(&mut stream).await? else {
@@ -245,9 +269,12 @@ async fn follow(
                     }
                 }
             }
-            Some(send_event::Event::SignatureRequired(req)) => {
-                satisfy(ctx, conn, key, &req).await?;
-            }
+            Some(send_event::Event::SignatureRequired(req)) => match req.kind() {
+                SignatureKind::KeystoneBatch | SignatureKind::KeystoneSinglePczt => {
+                    crate::keystone::satisfy(ctx, key, &req, qr_out).await?;
+                }
+                _ => satisfy(ctx, conn, key, &req).await?,
+            },
             Some(send_event::Event::Signed(s)) => {
                 ctx.note(format_args!("step {} signed", s.step));
             }
@@ -286,13 +313,14 @@ pub(crate) async fn satisfy(
     match req.kind() {
         SignatureKind::Passphrase => {}
         other => {
-            // Keystone sessions survive; the CLI's QR path arrives with M5.
+            // `tx send` and `tx shield` answer Keystone kinds themselves
+            // (`crate::keystone::satisfy`); elsewhere the session waits.
             return Err(CliError::Daemon(
                 GygesError::new(
                     ErrorReason::SignatureRequired,
                     format!(
-                        "a {other:?} signature is required and this gyges cannot provide it; \
-                         complete the session later with `gyges pczt qr-import --session`"
+                        "a {other:?} signature is required; complete the session with \
+                         `gyges pczt qr-import --session {session_id}`"
                     ),
                 )
                 .with_key(key)

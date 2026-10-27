@@ -219,8 +219,75 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
   - a recorded export from a real device (TESTING.md §4 `accounts.ur`, `firmware_old.ur`), and checking on hardware that v3.0.2 exports `13.0.2`;
   - `key import-ufvk`;
   - the signing itself (third item).
-- [ ] Batch protocol for shielded sends; single-PCZT protocol with Combiner for transparent inputs; signing sessions that survive restarts; `qr-import --from-file` and `--session`.
-- [ ] `qr-scan` camera path.
+- [x] Batch protocol for shielded sends; single-PCZT protocol with Combiner for transparent inputs; signing sessions that survive restarts; `qr-import --from-file` and `--session`. Landed as:
+  - **`gyges_core::keystone`:**
+    - `protocol_for`: batch without transparent inputs, single PCZT with them.
+    - `device_request`, built from the **unproven** PCZT as Zodl does, with the `gyges.*` tags stripped:
+      - batch: upstream's `redact_pczt_for_batch_signer` inside a `BatchSignRequest`, with a 16-byte request id, as `zcash-sign-batch` CBOR;
+      - single PCZT: `redact_pczt_for_signer(Full)` as `zcash-pczt`.
+    - `apply_answer`:
+      - batch: the request id must match, exactly one entry, and each signature goes through `Signer::apply_orchard_spend_auth_signature`, which verifies it;
+      - single PCZT: the Combiner.
+  - **`gyges_core::sessions`:** the Keystone half in its own `ext_gyges_keystone_sessions` table (DATA_MODEL.md §5.2): the proven PCZT, the payload, the request id, the route and the expiry height. Plus `leave_awaiting`, a conditional update that claims a session exactly once and keeps abort and expiry off finished rows.
+  - **`gygesd::keystone`:**
+    - `await_device`, step 5 of the send pipeline for a Keystone key: persist, emit `SignatureRequired`, wait. A client that leaves loses nothing.
+    - `CompleteKeystoneSign`, which runs in order:
+      - an in-memory claim against concurrent completions;
+      - lazy expiry;
+      - the tip against the transaction's expiry (`NOT_SYNCED` before anything is recorded);
+      - the answer;
+      - every signature present;
+      - the Verifier;
+      - the row claim;
+      - extract, record and broadcast.
+    - The waiting stream is told the txid.
+    - `ListSigningSessions` returns the persisted sessions with their payload (new `SigningSession.payload`), and `AbortSigningSession` aborts them.
+  - **`gygesd::tx`:** `tx send` and `tx shield` from a `keystone-qr` key go through it.
+    - The transaction gets a PCZT file's expiry (`target + 1152`) instead of 40 blocks, since a session may wait a day.
+    - A second spend while one session waits is refused with `SIGNATURE_REQUIRED` naming it, since it could pick the same notes.
+    - A `tex1` recipient is refused with `HARDWARE_SIGNER` (THREAT_MODEL.md §6 item 7).
+  - **CLI:**
+    - `tx send` / `tx shield` animate the request on a terminal and read the pasted answer frames.
+    - Otherwise, or with `--qr-out`, they print or write the frames and exit 4.
+    - `pczt qr-export --session` (animated, printed, or `-o`).
+    - `pczt qr-import --session` (positional, `--from-file` or stdin; prints the txid).
+
+  A refused answer leaves the session open for another scan instead of marking it failed (API.md §6.4 records the deviation).
+
+  Tests:
+  - `gyges_core::keystone::emulator` (feature `test-util`) is a device in software. It works from the payload alone, through shuffled, lossy fountain frames, with upstream's signer roles only.
+  - `rpc.rs::keystone_shield_and_send_through_both_protocols`: both protocols, the Redactor checks (TESTING.md §4, moved here from the first item), six refused answers each followed by a successful one, the pending-spend refusal, a double completion, and the balance.
+  - `rpc.rs::the_device_never_sees_gyges_tags`: both views of a tagged `pczt create` PCZT. A send's PCZT carries no tags, so the test above cannot show the stripping.
+  - `rpc.rs::a_keystone_session_survives_a_restart_and_expires_with_its_transaction`: abort; client gone plus daemon restart, then completion from the listed payload; expiry.
+  - `scenarios/keystone.rs::keystone_signing_through_the_binaries`: exit 4 with frames, `--qr-out`, `qr-export`, `qr-import` from a file and from arguments, a partial answer, an aborted session.
+  - CLI unit tests of the answer's reassembly.
+  - The item-2 test now expects a Keystone send to wait for the device instead of being refused.
+
+  Not done:
+  - real hardware (the device's acceptance of these exact views and the fields it displays, THREAT_MODEL.md §6 item 7);
+  - the PCZT file flow (`qr-export FILE`, `qr-import` without `--session`, `pczt sign` for a Keystone key, `SIGN_PCZT` sessions);
+  - `tex1` from a Keystone (fifth item);
+  - an automated test of the interactive terminal path;
+  - rebroadcasting a completed session the node refused (it stays `signed` with the node's error).
+- [x] `qr-scan` camera path. Landed as:
+  - **`gyges_qr::scan`** (always built; `rqrr` without `image`):
+    - `decode` finds the QR codes in a greyscale frame. Frames wider than 960 pixels are downscaled first, and a frame that decodes to nothing is tried mirrored.
+    - `Scanner` keeps only `ur:` frames of the expected answer type, because an `Assembler` locks onto its first frame's type and the camera may catch the terminal or anything else first. After three frames that do not fit the message being assembled, it starts over. It drops a completed message equal to the request, since single-PCZT requests and answers are both `zcash-pczt`.
+    - `scan_answer` drives any `FrameSource` until the answer completes, a stop flag is set, or the timeout passes.
+  - **`gyges_qr::camera`** (feature `camera`, off by default, on `nokhwa` 0.10.11):
+    - checks for a camera before asking macOS for access, then waits for the answer;
+    - requests only uncompressed formats (MJPEG would need `mozjpeg`, a C library) and names an MJPEG-only camera as such.
+  - **CLI** (feature `gyges-cli/camera`):
+    - `pczt qr-scan --session ID [--camera N] [--timeout 2m]`;
+    - `tx send` / `tx shield` scan by themselves for a minute after Enter, then fall back to pasting. `GYGES_NO_CAMERA=1` skips the camera, and Ctrl-C stops a scan.
+    - A build without the feature says so (exit 1).
+
+  Tests:
+  - `scan::tests` drive the scanner with synthetic camera frames: a code scaled and offset in a noisy frame (also mirrored, and in a 1920×1080 frame that is downscaled), blank frames, an unrelated code, and request frames. These include the request reassembling and being dropped, then a multi-frame single-PCZT answer whose fountain parts arrive shuffled and repeated. Also a stale message abandoned for the new one, a one-frame batch answer, and the stop, timeout and camera-failure ends.
+  - `scenarios/keystone.rs`: `qr-scan` in a default build is exit 1, naming the feature.
+  - `clippy -D warnings` and `cargo deny` pass with `--features gyges-cli/camera`.
+
+  Verified on macOS only. This Mac has no camera: the camera build refuses at once with "no camera found". Real capture, the macOS permission prompt and the Linux V4L2 build (which needs libclang: `v4l2-sys-mit` runs bindgen) are untested. `nokhwa`'s macOS bindings pull `block` 0.1.6, which Rust reports as future-incompatible.
 - [ ] Verify on hardware: TEX Step 2 signing, which PCZT fields the device displays. Settle the host side first: step 1 of a ZIP 320 send is part of a multi-step proposal, which `create_pczt_from_proposal` refuses, and the `TexQueue` signs with a spending key a Keystone profile does not hold.
 
 ## M6 — Hardening and release
@@ -229,7 +296,7 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
 - [ ] `perf` features with benchmarks in `docs/BENCHMARKS.md`; decide the release default once runtime CPU detection is confirmed.
 - [ ] `daemon install/uninstall` units; hardened deployment (dedicated user, 0660 socket, `gyges` group, `daemon install --hardened`, `THREAT_MODEL.md` §6 item 4) documented and tested.
 - [ ] Optional SQLCipher for `wallet.sqlite` (database key in the OS keychain only, `THREAT_MODEL.md` §6 item 3); `key delete --wipe`; `key backup` / `import-backup`.
-- [ ] Release pipeline: `rust-toolchain.toml`-pinned matrix builds, `SHA256SUMS`, `minisign`, SLSA attestation.
+- [ ] Release pipeline: `rust-toolchain.toml`-pinned matrix builds, `SHA256SUMS`, `minisign`, SLSA attestation. Release builds should enable `gyges-cli/camera` (M5, fourth item; Linux runners need libclang, since `v4l2-sys-mit` runs bindgen for the V4L2 bindings).
 - [ ] Nightly `audit` and `msrv` jobs (`TESTING.md` §7).
 - [ ] `tx status --pir` leaves experimental only with a documented server set and privacy guarantee.
 

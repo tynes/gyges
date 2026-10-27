@@ -110,6 +110,24 @@ The Redactor test belongs to the signing protocols (M5, third item) in `gygesd`,
 
 The `CompleteKeystoneSign` path is tested in-process by feeding `batch_result.ur` to the daemon against the matching stored session, and by feeding it to a *different* session to assert the `request_id` mismatch is refused.
 
+*Done synthetically (ROADMAP.md M5, third item)* with an emulated device, `gyges_core::keystone::emulator` (feature `test-util`). It answers a request from its payload alone, passed through shuffled fountain frames with a fifth of them dropped, and signs only with upstream's roles (the batch side as upstream's own batch test does), so a redaction mistake cannot be hidden by Gyges' own signing code.
+- `rpc.rs::keystone_shield_and_send_through_both_protocols`:
+  - shielding goes through single-PCZT and a send through batch, and each stream resumes when the completion arrives from another connection;
+  - the Redactor checks above, and the day-long expiry;
+  - a second spend refused while one waits;
+  - refused answers: a PCZT with one value changed, a batch answer to a PCZT session, another request id, a signature one bit off, a missing signature, two entries. Each leaves the session open, and the right answer then completes it;
+  - a second completion is `SESSION_NOT_FOUND`, and the balance moves.
+- `rpc.rs::a_keystone_session_survives_a_restart_and_expires_with_its_transaction`:
+  - abort, with the waiting stream ending `CANCELLED`;
+  - the client leaving and the daemon restarting, then completion from the listed payload alone;
+  - completion past the transaction's expiry is `NOT_SYNCED`, the session is expired, and nothing is recorded.
+- `scenarios/keystone.rs::keystone_signing_through_the_binaries`:
+  - exit 4 with the frames on stdout, and `--qr-out`;
+  - `qr-export --session`;
+  - `qr-import --session` from a file and from positional frames;
+  - a partial answer is exit 6, and an aborted session cannot be completed.
+- The interactive terminal path (animation until Enter, pasted answer) has unit tests for its reassembly only.
+
 ---
 
 ## 5. Log Redaction
@@ -168,6 +186,14 @@ cargo test --workspace
 ```bash
 cargo test -p gyges-regtest -- --test-threads=1
 ```
+
+The camera (`gyges pczt qr-scan`, ROADMAP.md M5) is behind the off-by-default `camera` feature, so the commands above never build it. Check it with:
+
+```bash
+cargo clippy -p gyges-qr -p gyges-cli --features gyges-cli/camera --all-targets
+```
+
+The scanner itself (`gyges_qr::scan`) is always built and tested with synthetic frames; capture from a real camera is checked by hand.
 
 ```bash
 GYGES_TEST_KEEP=1 cargo test -p gyges-regtest tex -- --nocapture

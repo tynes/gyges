@@ -16,9 +16,13 @@ default = []
 perf = ["pasta_curves/multicore", "orchard/multicore", "zcash_proofs/multicore"]
 perf-asm-x86_64 = ["perf", "pasta_curves/x86_64-asm", "orchard/x86_64-asm"]
 perf-asm-aarch64 = ["perf", "pasta_curves/aarch64-asm", "orchard/aarch64-asm"]
+# `keystone::emulator`: a Keystone in software for the tests (gygesd's and
+# the regtest crate's).
+test-util = []
 
 [dependencies]
 gyges-chain = { workspace = true }
+gyges-qr = { workspace = true }
 zcash_client_backend = { workspace = true }
 zcash_client_sqlite = { workspace = true }
 zcash_keys = { workspace = true }

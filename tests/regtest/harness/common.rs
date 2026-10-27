@@ -135,6 +135,24 @@ pub fn keystone_export(device_version: Option<&str>) -> String {
         .join("\n")
 }
 
+/// The Keystone that [`keystone_export`] pairs: [`mnemonic`]'s account 0,
+/// as `gyges_core::keystone::emulator` signs with it.
+pub fn keystone_device() -> gyges_core::keystone::emulator::Device {
+    let seed = bip0039::Mnemonic::<bip0039::English>::from_phrase(mnemonic())
+        .unwrap()
+        .to_seed("");
+    gyges_core::keystone::emulator::Device {
+        usk: zcash_keys::keys::UnifiedSpendingKey::from_seed(
+            &regtest(),
+            &seed,
+            zip32::AccountId::ZERO,
+        )
+        .unwrap(),
+        fingerprint: zip32::fingerprint::SeedFingerprint::from_seed(&seed).unwrap(),
+        coin_type: 1,
+    }
+}
+
 pub fn test_key_transparent_address() -> String {
     gyges_chain::compact::encode_transparent_address(NetworkType::Regtest, &test_key_transparent())
 }

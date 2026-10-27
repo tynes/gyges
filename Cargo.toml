@@ -109,6 +109,8 @@ age = { version = "0.12", features = ["armor"] }              # scrypt passphras
 ur          = "0.5"
 ur-registry = { version = "1.0", default-features = false, features = ["std"] }  # tags 49201..49207 (Q-K6); default `core` feature needs nightly (thiserror-core)
 qrcode      = { version = "0.14", default-features = false }
+rqrr        = { version = "=0.11.0", default-features = false }  # QR detection in camera frames (M5 qr-scan); pure Rust, no `image`
+nokhwa      = { version = "=0.10.11", default-features = false, features = ["input-native"] }  # camera capture, gyges-qr feature `camera` only; no MJPEG (mozjpeg is C)
 
 # --- CLI, config & observability ---
 clap               = { version = "4.5", features = ["derive", "env"] }

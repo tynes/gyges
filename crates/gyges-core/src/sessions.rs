@@ -2,8 +2,11 @@
 //! row per PCZT that left the daemon as a file, holding the proposal the
 //! user approved so that `BroadcastPczt` can run the Verifier against it
 //! days later and after restarts (ARCHITECTURE.md §3.5). Passphrase
-//! sessions of `tx send` stay in memory (`gygesd::tx::SessionHub`); the
-//! Keystone kinds arrive with ROADMAP.md M5 and will share this table.
+//! sessions of `tx send` stay in memory (`gygesd::tx::SessionHub`). A
+//! Keystone session (ROADMAP.md M5, third item) is a row here too, with its
+//! device-side half in `ext_gyges_keystone_sessions` under the same id: the
+//! proven PCZT the device's answer is applied to, the request it was shown,
+//! and how to broadcast it, so it can be completed after a restart.
 //!
 //! Like the ZIP 320 queue the table lives in the key's own `wallet.sqlite`
 //! under upstream's `ext_` prefix (`ext_gyges_signing_sessions`), created by
@@ -252,6 +255,174 @@ pub fn list(wallet: &mut Wallet, include_finished: bool) -> Result<Vec<SessionRo
         }
     }
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Keystone sessions
+// ---------------------------------------------------------------------------
+
+/// The external migration's id for the Keystone half (random, fixed
+/// forever).
+pub const KEYSTONE_MIGRATION_ID: Uuid = Uuid::from_u128(0x7d41_c2a9_3e86_4b0f_9a15_d4e8_62b7_0c93);
+
+const KEYSTONE_TABLE: &str = "ext_gyges_keystone_sessions";
+
+/// Creates `ext_gyges_keystone_sessions`: one row per Keystone session,
+/// sharing its `session_id` with `ext_gyges_signing_sessions`. A table of
+/// its own rather than new columns there, because an `ext_` migration has
+/// no ordering and its `down` drops its table.
+pub const KEYSTONE_MIGRATION: ExtTable = ExtTable {
+    id: KEYSTONE_MIGRATION_ID,
+    table: KEYSTONE_TABLE,
+    description: "Creates the Gyges Keystone sessions table (ext_gyges_keystone_sessions).",
+    create: create_keystone_migration,
+};
+
+fn create_keystone_migration() -> String {
+    format!(
+        "CREATE TABLE {KEYSTONE_TABLE} (
+            session_id    TEXT NOT NULL PRIMARY KEY,
+            purpose       TEXT NOT NULL CHECK (purpose IN ('send', 'sign-pczt')),
+            pczt          BLOB NOT NULL,
+            payload       BLOB NOT NULL,
+            request_id    BLOB,
+            via_tor       INTEGER NOT NULL,
+            expiry_height INTEGER NOT NULL
+        );"
+    )
+}
+
+/// The device-side half of a Keystone session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeystoneRow {
+    pub session_id: String,
+    /// The proven, unsigned PCZT the device's answer is applied to (the
+    /// authoritative copy; the device only ever saw a redacted one).
+    pub pczt: Vec<u8>,
+    /// The CBOR body shown to the device (`zcash-sign-batch` or
+    /// `zcash-pczt`), kept so `pczt qr-export --session` can show it again.
+    pub payload: Vec<u8>,
+    /// The batch protocol's request id, echoed by the device.
+    pub request_id: Option<Vec<u8>>,
+    /// Broadcast through the fallback endpoint's Tor client.
+    pub via_tor: bool,
+    /// The transaction's `nExpiryHeight`; past it, completing is refused.
+    pub expiry_height: u32,
+}
+
+/// Insert a Keystone session: its `ext_gyges_signing_sessions` row and its
+/// device-side half, in one transaction.
+pub fn insert_keystone(
+    wallet: &mut Wallet,
+    row: &SessionRow,
+    keystone: &KeystoneRow,
+) -> Result<(), SessionError> {
+    debug_assert_eq!(row.session_id, keystone.session_id);
+    with_ext(wallet, |ext| {
+        ext.execute(
+            &format!(
+                "INSERT INTO {TABLE} ({COLUMNS})
+                 VALUES (:session_id, :protocol, :status, :created_at, :expires_at,
+                         :proposal, :expected, :txid, :last_error)"
+            ),
+            named_params! {
+                ":session_id": row.session_id,
+                ":protocol": row.protocol.as_str(),
+                ":status": row.state.as_str(),
+                ":created_at": row.created_at,
+                ":expires_at": row.expires_at,
+                ":proposal": row.proposal,
+                ":expected": row.expected,
+                ":txid": row.txid.as_ref().map(|t| t.to_vec()),
+                ":last_error": row.last_error,
+            },
+        )?;
+        ext.execute(
+            &format!(
+                "INSERT INTO {KEYSTONE_TABLE}
+                   (session_id, purpose, pczt, payload, request_id, via_tor, expiry_height)
+                 VALUES (:session_id, 'send', :pczt, :payload, :request_id, :via_tor, :expiry)"
+            ),
+            named_params! {
+                ":session_id": keystone.session_id,
+                ":pczt": keystone.pczt,
+                ":payload": keystone.payload,
+                ":request_id": keystone.request_id,
+                ":via_tor": keystone.via_tor,
+                ":expiry": keystone.expiry_height,
+            },
+        )?;
+        Ok(())
+    })
+}
+
+/// The device-side half of a session, if it is a Keystone one.
+pub fn get_keystone(
+    wallet: &mut Wallet,
+    session_id: &str,
+) -> Result<Option<KeystoneRow>, SessionError> {
+    with_ext(wallet, |ext| {
+        Ok(ext
+            .query_row(
+                &format!(
+                    "SELECT session_id, pczt, payload, request_id, via_tor, expiry_height
+                     FROM {KEYSTONE_TABLE} WHERE session_id = :session_id"
+                ),
+                named_params! { ":session_id": session_id },
+                |r| {
+                    Ok(KeystoneRow {
+                        session_id: r.get(0)?,
+                        pczt: r.get(1)?,
+                        payload: r.get(2)?,
+                        request_id: r.get(3)?,
+                        via_tor: r.get(4)?,
+                        expiry_height: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    })
+}
+
+/// Move a row from awaiting a signature to `to`, and only from there:
+/// `false` when it had already left that state. This is how a completion
+/// claims a session exactly once, and why an abort or an expiry can never
+/// overwrite a finished row.
+pub fn leave_awaiting(
+    wallet: &mut Wallet,
+    session_id: &str,
+    to: SessionState,
+    last_error: Option<&str>,
+) -> Result<bool, SessionError> {
+    with_ext(wallet, |ext| {
+        let n = ext.execute(
+            &format!(
+                "UPDATE {TABLE} SET status = :status, last_error = :last_error
+                 WHERE session_id = :session_id AND status = 'awaiting-signature'"
+            ),
+            named_params! {
+                ":status": to.as_str(),
+                ":last_error": last_error,
+                ":session_id": session_id,
+            },
+        )?;
+        Ok(n == 1)
+    })
+}
+
+/// Record why a completion attempt failed while the row stays awaiting a
+/// signature, so the user can scan the device again.
+pub fn note_error(wallet: &mut Wallet, session_id: &str, error: &str) -> Result<(), SessionError> {
+    with_ext(wallet, |ext| {
+        ext.execute(
+            &format!(
+                "UPDATE {TABLE} SET last_error = :last_error
+                 WHERE session_id = :session_id AND status = 'awaiting-signature'"
+            ),
+            named_params! { ":last_error": error, ":session_id": session_id },
+        )?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]

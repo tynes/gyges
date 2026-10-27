@@ -88,6 +88,18 @@ When the recipient parses as a TEX address (`zcash_address::ZcashAddress::try_fr
    - **Shielded-only sends** use the batch protocol: the daemon runs `redact_pczt_for_batch_signer`, `gyges-cli` encodes `ur:zcash-sign-batch` (49205) as fountain frames and renders an 8 FPS UTF-8 half-block QR loop; the device returns `ur:zcash-batch-sig-result` (49207), a single frame of `(pool, action_index, signature)` tuples with the echoed `request_id`, which the daemon applies to its stored proven PCZT. No Combiner is needed.
    - **Sends with transparent inputs** (shielding, ZIP 320 Step 2) use the single-PCZT protocol: `Redactor` strips proofs, witnesses and the Gyges `proprietary` map but **never** amounts, recipients or memos the device displays; the device returns the signed `ur:zcash-pczt` (49204); the daemon runs **Combiner** on (proven ⊕ signed), which rejects structurally different PCZTs and is the correlation check. TEX Step 2 on Keystone is **needs verification on hardware**.
    - Both paths then run **Verifier** against the stored proposal (refusing to broadcast if any output, amount, fee or anchor differs), **Spend Finalizer**, **Tx Extractor**, and broadcast. `tx send` prints the same summary the device shows.
+   - *Landed (ROADMAP.md M5, third item)* as `gyges_core::keystone` and `gygesd::keystone`, with one change from the steps above: the device is shown the PCZT **before** it is proven, as Zodl does. Proofs are not signed over, so this keeps the QR loop shorter. The proven copy is what is stored and what the answer is applied to. **What the device is shown (the Redactor's field list, THREAT_MODEL.md §5 row 9):**
+     - **Both protocols:** the `gyges.*` tags are removed from the global proprietary map (`keystone::strip_gyges_tags`), then upstream's redaction applies.
+     - **Batch:** `redact_pczt_for_batch_signer`, the compact view.
+       - Removed: upstream's proposal, one-time-spend and output proprietary entries; spend witnesses; dummy spending keys; proofs; `bsk`; v6 anchors; spend FVKs; existing signatures; and the randomizer of actions already signed.
+       - Fields the device can recompute are compacted.
+     - **Single PCZT:** `redact_pczt_for_signer(SignerView::Full)`.
+       - Removed: the same upstream proprietary entries, spend witnesses and dummy spending keys.
+       - Kept: FVKs, randomizers and derivation paths.
+     - **Never removed:** values, recipients, `user_address` and the encrypted memos.
+
+     `CompleteKeystoneSign` applies the answer (batch signatures through `Signer::apply_orchard_spend_auth_signature`, which verifies each one; the single PCZT through the Combiner), requires every signature, runs the Verifier against the approved proposal, and only then claims the session and broadcasts.
+   - *Camera (ROADMAP.md M5, fourth item):* `gyges_qr::scan` (always built) decodes frames with `rqrr`, keeps only `ur:` frames of the expected answer type, and drops a re-read of the request. `gyges_qr::camera` (feature `camera`, off by default) is the `nokhwa` frame source. `tx send` uses it by itself when the build has it, falling back to pasted frames.
    - Host ingestion of the device's QR: `gyges pczt qr-scan` (laptop camera, used automatically when present), `gyges pczt qr-import --from-file` / stdin (one `ur:` frame per line), or positional frames for single-frame payloads. Sessions survive restarts, expire after `vault.signing_session_ttl` (default `24h`), and can be completed later with `--session <id>` (CLI_SPEC.md §2.6).
 
 ### 3.5 Air-gapped PCZT flow (`signer-only`, `gygesd --airgapped`)

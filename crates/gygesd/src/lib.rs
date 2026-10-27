@@ -27,6 +27,7 @@
 pub mod backfill;
 pub mod conn;
 pub mod keys;
+pub mod keystone;
 pub mod lifecycle;
 pub mod logs;
 pub mod node;

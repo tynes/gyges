@@ -39,6 +39,7 @@ use prost::Message as _;
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 use zcash_keys::keys::UnifiedSpendingKey;
+use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
 
 use crate::conn::ConnInfo;
@@ -80,6 +81,7 @@ impl Session {
             summary: Some(self.summary.clone()),
             step: self.step,
             last_error: self.last_error.clone(),
+            payload: Vec::new(),
         }
     }
 }
@@ -437,8 +439,8 @@ impl Prepared {
 /// What a spending RPC is for, which decides the profiles it accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Purpose {
-    /// `SendTransaction` / `ShieldFunds`: the daemon signs, so `local-seed`
-    /// only.
+    /// `SendTransaction` / `ShieldFunds`: the daemon signs (`local-seed`)
+    /// or the Keystone does, through a persisted session.
     Spend,
     /// `CreatePczt`: nothing is signed here, so a watch-only or Keystone
     /// profile qualifies too.
@@ -468,12 +470,13 @@ pub(crate) fn prepare(
     let typed = |reason, detail: &str| GygesError::new(reason, detail).with_key(&kid).into_status();
     let refused = match (key.profile().signing_mode, purpose) {
         (SigningMode::LocalSeed, _)
+        | (SigningMode::KeystoneQr, Purpose::Spend)
         | (SigningMode::WatchOnly | SigningMode::KeystoneQr, Purpose::CreatePczt)
         | (SigningMode::SignerOnly, Purpose::SignPczt) => None,
         (SigningMode::KeystoneQr, _) => Some((
             ErrorReason::HardwareSigner,
-            "signing with a Keystone arrives with its QR signing protocols (ROADMAP.md M5, \
-             third item); `gyges pczt create` already builds the PCZT the device will sign",
+            "`pczt sign` cannot sign with a Keystone; send with `gyges tx send`, which shows the \
+             device its QR request",
         )),
         (SigningMode::WatchOnly, Purpose::SignPczt) => Some((
             ErrorReason::InvalidArgument,
@@ -605,6 +608,22 @@ pub fn send_transaction(
         .with_key(&key_id)
         .into_status());
     }
+    let keystone = is_keystone(&prepared);
+    if keystone && matches!(to, zcash_keys::address::Address::Tex(_)) {
+        // THREAT_MODEL.md §6 item 7: how the device shows ZIP 320's
+        // transparent step 2 needs verification on hardware, and upstream
+        // builds a PCZT from a single-step proposal only.
+        return Err(GygesError::new(
+            ErrorReason::HardwareSigner,
+            "a tex1 recipient cannot be paid from a Keystone yet: its two-step transfer needs \
+             verification on the device (THREAT_MODEL.md §6 item 7); nothing was sent",
+        )
+        .with_key(&key_id)
+        .into_status());
+    }
+    if keystone && !req.dry_run {
+        refuse_if_pending(&prepared)?;
+    }
     let spend_pools = prepared.key.profile().spend_pools.clone();
     let min_confirmations = prepared.min_confirmations;
     let dry_run = req.dry_run;
@@ -620,15 +639,16 @@ pub fn send_transaction(
             memo,
             min_confirmations,
         )?;
-        let summary = core_tx::summarize(&params, &proposal, min_confirmations);
+        let mut summary = core_tx::summarize(&params, &proposal, min_confirmations);
+        let expiry = keystone_expiry(keystone, proposal.min_target_height(), &mut summary);
         if dry_run {
             return Ok((summary, None));
         }
         if core_tx::is_two_step(&proposal) {
             return Ok((summary, Some(Built::Tex(Box::new(proposal)))));
         }
-        let expected = Expected::from_proposal(&params, &proposal, None)?;
-        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal, None)?;
+        let expected = Expected::from_proposal(&params, &proposal, expiry)?;
+        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal, expiry)?;
         Ok((summary, Some(Built::Pczt(expected, Box::new(pczt)))))
     };
     Ok(run(
@@ -639,6 +659,48 @@ pub fn send_transaction(
         req.dry_run,
         req.wait_for_mined,
     ))
+}
+
+/// Whether the key signs on a Keystone.
+fn is_keystone(prepared: &Prepared) -> bool {
+    prepared.key.profile().signing_mode == SigningMode::KeystoneQr
+}
+
+/// A Keystone send waits for a person and a device, possibly across a
+/// restart, for up to `vault.signing_session_ttl`; it gets the expiry a
+/// PCZT file gets (`target + 1152`, about a day) instead of `tx send`'s 40
+/// blocks. Returns the override and updates the summary to match.
+fn keystone_expiry(
+    keystone: bool,
+    min_target: impl Into<BlockHeight>,
+    summary: &mut ProposalSummary,
+) -> Option<BlockHeight> {
+    if !keystone {
+        return None;
+    }
+    let expiry = min_target.into() + crate::roles::PCZT_EXPIRY_BLOCKS;
+    summary.expiry_height = u32::from(expiry);
+    Some(expiry)
+}
+
+/// One Keystone session per key at a time: until it is completed or
+/// aborted, another proposal could pick the same notes.
+fn refuse_if_pending(prepared: &Prepared) -> Result<(), Status> {
+    if let Some(session_id) = crate::keystone::pending_for(&prepared.key)? {
+        let key_id = prepared.key.key_id();
+        return Err(GygesError::new(
+            ErrorReason::SignatureRequired,
+            format!(
+                "key '{key_id}' already has a Keystone signing session awaiting the device \
+                 ({session_id}); complete it with `gyges pczt qr-import --session {session_id}` \
+                 or abort it with `gyges tx abort {session_id}` first"
+            ),
+        )
+        .with_key(key_id)
+        .with_session(session_id)
+        .into_status());
+    }
+    Ok(())
 }
 
 /// `ShieldFunds` (API.md §4.1): the same stream for a transparent → Orchard
@@ -666,18 +728,23 @@ pub fn shield_funds(
         )
         .into_status()
     })?;
+    let keystone = is_keystone(&prepared);
+    if keystone && !req.dry_run {
+        refuse_if_pending(&prepared)?;
+    }
     let min_confirmations = prepared.min_confirmations;
     let dry_run = req.dry_run;
     let propose = move |wallet: &mut gyges_core::registry::Wallet| -> Result<Proposed, TxError> {
         let account = core_tx::account_of(wallet)?;
         let proposal =
             core_tx::propose_shield(wallet, &params, account, threshold, min_confirmations)?;
-        let summary = core_tx::summarize(&params, &proposal, min_confirmations);
+        let mut summary = core_tx::summarize(&params, &proposal, min_confirmations);
+        let expiry = keystone_expiry(keystone, proposal.min_target_height(), &mut summary);
         if dry_run {
             return Ok((summary, None));
         }
-        let expected = Expected::from_proposal(&params, &proposal, None)?;
-        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal, None)?;
+        let expected = Expected::from_proposal(&params, &proposal, expiry)?;
+        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal, expiry)?;
         Ok((summary, Some(Built::Pczt(expected, Box::new(pczt)))))
     };
     Ok(run(
@@ -862,6 +929,17 @@ async fn pipeline(
         }
         Some(Built::Pczt(expected, pczt)) => (expected, *pczt),
     };
+    // A Keystone is shown the PCZT before it is proven (as Zodl does); the
+    // proven copy is what its answer is applied to.
+    let device_request = if key.profile().signing_mode == SigningMode::KeystoneQr {
+        Some(gyges_core::keystone::device_request(&pczt).map_err(|e| {
+            GygesError::new(ErrorReason::Internal, e.to_string())
+                .with_key(&key_id)
+                .into_status()
+        })?)
+    } else {
+        None
+    };
 
     // 4. Prove while locked: one `Proving` per shielded pool with work
     // before the proofs, one after.
@@ -892,6 +970,42 @@ async fn pipeline(
         ms = t0.elapsed().as_millis(),
         "proposal proven"
     );
+
+    // 5 (Keystone). A persisted session; the completion broadcasts.
+    if let Some(request) = device_request {
+        let via_tor = matches!(route, Route::Endpoint(_));
+        let Some(txid) = crate::keystone::await_device(
+            state,
+            prepared,
+            &proto,
+            &expected,
+            pczt,
+            request,
+            via_tor,
+            tx,
+            |r| SendEvent {
+                event: Some(send_event::Event::SignatureRequired(r)),
+            },
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
+        let txid_hex = txid.to_string();
+        emit_broadcast(tx, 1, txid_hex.clone()).await?;
+        if wait_for_mined {
+            let raw_txid = *txid.as_ref();
+            loop {
+                if let Some(h) = crate::sync::mined_height(key, raw_txid).await {
+                    return emit_mined(tx, 1, txid_hex, u32::from(h)).await;
+                }
+                state.sync.wake();
+                idle_or_closed(tx).await?;
+            }
+        }
+        return Ok(());
+    }
 
     // 5. The spending key: token, daemon unlock, or a session.
     let usk = obtain_key(state, prepared, &proto, tx, 1, |r| SendEvent {
