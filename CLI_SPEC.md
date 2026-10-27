@@ -253,4 +253,5 @@ Binary `.pczt` files use the `pczt` crate's postcard serialization; `-` means st
 - **`pczt qr-scan --session ID`** reads the device's answer with the camera (the first unless `--camera N`) for up to `--timeout` (default 2 minutes), completes the session, and prints the txid.
   - Progress goes to stderr; Ctrl-C stops the scan.
   - No camera, denied access (macOS asks once, for the terminal application) or a camera that offers only MJPEG is exit 1 with the reason, as is a build without the feature.
-- **`tx send` / `tx shield` on a terminal** scan the answer by themselves after Enter, for up to a minute, then fall back to pasted frames. A refused answer is scanned again. `GYGES_NO_CAMERA=1` skips the camera.
+- **`tx send` / `tx shield` on a terminal** scan the answer by themselves after Enter, for up to a minute, then fall back to pasted frames; Ctrl-C during the scan also switches to pasting. After a refused answer they wait for Enter (redo it on the device) before scanning again. `GYGES_NO_CAMERA=1` skips the camera.
+- **Ctrl-C** at the QR animation or the paste prompt (with or without a camera) leaves the session open and exits 4, for `qr-import` or `qr-scan --session` later.

@@ -61,7 +61,9 @@ pub(crate) fn frame_lines(mut frames: Frames) -> Result<Vec<String>, CliError> {
         .collect()
 }
 
-/// Loop the frames on stderr until the user presses Enter.
+/// Loop the frames on stderr until the user presses Enter; Ctrl-C is
+/// `Cancelled`. (Once the stream has been followed, tokio owns SIGINT, so
+/// every blocking prompt here races Ctrl-C itself.)
 pub(crate) async fn animate_until_enter(frames: Frames, fps: u32) -> Result<(), CliError> {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
@@ -70,7 +72,8 @@ pub(crate) async fn animate_until_enter(frames: Frames, fps: u32) -> Result<(), 
         let _ = std::io::stdin().lock().read_line(&mut line);
         flag.store(true, Ordering::Relaxed);
     });
-    tokio::task::spawn_blocking(move || {
+    let halt = stop.clone();
+    let play = tokio::task::spawn_blocking(move || {
         let mut anim = Animation::new(frames, fps);
         let mut err = std::io::stderr();
         let single = anim.frames().is_single();
@@ -82,10 +85,41 @@ pub(crate) async fn animate_until_enter(frames: Frames, fps: u32) -> Result<(), 
             }
         }
         Ok::<_, gyges_qr::QrError>(())
-    })
-    .await
-    .map_err(|e| CliError::Other(e.into()))?
-    .map_err(|e| CliError::Other(e.into()))
+    });
+    tokio::select! {
+        played = play => played
+            .map_err(|e| CliError::Other(e.into()))?
+            .map_err(|e| CliError::Other(e.into())),
+        _ = tokio::signal::ctrl_c() => {
+            halt.store(true, Ordering::Relaxed);
+            Err(CliError::Cancelled)
+        }
+    }
+}
+
+/// [`read_answer`], or `Cancelled` on Ctrl-C.
+async fn read_answer_or_cancel(answer: &'static str) -> Result<Vec<u8>, CliError> {
+    let read = tokio::task::spawn_blocking(move || read_answer(answer));
+    tokio::select! {
+        got = read => got.map_err(|e| CliError::Other(e.into()))?,
+        _ = tokio::signal::ctrl_c() => Err(CliError::Cancelled),
+    }
+}
+
+/// Wait for Enter after `prompt`; `Cancelled` on Ctrl-C or end of input.
+async fn wait_for_enter(prompt: &str) -> Result<(), CliError> {
+    eprintln!("{prompt}");
+    let read = tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line).map(|n| n > 0)
+    });
+    tokio::select! {
+        got = read => match got.map_err(|e| CliError::Other(e.into()))?? {
+            true => Ok(()),
+            false => Err(CliError::Cancelled),
+        },
+        _ = tokio::signal::ctrl_c() => Err(CliError::Cancelled),
+    }
 }
 
 /// Assemble `answer` type frames from `lines`; an incomplete or foreign set
@@ -245,7 +279,12 @@ pub(crate) async fn satisfy(
          device, check that it shows the recipients and amounts above, approve, then press Enter.",
         frames.fragment_count()
     );
-    animate_until_enter(frames, DEFAULT_FPS).await?;
+    if let Err(e) = animate_until_enter(frames, DEFAULT_FPS).await {
+        return Err(match e {
+            CliError::Cancelled => left_open(key, session_id, "the request was not scanned"),
+            other => other,
+        });
+    }
     let mut last = None;
     let mut use_camera = camera_wanted();
     for attempt in 1..=ANSWER_ATTEMPTS {
@@ -261,7 +300,11 @@ pub(crate) async fn satisfy(
         } else {
             None
         };
-        let cbor = match scanned.map_or_else(|| read_answer(answer), Ok) {
+        let cbor = match scanned {
+            Some(c) => Ok(c),
+            None => read_answer_or_cancel(answer).await,
+        };
+        let cbor = match cbor {
             Ok(c) => c,
             Err(CliError::Cancelled) => {
                 return Err(left_open(key, session_id, "no answer was read"));
@@ -282,6 +325,16 @@ pub(crate) async fn satisfy(
                     e.detail
                 );
                 last = Some(CliError::Daemon(e));
+                if use_camera {
+                    // The device most likely still shows the refused
+                    // answer; scan only once the user has redone it.
+                    if wait_for_enter("Redo it on the device, then press Enter to scan again.")
+                        .await
+                        .is_err()
+                    {
+                        return Err(left_open(key, session_id, "no answer was accepted"));
+                    }
+                }
             }
             Err(e) => return Err(e),
         }

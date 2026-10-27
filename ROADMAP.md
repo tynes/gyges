@@ -287,7 +287,7 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
   - `scenarios/keystone.rs`: `qr-scan` in a default build is exit 1, naming the feature.
   - `clippy -D warnings` and `cargo deny` pass with `--features gyges-cli/camera`.
 
-  Verified on macOS only. This Mac has no camera: the camera build refuses at once with "no camera found". Real capture, the macOS permission prompt and the Linux V4L2 build (which needs libclang) are untested. `nokhwa`'s macOS bindings pull `block` 0.1.6, which Rust reports as future-incompatible.
+  Verified on macOS only. This Mac has no camera: the camera build refuses at once with "no camera found". Real capture, the macOS permission prompt and the Linux V4L2 build (which needs libclang: `v4l2-sys-mit` runs bindgen) are untested. `nokhwa`'s macOS bindings pull `block` 0.1.6, which Rust reports as future-incompatible.
 - [ ] Verify on hardware: TEX Step 2 signing, which PCZT fields the device displays. Settle the host side first: step 1 of a ZIP 320 send is part of a multi-step proposal, which `create_pczt_from_proposal` refuses, and the `TexQueue` signs with a spending key a Keystone profile does not hold.
 
 ## M6 — Hardening and release
@@ -296,7 +296,7 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
 - [ ] `perf` features with benchmarks in `docs/BENCHMARKS.md`; decide the release default once runtime CPU detection is confirmed.
 - [ ] `daemon install/uninstall` units; hardened deployment (dedicated user, 0660 socket, `gyges` group, `daemon install --hardened`, `THREAT_MODEL.md` §6 item 4) documented and tested.
 - [ ] Optional SQLCipher for `wallet.sqlite` (database key in the OS keychain only, `THREAT_MODEL.md` §6 item 3); `key delete --wipe`; `key backup` / `import-backup`.
-- [ ] Release pipeline: `rust-toolchain.toml`-pinned matrix builds, `SHA256SUMS`, `minisign`, SLSA attestation. Release builds should enable `gyges-cli/camera` (M5, fourth item; Linux runners need libclang for the V4L2 bindings).
+- [ ] Release pipeline: `rust-toolchain.toml`-pinned matrix builds, `SHA256SUMS`, `minisign`, SLSA attestation. Release builds should enable `gyges-cli/camera` (M5, fourth item; Linux runners need libclang, since `v4l2-sys-mit` runs bindgen for the V4L2 bindings).
 - [ ] Nightly `audit` and `msrv` jobs (`TESTING.md` §7).
 - [ ] `tx status --pir` leaves experimental only with a documented server set and privacy guarantee.
 
