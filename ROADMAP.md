@@ -292,7 +292,7 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
 
 ## M6 — Hardening and release
 
-- [x] Sapling spending for `local-seed` profiles (Updater inserts the proof generation key before proving; proven and signed inside the one stream, nothing persisted, `THREAT_MODEL.md` §6 item 1). Landed as:
+- [x] Sapling spending for `local-seed` profiles (Updater inserts the proof generation key before proving; proven and signed inside the one stream, nothing persisted, `THREAT_MODEL.md` §6 item 1). Landed as [PR #48](https://github.com/tynes/gyges/pull/48):
   - `gyges_core::tx::insert_proof_generation_keys`: the Updater sets each Sapling spend's `proof_generation_key` from the unlocked key. The key for each spend is the one whose full viewing key reproduces the note's nullifier, external or internal (Sapling change sits at internal addresses, whose `nsk` differs). Dummies keep their own, and a spend of another key's note is refused.
   - `prove` and `sign` refuse a Sapling spend without its key (`refuse_unkeyed_sapling_spends`, `UNSUPPORTED_POOL`); `sign` signs Sapling spends with the account's `ask`; `verify` counts Sapling spend values in the fee after opening their value commitments, and refuses a spend of a note that is not the key's.
   - `gygesd::tx`: when the proposal spends Sapling, the key (token, daemon unlock or session) comes before `Proving`, and the keyed PCZT is proven, signed, verified and extracted in memory. Everything else still proves while locked.
