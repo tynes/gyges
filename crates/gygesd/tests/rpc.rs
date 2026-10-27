@@ -5458,9 +5458,7 @@ async fn sapling_payments_pass_the_output_checks() {
     use gyges_proto::v1::{
         BroadcastPcztRequest, CreatePcztRequest, NewAddressRequest, Pool, ProvePcztRequest,
     };
-    // Sapling outputs need ZIP 212 enforced for a PCZT, which starts
-    // `ZIP212_GRACE_PERIOD` (32,256) blocks after Canopy; every upgrade is
-    // at height 1 on regtest.
+    // Sapling outputs need ZIP 212 enforced for a PCZT ([`ZIP212_ON`]).
     let node = mined_node(32_300).await;
     let (running, mut c) = start_on(&node, ONE_CONF_CONFIG).await;
     for id in ["main", "bob"] {
@@ -6090,5 +6088,328 @@ async fn zip320_send_treats_already_known_as_accepted() {
     wait_in_mempool(&node, &s1).await;
     node.mine(1);
     wait_tex_state(&mut c, &s1, TexState::Step2Mined).await;
+    running.task.abort();
+}
+
+/// The first regtest height whose Sapling outputs the PCZT builder makes:
+/// ZIP 212 is enforced from Canopy (height 1) plus its 32,256-block grace
+/// period, and a Sapling spend always pads its bundle with two outputs.
+const ZIP212_ON: u32 = 1 + 32_256;
+
+/// Every regular file under `dir`, recursively.
+fn files_under(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(files_under(&path));
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// ROADMAP.md M6, first item (THREAT_MODEL.md §6 item 1): a `local-seed`
+/// key whose only money is Sapling sends it. The stream asks for the key
+/// before it proves; the Updater inserts the proof generation key, the
+/// PCZT is proven, signed, verified and broadcast; a second send spends
+/// what is left (change included) through ZIP 320. Neither `nsk` is ever
+/// on disk. A PCZT file never carries a Sapling spend: `CreatePczt` leaves
+/// Sapling notes out and says so, and `ProvePczt` / `SignPczt` refuse one
+/// built by hand, `SignPczt` before any prompt. Another key's spending key
+/// cannot be inserted.
+#[tokio::test]
+async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
+    use gyges_core::pczt_io::{self, Tags};
+    use gyges_core::tx::{self as core_tx, AmountSpec};
+    use gyges_proto::v1::{
+        CreatePcztRequest, NewAddressRequest, Pool, ProvePcztRequest, SignPcztRequest,
+    };
+    let _ = test_hub();
+    let node = mined_node(ZIP212_ON + 10).await;
+    let (running, mut c) = start_on(&node, ONE_CONF_CONFIG).await;
+    let state = &running.state;
+    let params = Network::Regtest.consensus_params();
+    let tip = node.tip().0;
+
+    // `main` pays; `bob` (the known mnemonic, so its keys can be derived
+    // here) holds Sapling only.
+    init_key(&mut c, "main").await;
+    c.restore_key(restore_req("bob", tip)).await.unwrap();
+    wait_spendable(&mut c, "main").await;
+    wait_spendable(&mut c, "bob").await;
+    let bob_profile = state.registry.resolve("bob").unwrap().profile().clone();
+    assert!(
+        bob_profile.spend_pools.contains(&gyges_core::Pool::Sapling),
+        "{bob_profile:?}"
+    );
+    fund_and_shield(&node, state, &mut c, "main", 500_000_000).await;
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    let bob_sapling = c
+        .new_address(NewAddressRequest {
+            key_id: "bob".into(),
+            receivers: vec![Pool::Sapling as i32],
+            label: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .address;
+    // Two notes, so that one is left for the ZIP 320 send.
+    for z in [200_000_000, 150_000_000] {
+        let events = collect_events(
+            c.send_transaction(SendTransactionRequest {
+                key_id: "main".into(),
+                to: bob_sapling.clone(),
+                amount: zats(z),
+                ..Default::default()
+            })
+            .await,
+        )
+        .await
+        .unwrap();
+        let _ = broadcast_txid(&events);
+        node.mine(1);
+        wait_spendable(&mut c, "main").await;
+    }
+    node.mine(1);
+    wait_spendable(&mut c, "bob").await;
+    let b = balance(&mut c, "bob").await;
+    assert_eq!(balance_of(&b, Pool::Sapling).0, 350_000_000, "{b:?}");
+    assert_eq!(balance_of(&b, Pool::Ironwood).0, 0, "{b:?}");
+
+    // A PCZT file leaves Sapling out, and says why.
+    let err = c
+        .create_pczt(CreatePcztRequest {
+            key_id: "bob".into(),
+            to: t_recipient(),
+            amount: zats(10_000_000),
+            memo: Vec::new(),
+            min_confirmations: 0,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InsufficientFunds, "{err:?}");
+    assert!(err.message().contains("gyges tx send"), "{err:?}");
+
+    // A hand-built PCZT that spends bob's Sapling note.
+    let key = state.registry.resolve("bob").unwrap();
+    let to = core_tx::parse_recipient(&params, &t_recipient()).unwrap();
+    let unkeyed = {
+        let mut w = key.wallet().unwrap();
+        let account = core_tx::account_of(&w).unwrap();
+        let proposal = core_tx::propose_send(
+            &mut w,
+            &params,
+            account,
+            &[gyges_core::Pool::Sapling],
+            &to,
+            AmountSpec::Zatoshis(zcash_protocol::value::Zatoshis::const_from_u64(10_000_000)),
+            None,
+            1,
+        )
+        .unwrap();
+        core_tx::build_pczt(&mut w, &params, account, &proposal, None).unwrap()
+    };
+    assert!(!unkeyed.sapling().spends().is_empty());
+    let tagged = pczt_io::serialize(pczt_io::tag(
+        unkeyed.clone(),
+        &Tags {
+            key_id: "bob".into(),
+            network: Network::Regtest,
+            session_id: pczt_io::new_session_id(),
+        },
+    ))
+    .unwrap();
+    let err = c
+        .prove_pczt(ProvePcztRequest {
+            pczt: tagged.clone(),
+            session_token: Vec::new(),
+            key_id: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::UnsupportedPool, "{err:?}");
+    assert!(err.message().contains("Sapling"), "{err:?}");
+    // Refused at the call, so no `SignatureRequired` is ever sent.
+    let err = c
+        .sign_pczt(SignPcztRequest {
+            pczt: tagged,
+            session_token: Vec::new(),
+            key_id: String::new(),
+        })
+        .await
+        .expect_err("refused before the stream");
+    assert_eq!(reason(&err), ErrorReason::UnsupportedPool, "{err:?}");
+
+    // Another key's spending key does not fit bob's notes; bob's does.
+    let bob_usk = keystone_usk(0);
+    let stranger = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+        &params,
+        &[7u8; 32],
+        zip32::AccountId::ZERO,
+    )
+    .unwrap();
+    let err = core_tx::insert_proof_generation_keys(unkeyed.clone(), &stranger).unwrap_err();
+    assert!(err.to_string().contains("not a note of this key"), "{err}");
+    let keyed = core_tx::insert_proof_generation_keys(unkeyed, &bob_usk).unwrap();
+    let provers = state.provers.clone();
+    core_tx::prove(keyed, &provers).expect("a keyed Sapling spend proves");
+
+    // The send: the key first, then the proofs.
+    let events = send_with_session(
+        &mut c,
+        SendTransactionRequest {
+            key_id: "bob".into(),
+            to: t_recipient(),
+            amount: zats(120_000_000),
+            wait_for_mined: true,
+            ..Default::default()
+        },
+        "pw",
+        |ev| {
+            if matches!(ev.event, Some(send_event::Event::Broadcast(_))) {
+                node.mine(1);
+            }
+        },
+    )
+    .await
+    .unwrap();
+    let names = event_names(&events);
+    let first = |n: &str| names.iter().position(|x| *x == n).unwrap();
+    assert!(first("signature_required") < first("proving"), "{names:?}");
+    assert_eq!(names.last(), Some(&"mined"), "{names:?}");
+    let p = proposal_of(&events);
+    assert!(
+        p.steps[0].inputs.iter().all(|i| i.pool() == Pool::Sapling),
+        "{p:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.event,
+            Some(send_event::Event::Proving(p)) if p.pool() == Pool::Sapling
+        )),
+        "{names:?}"
+    );
+    wait_spendable(&mut c, "bob").await;
+    let after = balance(&mut c, "bob").await;
+    let total = |b: &GetBalanceResponse| b.pools.iter().map(|p| p.spendable).sum::<i64>();
+    assert_eq!(
+        total(&after),
+        350_000_000 - 120_000_000 - p.total_fee,
+        "{after:?}"
+    );
+    // The change went back to Sapling, to an internal address.
+    assert_eq!(
+        balance_of(&after, Pool::Sapling).0,
+        total(&after),
+        "{after:?}"
+    );
+
+    // `max` spends the rest: the other received note and that change,
+    // whose proof needs the internal proof generation key.
+    let events = send_with_session(
+        &mut c,
+        SendTransactionRequest {
+            key_id: "bob".into(),
+            to: t_recipient(),
+            amount: Some(gyges_proto::v1::Amount {
+                value: Some(gyges_proto::v1::amount::Value::Max(true)),
+            }),
+            ..Default::default()
+        },
+        "pw",
+        |_| {},
+    )
+    .await
+    .unwrap();
+    let p = proposal_of(&events);
+    let inputs = &p.steps[0].inputs;
+    assert_eq!(inputs.len(), 1, "{p:?}");
+    assert_eq!(
+        (inputs[0].pool(), inputs[0].count),
+        (Pool::Sapling, 2),
+        "{p:?}"
+    );
+    let _ = broadcast_txid(&events);
+    node.mine(1);
+    wait_spendable(&mut c, "bob").await;
+    assert_eq!(total(&balance(&mut c, "bob").await), 0);
+
+    // ZIP 320 from a fresh Sapling note: `create_proposed_transactions`
+    // proves step 1's Sapling spend with the same key.
+    let events = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            key_id: "main".into(),
+            to: bob_sapling.clone(),
+            amount: zats(100_000_000),
+            ..Default::default()
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    let _ = broadcast_txid(&events);
+    node.mine(2);
+    wait_spendable(&mut c, "bob").await;
+    let tex = zcash_keys::address::Address::Tex([0x42; 20]).encode(&params);
+    let events = send_with_session(
+        &mut c,
+        SendTransactionRequest {
+            key_id: "bob".into(),
+            to: tex,
+            amount: zats(60_000_000),
+            ..Default::default()
+        },
+        "pw",
+        |_| {},
+    )
+    .await
+    .unwrap();
+    let names = event_names(&events);
+    assert!(
+        names.ends_with(&["broadcast", "tex_queued", "broadcast"]),
+        "{names:?}"
+    );
+    let p = proposal_of(&events);
+    assert!(
+        p.steps[0].inputs.iter().all(|i| i.pool() == Pool::Sapling),
+        "{p:?}"
+    );
+    node.mine(1);
+    wait_spendable(&mut c, "bob").await;
+    let b = balance(&mut c, "bob").await;
+    assert_eq!(total(&b), 100_000_000 - 60_000_000 - p.total_fee, "{b:?}");
+
+    // Neither scope's `nsk` was ever written, raw or as hex: not in the
+    // wallet, the profile or anything else under the home. (This daemon
+    // logs to the in-memory hub; the binaries' log files are swept in
+    // `scenarios/`.)
+    let ext = bob_usk.sapling();
+    let secrets: Vec<Vec<u8>> = [
+        ext.expsk.nsk.to_bytes(),
+        ext.derive_internal().expsk.nsk.to_bytes(),
+    ]
+    .into_iter()
+    .flat_map(|b| [b.to_vec(), hex::encode(b).into_bytes()])
+    .collect();
+    let home = running._home.path();
+    let files = files_under(home);
+    assert!(
+        files.iter().any(|f| f.ends_with("wallet.sqlite")),
+        "{files:?}"
+    );
+    for f in &files {
+        let bytes = std::fs::read(f).unwrap();
+        for s in &secrets {
+            assert!(
+                !bytes.windows(s.len()).any(|w| w == s.as_slice()),
+                "nsk found in {}",
+                f.display()
+            );
+        }
+    }
     running.task.abort();
 }

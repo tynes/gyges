@@ -26,6 +26,11 @@ pub const WALLET_FILE: &str = "wallet.sqlite";
 
 /// The `schema_version` this build writes and understands.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// What `local-seed` profiles spent from before Sapling spending landed
+/// (ROADMAP.md M6); see [`KeyProfile::upgrade`].
+pub const PRE_SAPLING_LOCAL_SEED_SPEND_POOLS: [Pool; 3] =
+    [Pool::Orchard, Pool::Ironwood, Pool::Transparent];
 /// The only `seed_format` today: an armored age file with one scrypt
 /// passphrase recipient over the 32-byte BIP 39 entropy.
 pub const SEED_FORMAT_AGE_SCRYPT_V1: &str = "age-scrypt-v1";
@@ -149,6 +154,23 @@ impl KeyProfile {
             f.sync_all().map_err(write)?;
         }
         std::fs::rename(&tmp, path).map_err(write)
+    }
+
+    /// Bring a profile written by an older build up to date, in memory;
+    /// `true` when something changed and the caller should save it. Before
+    /// M6 every `local-seed` profile was written with exactly
+    /// [`PRE_SAPLING_LOCAL_SEED_SPEND_POOLS`] and no command could change
+    /// it, so that list is a default, not a choice: it gains Sapling now
+    /// that Sapling notes can be spent (ROADMAP.md M6, first item). Any
+    /// other list is left alone.
+    pub fn upgrade(&mut self) -> bool {
+        if self.signing_mode == SigningMode::LocalSeed
+            && self.spend_pools == PRE_SAPLING_LOCAL_SEED_SPEND_POOLS
+        {
+            self.spend_pools = Pool::ALL.to_vec();
+            return true;
+        }
+        false
     }
 
     /// The per-mode rules of DATA_MODEL.md §3 plus the identity checks:

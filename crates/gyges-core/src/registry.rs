@@ -289,8 +289,12 @@ impl KeyRegistry {
             key_id: key_id.to_string(),
             source,
         };
-        let profile = KeyProfile::load(&dir.join(PROFILE_FILE)).map_err(with_key)?;
+        let mut profile = KeyProfile::load(&dir.join(PROFILE_FILE)).map_err(with_key)?;
         profile.validate(self.network, key_id).map_err(with_key)?;
+        if profile.upgrade() {
+            self.write_profile(dir, key_id, &profile)?;
+            tracing::info!(key_id, "profile upgraded: sapling added to spend_pools");
+        }
         if profile.has_seed_file() && !dir.join(SEED_FILE).is_file() {
             return Err(RegistryError::MissingFile {
                 key_id: key_id.to_string(),
@@ -613,12 +617,13 @@ impl KeyRegistry {
 
         let profile = KeyProfile {
             birthday_height: Some(req.birthday.height),
-            // MVP pools (ROADMAP.md "Pools are data"): Sapling receive-only.
-            // After NU6.3 every shielded output the wallet libraries build
-            // is Ironwood and the ZIP 318 turnstile keeps value out of
-            // Orchard, so Ironwood is both spent from and received to
-            // (OVERVIEW.md §4.3).
-            spend_pools: vec![Pool::Orchard, Pool::Ironwood, Pool::Transparent],
+            // Every pool is spent from (Sapling since M6: the proof
+            // generation key is inserted inside the sending stream,
+            // THREAT_MODEL.md §6 item 1). After NU6.3 every shielded output
+            // the wallet libraries build is Ironwood and the ZIP 318
+            // turnstile keeps value out of Orchard, so Ironwood is both
+            // spent from and received to (OVERVIEW.md §4.3).
+            spend_pools: Pool::ALL.to_vec(),
             receive_pools: Pool::ALL.to_vec(),
             account_index: req.account_index,
             ..self.seeded_profile(key_id, SigningMode::LocalSeed, fingerprint, req.label)
@@ -849,6 +854,48 @@ mod tests {
             .unwrap();
         assert_ne!(a.ufvk(), other.ufvk());
         assert_eq!(reg.key_ids(), ["a", "b", "c"]);
+    }
+
+    /// A new `local-seed` key spends Sapling; one written before M6 with the
+    /// old default is upgraded on load, on disk too; a list that is not
+    /// the old default, or a Keystone's, is left alone.
+    #[tokio::test]
+    async fn pre_sapling_local_seed_profiles_are_upgraded_on_load() {
+        let (_tmp, home) = home();
+        let reg = KeyRegistry::open(home.clone(), Network::Regtest, &config("")).unwrap();
+        let b = birthday().await;
+        let key = reg
+            .create_local_seed(req("old", &zero_entropy(), &b))
+            .unwrap();
+        assert_eq!(key.profile().spend_pools, Pool::ALL);
+        reg.create_local_seed(req("odd", &zero_entropy(), &b))
+            .unwrap();
+        drop((key, reg));
+
+        let path = |id: &str| home.key_dir(Network::Regtest, id).join(PROFILE_FILE);
+        let rewrite = |id: &str, pools: &[Pool]| {
+            let mut p = KeyProfile::load(&path(id)).unwrap();
+            p.spend_pools = pools.to_vec();
+            p.save(&path(id)).unwrap();
+        };
+        rewrite("old", &profile::PRE_SAPLING_LOCAL_SEED_SPEND_POOLS);
+        rewrite("odd", &[Pool::Ironwood]);
+
+        let reg = KeyRegistry::open(home.clone(), Network::Regtest, &config("")).unwrap();
+        assert_eq!(reg.resolve("old").unwrap().profile().spend_pools, Pool::ALL);
+        assert_eq!(
+            KeyProfile::load(&path("old")).unwrap().spend_pools,
+            Pool::ALL
+        );
+        assert_eq!(
+            reg.resolve("odd").unwrap().profile().spend_pools,
+            [Pool::Ironwood]
+        );
+
+        let mut keystone = KeyProfile::load(&path("old")).unwrap();
+        keystone.signing_mode = SigningMode::KeystoneQr;
+        keystone.spend_pools = profile::PRE_SAPLING_LOCAL_SEED_SPEND_POOLS.to_vec();
+        assert!(!keystone.upgrade());
     }
 
     #[test]

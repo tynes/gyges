@@ -9,7 +9,11 @@
 //! a time, so the sync scheduler interleaves with it.
 //!
 //! Prove before unlock (Q-S3): the proposal is built and proven while the
-//! vault is locked. The spending key is then obtained from, in order, the
+//! vault is locked, except when it spends Sapling notes, whose proofs need
+//! the proof generation key: then the key is obtained first, inserted by
+//! the Updater role, and the PCZT is proven and signed in this stream
+//! without ever being written (THREAT_MODEL.md §6 item 1). The spending
+//! key is obtained from, in order, the
 //! connection-scoped token the request carries, a daemon-scoped unlock, or
 //! a **signing session**: the stream pauses on `SignatureRequired` and the
 //! client answers with `UnlockKey { session_id, passphrase }`, which
@@ -941,9 +945,31 @@ async fn pipeline(
         None
     };
 
-    // 4. Prove while locked: one `Proving` per shielded pool with work
-    // before the proofs, one after.
+    // 4. Prove: one `Proving` per shielded pool with work before the
+    // proofs, one after. Orchard, Ironwood and transparent need no secret,
+    // so the vault stays locked (Q-S3). A Sapling spend needs its proof
+    // generation key, derived from the seed, so the spending key comes
+    // first and the PCZT is keyed, proven and signed here in memory
+    // (THREAT_MODEL.md §6 item 1); `SignatureRequired` then precedes
+    // `Proving`.
     let work = core_tx::proving_work(&pczt);
+    let early_key = if work.sapling_spends == 0 {
+        None
+    } else if device_request.is_some() {
+        return Err(GygesError::new(
+            ErrorReason::UnsupportedPool,
+            "a Keystone does not sign Sapling spends",
+        )
+        .with_key(&key_id)
+        .into_status());
+    } else {
+        Some(
+            obtain_key(state, prepared, &proto, tx, 1, |r| SendEvent {
+                event: Some(send_event::Event::SignatureRequired(r)),
+            })
+            .await?,
+        )
+    };
     let pools: Vec<(v1::Pool, u32)> = [
         (v1::Pool::Orchard, work.orchard_actions),
         (v1::Pool::Ironwood, work.ironwood_actions),
@@ -958,14 +984,21 @@ async fn pipeline(
     emit_proving(tx, &pools, false).await?;
     let provers = state.provers.clone();
     let t0 = std::time::Instant::now();
-    let pczt = blocking(move || core_tx::prove(pczt, &provers))
-        .await
-        .map_err(err)?;
+    let (pczt, early_key) = blocking(move || {
+        let pczt = match &early_key {
+            Some(usk) => core_tx::insert_proof_generation_keys(pczt, usk)?,
+            None => pczt,
+        };
+        Ok((core_tx::prove(pczt, &provers)?, early_key))
+    })
+    .await
+    .map_err(err)?;
     emit_proving(tx, &pools, true).await?;
     tracing::info!(
         key_id,
         orchard_actions = work.orchard_actions,
         ironwood_actions = work.ironwood_actions,
+        sapling_spends = work.sapling_spends,
         sapling_outputs = work.sapling_outputs,
         ms = t0.elapsed().as_millis(),
         "proposal proven"
@@ -1007,11 +1040,17 @@ async fn pipeline(
         return Ok(());
     }
 
-    // 5. The spending key: token, daemon unlock, or a session.
-    let usk = obtain_key(state, prepared, &proto, tx, 1, |r| SendEvent {
-        event: Some(send_event::Event::SignatureRequired(r)),
-    })
-    .await?;
+    // 5. The spending key: token, daemon unlock, or a session (already in
+    // hand when the proposal spends Sapling).
+    let usk = match early_key {
+        Some(usk) => usk,
+        None => {
+            obtain_key(state, prepared, &proto, tx, 1, |r| SendEvent {
+                event: Some(send_event::Event::SignatureRequired(r)),
+            })
+            .await?
+        }
+    };
     let signer = core_tx::SignerId::of(key.profile(), &state.registry.params()).map_err(err)?;
     let pczt = with_wallet(key, move |w| core_tx::sign(Some(&*w), pczt, &usk, &signer))
         .await

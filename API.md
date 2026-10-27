@@ -157,9 +157,15 @@ Rules:
 - **Prove before unlock.** Orchard and transparent proving need no secret, so
   the proposal is proven while the vault is locked and `SignatureRequired` is
   emitted as late as possible (Q-S3). The exception is a step with Sapling
-  spends from a `LOCAL_SEED` or `SIGNER_ONLY` profile: its `SignatureRequired`
+  spends, which only a `LOCAL_SEED` profile sends: its `SignatureRequired`
   precedes its `Proving` events because the proof generation key must be
-  inserted first (Q-K3). A ZIP 320 send (`n = 2`) is the other exception
+  inserted first (Q-K3, THREAT_MODEL.md §6 item 1). As landed (ROADMAP.md
+  M6, first item), the key from the token, daemon unlock or session is
+  derived once, the Updater role inserts each spend's key, and the same key
+  proves, signs and is dropped. A PCZT file never carries a Sapling spend:
+  `CreatePczt` leaves Sapling notes out (`INSUFFICIENT_FUNDS` says so when
+  they are all that is left), and `ProvePczt` and `SignPczt` refuse one with
+  `UNSUPPORTED_POOL`, `SignPczt` before any `SignatureRequired`. A ZIP 320 send (`n = 2`) is the other exception
   (§9): one `SignatureRequired { step: 1 }` comes right after `Proposed`,
   then the `Proving` events of step 1, then `Signed { 1 }`, `Signed { 2 }`.
 - **One signature prompt per send.** Both ZIP 320 steps are signed in the

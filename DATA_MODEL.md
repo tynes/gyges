@@ -122,7 +122,7 @@ Rules:
   "signing_mode": "local-seed",
   "birthday_height": 2650000,
   "created_at": "2026-10-20T10:00:00Z",
-  "spend_pools": ["orchard", "ironwood", "transparent"],
+  "spend_pools": ["orchard", "ironwood", "sapling", "transparent"],
   "receive_pools": ["orchard", "ironwood", "sapling", "transparent"],
   "seed_format": "age-scrypt-v1",
   "seed_fingerprint": "f0a1…",
@@ -138,7 +138,7 @@ Rules:
 | `network` | `mainnet` \| `testnet` \| `regtest` | all | Must equal the home's network |
 | `signing_mode` | `local-seed` \| `keystone-qr` \| `watch-only` \| `signer-only` | all | |
 | `birthday_height` | int | all except `signer-only` | Required; see defaults below |
-| `spend_pools` | list | all | Input selection is restricted to these; `[]` for `watch-only` |
+| `spend_pools` | list | all | Input selection is restricted to these; `[]` for `watch-only`. A `local-seed` profile written before M6 holds exactly `["orchard", "ironwood", "transparent"]` (no command could change it); the daemon adds `sapling` when it loads one and saves the file (`KeyProfile::upgrade`), and leaves any other list alone |
 | `receive_pools` | list | all with a wallet | Default receivers for `address new` |
 | `seed_format` | string | `local-seed`, `signer-only` | `age-scrypt-v1` today |
 | `seed_fingerprint` | hex | `local-seed`, `keystone-qr`, `signer-only` | ZIP 32 seed fingerprint |
