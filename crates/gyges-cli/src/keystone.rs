@@ -15,6 +15,7 @@ use std::io::{BufRead as _, IsTerminal as _};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use gyges_proto::v1::{
     CompleteKeystoneSignRequest, CompleteKeystoneSignResponse, ErrorReason, GygesError,
@@ -246,8 +247,21 @@ pub(crate) async fn satisfy(
     );
     animate_until_enter(frames, DEFAULT_FPS).await?;
     let mut last = None;
+    let mut use_camera = camera_wanted();
     for attempt in 1..=ANSWER_ATTEMPTS {
-        let cbor = match read_answer(answer) {
+        let scanned = if use_camera {
+            match scan(None, answer, &req.payload, INLINE_SCAN_TIMEOUT).await {
+                Ok(c) => Some(c),
+                Err(reason) => {
+                    eprintln!("camera: {}; paste the frames instead", reason.message());
+                    use_camera = false;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let cbor = match scanned.map_or_else(|| read_answer(answer), Ok) {
             Ok(c) => c,
             Err(CliError::Cancelled) => {
                 return Err(left_open(key, session_id, "no answer was read"));
@@ -273,6 +287,78 @@ pub(crate) async fn satisfy(
         }
     }
     Err(last.unwrap_or_else(|| left_open(key, session_id, "no answer was accepted")))
+}
+
+/// How long `tx send` scans before falling back to pasted frames.
+const INLINE_SCAN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The camera is tried when this build has one and `GYGES_NO_CAMERA` is
+/// unset.
+fn camera_wanted() -> bool {
+    cfg!(feature = "camera") && std::env::var_os("GYGES_NO_CAMERA").is_none()
+}
+
+/// Read the device's `answer`-type reply with camera `index` (the first
+/// when `None`), showing progress on stderr; Ctrl-C stops the scan. `request`
+/// is what the device was shown, so the camera catching it is ignored.
+#[cfg(feature = "camera")]
+pub(crate) async fn scan(
+    index: Option<u32>,
+    answer: &'static str,
+    request: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, CliError> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let ctrl_c = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            flag.store(true, Ordering::Relaxed);
+        }
+    });
+    let request = request.to_vec();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut camera = gyges_qr::camera::Camera::open(index)
+            .map_err(|e| CliError::Other(anyhow::anyhow!("{e}")))?;
+        eprintln!(
+            "Point {} at the Keystone's answer (Ctrl-C to stop; GYGES_NO_CAMERA=1 skips the camera).",
+            camera.name()
+        );
+        let mut shown = (0, 0);
+        let got = gyges_qr::scan_answer(
+            &mut camera,
+            answer,
+            Some(request),
+            timeout,
+            || stop.load(Ordering::Relaxed),
+            |p| {
+                if p.fragments != shown && p.fragments.1 > 0 {
+                    shown = p.fragments;
+                    eprintln!("  {} of {} fragments", p.fragments.0, p.fragments.1);
+                }
+            },
+        );
+        got.map_err(|e| match e {
+            gyges_qr::ScanEnd::Stopped => CliError::Cancelled,
+            other => CliError::Other(anyhow::anyhow!("{other}")),
+        })
+    })
+    .await;
+    ctrl_c.abort();
+    outcome.map_err(|e| CliError::Other(e.into()))?
+}
+
+/// This build has no camera (feature `camera`).
+#[cfg(not(feature = "camera"))]
+pub(crate) async fn scan(
+    _index: Option<u32>,
+    _answer: &'static str,
+    _request: &[u8],
+    _timeout: Duration,
+) -> Result<Vec<u8>, CliError> {
+    Err(CliError::Other(anyhow::anyhow!(
+        "this gyges was built without the camera; rebuild with `--features camera`, or use \
+         `gyges pczt qr-import`"
+    )))
 }
 
 /// Whether the terminal can show an animation.

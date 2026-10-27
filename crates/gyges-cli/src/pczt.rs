@@ -26,7 +26,6 @@ use crate::amount::{MemoArg, ParsedAmount, parse_amount, parse_memo};
 use crate::balance::pool_name;
 use crate::client::Ctx;
 use crate::exit::CliError;
-use crate::key::Unimplemented;
 use crate::output::to_json;
 use crate::tx::{render_steps, satisfy, shown_key};
 
@@ -46,8 +45,8 @@ pub enum PcztCmd {
     Broadcast(BroadcastArgs),
     /// Show a pending Keystone signing session's request as an animated QR code (or its frames).
     QrExport(QrExportArgs),
-    /// Read a Keystone's answer from the camera (ROADMAP.md M5).
-    QrScan(Unimplemented),
+    /// Complete a Keystone signing session by scanning the device's answer with the camera.
+    QrScan(QrScanArgs),
     /// Complete a Keystone signing session with the device's answer frames.
     QrImport(QrImportArgs),
 }
@@ -65,6 +64,19 @@ pub struct QrExportArgs {
     /// Write the frames here, one per line, instead of animating them.
     #[arg(short, long, value_name = "FILE")]
     pub out: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct QrScanArgs {
+    /// The Keystone session the answer completes (required for now).
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
+    /// Which camera, by index [default: the first].
+    #[arg(long, value_name = "N")]
+    pub camera: Option<u32>,
+    /// Give up after this long, e.g. 90s, 5m.
+    #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration, default_value = "2m")]
+    pub timeout: std::time::Duration,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -148,7 +160,7 @@ pub async fn run(ctx: &Ctx, cmd: PcztCmd) -> Result<(), CliError> {
         PcztCmd::Combine(args) => combine(ctx, args).await,
         PcztCmd::Broadcast(args) => broadcast(ctx, args).await,
         PcztCmd::QrExport(args) => qr_export(ctx, args).await,
-        PcztCmd::QrScan(_) => Err(CliError::NotImplemented("pczt qr-scan")),
+        PcztCmd::QrScan(args) => qr_scan(ctx, args).await,
         PcztCmd::QrImport(args) => qr_import(ctx, args).await,
     }
 }
@@ -504,6 +516,27 @@ async fn qr_export(ctx: &Ctx, args: QrExportArgs) -> Result<(), CliError> {
     }
     eprintln!("Scan this QR code with the Keystone, then press Enter.");
     crate::keystone::animate_until_enter(frames, args.fps.max(1)).await
+}
+
+/// `pczt qr-scan --session ID`: the device's answer from the camera
+/// (feature `camera`), through `CompleteKeystoneSign`; prints the txid.
+async fn qr_scan(ctx: &Ctx, args: QrScanArgs) -> Result<(), CliError> {
+    let session_id = session_arg(args.session, "pczt qr-scan without --session")?;
+    let session = pending_session(ctx, &session_id).await?;
+    let (_, answer) = crate::keystone::ur_types(session.kind())?;
+    let cbor = crate::keystone::scan(args.camera, answer, &session.payload, args.timeout).await?;
+    let resp = crate::keystone::complete(ctx, &session_id, cbor).await?;
+    if ctx.json {
+        println!("{}", to_json(&resp)?);
+        return Ok(());
+    }
+    for txid in crate::keystone::txids(&resp) {
+        println!("{txid}");
+    }
+    ctx.note(format_args!(
+        "session {session_id} signed on the Keystone and broadcast"
+    ));
+    Ok(())
 }
 
 /// `pczt qr-import --session ID`: the device's answer from positional

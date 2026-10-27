@@ -17,15 +17,19 @@
 #![forbid(unsafe_code)]
 
 mod animate;
+#[cfg(feature = "camera")]
+pub mod camera;
 pub mod firmware;
 mod fountain;
 mod registry;
 mod render;
+pub mod scan;
 
 pub use animate::{Animation, DEFAULT_FPS};
 pub use fountain::{Assembler, DEFAULT_FRAGMENT_LEN, Frames};
 pub use registry::{Account, Accounts, Payload};
 pub use render::{render, render_frame, render_str};
+pub use scan::{FrameSource, LumaFrame, Progress, ScanEnd, Scanner, scan_answer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum QrError {

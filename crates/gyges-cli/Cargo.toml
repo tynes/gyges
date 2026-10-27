@@ -28,6 +28,11 @@ rand = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
 
+[features]
+# `pczt qr-scan` and the camera step of `tx send` (ROADMAP.md M5, fourth
+# item). Off by default: native capture, and libclang on Linux.
+camera = ["gyges-qr/camera"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

@@ -13,6 +13,14 @@ qrcode = { workspace = true }
 ur = { workspace = true }
 ur-registry = { workspace = true }
 thiserror = { workspace = true }
+rqrr = { workspace = true }
+nokhwa = { workspace = true, optional = true }
+
+[features]
+# The camera path of `qr-scan` (ROADMAP.md M5, fourth item): native capture
+# (AVFoundation, V4L2, Media Foundation). Off by default; the Linux backend
+# needs libclang to generate its V4L2 bindings.
+camera = ["dep:nokhwa"]
 
 [dev-dependencies]
 hex = { workspace = true }

@@ -269,7 +269,25 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
   - `tex1` from a Keystone (fifth item);
   - an automated test of the interactive terminal path;
   - rebroadcasting a completed session the node refused (it stays `signed` with the node's error).
-- [ ] `qr-scan` camera path.
+- [x] `qr-scan` camera path. Landed as:
+  - **`gyges_qr::scan`** (always built; `rqrr` without `image`):
+    - `decode` finds the QR codes in a greyscale frame. Frames wider than 960 pixels are downscaled first, and a frame that decodes to nothing is tried mirrored.
+    - `Scanner` keeps only `ur:` frames of the expected answer type, because an `Assembler` locks onto its first frame's type and the camera may catch the terminal or anything else first. After three frames that do not fit the message being assembled, it starts over. It drops a completed message equal to the request, since single-PCZT requests and answers are both `zcash-pczt`.
+    - `scan_answer` drives any `FrameSource` until the answer completes, a stop flag is set, or the timeout passes.
+  - **`gyges_qr::camera`** (feature `camera`, off by default, on `nokhwa` 0.10.11):
+    - checks for a camera before asking macOS for access, then waits for the answer;
+    - requests only uncompressed formats (MJPEG would need `mozjpeg`, a C library) and names an MJPEG-only camera as such.
+  - **CLI** (feature `gyges-cli/camera`):
+    - `pczt qr-scan --session ID [--camera N] [--timeout 2m]`;
+    - `tx send` / `tx shield` scan by themselves for a minute after Enter, then fall back to pasting. `GYGES_NO_CAMERA=1` skips the camera, and Ctrl-C stops a scan.
+    - A build without the feature says so (exit 1).
+
+  Tests:
+  - `scan::tests` drive the scanner with synthetic camera frames: a code scaled and offset in a noisy frame (also mirrored, and in a 1920×1080 frame that is downscaled), blank frames, an unrelated code, and request frames. These include the request reassembling and being dropped, then a multi-frame single-PCZT answer whose fountain parts arrive shuffled and repeated. Also a stale message abandoned for the new one, a one-frame batch answer, and the stop, timeout and camera-failure ends.
+  - `scenarios/keystone.rs`: `qr-scan` in a default build is exit 1, naming the feature.
+  - `clippy -D warnings` and `cargo deny` pass with `--features gyges-cli/camera`.
+
+  Verified on macOS only. This Mac has no camera: the camera build refuses at once with "no camera found". Real capture, the macOS permission prompt and the Linux V4L2 build (which needs libclang) are untested. `nokhwa`'s macOS bindings pull `block` 0.1.6, which Rust reports as future-incompatible.
 - [ ] Verify on hardware: TEX Step 2 signing, which PCZT fields the device displays. Settle the host side first: step 1 of a ZIP 320 send is part of a multi-step proposal, which `create_pczt_from_proposal` refuses, and the `TexQueue` signs with a spending key a Keystone profile does not hold.
 
 ## M6 — Hardening and release
@@ -278,7 +296,7 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
 - [ ] `perf` features with benchmarks in `docs/BENCHMARKS.md`; decide the release default once runtime CPU detection is confirmed.
 - [ ] `daemon install/uninstall` units; hardened deployment (dedicated user, 0660 socket, `gyges` group, `daemon install --hardened`, `THREAT_MODEL.md` §6 item 4) documented and tested.
 - [ ] Optional SQLCipher for `wallet.sqlite` (database key in the OS keychain only, `THREAT_MODEL.md` §6 item 3); `key delete --wipe`; `key backup` / `import-backup`.
-- [ ] Release pipeline: `rust-toolchain.toml`-pinned matrix builds, `SHA256SUMS`, `minisign`, SLSA attestation.
+- [ ] Release pipeline: `rust-toolchain.toml`-pinned matrix builds, `SHA256SUMS`, `minisign`, SLSA attestation. Release builds should enable `gyges-cli/camera` (M5, fourth item; Linux runners need libclang for the V4L2 bindings).
 - [ ] Nightly `audit` and `msrv` jobs (`TESTING.md` §7).
 - [ ] `tx status --pir` leaves experimental only with a documented server set and privacy guarantee.
 

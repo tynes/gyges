@@ -187,6 +187,14 @@ cargo test --workspace
 cargo test -p gyges-regtest -- --test-threads=1
 ```
 
+The camera (`gyges pczt qr-scan`, ROADMAP.md M5) is behind the off-by-default `camera` feature, so the commands above never build it. Check it with:
+
+```bash
+cargo clippy -p gyges-qr -p gyges-cli --features gyges-cli/camera --all-targets
+```
+
+The scanner itself (`gyges_qr::scan`) is always built and tested with synthetic frames; capture from a real camera is checked by hand.
+
 ```bash
 GYGES_TEST_KEEP=1 cargo test -p gyges-regtest tex -- --nocapture
 ```

@@ -99,6 +99,7 @@ When the recipient parses as a TEX address (`zcash_address::ZcashAddress::try_fr
      - **Never removed:** values, recipients, `user_address` and the encrypted memos.
 
      `CompleteKeystoneSign` applies the answer (batch signatures through `Signer::apply_orchard_spend_auth_signature`, which verifies each one; the single PCZT through the Combiner), requires every signature, runs the Verifier against the approved proposal, and only then claims the session and broadcasts.
+   - *Camera (ROADMAP.md M5, fourth item):* `gyges_qr::scan` (always built) decodes frames with `rqrr`, keeps only `ur:` frames of the expected answer type, and drops a re-read of the request. `gyges_qr::camera` (feature `camera`, off by default) is the `nokhwa` frame source. `tx send` uses it by itself when the build has it, falling back to pasted frames.
    - Host ingestion of the device's QR: `gyges pczt qr-scan` (laptop camera, used automatically when present), `gyges pczt qr-import --from-file` / stdin (one `ur:` frame per line), or positional frames for single-frame payloads. Sessions survive restarts, expire after `vault.signing_session_ttl` (default `24h`), and can be completed later with `--session <id>` (CLI_SPEC.md §2.6).
 
 ### 3.5 Air-gapped PCZT flow (`signer-only`, `gygesd --airgapped`)

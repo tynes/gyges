@@ -5,7 +5,8 @@
 //! same frames again; the emulated device answers from the frames alone;
 //! `pczt qr-import --session` completes the session from a file or from
 //! positional frames and prints the txid; an aborted session cannot be
-//! completed.
+//! completed. `pczt qr-scan` needs the `camera` feature, which this build
+//! lacks.
 
 use gyges_core::keystone::emulator;
 use gyges_regtest::{
@@ -95,6 +96,10 @@ fn keystone_signing_through_the_binaries() {
     ])
     .code(4)
     .stderr_has(&sid);
+    // This build has no camera (feature `camera` is off by default).
+    fx.gyges(&["pczt", "qr-scan", "--session", &sid])
+        .code(1)
+        .stderr_has("built without the camera");
     // `qr-export` shows the same frames again.
     let again = fx.gyges(&["pczt", "qr-export", "--session", &sid]).ok();
     assert_eq!(ur_lines(&again.stdout), request);
