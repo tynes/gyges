@@ -19,7 +19,7 @@
 pub mod addresses;
 pub mod birthday;
 pub mod config;
-pub mod ext;
+pub mod db;
 pub mod handoff;
 pub mod history;
 pub mod keystone;
@@ -32,9 +32,7 @@ pub mod perms;
 pub mod profile;
 pub mod recovery;
 pub mod registry;
-pub mod sessions;
 pub mod sync;
-pub mod tex;
 pub mod tx;
 pub mod vault;
 

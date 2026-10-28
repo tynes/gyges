@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use gyges_chain::{ChainError, TxStatus, display_hash, parse_display_hash};
 use gyges_core::addresses::{self, AddressKind, Inspected};
+use gyges_core::db::tex::{self as core_tex, TexRow};
 use gyges_core::history::{self, NoteRow, TxRow};
-use gyges_core::tex::{self as core_tex, TexRow};
 use gyges_core::{KeyEntry, Network, Pool, SigningMode};
 use gyges_proto::v1::{
     self, AddressInfo, ErrorReason, GetCurrentAddressRequest, GetTransactionStatusRequest,

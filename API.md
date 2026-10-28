@@ -415,11 +415,11 @@ and so that a Keystone round trip can be completed from a later process.
 
 ### 6.1 Record
 
-*As built:* `ext_gyges_signing_sessions` plus, for Keystone kinds,
-`ext_gyges_keystone_sessions` (DATA_MODEL.md §5.2). The first draft below is
-kept for the fields' meaning; `key_id` is implied by the key's own wallet,
-`proven_pczt`, `request_id` and the payload are in the Keystone table, and
-there is no `failed` status (§6.4).
+*As built:* one `ext_gyges_signing_sessions` row per session, with the
+Keystone kinds' device-side columns filled (DATA_MODEL.md §5.2). The first
+draft below is kept for the fields' meaning; `key_id` is implied by the key's
+own wallet, `proven_pczt`, `request_id` and the payload are the row's
+nullable Keystone columns, and there is no `failed` status (§6.4).
 
 Persisted in `wallet.sqlite` (table `signing_sessions`, Q-K4):
 

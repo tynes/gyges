@@ -185,28 +185,38 @@ Argon2id is not used; see Q-S5 for the compatible construction if it is ever req
 
 ## 5. `wallet.sqlite`
 
-The upstream `zcash_client_sqlite` schema is created and migrated by `zcash_client_sqlite::wallet::init::init_wallet_db` and is not modified. Gyges adds its own tables in the same database, prefixed `gyges_`, so that a key directory is self-contained and transactional with the wallet state.
+The upstream `zcash_client_sqlite` schema is created and migrated by upstream's `WalletMigrator` and is not modified. Gyges adds its own tables to the same database, so a key directory is self-contained and Gyges' writes are transactional with the wallet state.
+
+**All of it lives in `gyges_core::db`** (`crates/gyges-core/src/db/`). `zcash_client_sqlite` reserves the `ext_` prefix for application tables, so every Gyges table is `ext_gyges_*`. One external migration (`db::MIGRATION`, registered with `WalletMigrator::with_external_migrations` when the registry opens a wallet) creates them from `db/schema.sql`. Every statement runs through `WalletDb::transactionally_with_extension`, whose SQLite authorizer allows reads of any table but writes only to `ext_*` tables, and refuses schema changes and transaction control.
+
+Rules the module enforces:
+
+* **Static SQL, bound values.** Its `Db` wrapper accepts only `&'static str` statements, so SQL cannot be assembled at run time. Every value is a named parameter, and a set is bound as a JSON array and read with `json_each(:param)`. Enums bind through `ToSql`/`FromSql` as their `as_str()` spelling, and an unknown stored value is an error, never a default.
+* **One row per statement.** The extension handle offers only `execute` and `query_row`, so a read of many rows is one `json_group_array(...)` cell decoded with serde, or a list of ids followed by one read per id inside the same transaction. BLOB columns go through `hex()` inside JSON.
+* **No `AUTOINCREMENT`.** It writes `sqlite_sequence`, which the authorizer refuses.
+
+The CHECK lists in `schema.sql` repeat the enums' spellings, and `db` tests insert every variant so the two cannot drift apart.
 
 ### 5.1 `ext_gyges_tex_queue` (Q-T1)
 
-**Landed (ROADMAP.md M3) as `gyges_core::tex`.** `zcash_client_sqlite` reserves the `ext_` prefix for application tables: they are created by an external migration (`WalletMigrator::with_external_migrations`, run with the upstream migrations when the registry opens a wallet) and written only through `WalletDb::transactionally_with_extension`, whose SQLite authorizer refuses writes to any other table, schema changes and transaction control. The table is therefore `ext_gyges_tex_queue`, not the `gyges_tex_queue` of the first draft; `gyges_signing_sessions` and `gyges_address_labels` below follow the same rule (both landed as `ext_gyges_*`). Two consequences shape the code: the extension handle answers single rows only (`execute`, `query_row`), so listing goes through a `group_concat` of ids; and `AUTOINCREMENT` is unusable (it writes `sqlite_sequence`), which this table does not need.
+`gyges_core::db::tex`. One row per ZIP 320 transfer, holding both signed steps.
 
 ```sql
 CREATE TABLE ext_gyges_tex_queue (
-    step1_txid       BLOB NOT NULL PRIMARY KEY,   -- 32 bytes, internal order
-    step2_txid       BLOB NOT NULL,               -- replaced, with step2_raw, by `tx resume`
-    proposal         BLOB NOT NULL,               -- gyges.v1.Proposal the user approved, for `tx sessions` and the resume session's summary
-    step1_raw        BLOB NOT NULL,               -- signed, serialised Step 1
-    step2_raw        BLOB NOT NULL,               -- signed, serialised Step 2 (the current one)
-    ephemeral_addr   TEXT NOT NULL,               -- t1… receiving Step 1's output
-    recipient        TEXT NOT NULL,               -- tex1… / textest1…
-    amount           INTEGER NOT NULL,            -- Step 2's single output, zatoshis
-    expiry_height    INTEGER NOT NULL,            -- shared by both steps; a rebuilt Step 2 has its own
+    step1_txid       BLOB NOT NULL PRIMARY KEY,
+    step2_txid       BLOB NOT NULL,
+    proposal         BLOB NOT NULL,
+    step1_raw        BLOB NOT NULL,
+    step2_raw        BLOB NOT NULL,
+    ephemeral_addr   TEXT NOT NULL,
+    recipient        TEXT NOT NULL,
+    amount           INTEGER NOT NULL,
+    expiry_height    INTEGER NOT NULL,
     state            TEXT NOT NULL CHECK (state IN (
                          'built', 'step1_broadcast', 'step2_broadcast',
                          'step1_mined', 'step2_mined', 'step2_failed',
                          'expired', 'failed', 'aborted')),
-    created_at       INTEGER NOT NULL,            -- unix seconds
+    created_at       INTEGER NOT NULL,
     last_attempt_at  INTEGER,
     attempts         INTEGER NOT NULL DEFAULT 0,
     last_error       TEXT
@@ -214,88 +224,82 @@ CREATE TABLE ext_gyges_tex_queue (
 CREATE INDEX ext_gyges_tex_queue_state ON ext_gyges_tex_queue (state);
 ```
 
-State machine: `built → step1_broadcast → step2_broadcast → step1_mined → step2_mined` (terminal), with `expired` (both unmined at `expiry_height`), `step2_failed` (Step 1 mined, Step 2 unmined at `expiry_height`; `tx resume` stores a new Step 2 and puts the row back to `step1_mined`), `failed` (the node refused Step 1 with a reason other than already having it; its text is in `last_error`) and `aborted` (`tx abort`, allowed only in `built`) as the other terminals. The row is inserted as `built` before the first broadcast, so a crash between the two leaves something the queue finishes. A node that will not take Step 2 while Step 1 is unmined leaves the row in `step1_broadcast` with its text in `last_error`; the queue offers Step 2 again on every pass and keeps `step1_mined` as the furthest state once the node has Step 1 in a block. Mined heights are recorded in the upstream `transactions` table through `set_transaction_status`.
+State machine: `built → step1_broadcast → step2_broadcast → step1_mined → step2_mined` (terminal). The other terminals:
+* `expired`: both steps unmined at `expiry_height`.
+* `failed`: the node refused Step 1 for a reason other than already having it; its text is in `last_error`.
+* `aborted`: `tx abort`, allowed only in `built`.
 
-### 5.2 `gyges_signing_sessions` (Q-K4, Q-C4)
+`step2_failed` means Step 1 is mined but Step 2 was unmined at `expiry_height`; `tx resume` stores a new Step 2 and puts the row back to `step1_mined`.
 
-**Landed (ROADMAP.md M4, first item) as `gyges_core::sessions`, table `ext_gyges_signing_sessions`** (the `ext_` prefix, as for §5.1), with the columns the file protocol needs; Keystone sessions add a table of their own (below):
+The row is inserted as `built` before the first broadcast, so a crash between the two leaves something the queue finishes. A node that will not take Step 2 while Step 1 is unmined leaves the row in `step1_broadcast` with its text in `last_error`; the queue offers Step 2 again on every pass and keeps `step1_mined` as the furthest state once the node has Step 1 in a block. Mined heights are recorded in the upstream `transactions` table through `set_transaction_status`.
+
+### 5.2 `ext_gyges_signing_sessions` (Q-K4, Q-C4)
+
+`gyges_core::db::sessions`. One row per signing session that outlives a connection: a PCZT file (`file`) or a Keystone session (`keystone-batch`, `keystone-pczt`). Passphrase sessions of `tx send` are memory-only (API.md §6.1).
 
 ```sql
 CREATE TABLE ext_gyges_signing_sessions (
-    session_id   TEXT NOT NULL PRIMARY KEY,   -- 16 random bytes, hex: the PCZT's gyges.session_id
-    protocol     TEXT NOT NULL CHECK (protocol IN ('passphrase', 'keystone-batch', 'keystone-pczt', 'file')),
-    status       TEXT NOT NULL CHECK (status IN ('awaiting-signature', 'signed', 'broadcast', 'aborted', 'expired')),
-    created_at   INTEGER NOT NULL,
-    expires_at   INTEGER NOT NULL,            -- created_at + vault.signing_session_ttl (informational; the file's own limit is its expiry height)
-    proposal     BLOB NOT NULL,               -- the gyges.v1.Proposal the user approved, serialised
-    expected     BLOB NOT NULL,               -- gyges_core::tx::Expected as JSON: what the Verifier checks against
-    txid         BLOB,                        -- set on broadcast, internal byte order
-    last_error   TEXT                         -- the node's refusal, when a broadcast failed (status stays `signed`)
+    session_id     TEXT NOT NULL PRIMARY KEY,
+    protocol       TEXT NOT NULL CHECK (protocol IN ('keystone-batch', 'keystone-pczt', 'file')),
+    status         TEXT NOT NULL CHECK (status IN (
+                       'awaiting-signature', 'signed', 'broadcast', 'aborted', 'expired')),
+    created_at     INTEGER NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    proposal       BLOB NOT NULL,
+    expected       BLOB NOT NULL,
+    txid           BLOB,
+    last_error     TEXT,
+    pczt           BLOB,
+    payload        BLOB,
+    request_id     BLOB,
+    via_tor        INTEGER,
+    expiry_height  INTEGER,
+    -- A Keystone session always carries its device-side half; a file one never does.
+    CHECK ((protocol = 'file') = (pczt IS NULL)),
+    CHECK ((pczt IS NULL) = (payload IS NULL)
+       AND (pczt IS NULL) = (via_tor IS NULL)
+       AND (pczt IS NULL) = (expiry_height IS NULL))
 );
-CREATE INDEX ext_gyges_signing_sessions_status ON ext_gyges_signing_sessions (status, expires_at);
+CREATE INDEX ext_gyges_signing_sessions_status
+    ON ext_gyges_signing_sessions (status, expires_at);
 ```
 
-A row is inserted as `awaiting-signature` by `CreatePczt` (protocol `file`) and moved to `broadcast` by `BroadcastPczt`; a second broadcast of the same session is refused. Passphrase sessions of `tx send` are still memory-only (API.md §6.1).
+* `expires_at` is `created_at + vault.signing_session_ttl`.
+* `expected` is `gyges_core::tx::Expected` as JSON: what the Verifier checks the signed PCZT against.
+* The nullable columns are a Keystone session's device-side half:
+  * `pczt`: the proven, unsigned PCZT the answer is applied to.
+  * `payload`: the CBOR shown to the device, for `pczt qr-export --session`.
+  * `request_id`: echoed by `zcash-batch-sig-result`.
+  * `via_tor`: broadcast through the fallback endpoint.
+  * `expiry_height`: completing at or past it is refused.
+* The CHECKs make them present exactly for the Keystone protocols.
 
-**Keystone sessions (ROADMAP.md M5, third item)** are a row here (protocol `keystone-batch` or `keystone-pczt`) plus their device-side half in a table of their own under the same `session_id`. It is a separate table, not new columns, because an `ext_` migration has no ordering and its `down` drops its table, so an `ALTER` migration could neither be ordered after the `CREATE` nor rolled back safely:
+A file session is inserted as `awaiting-signature` by `CreatePczt` and moved to `broadcast` by `BroadcastPczt`; a second broadcast of the same session is refused.
 
-```sql
-CREATE TABLE ext_gyges_keystone_sessions (
-    session_id    TEXT NOT NULL PRIMARY KEY,   -- = ext_gyges_signing_sessions.session_id
-    purpose       TEXT NOT NULL CHECK (purpose IN ('send', 'sign-pczt')),  -- 'send' only so far
-    pczt          BLOB NOT NULL,               -- the proven, unsigned PCZT the device's answer is applied to
-    payload       BLOB NOT NULL,               -- the CBOR shown to the device (zcash-sign-batch or zcash-pczt), for `pczt qr-export --session`
-    request_id    BLOB,                        -- 16 random bytes, echoed by zcash-batch-sig-result
-    via_tor       INTEGER NOT NULL,            -- broadcast through the fallback endpoint
-    expiry_height INTEGER NOT NULL             -- the transaction's nExpiryHeight; completing at or past it is refused
-);
-```
-
-Both rows are inserted in one transaction. A completion moves the row from `awaiting-signature` to `signed` with a conditional update, which is how a session is claimed exactly once, then to `broadcast` with the txid. A node refusal leaves it `signed` with `last_error`. A refused device answer leaves it `awaiting-signature` with `last_error`, so the user can scan again. Abort and expiry also update only a row still awaiting. The first draft's `sent_payload_hash`, `input_path` and `tex_step1_txid` were not needed: the payload itself is kept, the input path is the CLI's business, and Keystone keys cannot pay `tex1` recipients yet.
+A Keystone completion moves the row from `awaiting-signature` to `signed` with a conditional update, which is how a session is claimed exactly once, and then to `broadcast` with the txid.
+* A node refusal leaves it `signed` with `last_error`.
+* A refused device answer leaves it `awaiting-signature` with `last_error`, so the user can scan again.
+* Abort and expiry also update only a row still awaiting.
 
 The connection-scoped unlock token from Q-S1 is **not** stored here: it lives only in daemon memory and dies with the connection.
 
 ### 5.3 `ext_gyges_address_labels`
 
-**Landed (ROADMAP.md M1 follow-up) as `gyges_core::addresses::AddressLabelsMigration`**, with the `ext_` prefix as for §5.1. Written by `address new --label` (an upsert keyed on the address) and read back by `GetCurrentAddress` / `NewAddress`.
+`gyges_core::db::labels`. Written by `address new --label` (an upsert keyed on the address as handed out) and read back by `GetCurrentAddress` / `NewAddress`.
 
 ```sql
 CREATE TABLE ext_gyges_address_labels (
-    address     TEXT NOT NULL PRIMARY KEY,        -- encoded as handed out (u1…, t1…)
+    address     TEXT NOT NULL PRIMARY KEY,
     label       TEXT NOT NULL,
     created_at  INTEGER NOT NULL
 );
 ```
 
-### 5.4 `gyges_transparent_received_outputs`
+### 5.4 Reads of upstream views
 
-Transparent outputs seen in full raw blocks during Case A (`SYNC.md` §2.1). The compact blocks in the shared cache (§6) carry every transparent input and output of their blocks, so the scheduler finds a key's outputs by matching `scriptPubKey`s from the cache against the key's receivers (external, change and ephemeral, re-read after each hit because a hit advances the gap limit); upstream already stores UTXOs it learns about through `put_received_transparent_utxo`, and this table is the staging area from which that call is made, and the source of truth for "which block did we see it in" when the node's address index is unavailable. *Status:* the scheduler calls `put_received_transparent_utxo` directly (the upstream `transparent_received_outputs` row carries `mined_height`); this table is created with the first `gyges_` migration set and filled from then on.
+`gyges_core::db::history` reads upstream's documented views (`v_received_outputs`, `v_received_output_spends`, `v_tx_outputs`) for `ListNotes` and the outputs of `ListTransactions`, since upstream has no production API for either. These are reads only, through the same handle.
 
-```sql
-CREATE TABLE gyges_transparent_received_outputs (
-    txid        BLOB NOT NULL,
-    vout        INTEGER NOT NULL,
-    height      INTEGER NOT NULL,
-    block_hash  BLOB NOT NULL,
-    address     TEXT NOT NULL,
-    value_zat   INTEGER NOT NULL,
-    script      BLOB NOT NULL,
-    source      TEXT NOT NULL CHECK (source IN ('node', 'tor-lwd')),
-    PRIMARY KEY (txid, vout)
-);
-```
-
-### 5.5 `gyges_meta`
-
-```sql
-CREATE TABLE gyges_meta (
-    key   TEXT NOT NULL PRIMARY KEY,
-    value TEXT NOT NULL
-);
--- rows: ('gyges_schema_version', '1'), ('untrusted_endpoint', '<url>') when SYNC.md §5.2 fails
-```
-
-### 5.6 What is not in SQLite
+### 5.5 What is not in SQLite
 
 The audit trail is `logs/audit.log` (Q-O1), not a table: it must survive a database wipe, and it must be appendable while a migration holds the database. Decrypted spending keys, passphrases and session tokens are never written anywhere.
 
@@ -316,11 +320,12 @@ CREATE TABLE compact_blocks (
 );
 CREATE TABLE cache_meta (
     key   TEXT NOT NULL PRIMARY KEY,
-    value TEXT NOT NULL                 -- ('schema_version', '1'), ('network', 'mainnet')
+    value TEXT NOT NULL                 -- ('network', 'mainnet')
 );
+-- The schema version is `PRAGMA user_version` (currently 1).
 ```
 
-Eviction policy and privacy trade-off are in `SYNC.md` §2.2: `source = 'tor-lwd'` rows reveal an approximate birthday, so the file is `0600` and those rows are dropped once consumed unless `cache.keep_historical = true`. The cache is disposable; deleting it costs a refetch, never wallet state. `data` is the lightwalletd `CompactBlock` protobuf including `vin`/`vout` for every transaction (the Case A transparent index, §5.4), so a cached mainnet block is tens of kilobytes rather than a few. The daemon refuses to open a cache whose `cache_meta.network` is another network or whose `schema_version` is newer than its own, naming the file (`gyges_chain::cache::BlockDb::open`).
+Eviction policy and privacy trade-off are in `SYNC.md` §2.2: `source = 'tor-lwd'` rows reveal an approximate birthday, so the file is `0600` and those rows are dropped once consumed unless `cache.keep_historical = true`. The cache is disposable; deleting it costs a refetch, never wallet state. `data` is the lightwalletd `CompactBlock` protobuf including `vin`/`vout` for every transaction (the Case A transparent index, SYNC.md §2.1), so a cached mainnet block is tens of kilobytes rather than a few. The daemon refuses to open a cache whose `cache_meta.network` is another network or whose `user_version` is newer than its own, naming the file (`gyges_chain::cache::BlockDb::open`).
 
 ---
 
@@ -328,9 +333,9 @@ Eviction policy and privacy trade-off are in `SYNC.md` §2.2: `source = 'tor-lwd
 
 | Store | Mechanism | Trigger |
 |---|---|---|
-| upstream wallet tables | `init_wallet_db` (schemerz migrations shipped by `zcash_client_sqlite`) | every daemon start, before the Gyges migrations |
-| `gyges_*` tables | `schemerz` + `schemerz-rusqlite` migrations in `gyges-core/src/db/migrations/`, named `gyges_0001_initial`, `gyges_0002_…`, each depending on the upstream migration it needs | every daemon start, after `init_wallet_db` |
-| `blocks.sqlite` | same mechanism, separate migration set | every daemon start |
+| upstream wallet tables | `WalletMigrator` (schemerz migrations shipped by `zcash_client_sqlite`) | every wallet open, with the Gyges migration |
+| `ext_gyges_*` tables | one external `schemerz-rusqlite` migration, `gyges_core::db::MIGRATION` (`db/schema.sql`), run by upstream's `WalletMigrator` with its own; later changes are new migrations depending on it | every wallet open |
+| `blocks.sqlite` | `PRAGMA user_version` checked against `gyges_chain::cache::SCHEMA_VERSION`; the file is disposable | every daemon start |
 | `profile.json` | `schema_version` switch in `gyges-core::profile`; rewritten atomically after a successful upgrade | profile load |
 | `seed.age` | re-encryption only when `seed_format` changes, which requires the passphrase and therefore runs lazily on the next unlock | unlock |
 | `config.toml` | never rewritten by the daemon; removed keys produce a startup error naming the replacement | startup |

@@ -2,7 +2,7 @@
 //! `InspectAddress`): the key's current and fresh unified addresses through
 //! upstream's address APIs, the network-independent parse behind
 //! `address inspect`, and the `ext_gyges_address_labels` table behind
-//! `address new --label` (DATA_MODEL.md §5.3).
+//! `address new --label` (DATA_MODEL.md §5.3, `crate::db::labels`).
 //!
 //! The receiver list is built the same way for all three, from the encoded
 //! address, so `address current` and `address inspect` of the same string
@@ -10,8 +10,6 @@
 //! the same receiver also takes Ironwood notes (`zcash_keys` "Ironwood
 //! shares the Orchard receiver"), and a UA has no separate Ironwood item.
 
-use rusqlite::{OptionalExtension as _, named_params};
-use uuid::Uuid;
 use zcash_address::unified::{self, Container as _};
 use zcash_address::{ConversionError, ToAddress as _, TryFromAddress, ZcashAddress};
 use zcash_client_backend::data_api::{
@@ -24,7 +22,7 @@ use zcash_protocol::consensus::NetworkType;
 use zip32::DiversifierIndex;
 
 use crate::Pool;
-use crate::ext::{ExtTable, with_ext};
+use crate::db;
 use crate::registry::Wallet;
 use crate::tx::{TxError, account_of, internal};
 
@@ -308,7 +306,9 @@ pub fn new_address(
         .map_err(|e| address_error("next available address", e))?
         .ok_or_else(|| TxError::Internal("the wallet has no account".into()))?;
     if let Some(l) = label {
-        set_label(wallet, &ua.encode(wallet.params()), l)?;
+        let address = ua.encode(wallet.params());
+        db::labels::set(wallet, &address, l, crate::profile::unix_now())
+            .map_err(|e| internal("storing the label", e))?;
     }
     describe(wallet, account, &ua)
 }
@@ -346,69 +346,13 @@ fn describe(
             _ => None,
         })
         .unwrap_or_default();
-    let label = label_of(wallet, &encoded)?;
+    let label = db::labels::get(wallet, &encoded).map_err(|e| internal("reading the label", e))?;
     Ok(AddressInfo {
         address: encoded,
         diversifier_index,
         receivers,
         label,
     })
-}
-
-// ---------------------------------------------------------------------------
-// ext_gyges_address_labels
-// ---------------------------------------------------------------------------
-
-/// The external migration's id (random, fixed forever).
-pub const LABELS_MIGRATION_ID: Uuid = Uuid::from_u128(0x2c6b_91d4_0f3e_4a7c_b85d_6e1a_93f2_07c8);
-
-const LABELS: &str = "ext_gyges_address_labels";
-
-/// Creates `ext_gyges_address_labels` (DATA_MODEL.md §5.3; the `ext_`
-/// prefix is upstream's rule for application tables, as for §5.1).
-pub const LABELS_MIGRATION: ExtTable = ExtTable {
-    id: LABELS_MIGRATION_ID,
-    table: LABELS,
-    description: "Creates the Gyges address labels (ext_gyges_address_labels).",
-    create: create_labels_migration,
-};
-
-fn create_labels_migration() -> String {
-    format!(
-        "CREATE TABLE {LABELS} (
-            address     TEXT NOT NULL PRIMARY KEY,
-            label       TEXT NOT NULL,
-            created_at  INTEGER NOT NULL
-        );"
-    )
-}
-
-fn set_label(wallet: &mut Wallet, address: &str, label: &str) -> Result<(), TxError> {
-    let now = crate::profile::unix_now();
-    with_ext(wallet, |ext| {
-        ext.execute(
-            &format!(
-                "INSERT INTO {LABELS} (address, label, created_at) \
-                     VALUES (:address, :label, :now) \
-                     ON CONFLICT (address) DO UPDATE SET label = excluded.label"
-            ),
-            named_params! {":address": address, ":label": label, ":now": now},
-        )
-    })
-    .map(|_| ())
-    .map_err(|e: rusqlite::Error| internal("storing the label", e))
-}
-
-fn label_of(wallet: &mut Wallet, address: &str) -> Result<Option<String>, TxError> {
-    with_ext(wallet, |ext| {
-        ext.query_row(
-            &format!("SELECT label FROM {LABELS} WHERE address = :address"),
-            named_params! {":address": address},
-            |r| r.get(0),
-        )
-        .optional()
-    })
-    .map_err(|e: rusqlite::Error| internal("reading the label", e))
 }
 
 #[cfg(test)]

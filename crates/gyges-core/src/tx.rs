@@ -1674,7 +1674,7 @@ pub fn is_two_step<N>(proposal: &Proposal<StandardFeeRule, N>) -> bool {
 }
 
 /// Both transactions of a ZIP 320 transfer, signed, as the queue stores
-/// them (`gyges_core::tex::TexRow` minus the bookkeeping).
+/// them (`gyges_core::db::tex::TexRow` minus the bookkeeping).
 #[derive(Clone, Debug)]
 pub struct TexBuilt {
     pub step1_txid: TxId,
