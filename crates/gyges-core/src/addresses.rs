@@ -26,7 +26,7 @@ use zip32::DiversifierIndex;
 use crate::Pool;
 use crate::ext::{ExtTable, with_ext};
 use crate::registry::Wallet;
-use crate::tx::{TxError, account_of};
+use crate::tx::{TxError, account_of, internal};
 
 /// `address new` without `--receivers` (CLI_SPEC.md §2.4): shielded only,
 /// so a fresh address never links to a transparent receiver.
@@ -100,11 +100,11 @@ impl TryFromAddress for Inspected {
         net: NetworkType,
         data: [u8; 43],
     ) -> Result<Self, ConversionError<Self::Error>> {
-        Ok(Self {
-            network: net,
-            kind: AddressKind::Sapling,
-            receivers: vec![sapling_receiver(net, data)],
-        })
+        Ok(Self::single(
+            net,
+            AddressKind::Sapling,
+            sapling_receiver(net, data),
+        ))
     }
 
     fn try_from_unified(
@@ -120,14 +120,12 @@ impl TryFromAddress for Inspected {
                     encoded: String::new(),
                 }),
                 unified::Receiver::Sapling(d) => Some(sapling_receiver(net, d)),
-                unified::Receiver::P2pkh(h) => Some(Receiver {
-                    pool: Pool::Transparent,
-                    encoded: ZcashAddress::from_transparent_p2pkh(net, h).encode(),
-                }),
-                unified::Receiver::P2sh(h) => Some(Receiver {
-                    pool: Pool::Transparent,
-                    encoded: ZcashAddress::from_transparent_p2sh(net, h).encode(),
-                }),
+                unified::Receiver::P2pkh(h) => Some(transparent_receiver(
+                    ZcashAddress::from_transparent_p2pkh(net, h),
+                )),
+                unified::Receiver::P2sh(h) => Some(transparent_receiver(
+                    ZcashAddress::from_transparent_p2sh(net, h),
+                )),
                 // Receiver types this release does not know are not listed.
                 unified::Receiver::Unknown { .. } => None,
             })
@@ -143,28 +141,22 @@ impl TryFromAddress for Inspected {
         net: NetworkType,
         data: [u8; 20],
     ) -> Result<Self, ConversionError<Self::Error>> {
-        Ok(Self {
-            network: net,
-            kind: AddressKind::TransparentP2pkh,
-            receivers: vec![Receiver {
-                pool: Pool::Transparent,
-                encoded: ZcashAddress::from_transparent_p2pkh(net, data).encode(),
-            }],
-        })
+        Ok(Self::single(
+            net,
+            AddressKind::TransparentP2pkh,
+            transparent_receiver(ZcashAddress::from_transparent_p2pkh(net, data)),
+        ))
     }
 
     fn try_from_transparent_p2sh(
         net: NetworkType,
         data: [u8; 20],
     ) -> Result<Self, ConversionError<Self::Error>> {
-        Ok(Self {
-            network: net,
-            kind: AddressKind::TransparentP2sh,
-            receivers: vec![Receiver {
-                pool: Pool::Transparent,
-                encoded: ZcashAddress::from_transparent_p2sh(net, data).encode(),
-            }],
-        })
+        Ok(Self::single(
+            net,
+            AddressKind::TransparentP2sh,
+            transparent_receiver(ZcashAddress::from_transparent_p2sh(net, data)),
+        ))
     }
 
     /// The receiver of a TEX address is the P2PKH hash it wraps.
@@ -172,14 +164,28 @@ impl TryFromAddress for Inspected {
         net: NetworkType,
         data: [u8; 20],
     ) -> Result<Self, ConversionError<Self::Error>> {
-        Ok(Self {
-            network: net,
-            kind: AddressKind::Tex,
-            receivers: vec![Receiver {
-                pool: Pool::Transparent,
-                encoded: ZcashAddress::from_transparent_p2pkh(net, data).encode(),
-            }],
-        })
+        Ok(Self::single(
+            net,
+            AddressKind::Tex,
+            transparent_receiver(ZcashAddress::from_transparent_p2pkh(net, data)),
+        ))
+    }
+}
+
+impl Inspected {
+    fn single(network: NetworkType, kind: AddressKind, receiver: Receiver) -> Self {
+        Self {
+            network,
+            kind,
+            receivers: vec![receiver],
+        }
+    }
+}
+
+fn transparent_receiver(addr: ZcashAddress) -> Receiver {
+    Receiver {
+        pool: Pool::Transparent,
+        encoded: addr.encode(),
     }
 }
 
@@ -325,7 +331,7 @@ fn describe(
     let params = *wallet.params();
     let encoded = ua.encode(&params);
     let receivers = inspect(&encoded)
-        .map_err(|e| TxError::Internal(format!("re-parsing an own address: {e}")))?
+        .map_err(|e| internal("re-parsing an own address", e))?
         .receivers;
     let diversifier_index = wallet
         .list_addresses(account)
@@ -390,7 +396,7 @@ fn set_label(wallet: &mut Wallet, address: &str, label: &str) -> Result<(), TxEr
         )
     })
     .map(|_| ())
-    .map_err(|e: rusqlite::Error| TxError::Internal(format!("storing the label: {e}")))
+    .map_err(|e: rusqlite::Error| internal("storing the label", e))
 }
 
 fn label_of(wallet: &mut Wallet, address: &str) -> Result<Option<String>, TxError> {
@@ -402,7 +408,7 @@ fn label_of(wallet: &mut Wallet, address: &str) -> Result<Option<String>, TxErro
         )
         .optional()
     })
-    .map_err(|e: rusqlite::Error| TxError::Internal(format!("reading the label: {e}")))
+    .map_err(|e: rusqlite::Error| internal("reading the label", e))
 }
 
 #[cfg(test)]

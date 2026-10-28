@@ -38,8 +38,9 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::conn::ConnInfo;
 use crate::keys::{AUDIT_TARGET, proto_pool};
-use crate::service::{DaemonState, proto_network, unix_now};
-use crate::tx::{self, Purpose, blocking, obtain_key, proto_proposal, tx_error, with_wallet};
+use crate::service::{DaemonState, invalid, proto_network, unix_now};
+use crate::tx::{self, Purpose, blocking, obtain_key, proto_proposal, tx_error, wallet_rpc};
+use crate::with_wallet;
 
 /// The server-streaming response type for `SignPczt`.
 pub type SignStream = tonic::codegen::BoxStream<SignPcztEvent>;
@@ -86,10 +87,6 @@ fn parse_and_check(
         .into_status());
     }
     Ok((pczt, tags))
-}
-
-fn session_error(e: impl std::fmt::Display) -> TxError {
-    TxError::Internal(e.to_string())
 }
 
 fn proto_role(r: Role) -> PcztRole {
@@ -212,8 +209,7 @@ pub async fn create_pczt(
                 txid: None,
                 last_error: None,
             },
-        )
-        .map_err(session_error)?;
+        )?;
         Ok((proto, bytes, session_id))
     })
     .await
@@ -332,11 +328,7 @@ pub fn combine_pczt(
     req: CombinePcztRequest,
 ) -> Result<CombinePcztResponse, Status> {
     if req.pczts.len() < 2 {
-        return Err(GygesError::new(
-            ErrorReason::InvalidArgument,
-            "combine needs at least two PCZTs",
-        )
-        .into_status());
+        return Err(invalid("combine needs at least two PCZTs"));
     }
     let mut parsed = Vec::with_capacity(req.pczts.len());
     let mut first: Option<Tags> = None;
@@ -408,9 +400,7 @@ pub async fn broadcast_pczt(
     // The approved proposal, from the key's own table.
     let session_id = tags.session_id.clone();
     let sid = session_id.clone();
-    let row = with_wallet(&key, move |w| sessions::get(w, &sid).map_err(session_error))
-        .await
-        .map_err(err)?;
+    let row = wallet_rpc(&key, move |w| Ok(sessions::get(w, &sid)?)).await?;
     let Some(row) = row else {
         return Err(typed(
             ErrorReason::SessionNotFound,
@@ -437,38 +427,25 @@ pub async fn broadcast_pczt(
 
     // Verifier (Q-K7), then extract and record.
     let owner_params = state.registry.params();
-    let owner = with_wallet(&key, move |w| core_tx::Owner::of_wallet(&owner_params, w))
-        .await
-        .map_err(err)?;
+    let owner = wallet_rpc(&key, move |w| core_tx::Owner::of_wallet(&owner_params, w)).await?;
     let pczt = core_tx::verify(pczt, &expected, &owner).map_err(err)?;
     let provers = state.provers.clone();
-    let (txid, raw) = with_wallet(&key, move |w| core_tx::extract_and_store(w, pczt, &provers))
-        .await
-        .map_err(err)?;
-    let txid_hex = txid.to_string();
-    let raw_txid = *txid.as_ref();
-    let sid = session_id.clone();
-    if let Err(e) = route.send(&chain, raw, &key_id).await {
-        let text = if e.node_error.is_empty() {
-            e.detail.clone()
-        } else {
-            e.node_error.clone()
-        };
-        let _ = with_wallet(&key, move |w| {
-            sessions::set_state(w, &sid, SessionState::Signed, None, Some(&text))
-                .map_err(session_error)
-        })
-        .await;
-        return Err(e.into_status());
-    }
-    with_wallet(&key, move |w| {
-        sessions::set_state(w, &sid, SessionState::Broadcast, Some(raw_txid), None)
-            .map_err(session_error)
-    })
+    let (txid, raw) =
+        wallet_rpc(&key, move |w| core_tx::extract_and_store(w, pczt, &provers)).await?;
+    tx::broadcast_signed(&key, &chain, &route, &session_id, raw).await?;
+    tx::set_session_state(
+        &key,
+        &session_id,
+        SessionState::Broadcast,
+        Some(*txid.as_ref()),
+        None,
+    )
     .await
     .map_err(err)?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());
     tracing::info!(key_id, via = route.name(), "transaction broadcast");
     state.sync.wake();
-    Ok(BroadcastPcztResponse { txid: txid_hex })
+    Ok(BroadcastPcztResponse {
+        txid: txid.to_string(),
+    })
 }

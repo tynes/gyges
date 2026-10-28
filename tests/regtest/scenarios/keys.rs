@@ -372,31 +372,23 @@ fn import_keystone_through_the_binaries() {
     let old = keystone_export(Some("13.0.1"));
     let silent = keystone_export(None);
     let import = |extra: &[&str]| {
-        let mut args = vec!["key", "import-keystone", "--id", "ks"];
-        args.extend_from_slice(extra);
-        args.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        fx.gyges(&["key", "import-keystone", "--id", "ks"])
+            .args(extra)
     };
-    let run = |args: Vec<String>| {
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        fx.gyges(&refs)
-    };
-    let keys = fx.home().join("regtest/keys");
 
     // 6: not an accounts export.
-    run(import(&["--birthday", "1", "--ur", "uview1qqqq"]))
+    import(&["--birthday", "1", "--ur", "uview1qqqq"])
         .code(6)
         .stderr_has("import-ufvk");
     // 9: firmware below v3.0.2, in both numberings.
-    run(import(&["--birthday", "1", "--ur", &old]))
+    import(&["--birthday", "1", "--ur", &old])
         .code(9)
         .stderr_has("13.0.1 (v3.0.1 on the device)");
     // 4: no version and no flag; no birthday and no terminal.
-    run(import(&["--birthday", "1", "--ur", &silent]))
+    import(&["--birthday", "1", "--ur", &silent])
         .code(4)
         .stderr_has("--allow-unknown-firmware");
-    run(import(&["--ur", &good]))
-        .code(4)
-        .stderr_has("--birthday");
+    import(&["--ur", &good]).code(4).stderr_has("--birthday");
     // 6 before any question, with no --birthday: a lone UFVK as a UR, and
     // one frame of a multi-frame export.
     let lone = gyges_qr::Payload::Ufvk(gyges_qr::Account {
@@ -408,17 +400,15 @@ fn import_keystone_through_the_binaries() {
     .unwrap()
     .next_frame()
     .unwrap();
-    run(import(&["--ur", &lone]))
-        .code(6)
-        .stderr_has("import-ufvk");
+    import(&["--ur", &lone]).code(6).stderr_has("import-ufvk");
     assert!(good.lines().count() > 1, "the export should span frames");
-    run(import(&["--ur", good.lines().next().unwrap()]))
+    import(&["--ur", good.lines().next().unwrap()])
         .code(6)
         .stderr_has("incomplete");
-    assert!(!keys.join("ks").exists());
+    assert!(!fx.key_dir("ks").exists());
 
     // The frames on stdin, one per line.
-    let v = run(import(&["--birthday", "1", "--json"]))
+    let v = import(&["--birthday", "1", "--json"])
         .stdin(good.clone())
         .ok()
         .json();
@@ -444,16 +434,19 @@ fn import_keystone_through_the_binaries() {
     .stderr_has("firmware unknown")
     .stderr_has("warning: the Keystone does not report its firmware version");
 
-    let list = fx.gyges(&["key", "list", "--json"]).ok().json();
-    let ks = list["keys"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|k| k["key_id"] == "ks")
-        .unwrap()
-        .clone();
-    assert_eq!(ks["signing_mode"], "SIGNING_MODE_KEYSTONE_QR", "{ks}");
-    assert_eq!(ks["device_version"], "13.2.0");
+    // `ks` in `key list --json`: a Keystone key on the paired firmware.
+    let listed = |fx: &Fixture| {
+        let list = fx.gyges(&["key", "list", "--json"]).ok().json();
+        let ks = list["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["key_id"] == "ks")
+            .unwrap();
+        assert_eq!(ks["signing_mode"], "SIGNING_MODE_KEYSTONE_QR", "{ks}");
+        assert_eq!(ks["device_version"], "13.2.0");
+    };
+    listed(&fx);
     fx.gyges(&["key", "list"]).ok().stdout_has("keystone-qr");
     let wait = |fx: &Fixture| {
         fx.gyges(&[
@@ -489,15 +482,6 @@ fn import_keystone_through_the_binaries() {
     // A restart loads the seedless profile and keeps syncing it.
     fx.stop_daemon();
     fx.start_daemon(&["--zakura-rpc", n.url()]).unwrap();
-    let list = fx.gyges(&["key", "list", "--json"]).ok().json();
-    let ks = list["keys"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|k| k["key_id"] == "ks")
-        .unwrap()
-        .clone();
-    assert_eq!(ks["signing_mode"], "SIGNING_MODE_KEYSTONE_QR", "{ks}");
-    assert_eq!(ks["device_version"], "13.2.0");
+    listed(&fx);
     wait(&fx);
 }

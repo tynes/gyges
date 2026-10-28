@@ -282,9 +282,8 @@ pub trait ChainBackend: Send + Sync + fmt::Debug {
     /// mined and pruned, never seen). `txid` is in internal byte order.
     fn fetch_transaction(
         &self,
-        txid: [u8; 32],
+        _txid: [u8; 32],
     ) -> BoxFuture<'_, Result<Option<Vec<u8>>, ChainError>> {
-        let _ = txid;
         Box::pin(async {
             Err(ChainError::Rpc(
                 "no transaction lookup on this backend".into(),
@@ -374,19 +373,6 @@ pub(crate) fn innermost_error(e: &dyn std::error::Error) -> String {
         cur = next;
     }
     cur.to_string()
-}
-
-/// Compile-time proof that the upstream module paths cited in the design
-/// documents exist under the `package =` renames in `Cargo.toml`.
-#[allow(unused_imports)]
-mod paths_compile {
-    use zcash_client_backend::data_api::chain::{
-        BlockCache, BlockSource, CommitmentTreeRoot, scan_cached_blocks,
-    };
-    use zcash_client_backend::data_api::{WalletCommitmentTrees, WalletRead, WalletWrite};
-    use zcash_client_backend::proto::compact_formats::CompactBlock;
-    use zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient;
-    use zcash_client_backend::tor::{self, Client, Timeouts};
 }
 
 #[cfg(test)]

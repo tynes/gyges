@@ -5,7 +5,7 @@
 //! both sides need them identically:
 //!
 //! * the API version constants (API.md §2);
-//! * [`GygesError`] ⇄ [`tonic::Status`] conversion through
+//! * [`v1::GygesError`] ⇄ [`tonic::Status`] conversion through
 //!   `grpc-status-details-bin` (API.md §3);
 //! * the `google.rpc.Status` envelope those details travel in;
 //! * [`uds::connect`], the Unix-domain-socket connector (API.md §1.1);
@@ -69,11 +69,12 @@ impl v1::ErrorReason {
             | R::ConfirmationRequired
             | R::NotSynced
             | R::Airgapped
-            | R::FallbackUnavailable => Code::FailedPrecondition,
+            | R::FallbackUnavailable
+            | R::InsufficientFunds
+            | R::HardwareSigner => Code::FailedPrecondition,
             R::SeedExportDisabled | R::PermissionDenied => Code::PermissionDenied,
             R::InvalidPassphrase => Code::Unauthenticated,
             R::RateLimited => Code::ResourceExhausted,
-            R::InsufficientFunds => Code::FailedPrecondition,
             R::InvalidArgument
             | R::NetworkMismatch
             | R::KeyMismatch
@@ -83,7 +84,6 @@ impl v1::ErrorReason {
             R::KeyExists => Code::AlreadyExists,
             R::NodeUnreachable => Code::Unavailable,
             R::Cancelled => Code::Cancelled,
-            R::HardwareSigner => Code::FailedPrecondition,
             R::NodeRejected => Code::Aborted,
         }
     }
@@ -95,10 +95,8 @@ impl v1::GygesError {
     pub fn new(reason: v1::ErrorReason, detail: impl Into<String>) -> Self {
         Self {
             reason: reason as i32,
-            key_id: String::new(),
-            session_id: String::new(),
             detail: detail.into(),
-            node_error: String::new(),
+            ..Default::default()
         }
     }
 
@@ -214,30 +212,14 @@ pub mod uds {
     }
 
     /// Why [`connect`] failed.
-    #[derive(Debug)]
+    #[derive(Debug, thiserror::Error)]
     pub enum ConnectError {
         /// The socket could not be opened; see the kind.
-        Io(std::io::Error),
+        #[error("cannot connect to the daemon socket: {0}")]
+        Io(#[source] std::io::Error),
         /// The tonic endpoint could not be built (never expected in practice).
-        Transport(tonic::transport::Error),
-    }
-
-    impl std::fmt::Display for ConnectError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::Io(e) => write!(f, "cannot connect to the daemon socket: {e}"),
-                Self::Transport(e) => write!(f, "cannot build the gRPC channel: {e}"),
-            }
-        }
-    }
-
-    impl std::error::Error for ConnectError {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            match self {
-                Self::Io(e) => Some(e),
-                Self::Transport(e) => Some(e),
-            }
-        }
+        #[error("cannot build the gRPC channel: {0}")]
+        Transport(#[source] tonic::transport::Error),
     }
 }
 

@@ -1,12 +1,17 @@
 //! `gyges daemon …` (CLI_SPEC.md §2.1, API.md §7).
 
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use anyhow::anyhow;
 use clap::{Args, Subcommand};
 use gyges_proto::uds;
-use gyges_proto::v1::{GetInfoResponse, LogEntry, LogLevel, ShutdownRequest, StreamLogsRequest};
+use gyges_proto::v1::{
+    FallbackTrust, GetInfoResponse, LogEntry, LogLevel, ShutdownRequest, StreamLogsRequest,
+    TorState,
+};
 
 use crate::client::Ctx;
 use crate::exit::CliError;
@@ -125,14 +130,13 @@ async fn start(ctx: &Ctx, args: StartArgs) -> Result<(), CliError> {
     // the network).
     match ctx.connect().await {
         Ok(conn) => {
-            ctx.report(&conn.info, || {
+            return ctx.report(&conn.info, || {
                 eprintln!(
                     "gygesd is already running for {} (since {})",
                     conn.info.network().name(),
                     format_unix(conn.info.started_at)
                 );
-            })?;
-            return Ok(());
+            });
         }
         Err(CliError::Unreachable { .. }) => {}
         Err(e) => return Err(e),
@@ -148,21 +152,13 @@ async fn start(ctx: &Ctx, args: StartArgs) -> Result<(), CliError> {
         // for it rather than dying first.
         cmd.arg("--foreground");
         let mut child = cmd.spawn().map_err(|e| spawn_error(&bin, e))?;
-        let ignore_ctrl_c = tokio::spawn(async {
-            loop {
-                if tokio::signal::ctrl_c().await.is_err() {
-                    break;
-                }
-            }
-        });
+        let ignore_ctrl_c = tokio::spawn(async { while tokio::signal::ctrl_c().await.is_ok() {} });
         let status = child.wait().await?;
         ignore_ctrl_c.abort();
         return if status.success() {
             Ok(())
         } else {
-            Err(CliError::Other(anyhow::anyhow!(
-                "gygesd exited with {status}"
-            )))
+            Err(anyhow!("gygesd exited with {status}").into())
         };
     }
 
@@ -175,14 +171,15 @@ async fn start(ctx: &Ctx, args: StartArgs) -> Result<(), CliError> {
         .map_err(|e| spawn_error(&bin, e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::Other(anyhow::anyhow!(
+        return Err(anyhow!(
             "gygesd failed to start ({}): {}",
             output.status,
             stderr
                 .trim()
                 .strip_prefix("gygesd: ")
                 .unwrap_or(stderr.trim())
-        )));
+        )
+        .into());
     }
     let conn = ctx.connect().await?;
     ctx.report(&conn.info, || {
@@ -196,11 +193,12 @@ async fn start(ctx: &Ctx, args: StartArgs) -> Result<(), CliError> {
     })
 }
 
-fn spawn_error(bin: &std::path::Path, e: std::io::Error) -> CliError {
-    CliError::Other(anyhow::anyhow!(
+fn spawn_error(bin: &Path, e: std::io::Error) -> CliError {
+    anyhow!(
         "cannot run {} ({e}); set {DAEMON_BIN_ENV} or put gygesd on PATH",
         bin.display()
-    ))
+    )
+    .into()
 }
 
 async fn stop(ctx: &Ctx, force: bool) -> Result<(), CliError> {
@@ -216,10 +214,11 @@ async fn stop(ctx: &Ctx, force: bool) -> Result<(), CliError> {
     let deadline = Instant::now() + Duration::from_secs(60);
     while uds::probe(&ctx.socket).await.is_ok() || ctx.socket.exists() {
         if Instant::now() > deadline {
-            return Err(CliError::Other(anyhow::anyhow!(
+            return Err(anyhow!(
                 "gygesd acknowledged the shutdown but {} is still open after 60s",
                 ctx.socket.display()
-            )));
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -235,7 +234,6 @@ async fn status(ctx: &Ctx) -> Result<(), CliError> {
 
 /// Human-readable `daemon status` (CLI_SPEC.md §2.1).
 pub fn render_status(info: &GetInfoResponse) -> String {
-    use std::fmt::Write as _;
     let api = info.api_version.unwrap_or_default();
     let mut s = String::new();
     let _ = writeln!(
@@ -284,12 +282,11 @@ pub fn render_status(info: &GetInfoResponse) -> String {
         "  tor:          {}",
         match tor.state() {
             // Tor configured but not needed yet (it bootstraps on the first backfill).
-            gyges_proto::v1::TorState::Unspecified => "not started".to_string(),
-            gyges_proto::v1::TorState::Disabled => "disabled".to_string(),
-            gyges_proto::v1::TorState::Bootstrapping =>
-                format!("bootstrapping {}%", tor.bootstrap_percent),
-            gyges_proto::v1::TorState::Ready => "ready".to_string(),
-            gyges_proto::v1::TorState::Failed => format!("failed ({})", tor.last_error),
+            TorState::Unspecified => "not started".to_string(),
+            TorState::Disabled => "disabled".to_string(),
+            TorState::Bootstrapping => format!("bootstrapping {}%", tor.bootstrap_percent),
+            TorState::Ready => "ready".to_string(),
+            TorState::Failed => format!("failed ({})", tor.last_error),
         }
     );
     match &info.fallback {
@@ -300,8 +297,8 @@ pub fn render_status(info: &GetInfoResponse) -> String {
                 f.grpc_url,
                 if f.use_tor { "over Tor" } else { "direct" },
                 match f.trust() {
-                    gyges_proto::v1::FallbackTrust::Verified => "verified",
-                    gyges_proto::v1::FallbackTrust::Untrusted => "UNTRUSTED",
+                    FallbackTrust::Verified => "verified",
+                    FallbackTrust::Untrusted => "UNTRUSTED",
                     _ => "untested",
                 }
             );
@@ -360,12 +357,10 @@ async fn logs(ctx: &Ctx, follow: bool, lines: u32, audit: bool) -> Result<(), Cl
         })
         .await?
         .into_inner();
-    loop {
-        let Some(entry) = Ctx::next_or_cancel(&mut stream).await? else {
-            return Ok(());
-        };
+    while let Some(entry) = Ctx::next_or_cancel(&mut stream).await? {
         ctx.print(&entry, || format!("{}\n", render_log(&entry)))?;
     }
+    Ok(())
 }
 
 fn render_log(e: &LogEntry) -> String {
@@ -380,7 +375,7 @@ fn render_log(e: &LogEntry) -> String {
     };
     let mut s = format!("{} {level} {}: {}", format_unix(secs), e.target, e.message);
     for (k, v) in &e.fields {
-        s.push_str(&format!(" {k}={v}"));
+        let _ = write!(s, " {k}={v}");
     }
     s
 }

@@ -299,8 +299,9 @@ pub fn inspect(params: &ConsensusParams, pczt: &Pczt) -> Result<Inspection, TxEr
     }
     let sapling_spends = pczt.sapling().spends().len() as u32;
     if sapling_spends > 0 {
-        // Sapling spends are never proposed in this milestone (Q-K3); their
-        // value is not readable from the file without the key.
+        // A Gyges PCZT file never carries a Sapling spend (`pczt create`
+        // leaves Sapling notes out; prove and sign refuse one), so their
+        // value is not read here and shows as 0.
         inputs.push(InputSummary {
             pool: Pool::Sapling,
             count: sapling_spends,

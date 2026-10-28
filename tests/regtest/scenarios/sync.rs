@@ -1,6 +1,6 @@
 //! `gyges sync status / wait / run` through the binaries against an
-//! in-process fake `zakurad` (TESTING.md §2: the stand-in until a pinned
-//! node is wired in). Covers the daemon reaching the tip for a new key, the
+//! in-process fake `zakurad` (TESTING.md §2; the real-node runs are in
+//! `scenarios/node.rs`). Covers the daemon reaching the tip for a new key, the
 //! node bounds in `daemon status`, the exit-7 stall on a prune race and the
 //! `--from` rewind confirmation.
 
@@ -148,9 +148,8 @@ fn restore_below_the_window_asks_consent_warns_and_backfills() {
     fx.start_daemon(&["--zakura-rpc", n.url()]).unwrap();
     let pw = fx.passphrase_file("restore-passphrase-0001");
     let restore = |extra: &[&str]| {
-        let mut args = vec!["key", "restore", "--id", "r", "--stdin", "--birthday", "4"];
-        args.extend_from_slice(extra);
-        fx.gyges(&args)
+        fx.gyges(&["key", "restore", "--id", "r", "--stdin", "--birthday", "4"])
+            .args(extra)
             .env("GYGES_PASSPHRASE_FILE", &pw)
             .stdin(mnemonic())
     };

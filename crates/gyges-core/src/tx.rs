@@ -331,13 +331,12 @@ fn spendable_total(
     spend_pools: &[Pool],
     min_confirmations: u32,
 ) -> Result<Zatoshis, TxError> {
-    let b = balance(wallet, min_confirmations)?;
-    let mut total = 0u64;
-    for p in &b.pools {
-        if spend_pools.contains(&p.pool) {
-            total += p.spendable;
-        }
-    }
+    let total = balance(wallet, min_confirmations)?
+        .pools
+        .iter()
+        .filter(|p| spend_pools.contains(&p.pool))
+        .map(|p| p.spendable)
+        .sum();
     Zatoshis::from_u64(total).map_err(|e| internal("balance", e))
 }
 
@@ -350,9 +349,7 @@ pub fn propose_shield(
     threshold: u64,
     min_confirmations: u32,
 ) -> Result<ShieldProposal, TxError> {
-    let receivers: Vec<_> = wallet
-        .get_transparent_receivers(account, true, true)
-        .map_err(|e| internal("listing transparent receivers", e))?
+    let receivers: Vec<_> = transparent_receivers(wallet, account)?
         .into_keys()
         .collect();
     if receivers.is_empty() {
@@ -667,20 +664,19 @@ pub fn proving_work(pczt: &Pczt) -> ProvingWork {
     }
 }
 
-/// Why a Sapling spend without its proof generation key goes no further:
-/// the key is derived from the seed and never leaves the stream that
-/// unlocked it (THREAT_MODEL.md §6 item 1), so only `tx send` proves and
-/// signs one.
-const SAPLING_SPEND_IN_STREAM_ONLY: &str = "a Sapling spend is proven and signed only inside `gyges tx send` on the key that owns it (THREAT_MODEL.md §6 item 1)";
-
-/// The Sapling spends that carry no proof generation key: every real spend
-/// before [`insert_proof_generation_keys`]; a dummy carries its own.
-fn unkeyed_sapling_spends(pczt: Pczt) -> Result<(Pczt, usize), TxError> {
+/// `UNSUPPORTED_POOL` for a PCZT with a Sapling spend that does not carry
+/// its proof generation key (every real spend before
+/// [`insert_proof_generation_keys`]; a dummy carries its own): [`prove`]
+/// and [`sign`] call it, and so does `SignPczt` before it asks for a
+/// passphrase. The key is derived from the seed and never leaves the
+/// stream that unlocked it (THREAT_MODEL.md §6 item 1), so only `tx send`
+/// proves and signs one.
+pub fn refuse_unkeyed_sapling_spends(pczt: Pczt) -> Result<Pczt, TxError> {
     if pczt.sapling().spends().is_empty() {
-        return Ok((pczt, 0));
+        return Ok(pczt);
     }
     let mut unkeyed = 0;
-    let verifier = Verifier::new(pczt)
+    let pczt = Verifier::new(pczt)
         .with_sapling::<Infallible, _>(|bundle| {
             unkeyed = bundle
                 .spends()
@@ -689,18 +685,11 @@ fn unkeyed_sapling_spends(pczt: Pczt) -> Result<(Pczt, usize), TxError> {
                 .count();
             Ok(())
         })
-        .map_err(|e| TxError::InvalidArgument(format!("sapling bundle: {e:?}")))?;
-    Ok((verifier.finish(), unkeyed))
-}
-
-/// `UNSUPPORTED_POOL` for a PCZT with a Sapling spend that does not carry
-/// its proof generation key: [`prove`] and [`sign`] call it, and so does
-/// `SignPczt` before it asks for a passphrase.
-pub fn refuse_unkeyed_sapling_spends(pczt: Pczt) -> Result<Pczt, TxError> {
-    let (pczt, unkeyed) = unkeyed_sapling_spends(pczt)?;
+        .map_err(|e| TxError::InvalidArgument(format!("sapling bundle: {e:?}")))?
+        .finish();
     if unkeyed > 0 {
         return Err(TxError::UnsupportedPool(format!(
-            "this PCZT spends {unkeyed} Sapling note(s); {SAPLING_SPEND_IN_STREAM_ONLY}"
+            "this PCZT spends {unkeyed} Sapling note(s); a Sapling spend is proven and signed only inside `gyges tx send` on the key that owns it (THREAT_MODEL.md §6 item 1)"
         )));
     }
     Ok(pczt)
@@ -778,7 +767,7 @@ pub fn insert_proof_generation_keys(pczt: Pczt, usk: &UnifiedSpendingKey) -> Res
 /// first, inside `tx send` only).
 pub fn prove(pczt: Pczt, provers: &Provers) -> Result<Pczt, TxError> {
     let branch = BranchId::try_from(*pczt.global().consensus_branch_id())
-        .map_err(|e| TxError::Internal(format!("unknown consensus branch in the PCZT: {e}")))?;
+        .map_err(|e| internal("unknown consensus branch in the PCZT", e))?;
     let pczt = refuse_unkeyed_sapling_spends(pczt)?;
     let mut prover = Prover::new(pczt);
     if prover.requires_orchard_proof() || prover.requires_ironwood_proof() {
@@ -825,14 +814,18 @@ fn next_max(amount: u64, available: u64, required: u64, total: u64) -> u64 {
     have.saturating_sub(fee)
 }
 
+fn account_id(index: u32) -> Result<zip32::AccountId, TxError> {
+    zip32::AccountId::try_from(index)
+        .map_err(|_| TxError::Internal("account index out of range".into()))
+}
+
 /// Derive the account's spending key from decrypted entropy.
 pub fn spending_key(
     params: &ConsensusParams,
     entropy: &Entropy,
     account_index: u32,
 ) -> Result<UnifiedSpendingKey, TxError> {
-    let account = zip32::AccountId::try_from(account_index)
-        .map_err(|_| TxError::Internal("account index out of range".into()))?;
+    let account = account_id(account_index)?;
     let seed = seed_from_entropy(entropy);
     UnifiedSpendingKey::from_seed(params, seed.expose_secret(), account)
         .map_err(|e| TxError::Internal(format!("key derivation failed: {e:?}")))
@@ -864,8 +857,7 @@ impl SignerId {
             .ok_or_else(|| {
                 TxError::Internal("the profile's seed fingerprint is malformed".into())
             })?;
-        let account = zip32::AccountId::try_from(profile.account_index)
-            .map_err(|_| TxError::Internal("account index out of range".into()))?;
+        let account = account_id(profile.account_index)?;
         Ok(Self {
             params: *params,
             seed_fingerprint: zip32::fingerprint::SeedFingerprint::from_bytes(bytes),
@@ -921,8 +913,6 @@ pub fn sign(
     usk: &UnifiedSpendingKey,
     signer: &SignerId,
 ) -> Result<Pczt, TxError> {
-    use pczt::roles::signer::Error as SignErr;
-
     // Which key signs which transparent input, decided before the Signer
     // takes the PCZT.
     let mut transparent_keys = Vec::new();
@@ -942,12 +932,7 @@ pub fn sign(
                 (Some(path), _) => path,
                 (None, Some(wallet)) => {
                     if receivers.is_none() {
-                        let account = account_of(wallet)?;
-                        receivers = Some(
-                            wallet
-                                .get_transparent_receivers(account, true, true)
-                                .map_err(|e| internal("listing transparent receivers", e))?,
-                        );
+                        receivers = Some(transparent_receivers(wallet, account_of(wallet)?)?);
                     }
                     wallet_path(receivers.as_ref().expect("set above"), script, i)?
                 }
@@ -960,7 +945,7 @@ pub fn sign(
             let sk = usk
                 .transparent()
                 .derive_secret_key(scope, index)
-                .map_err(|e| TxError::Internal(format!("transparent key derivation: {e}")))?;
+                .map_err(|e| internal("transparent key derivation", e))?;
             transparent_keys.push((i, sk));
         }
         pczt
@@ -977,33 +962,12 @@ pub fn sign(
     let mut signer = Signer::new(pczt)
         .map_err(|e| TxError::Internal(format!("the PCZT cannot be signed: {e:?}")))?;
     let ask = orchard::keys::SpendAuthorizingKey::from(usk.orchard());
-    for index in 0.. {
-        match signer.sign_orchard(index, &ask) {
-            Err(SignErr::InvalidIndex) => break,
-            Ok(())
-            | Err(SignErr::OrchardSign(orchard::pczt::SignerError::WrongSpendAuthorizingKey)) => {}
-            Err(e) => return Err(TxError::Internal(format!("orchard signing failed: {e:?}"))),
-        }
-    }
-    for index in 0.. {
-        match signer.sign_ironwood(index, &ask) {
-            Err(SignErr::InvalidIndex) => break,
-            Ok(())
-            | Err(SignErr::IronwoodSign(orchard::pczt::SignerError::WrongSpendAuthorizingKey)) => {}
-            Err(e) => return Err(TxError::Internal(format!("ironwood signing failed: {e:?}"))),
-        }
-    }
-    // Sapling: one `ask` for both scopes (ZIP 32 internal keys keep it);
-    // dummies, signed by the IO Finalizer, answer `WrongSpendAuthorizingKey`.
-    let sapling_ask = &usk.sapling().expsk.ask;
-    for index in 0.. {
-        match signer.sign_sapling(index, sapling_ask) {
-            Err(SignErr::InvalidIndex) => break,
-            Ok(())
-            | Err(SignErr::SaplingSign(sapling::pczt::SignerError::WrongSpendAuthorizingKey)) => {}
-            Err(e) => return Err(TxError::Internal(format!("sapling signing failed: {e:?}"))),
-        }
-    }
+    sign_each("orchard", |i| signer.sign_orchard(i, &ask))?;
+    sign_each("ironwood", |i| signer.sign_ironwood(i, &ask))?;
+    // Sapling: one `ask` for both scopes (ZIP 32 internal keys keep it).
+    sign_each("sapling", |i| {
+        signer.sign_sapling(i, &usk.sapling().expsk.ask)
+    })?;
     for (index, sk) in &transparent_keys {
         signer
             .sign_transparent(*index, sk)
@@ -1012,16 +976,32 @@ pub fn sign(
     Ok(signer.finish())
 }
 
+/// Sign every spend of one pool. Spends that are not ours, and dummies
+/// (signed by the IO Finalizer), answer `WrongSpendAuthorizingKey` and are
+/// skipped, as upstream does.
+fn sign_each(
+    pool: &str,
+    mut sign: impl FnMut(usize) -> Result<(), pczt::roles::signer::Error>,
+) -> Result<(), TxError> {
+    use orchard::pczt::SignerError::WrongSpendAuthorizingKey as WrongOrchardKey;
+    use pczt::roles::signer::Error as SignErr;
+    use sapling::pczt::SignerError::WrongSpendAuthorizingKey as WrongSaplingKey;
+    for index in 0.. {
+        match sign(index) {
+            Err(SignErr::InvalidIndex) => break,
+            Ok(())
+            | Err(SignErr::OrchardSign(WrongOrchardKey))
+            | Err(SignErr::IronwoodSign(WrongOrchardKey))
+            | Err(SignErr::SaplingSign(WrongSaplingKey)) => {}
+            Err(e) => return Err(TxError::Internal(format!("{pool} signing failed: {e:?}"))),
+        }
+    }
+    Ok(())
+}
+
 /// The derivation of the wallet address `script` pays, for an input without
 /// a BIP 44 derivation of its own.
-fn wallet_path(
-    receivers: &std::collections::HashMap<
-        transparent::address::TransparentAddress,
-        zcash_client_backend::wallet::TransparentAddressMetadata,
-    >,
-    script: &[u8],
-    i: usize,
-) -> Result<Bip44Path, TxError> {
+fn wallet_path(receivers: &Receivers, script: &[u8], i: usize) -> Result<Bip44Path, TxError> {
     let addr = gyges_chain::compact::address_of_script(script).ok_or_else(|| {
         TxError::Internal(format!("transparent input {i} has an unrecognised script"))
     })?;
@@ -1164,15 +1144,44 @@ impl Owner {
     }
 }
 
+type Receivers = std::collections::HashMap<
+    transparent::address::TransparentAddress,
+    zcash_client_backend::wallet::TransparentAddressMetadata,
+>;
+
+/// Every transparent receiver of `account`, ephemeral and change included.
+fn transparent_receivers(wallet: &Wallet, account: AccountUuid) -> Result<Receivers, TxError> {
+    wallet
+        .get_transparent_receivers(account, true, true)
+        .map_err(|e| internal("listing transparent receivers", e))
+}
+
 fn wallet_transparent(
     wallet: &Wallet,
 ) -> Result<std::collections::HashSet<transparent::address::TransparentAddress>, TxError> {
-    let account = account_of(wallet)?;
-    Ok(wallet
-        .get_transparent_receivers(account, true, true)
-        .map_err(|e| internal("listing transparent receivers", e))?
+    Ok(transparent_receivers(wallet, account_of(wallet)?)?
         .into_keys()
         .collect())
+}
+
+/// Rules 2 and 3 of [`check_change`] for one output: a recipient label
+/// must name what the output pays (`label_matches`, `None` without a
+/// label), and an unlabelled output is change that must be this key's.
+fn recipient_problem(
+    what: &str,
+    paid: &str,
+    label_matches: Option<bool>,
+    foreign_change: impl FnOnce() -> bool,
+) -> Option<String> {
+    match label_matches {
+        Some(false) => Some(format!(
+            "{what}: its recipient address label does not match the {paid} it pays"
+        )),
+        None if foreign_change() => Some(format!(
+            "{what} is change (no recipient address) that does not belong to this key"
+        )),
+        _ => None,
+    }
 }
 
 /// Check what a PCZT says about its outputs before anything relies on it,
@@ -1206,19 +1215,21 @@ pub fn check_change(pczt: Pczt, owner: &Owner) -> Result<Pczt, TxError> {
         .with_transparent::<Infallible, _>(|bundle| {
             for (i, o) in bundle.outputs().iter().enumerate() {
                 let script = scripts.get(i).map(Vec::as_slice).unwrap_or_default();
-                match o.user_address() {
-                    Some(s) => {
-                        let pays = label(s)
-                            .and_then(|a| a.to_transparent_address())
-                            .map(|t| transparent::address::Script::from(t.script()).0.0.clone());
-                        if pays.as_deref() != Some(script) {
-                            flag(format!("transparent output {i}: its recipient address label does not match the script it pays"));
-                        }
-                    }
-                    None if *o.value() > Zatoshis::ZERO && !owner.owns_script(script) => {
-                        flag(format!("transparent output {i} is change (no recipient address) that does not belong to this key"));
-                    }
-                    None => {}
+                let matches = o.user_address().as_deref().map(|s| {
+                    label(s)
+                        .and_then(|a| a.to_transparent_address())
+                        .map(|t| transparent::address::Script::from(t.script()).0.0.clone())
+                        .as_deref()
+                        == Some(script)
+                });
+                let foreign = || *o.value() > Zatoshis::ZERO && !owner.owns_script(script);
+                if let Some(p) = recipient_problem(
+                    &format!("transparent output {i}"),
+                    "script",
+                    matches,
+                    foreign,
+                ) {
+                    flag(p);
                 }
             }
             Ok(())
@@ -1243,24 +1254,17 @@ pub fn check_change(pczt: Pczt, owner: &Owner) -> Result<Pczt, TxError> {
                 continue; // unreachable: the note commitment needs both
             };
             let raw = recipient.to_raw_address_bytes();
-            match out.user_address() {
-                Some(s) => {
-                    let pays = label(s).and_then(|a| match a {
-                        Address::Unified(ua) => ua.orchard().map(|o| o.to_raw_address_bytes()),
-                        _ => None,
-                    });
-                    if pays != Some(raw) {
-                        flag(format!(
-                            "{pool} action {i}: its recipient address label does not match the note it pays"
-                        ));
-                    }
-                }
-                None if value.inner() > 0 && !owner.owns_orchard(&raw) => {
-                    flag(format!(
-                        "{pool} action {i} is change (no recipient address) that does not belong to this key"
-                    ));
-                }
-                None => {}
+            let matches = out.user_address().as_deref().map(|s| {
+                label(s).and_then(|a| match a {
+                    Address::Unified(ua) => ua.orchard().map(|o| o.to_raw_address_bytes()),
+                    _ => None,
+                }) == Some(raw)
+            });
+            let foreign = || value.inner() > 0 && !owner.owns_orchard(&raw);
+            if let Some(p) =
+                recipient_problem(&format!("{pool} action {i}"), "note", matches, foreign)
+            {
+                flag(p);
             }
         }
     };
@@ -1278,30 +1282,32 @@ pub fn check_change(pczt: Pczt, owner: &Owner) -> Result<Pczt, TxError> {
         .with_sapling::<Infallible, _>(|bundle| {
             for (i, o) in bundle.outputs().iter().enumerate() {
                 if let Err(e) = o.verify_note_commitment() {
-                    flag(format!("Sapling output {i}: it does not match its note commitment ({e:?})"));
+                    flag(format!(
+                        "Sapling output {i}: it does not match its note commitment ({e:?})"
+                    ));
                     continue;
                 }
                 if let Err(e) = o.verify_cv() {
-                    flag(format!("Sapling output {i}: its value does not match the value commitment ({e:?})"));
+                    flag(format!(
+                        "Sapling output {i}: its value does not match the value commitment ({e:?})"
+                    ));
                     continue;
                 }
                 let (Some(recipient), Some(value)) = (o.recipient(), o.value()) else {
                     continue; // unreachable: the note commitment needs both
                 };
                 let raw = recipient.to_bytes();
-                match o.user_address() {
-                    Some(s) => {
-                        let pays = label(s)
-                            .and_then(|a| a.to_sapling_address())
-                            .map(|a| a.to_bytes());
-                        if pays != Some(raw) {
-                            flag(format!("Sapling output {i}: its recipient address label does not match the note it pays"));
-                        }
-                    }
-                    None if value.inner() > 0 && !owner.owns_sapling(&raw) => {
-                        flag(format!("Sapling output {i} is change (no recipient address) that does not belong to this key"));
-                    }
-                    None => {}
+                let matches = o.user_address().as_deref().map(|s| {
+                    label(s)
+                        .and_then(|a| a.to_sapling_address())
+                        .map(|a| a.to_bytes())
+                        == Some(raw)
+                });
+                let foreign = || value.inner() > 0 && !owner.owns_sapling(&raw);
+                if let Some(p) =
+                    recipient_problem(&format!("Sapling output {i}"), "note", matches, foreign)
+                {
+                    flag(p);
                 }
             }
             Ok(())
@@ -1653,7 +1659,7 @@ pub fn extract_and_store(
         sapling_vks.as_ref().map(|(s, o)| (s, o)),
         Some(orchard_vk),
     )
-    .map_err(|e| TxError::Internal(format!("extracting the transaction failed: {e}")))?;
+    .map_err(|e| internal("extracting the transaction failed", e))?;
     let (_, raw) = stored_transaction(wallet, txid)?;
     Ok((txid, raw))
 }
@@ -1792,10 +1798,8 @@ fn run_create_proposed<N: fmt::Display>(
     expiry: BlockHeight,
 ) -> Result<Vec<TxId>, TxError> {
     let keys = SpendingKeys::from_unified_spending_key(usk);
-    // The Sapling prover is only consulted for Sapling spends or outputs,
-    // of which a ZIP 320 transfer from an Orchard/Ironwood wallet has none;
-    // the builder still wants one, and the bundled parameters load once per
-    // daemon.
+    // The builder consults the Sapling prover only for Sapling spends or
+    // outputs; the bundled parameters load once per daemon.
     let sapling = provers.sapling();
     let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, N>(
         wallet,

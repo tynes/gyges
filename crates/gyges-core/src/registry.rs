@@ -242,18 +242,14 @@ impl KeyRegistry {
             default_key: RwLock::new(config.default_key.clone()),
             keys: RwLock::new(BTreeMap::new()),
         };
-        let entries = std::fs::read_dir(&keys_dir).map_err(|source| RegistryError::Io {
+        let list_err = |source| RegistryError::Io {
             context: "cannot list",
             path: keys_dir.clone(),
             source,
-        })?;
+        };
         let mut loaded = BTreeMap::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| RegistryError::Io {
-                context: "cannot list",
-                path: keys_dir.clone(),
-                source,
-            })?;
+        for entry in std::fs::read_dir(&keys_dir).map_err(list_err)? {
+            let entry = entry.map_err(list_err)?;
             let path = entry.path();
             if !path.is_dir() {
                 // Stray files (editor backups, .DS_Store) are ignored; the
@@ -374,10 +370,7 @@ impl KeyRegistry {
                 error: WalletMigrationError::SeedRequired,
                 ..
             }) => Err(RegistryError::SeedRequiredForMigration(key_id.to_string())),
-            Err(e) => Err(RegistryError::Wallet {
-                key_id: key_id.to_string(),
-                detail: e.to_string(),
-            }),
+            Err(e) => Err(wallet_error(key_id, e)),
         }
     }
 

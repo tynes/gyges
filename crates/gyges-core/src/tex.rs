@@ -37,11 +37,7 @@ pub const MIGRATION: ExtTable = ExtTable {
 };
 
 fn create_table() -> String {
-    let states = TexState::ALL
-        .iter()
-        .map(|s| format!("'{}'", s.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let states = quoted(&TexState::ALL);
     format!(
         "CREATE TABLE {TABLE} (
             step1_txid       BLOB NOT NULL PRIMARY KEY,
@@ -95,10 +91,23 @@ pub struct TexRow {
 pub enum TexQueueError {
     #[error("tex queue: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("tex queue: row {0} has an unknown state {1:?}")]
-    BadState(String, String),
     #[error("tex queue: no row for step-1 txid {0}")]
     NotFound(String),
+}
+
+impl From<TexQueueError> for crate::TxError {
+    fn from(e: TexQueueError) -> Self {
+        Self::Internal(e.to_string())
+    }
+}
+
+/// `states` as a SQL list of string literals.
+fn quoted(states: &[TexState]) -> String {
+    states
+        .iter()
+        .map(|s| format!("'{}'", s.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn read_row(r: &rusqlite::Row<'_>) -> Result<TexRow, rusqlite::Error> {
@@ -123,7 +132,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> Result<TexRow, rusqlite::Error> {
         recipient: r.get(6)?,
         amount: r.get::<_, i64>(7)?.try_into().unwrap_or(0),
         expiry_height: r.get::<_, i64>(8)?.try_into().unwrap_or(0),
-        // Checked by the caller; the CHECK constraint keeps it valid.
+        // The CHECK constraint keeps it valid.
         state: TexState::parse(&state).unwrap_or(TexState::Failed),
         created_at: r.get(10)?,
         last_attempt_at: r.get(11)?,
@@ -183,11 +192,7 @@ pub fn list_ids(wallet: &mut Wallet, states: &[TexState]) -> Result<Vec<[u8; 32]
     if states.is_empty() {
         return Ok(Vec::new());
     }
-    let filter = states
-        .iter()
-        .map(|s| format!("'{}'", s.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let filter = quoted(states);
     let rest = format!("FROM {TABLE} WHERE state IN ({filter}) ORDER BY created_at, step1_txid");
     let mut out = Vec::new();
     for h in query_ids(wallet, "hex(step1_txid)", &rest)? {
@@ -212,14 +217,10 @@ pub fn list(wallet: &mut Wallet, include_finished: bool) -> Result<Vec<TexRow>, 
         .into_iter()
         .filter(|s| include_finished || !s.is_terminal())
         .collect();
-    let ids = list_ids(wallet, &states)?;
-    let mut rows = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(row) = get(wallet, id)? {
-            rows.push(row);
-        }
-    }
-    Ok(rows)
+    list_ids(wallet, &states)?
+        .into_iter()
+        .filter_map(|id| get(wallet, id).transpose())
+        .collect()
 }
 
 /// Move a row to `state`, replacing `last_error` (`None` clears it).

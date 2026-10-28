@@ -2459,7 +2459,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "bytes",
  "futures-util",
  "gyges-chain",
  "hex",
@@ -2505,7 +2504,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-stream",
  "tonic",
  "zeroize",
 ]
@@ -2566,6 +2564,7 @@ dependencies = [
  "prost-types 0.14.4",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
  "tokio",
  "tonic",
  "tonic-prost",
@@ -2630,7 +2629,6 @@ dependencies = [
  "nix",
  "proptest",
  "prost 0.14.4",
- "rand 0.10.3",
  "secrecy 0.8.0",
  "serde",
  "serde_json",

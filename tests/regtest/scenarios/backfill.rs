@@ -23,7 +23,7 @@ fn zaino_serves_what_the_pruned_node_dropped() {
     let Some(mut fb) = Fallback::start_or_skip(NodeOpts::default()) else {
         return;
     };
-    fb.mine(FINALITY_DEPTH + MIN_TX_RETENTION + 99);
+    fb.mine(PAST_THE_WINDOW);
     let tip = fb.node.tip_height();
     assert_eq!(fb.archive.tip_height(), tip);
     assert_eq!(fb.zaino.tip().unwrap(), tip);

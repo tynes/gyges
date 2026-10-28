@@ -47,7 +47,7 @@ zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc
     "orchard",
     "transparent-inputs",
     "spend-index",                   # node-backed spent-outpoint lookups (Q-D4)
-    "sync",                          # the `BlockCache` trait is gated behind this feature (not source-agnostic as the review assumed)
+    "sync",                          # gates the `BlockCache` trait
 ] }
 zcash_client_sqlite = { package = "zakura-client-sqlite", version = "=0.1.0-rc9.1", features = [
     "orchard",
@@ -137,7 +137,6 @@ tempfile       = "3"
 proptest   = { version = "1", default-features = false, features = ["std"] }  # property tests of the PCZT role pipeline
 hyper          = { version = "1", features = ["server", "http1"] }   # fake zakurad JSON-RPC server (gyges-chain `test-util`)
 http-body-util = "0.1"
-bytes          = "1"
 base64         = "0.22"
 sha2           = "0.10"                                           # verifies the downloaded zakurad release (tests/regtest)
 

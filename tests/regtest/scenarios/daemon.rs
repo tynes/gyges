@@ -1,6 +1,6 @@
 //! Daemon lifecycle and handshake scenarios (TESTING.md §3 row 15 and the
 //! THREAT_MODEL.md §5 rows for socket mode, permission sweep and the
-//! single-instance lock). No node is involved yet.
+//! single-instance lock). No node is involved.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::time::Duration;

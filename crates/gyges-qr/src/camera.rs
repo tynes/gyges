@@ -80,11 +80,6 @@ impl fmt::Debug for Camera {
 }
 
 impl Camera {
-    /// Whether any camera is attached (without asking for access).
-    pub fn present() -> bool {
-        nokhwa::query(ApiBackend::Auto).is_ok_and(|c| !c.is_empty())
-    }
-
     /// Open camera `index` (the first when `None`) and start its stream.
     pub fn open(index: Option<u32>) -> Result<Self, CameraError> {
         // Look before asking: a machine without a camera fails at once

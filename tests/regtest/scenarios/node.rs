@@ -79,6 +79,19 @@ fn ensure_mined(node: &Node, txid: &str, raw: &str) -> u32 {
     node.mined_height(txid).expect("mined after rebroadcast")
 }
 
+/// A node (an archive node if `archive`) with two coinbases to the wallet
+/// ([`test_key_miner`]), then a hundred to nobody so that both are mature
+/// (COINBASE_MATURITY = 100) before anything spends them. `None` where no
+/// node binary is available.
+fn node_with_mature_coinbases(archive: bool) -> Option<Node> {
+    let opts = |o: NodeOpts| NodeOpts { archive, ..o };
+    let mut node = Node::start_or_skip(opts(test_key_miner()))?;
+    node.mine(2);
+    node.restart(opts(NodeOpts::default())).unwrap();
+    node.mine(100);
+    Some(node)
+}
+
 /// TESTING.md §3 row 15 in spirit, plus the status surface: the daemon sees
 /// the node's bounds, `key init` takes its birthday from the live tip, and
 /// a daemon for the wrong network is refused by the activation heights.
@@ -131,14 +144,9 @@ fn daemon_status_and_key_init_against_the_real_node() {
 #[test]
 fn restore_mine_shield_send_and_reorg_against_the_real_node() {
     let wallet_taddr = test_key_transparent_address();
-    // Two coinbases to the wallet, then a hundred to nobody so that both are
-    // mature (COINBASE_MATURITY = 100) before anything spends them.
-    let Some(mut node) = Node::start_or_skip(test_key_miner()) else {
+    let Some(node) = node_with_mature_coinbases(false) else {
         return;
     };
-    node.mine(2);
-    node.restart(NodeOpts::default()).unwrap();
-    node.mine(100);
     assert_eq!(node.tip_height(), 102);
     let log = node.log_path();
 
@@ -336,12 +344,9 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
 #[test]
 fn zip320_against_the_real_node() {
     let wallet_taddr = test_key_transparent_address();
-    let Some(mut node) = Node::start_or_skip(test_key_miner()) else {
+    let Some(mut node) = node_with_mature_coinbases(false) else {
         return;
     };
-    node.mine(2);
-    node.restart(NodeOpts::default()).unwrap();
-    node.mine(100);
     let log = node.log_path();
     let (mut fx, pw, funded) = funded_wallet(&node);
     let (shield_txid, b) = shield(&fx, &pw, &log, |_| {
@@ -463,16 +468,9 @@ fn sapling_spend_against_the_real_node() {
     // every few hundred blocks, so a coinbase past ZIP 212 pays nothing).
     // An archive node, so that nothing is pruned while the daemon scans
     // the long chain behind the miner.
-    let archive = |opts: NodeOpts| NodeOpts {
-        archive: true,
-        ..opts
-    };
-    let Some(mut node) = Node::start_or_skip(archive(test_key_miner())) else {
+    let Some(node) = node_with_mature_coinbases(true) else {
         return;
     };
-    node.mine(2);
-    node.restart(archive(NodeOpts::default())).unwrap();
-    node.mine(100);
     let log = node.log_path();
     let (fx, pw, _) = funded_wallet(&node);
     let keys = fx.gyges(&["key", "list", "--json"]).ok().json();

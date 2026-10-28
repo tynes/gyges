@@ -14,7 +14,14 @@ use crate::QrError;
 pub fn render(data: &[u8]) -> Result<String, QrError> {
     let code = QrCode::with_error_correction_level(data, EcLevel::L)
         .map_err(|e| QrError::TooLong(e.to_string()))?;
-    Ok(draw(&code))
+    let mut s = code
+        .render::<Dense1x2>()
+        .dark_color(Dense1x2::Light)
+        .light_color(Dense1x2::Dark)
+        .quiet_zone(true)
+        .build();
+    s.push('\n');
+    Ok(s)
 }
 
 /// Render a string as given (an address: bech32 strings are not uppercased,
@@ -28,17 +35,6 @@ pub fn render_str(s: &str) -> Result<String, QrError> {
 /// per character instead of 8, so frames are uppercased first.
 pub fn render_frame(frame: &str) -> Result<String, QrError> {
     render(frame.to_ascii_uppercase().as_bytes())
-}
-
-fn draw(code: &QrCode) -> String {
-    let mut s = code
-        .render::<Dense1x2>()
-        .dark_color(Dense1x2::Light)
-        .light_color(Dense1x2::Dark)
-        .quiet_zone(true)
-        .build();
-    s.push('\n');
-    s
 }
 
 #[cfg(test)]

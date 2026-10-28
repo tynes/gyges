@@ -13,13 +13,14 @@ use gyges_core::{Home, Network, perms};
 use gyges_proto::uds;
 use gyges_proto::v1::gyges_client::GygesClient;
 use gyges_proto::v1::{
-    AbortSigningSessionRequest, ErrorReason, ExportSeedRequest, ExportUfvkRequest,
-    GetBalanceRequest, GetBalanceResponse, GetInfoRequest, GetSyncStatusRequest, GygesError,
-    ImportKeystoneRequest, InitKeyRequest, InitKeyResponse, ListKeysRequest,
-    ListSigningSessionsRequest, LockKeyRequest, Proposal, RestoreKeyRequest, RunSyncRequest,
-    SendEvent, SendTransactionRequest, SessionStatus, ShieldFundsRequest, ShutdownRequest,
-    SignatureKind, SigningMode, StreamLogsRequest, SyncProgress, SyncState, SyncTarget,
-    UnlockKeyRequest, UnlockScope, WaitSyncRequest, send_event,
+    AbortSigningSessionRequest, BroadcastPcztRequest, CreatePcztRequest, ErrorReason,
+    ExportSeedRequest, ExportUfvkRequest, GetBalanceRequest, GetBalanceResponse, GetInfoRequest,
+    GetSyncStatusRequest, GygesError, ImportKeystoneRequest, InitKeyRequest, InitKeyResponse,
+    KeySummary, ListKeysRequest, ListSigningSessionsRequest, LockKeyRequest, Proposal,
+    ProvePcztRequest, RestoreKeyRequest, RunSyncRequest, SendEvent, SendTransactionRequest,
+    SessionStatus, ShieldFundsRequest, ShutdownRequest, SignatureKind, SigningMode,
+    StreamLogsRequest, SyncProgress, SyncState, SyncTarget, UnlockKeyRequest, UnlockScope,
+    WaitSyncRequest, send_event,
 };
 use gygesd::{Daemon, DaemonState, LogHub, Options};
 use tokio_stream::StreamExt as _;
@@ -30,7 +31,7 @@ use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_protocol::consensus::BlockHeight;
 
 struct Running {
-    _home: tempfile::TempDir,
+    home: tempfile::TempDir,
     socket: PathBuf,
     pid: PathBuf,
     state: Arc<DaemonState>,
@@ -67,6 +68,12 @@ fn fresh_home_with(config: &str) -> (tempfile::TempDir, Home) {
 /// 23×abandon + art: the all-zero-entropy BIP 39 vector.
 fn known_mnemonic() -> String {
     "abandon ".repeat(23) + "art"
+}
+
+/// The BIP 39 seed of [`known_mnemonic`].
+fn known_seed() -> secrecy::SecretVec<u8> {
+    let entropy = gyges_core::vault::entropy_from_phrase(&known_mnemonic()).unwrap();
+    gyges_core::vault::seed_from_entropy(&entropy)
 }
 
 /// One log hub for the whole test binary, fed by the production capture
@@ -125,7 +132,7 @@ async fn start_in(dir: tempfile::TempDir, configure: impl FnOnce(&mut Options)) 
     for _ in 0..400 {
         if uds::probe(&socket).await.is_ok() {
             return Running {
-                _home: dir,
+                home: dir,
                 socket,
                 pid,
                 state,
@@ -228,6 +235,100 @@ fn zats(z: i64) -> Option<gyges_proto::v1::Amount> {
     })
 }
 
+/// `max`, as a request's amount.
+fn max_amount() -> Option<gyges_proto::v1::Amount> {
+    Some(gyges_proto::v1::Amount {
+        value: Some(gyges_proto::v1::amount::Value::Max(true)),
+    })
+}
+
+/// A `SendTransaction` of `z` zatoshis from `key_id` to `to`.
+fn send_req(key_id: &str, to: &str, z: i64) -> SendTransactionRequest {
+    SendTransactionRequest {
+        key_id: key_id.into(),
+        to: to.into(),
+        amount: zats(z),
+        ..Default::default()
+    }
+}
+
+/// A `CreatePczt` of `z` zatoshis from `key_id` to `to`.
+fn create_req(key_id: &str, to: &str, z: i64) -> CreatePcztRequest {
+    CreatePcztRequest {
+        key_id: key_id.into(),
+        to: to.into(),
+        amount: zats(z),
+        ..Default::default()
+    }
+}
+
+/// `ProvePczt` of `pczt` (no key needed): the proven bytes.
+async fn prove(c: &mut GygesClient<Channel>, pczt: Vec<u8>) -> Result<Vec<u8>, tonic::Status> {
+    c.prove_pczt(ProvePcztRequest {
+        pczt,
+        ..Default::default()
+    })
+    .await
+    .map(|r| r.into_inner().pczt)
+}
+
+/// `BroadcastPczt` of `pczt` to the node: the txid.
+async fn broadcast(c: &mut GygesClient<Channel>, pczt: Vec<u8>) -> Result<String, tonic::Status> {
+    c.broadcast_pczt(BroadcastPcztRequest {
+        pczt,
+        ..Default::default()
+    })
+    .await
+    .map(|r| r.into_inner().txid)
+}
+
+/// A `ShieldFunds` of everything `key_id` holds transparently.
+fn shield_req(key_id: &str) -> ShieldFundsRequest {
+    ShieldFundsRequest {
+        key_id: key_id.into(),
+        ..Default::default()
+    }
+}
+
+/// Every key, as `ListKeys` returns them.
+async fn list_keys(c: &mut GygesClient<Channel>) -> Vec<KeySummary> {
+    c.list_keys(ListKeysRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .keys
+}
+
+/// `LockKey` of `key_id` alone.
+async fn lock(c: &mut GygesClient<Channel>, key_id: &str) {
+    c.lock_key(LockKeyRequest {
+        key_id: key_id.into(),
+        all: false,
+    })
+    .await
+    .unwrap();
+}
+
+/// A fixed chain backend at `tip`, retaining blocks from `retained_from`.
+fn fixed(tip: u32, retained_from: u32) -> Arc<FixedChain> {
+    Arc::new(FixedChain { tip, retained_from })
+}
+
+/// `Shutdown`, then the daemon's task ends cleanly within `within`.
+async fn shutdown(
+    c: &mut GygesClient<Channel>,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    graceful: bool,
+    within: Duration,
+) {
+    c.shutdown(ShutdownRequest { graceful }).await.unwrap();
+    tokio::time::timeout(within, task)
+        .await
+        .expect("shutdown in time")
+        .unwrap()
+        .unwrap();
+}
+
 /// A regtest P2PKH address of no key here (pubkey hash `0x42…`): the
 /// transparent recipient of the send tests.
 fn t_recipient() -> String {
@@ -315,14 +416,7 @@ async fn airgapped_daemon_refuses_networked_rpcs_with_typed_error() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 
     // Shutdown is on the allow-list and actually stops the server.
-    c.shutdown(ShutdownRequest { graceful: true })
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), running.task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    shutdown(&mut c, running.task, true, Duration::from_secs(10)).await;
     assert!(!running.socket.exists());
 }
 
@@ -330,14 +424,7 @@ async fn airgapped_daemon_refuses_networked_rpcs_with_typed_error() {
 async fn shutdown_rpc_removes_socket_and_pid_file() {
     let running = start(|_| {}).await;
     let mut c = client(&running.socket).await;
-    c.shutdown(ShutdownRequest { graceful: false })
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), running.task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    shutdown(&mut c, running.task, false, Duration::from_secs(10)).await;
     assert!(!running.socket.exists(), "socket removed");
     assert!(!running.pid.exists(), "pid file removed");
     assert!(uds::probe(&running.socket).await.is_err());
@@ -346,7 +433,7 @@ async fn shutdown_rpc_removes_socket_and_pid_file() {
 #[tokio::test]
 async fn second_daemon_for_the_same_home_is_refused() {
     let running = start(|_| {}).await;
-    let home = Home::new(running._home.path());
+    let home = Home::new(running.home.path());
     let err = Daemon::prepare(Options::new(home, Network::Regtest)).unwrap_err();
     assert!(format!("{err:#}").contains("already running"), "{err:#}");
     // The failed attempt must not have disturbed the running daemon.
@@ -363,7 +450,6 @@ fn wide_permissions_refuse_start_with_a_chmod_hint() {
     let (dir, home) = fresh_home();
     let net = home.network_dir(Network::Regtest);
     std::fs::create_dir_all(net.join("keys")).unwrap();
-    perms::set_mode(&net, 0o700).unwrap();
     perms::set_mode(&net.join("keys"), 0o755).unwrap();
     let err = Daemon::prepare(Options::new(home, Network::Regtest)).unwrap_err();
     let msg = format!("{err:#}");
@@ -376,16 +462,7 @@ fn wide_permissions_refuse_start_with_a_chmod_hint() {
 
 #[test]
 fn config_for_another_network_refuses_start() {
-    let (_dir, home) = fresh_home();
-    let net = home.network_dir(Network::Regtest);
-    std::fs::create_dir_all(&net).unwrap();
-    perms::set_mode(&net, 0o700).unwrap();
-    perms::create_private_file(&home.config_path(Network::Regtest)).unwrap();
-    std::fs::write(
-        home.config_path(Network::Regtest),
-        "network = \"mainnet\"\n[vault]\nscrypt_work_factor = 10\n",
-    )
-    .unwrap();
+    let (_dir, home) = fresh_home_with("network = \"mainnet\"\n[vault]\nscrypt_work_factor = 10\n");
     let err = Daemon::prepare(Options::new(home, Network::Regtest)).unwrap_err();
     assert!(
         format!("{err:#}").contains("network = \"mainnet\""),
@@ -395,16 +472,9 @@ fn config_for_another_network_refuses_start() {
 
 #[test]
 fn fallback_without_endpoint_refuses_start() {
-    let (_dir, home) = fresh_home();
-    let net = home.network_dir(Network::Regtest);
-    std::fs::create_dir_all(&net).unwrap();
-    perms::set_mode(&net, 0o700).unwrap();
-    perms::create_private_file(&home.config_path(Network::Regtest)).unwrap();
-    std::fs::write(
-        home.config_path(Network::Regtest),
+    let (_dir, home) = fresh_home_with(
         "network = \"regtest\"\n[fallback_lightwalletd]\nenabled = true\n[vault]\nscrypt_work_factor = 10\n",
-    )
-    .unwrap();
+    );
     let err = Daemon::prepare(Options::new(home, Network::Regtest)).unwrap_err();
     assert!(format!("{err:#}").contains("grpc_url"), "{err:#}");
 }
@@ -416,10 +486,7 @@ fn fallback_without_endpoint_refuses_start() {
 async fn fallback_backend_is_built_from_the_config_and_touches_nothing() {
     let url = closed_port_url();
     let running = start(|o| {
-        o.chain = Some(Arc::new(FixedChain {
-            tip: 10,
-            retained_from: 0,
-        }));
+        o.chain = Some(fixed(10, 0));
         o.fallback_lwd = Some(url.clone());
         o.no_tor = true;
     })
@@ -449,10 +516,7 @@ async fn fallback_backend_is_built_from_the_config_and_touches_nothing() {
     // Over Tor (the default): the arti state goes under tor_cache/, which
     // is created only when Tor is first bootstrapped.
     let running = start(|o| {
-        o.chain = Some(Arc::new(FixedChain {
-            tip: 10,
-            retained_from: 0,
-        }));
+        o.chain = Some(fixed(10, 0));
         o.fallback_lwd = Some("http://abcdefghijklmnop.onion:9067".into());
     })
     .await;
@@ -461,7 +525,7 @@ async fn fallback_backend_is_built_from_the_config_and_touches_nothing() {
         .fallback
         .as_ref()
         .expect("fallback configured");
-    let tor_dir = running._home.path().join("regtest").join("tor_cache");
+    let tor_dir = running.home.path().join("regtest").join("tor_cache");
     assert_eq!(
         fallback.transport(),
         &gyges_chain::Transport::Tor {
@@ -516,27 +580,14 @@ async fn init_key_needs_a_node_unless_airgapped() {
         detail.detail
     );
     assert!(detail.detail.contains("unreachable"), "{}", detail.detail);
-    assert!(
-        c.list_keys(ListKeysRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .keys
-            .is_empty()
-    );
-    assert!(!running._home.path().join("regtest/keys/main").exists());
+    assert!(list_keys(&mut c).await.is_empty());
+    assert!(!running.home.path().join("regtest/keys/main").exists());
     running.task.abort();
 }
 
 #[tokio::test]
 async fn init_and_restore_against_a_fake_node() {
-    let running = start(|o| {
-        o.chain = Some(Arc::new(FixedChain {
-            tip: 50,
-            retained_from: 0,
-        }));
-    })
-    .await;
+    let running = start(|o| o.chain = Some(fixed(50, 0))).await;
     let mut c = client(&running.socket).await;
 
     // Argument checks happen before anything is written.
@@ -583,7 +634,7 @@ async fn init_and_restore_against_a_fake_node() {
     assert_eq!(resp.birthday_height, 50, "the node's tip");
     assert!(resp.ufvk.starts_with("uviewregtest1"), "{}", resp.ufvk);
 
-    let dir = running._home.path().join("regtest/keys/main");
+    let dir = running.home.path().join("regtest/keys/main");
     for f in ["profile.json", "seed.age", "wallet.sqlite"] {
         let mode = std::fs::metadata(dir.join(f)).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o600, "{f} is {mode:o}");
@@ -594,12 +645,7 @@ async fn init_and_restore_against_a_fake_node() {
             .starts_with("-----BEGIN AGE ENCRYPTED FILE-----")
     );
 
-    let keys = c
-        .list_keys(ListKeysRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .keys;
+    let keys = list_keys(&mut c).await;
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].key_id, "main");
     assert_eq!(keys[0].signing_mode(), SigningMode::LocalSeed);
@@ -654,11 +700,8 @@ async fn init_and_restore_against_a_fake_node() {
     let err = c.restore_key(restore_req("future", 52)).await.unwrap_err();
     assert_eq!(reason(&err), ErrorReason::InvalidArgument);
     assert_eq!(
-        c.list_keys(ListKeysRequest {})
+        list_keys(&mut c)
             .await
-            .unwrap()
-            .into_inner()
-            .keys
             .iter()
             .map(|k| k.key_id.as_str())
             .collect::<Vec<_>>(),
@@ -666,15 +709,8 @@ async fn init_and_restore_against_a_fake_node() {
     );
 
     // A restart over the same home loads both keys back.
-    c.shutdown(ShutdownRequest { graceful: true })
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), running.task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let home = Home::new(running._home.path());
+    shutdown(&mut c, running.task, true, Duration::from_secs(10)).await;
+    let home = Home::new(running.home.path());
     let daemon = Daemon::prepare(Options::new(home, Network::Regtest)).expect("reopen");
     assert_eq!(daemon.state.registry.key_ids(), ["copy", "main"]);
     assert_eq!(
@@ -693,13 +729,7 @@ async fn init_and_restore_against_a_fake_node() {
 
 #[tokio::test]
 async fn restore_below_the_retention_window_is_refused_in_two_steps() {
-    let running = start(|o| {
-        o.chain = Some(Arc::new(FixedChain {
-            tip: 500,
-            retained_from: 400,
-        }));
-    })
-    .await;
+    let running = start(|o| o.chain = Some(fixed(500, 400))).await;
     let mut c = client(&running.socket).await;
     let req = restore_req("old", 300);
     let err = c.restore_key(req.clone()).await.unwrap_err();
@@ -714,7 +744,7 @@ async fn restore_below_the_retention_window_is_refused_in_two_steps() {
         .await
         .unwrap_err();
     assert_eq!(reason(&err), ErrorReason::FallbackUnavailable);
-    assert!(!running._home.path().join("regtest/keys/old").exists());
+    assert!(!running.home.path().join("regtest/keys/old").exists());
 
     // The default birthday (Sapling activation = 1 on regtest) needs no
     // tree state, but blocks 1..400 are pruned: the same two steps.
@@ -731,7 +761,7 @@ async fn restore_below_the_retention_window_is_refused_in_two_steps() {
         .await
         .unwrap_err();
     assert_eq!(reason(&err), ErrorReason::FallbackUnavailable);
-    assert!(!running._home.path().join("regtest/keys/genesis").exists());
+    assert!(!running.home.path().join("regtest/keys/genesis").exists());
     // At the window's edge: prior state at 400 is served.
     let ok = c
         .restore_key(restore_req("edge", 401))
@@ -758,8 +788,7 @@ fn keystone_export_with(
 ) -> (String, [u8; 32]) {
     use secrecy::ExposeSecret as _;
     use zcash_address::unified::{Container as _, Encoding as _, Fvk, Ufvk};
-    let entropy = gyges_core::vault::entropy_from_phrase(&known_mnemonic()).unwrap();
-    let seed = gyges_core::vault::seed_from_entropy(&entropy);
+    let seed = known_seed();
     let params = network.consensus_params();
     let accounts = accounts
         .iter()
@@ -852,12 +881,7 @@ async fn a_keystone_import_is_the_seeds_account_and_builds_pczts_for_the_device(
     ];
     assert_eq!(resp.spend_pools, pools);
 
-    let keys = c
-        .list_keys(ListKeysRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .keys;
+    let keys = list_keys(&mut c).await;
     let seed = keys.iter().find(|k| k.key_id == "seed").unwrap();
     let ks = keys.iter().find(|k| k.key_id == "ks").unwrap();
     assert_eq!(ks.signing_mode(), SigningMode::KeystoneQr);
@@ -878,7 +902,7 @@ async fn a_keystone_import_is_the_seeds_account_and_builds_pczts_for_the_device(
     assert_eq!(profile.seed_format, None);
     assert!(
         !running
-            ._home
+            .home
             .path()
             .join("regtest/keys/ks/seed.age")
             .exists()
@@ -920,13 +944,7 @@ async fn a_keystone_import_is_the_seeds_account_and_builds_pczts_for_the_device(
     // `pczt create` works, and every transparent input names the device's
     // seed fingerprint and account 0 in its BIP 44 derivation.
     let created = c
-        .create_pczt(gyges_proto::v1::CreatePcztRequest {
-            key_id: "ks".into(),
-            to: t_recipient(),
-            amount: zats(100_000_000),
-            memo: Vec::new(),
-            min_confirmations: 0,
-        })
+        .create_pczt(create_req("ks", &t_recipient(), 100_000_000))
         .await
         .unwrap()
         .into_inner();
@@ -957,12 +975,7 @@ async fn a_keystone_import_is_the_seeds_account_and_builds_pczts_for_the_device(
     // cannot be unlocked.
     let mut s = c
         .clone()
-        .send_transaction(SendTransactionRequest {
-            key_id: "ks".into(),
-            to: t_recipient(),
-            amount: zats(100_000_000),
-            ..Default::default()
-        })
+        .send_transaction(send_req("ks", &t_recipient(), 100_000_000))
         .await
         .unwrap()
         .into_inner();
@@ -994,15 +1007,9 @@ async fn a_keystone_import_is_the_seeds_account_and_builds_pczts_for_the_device(
 /// accounts, the second one chosen, and an unknown version allowed.
 #[tokio::test]
 async fn keystone_import_refusals_and_account_choice() {
-    let running = start(|o| {
-        o.chain = Some(Arc::new(FixedChain {
-            tip: 500,
-            retained_from: 400,
-        }));
-    })
-    .await;
+    let running = start(|o| o.chain = Some(fixed(500, 400))).await;
     let mut c = client(&running.socket).await;
-    let keys_dir = running._home.path().join("regtest/keys");
+    let keys_dir = running.home.path().join("regtest/keys");
     let (good, _) = keystone_export(&[0], Some("13.2.0"));
     let ufvk = |p: &str| -> String {
         let mut asm = gyges_qr::Assembler::new();
@@ -1198,11 +1205,9 @@ async fn keystone_import_refusals_and_account_choice() {
 /// `account`.
 fn keystone_usk(account: u32) -> zcash_keys::keys::UnifiedSpendingKey {
     use secrecy::ExposeSecret as _;
-    let entropy = gyges_core::vault::entropy_from_phrase(&known_mnemonic()).unwrap();
-    let seed = gyges_core::vault::seed_from_entropy(&entropy);
     zcash_keys::keys::UnifiedSpendingKey::from_seed(
         &Network::Regtest.consensus_params(),
-        seed.expose_secret(),
+        known_seed().expose_secret(),
         zip32::AccountId::try_from(account).unwrap(),
     )
     .unwrap()
@@ -1210,9 +1215,7 @@ fn keystone_usk(account: u32) -> zcash_keys::keys::UnifiedSpendingKey {
 
 fn keystone_fingerprint() -> zip32::fingerprint::SeedFingerprint {
     use secrecy::ExposeSecret as _;
-    let entropy = gyges_core::vault::entropy_from_phrase(&known_mnemonic()).unwrap();
-    let seed = gyges_core::vault::seed_from_entropy(&entropy);
-    zip32::fingerprint::SeedFingerprint::from_seed(seed.expose_secret()).unwrap()
+    zip32::fingerprint::SeedFingerprint::from_seed(known_seed().expose_secret()).unwrap()
 }
 
 /// `cbor` carried through a camera: fountain frames of `ur_type`, shuffled,
@@ -1437,13 +1440,7 @@ async fn the_device_never_sees_gyges_tags() {
     let node = mined_node(10).await;
     let (running, mut c) = funded_keystone(&node, 300_000_000).await;
     let created = c
-        .create_pczt(gyges_proto::v1::CreatePcztRequest {
-            key_id: "ks".into(),
-            to: t_recipient(),
-            amount: zats(100_000_000),
-            memo: Vec::new(),
-            min_confirmations: 0,
-        })
+        .create_pczt(create_req("ks", &t_recipient(), 100_000_000))
         .await
         .unwrap()
         .into_inner();
@@ -1484,14 +1481,7 @@ async fn keystone_shield_and_send_through_both_protocols() {
     let mut other = client(&running.socket).await;
 
     // Shield: single PCZT.
-    let mut s = c
-        .shield_funds(ShieldFundsRequest {
-            key_id: "ks".into(),
-            ..Default::default()
-        })
-        .await
-        .unwrap()
-        .into_inner();
+    let mut s = c.shield_funds(shield_req("ks")).await.unwrap().into_inner();
     let req = until_signature_required(&mut s).await;
     assert_eq!(req.kind(), SignatureKind::KeystoneSinglePczt);
     assert_eq!(req.key_id, "ks");
@@ -1513,12 +1503,7 @@ async fn keystone_shield_and_send_through_both_protocols() {
     // A second spend while this one waits is refused, naming it.
     let err = collect_events(
         c.clone()
-            .send_transaction(SendTransactionRequest {
-                key_id: "ks".into(),
-                to: t_recipient(),
-                amount: zats(10_000),
-                ..Default::default()
-            })
+            .send_transaction(send_req("ks", &t_recipient(), 10_000))
             .await,
     )
     .await
@@ -1581,12 +1566,7 @@ async fn keystone_shield_and_send_through_both_protocols() {
 
     // Send from the shielded funds: batch.
     let mut s = c
-        .send_transaction(SendTransactionRequest {
-            key_id: "ks".into(),
-            to: t_recipient(),
-            amount: zats(100_000_000),
-            ..Default::default()
-        })
+        .send_transaction(send_req("ks", &t_recipient(), 100_000_000))
         .await
         .unwrap()
         .into_inner();
@@ -1684,13 +1664,14 @@ async fn keystone_shield_and_send_through_both_protocols() {
 async fn a_keystone_session_survives_a_restart_and_expires_with_its_transaction() {
     let node = mined_node(10).await;
     let (running, mut c) = funded_keystone(&node, 300_000_000).await;
-    let shield = || ShieldFundsRequest {
-        key_id: "ks".into(),
-        ..Default::default()
-    };
 
     // Abort.
-    let mut s = c.clone().shield_funds(shield()).await.unwrap().into_inner();
+    let mut s = c
+        .clone()
+        .shield_funds(shield_req("ks"))
+        .await
+        .unwrap()
+        .into_inner();
     let req = until_signature_required(&mut s).await;
     let aborted = c
         .abort_signing_session(AbortSigningSessionRequest {
@@ -1708,21 +1689,19 @@ async fn a_keystone_session_survives_a_restart_and_expires_with_its_transaction(
     assert_eq!(reason(&err), ErrorReason::SessionNotFound, "{err:?}");
 
     // The client leaves, the daemon restarts.
-    let mut s = c.clone().shield_funds(shield()).await.unwrap().into_inner();
+    let mut s = c
+        .clone()
+        .shield_funds(shield_req("ks"))
+        .await
+        .unwrap()
+        .into_inner();
     let req = until_signature_required(&mut s).await;
     drop(s);
-    c.shutdown(ShutdownRequest { graceful: true })
-        .await
-        .unwrap();
-    let Running {
-        _home: home, task, ..
-    } = running;
-    tokio::time::timeout(Duration::from_secs(30), task)
-        .await
-        .expect("shutdown within 30 s")
-        .unwrap()
-        .unwrap();
-    let running = start_in(home, |o| o.zakura_rpc = Some(node.url().to_string())).await;
+    shutdown(&mut c, running.task, true, Duration::from_secs(30)).await;
+    let running = start_in(running.home, |o| {
+        o.zakura_rpc = Some(node.url().to_string())
+    })
+    .await;
     let mut c = client(&running.socket).await;
     let listed = keystone_sessions(&mut c, false).await;
     assert_eq!(listed.len(), 1, "{listed:?}");
@@ -1753,12 +1732,7 @@ async fn a_keystone_session_survives_a_restart_and_expires_with_its_transaction(
     // Expiry: a send left pending while the chain passes its expiry.
     let mut s = c
         .clone()
-        .send_transaction(SendTransactionRequest {
-            key_id: "ks".into(),
-            to: t_recipient(),
-            amount: zats(10_000_000),
-            ..Default::default()
-        })
+        .send_transaction(send_req("ks", &t_recipient(), 10_000_000))
         .await
         .unwrap()
         .into_inner();
@@ -1798,15 +1772,10 @@ async fn airgapped_init_key_creates_a_signer_only_profile() {
     assert_eq!(resp.mnemonic.split_whitespace().count(), 24);
     assert_eq!(resp.birthday_height, 0);
     assert_eq!(resp.ufvk, "");
-    let keys = c
-        .list_keys(ListKeysRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .keys;
+    let keys = list_keys(&mut c).await;
     assert_eq!(keys[0].signing_mode(), SigningMode::SignerOnly);
     assert_eq!(keys[0].birthday_height, 0);
-    let dir = running._home.path().join("regtest/keys/box");
+    let dir = running.home.path().join("regtest/keys/box");
     assert!(dir.join("seed.age").is_file());
     assert!(!dir.join("wallet.sqlite").exists());
 
@@ -1875,12 +1844,7 @@ async fn daemon_unlock_lock_and_the_key_list_window() {
         resp.expires_at
     );
 
-    let keys = c
-        .list_keys(ListKeysRequest {})
-        .await
-        .unwrap()
-        .into_inner()
-        .keys;
+    let keys = list_keys(&mut c).await;
     assert!(!keys[0].locked);
     assert_eq!(keys[0].unlock_expires_at, resp.expires_at);
     let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
@@ -1906,14 +1870,7 @@ async fn daemon_unlock_lock_and_the_key_list_window() {
         .unwrap()
         .into_inner();
     assert_eq!(locked.locked_key_ids, ["main"]);
-    assert!(
-        c.list_keys(ListKeysRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .keys[0]
-            .locked
-    );
+    assert!(list_keys(&mut c).await[0].locked);
     let again = c
         .lock_key(LockKeyRequest {
             key_id: "".into(),
@@ -1932,7 +1889,7 @@ async fn daemon_unlock_lock_and_the_key_list_window() {
         .unwrap_err();
     assert_eq!(reason(&err), ErrorReason::KeyNotFound);
 
-    // A bound session id is refused until signing sessions exist.
+    // An unknown session id is SESSION_NOT_FOUND.
     let err = c
         .unlock_key(UnlockKeyRequest {
             key_id: "main".into(),
@@ -1965,14 +1922,7 @@ async fn connection_unlock_dies_with_its_connection_and_shutdown_zeroizes() {
     assert_eq!(resp.scope(), UnlockScope::Connection);
     assert_eq!(running.state.vault.unlock_count(), 1);
     // Not visible as unlocked to anyone, and not usable without the token.
-    assert!(
-        c.list_keys(ListKeysRequest {})
-            .await
-            .unwrap()
-            .into_inner()
-            .keys[0]
-            .locked
-    );
+    assert!(list_keys(&mut c).await[0].locked);
     let err = c
         .export_ufvk(ExportUfvkRequest {
             key_id: "main".into(),
@@ -1995,14 +1945,7 @@ async fn connection_unlock_dies_with_its_connection_and_shutdown_zeroizes() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(running.state.vault.unlock_count(), 1);
     let mut c = client(&running.socket).await;
-    c.shutdown(ShutdownRequest { graceful: true })
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), running.task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    shutdown(&mut c, running.task, true, Duration::from_secs(10)).await;
     assert_eq!(running.state.vault.unlock_count(), 0, "zeroized on stop");
 }
 
@@ -2102,12 +2045,7 @@ async fn stream_logs_replays_the_audit_trail_and_follows() {
         .await
         .unwrap()
         .into_inner();
-    c.lock_key(LockKeyRequest {
-        key_id: key_id.clone(),
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    lock(&mut c, &key_id).await;
     let locked = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let e = follow.message().await.unwrap().expect("stream open");
@@ -2213,7 +2151,7 @@ async fn real_backend_against_the_fake_node_reports_bounds_and_seeds_birthdays()
     assert!(status.last_error.is_empty());
 
     // The shared block cache exists, private, bound to this network.
-    let cache = running._home.path().join("regtest/cache/blocks.sqlite");
+    let cache = running.home.path().join("regtest/cache/blocks.sqlite");
     assert!(cache.is_file());
     assert_eq!(std::fs::metadata(&cache).unwrap().mode() & 0o777, 0o600);
     let db = running.state.block_cache.as_ref().expect("cache open");
@@ -2253,10 +2191,7 @@ async fn real_backend_against_the_fake_node_reports_bounds_and_seeds_birthdays()
     assert_eq!(ok.birthday_height, 31);
 
     // Shutdown checkpoints the cache (no -wal left behind).
-    c.shutdown(ShutdownRequest { graceful: true })
-        .await
-        .unwrap();
-    running.task.await.unwrap().unwrap();
+    shutdown(&mut c, running.task, true, Duration::from_secs(30)).await;
     let wal = cache.with_extension("sqlite-wal");
     assert!(
         !wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0,
@@ -2350,33 +2285,42 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
     // more, and watch the scheduler pick it all up from its poll.
     let key = running.state.registry.resolve("main").unwrap();
     let account = key.wallet().unwrap().get_account_ids().unwrap()[0];
+    // The account's unshielded balance. It takes the wallet's lock, so no
+    // other `key.wallet()` guard may be alive when it is called.
+    let unshielded = || {
+        let summary = key
+            .wallet()
+            .unwrap()
+            .get_wallet_summary(ConfirmationsPolicy::MIN)
+            .unwrap()
+            .expect("summary");
+        u64::from(
+            summary.account_balances()[&account]
+                .unshielded_balance()
+                .total(),
+        )
+    };
     let receiver = transparent_receiver(&running.state, "main");
     let paid = node.mine_with_payments(&[(receiver, 70_000)]);
     assert_eq!(paid.height, 11);
     node.mine(2);
     let status = wait_spendable(&mut c, "main").await;
     assert_eq!(status.scanned_tip, 13, "{status:?}");
-    {
-        let w = key.wallet().unwrap();
-        let summary = w
-            .get_wallet_summary(ConfirmationsPolicy::MIN)
+    assert_eq!(
+        unshielded(),
+        70_000,
+        "the transparent output was credited from the raw block"
+    );
+    assert_eq!(
+        key.wallet()
             .unwrap()
-            .expect("summary");
-        let balance = &summary.account_balances()[&account];
-        assert_eq!(
-            u64::from(balance.unshielded_balance().total()),
-            70_000,
-            "the transparent output was credited from the raw block"
-        );
-        assert_eq!(
-            w.block_metadata(BlockHeight::from_u32(13))
-                .unwrap()
-                .unwrap()
-                .block_hash()
-                .0,
-            node.block(13).unwrap().hash
-        );
-    }
+            .block_metadata(BlockHeight::from_u32(13))
+            .unwrap()
+            .unwrap()
+            .block_hash()
+            .0,
+        node.block(13).unwrap().hash
+    );
     let cache = running.state.block_cache.as_ref().unwrap();
     assert_eq!(
         cache.hash_at(BlockHeight::from_u32(11)).unwrap(),
@@ -2430,31 +2374,19 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
             Some(BlockHeight::from_u32(14))
         );
     }
-    {
-        let w = key.wallet().unwrap();
-        assert_eq!(
-            w.block_metadata(BlockHeight::from_u32(12))
-                .unwrap()
-                .unwrap()
-                .block_hash()
-                .0,
-            new_12,
-            "the wallet follows the new chain"
-        );
-        // Block 11 (below the fork) and its output survived the rewind.
-        let summary = w
-            .get_wallet_summary(ConfirmationsPolicy::MIN)
+    assert_eq!(
+        key.wallet()
             .unwrap()
-            .unwrap();
-        assert_eq!(
-            u64::from(
-                summary.account_balances()[&account]
-                    .unshielded_balance()
-                    .total()
-            ),
-            70_000
-        );
-    }
+            .block_metadata(BlockHeight::from_u32(12))
+            .unwrap()
+            .unwrap()
+            .block_hash()
+            .0,
+        new_12,
+        "the wallet follows the new chain"
+    );
+    // Block 11 (below the fork) and its output survived the rewind.
+    assert_eq!(unshielded(), 70_000);
     assert_eq!(
         cache.hash_at(BlockHeight::from_u32(12)).unwrap(),
         Some(new_12)
@@ -2485,22 +2417,7 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
     .unwrap();
     let status = p.status.unwrap();
     assert!(status.spendable && status.scanned_tip == 14, "{status:?}");
-    {
-        let w = key.wallet().unwrap();
-        let summary = w
-            .get_wallet_summary(ConfirmationsPolicy::MIN)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            u64::from(
-                summary.account_balances()[&account]
-                    .unshielded_balance()
-                    .total()
-            ),
-            70_000,
-            "re-indexed after the rescan"
-        );
-    }
+    assert_eq!(unshielded(), 70_000, "re-indexed after the rescan");
 
     // Pruning past the key's position stalls it with the documented fix,
     // WaitSync fails fast, and the key recovers when the window widens.
@@ -2547,7 +2464,7 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
     let status = wait_spendable(&mut c, "main").await;
     assert_eq!(status.scanned_tip, 19, "{status:?}");
 
-    // Signer-only profiles have nothing to sync.
+    // GetSyncStatus of an unknown key is typed.
     let err = c
         .get_sync_status(GetSyncStatusRequest {
             key_id: "nope".into(),
@@ -2562,7 +2479,7 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
 async fn offline_node_keeps_keys_initializing_then_stalls_after_the_grace() {
     let url = closed_port_url();
     let running = start_with(
-        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n[daemon]\noffline_grace = \"2s\"\n",
+        &format!("{TEST_CONFIG}[daemon]\noffline_grace = \"2s\"\n"),
         |o| o.zakura_rpc = Some(url),
     )
     .await;
@@ -2652,6 +2569,11 @@ fn small_batch_config() -> String {
     format!("{ONE_CONF_CONFIG}[cache]\nscan_batch = 10\nfetch_batch = 10\n")
 }
 
+/// A one-second ZIP 320 rebroadcast, so the queue's passes come quickly.
+fn tex_config() -> String {
+    format!("{ONE_CONF_CONFIG}[tex]\nrebroadcast_interval = \"1s\"\n")
+}
+
 /// TESTING.md §3 row 16: `daemon stop` mid-scan. The node holds the
 /// scheduler's next fetch, so the stop lands deterministically inside a
 /// batch. Shutdown waits for that batch to finish (one more batch is
@@ -2660,7 +2582,6 @@ fn small_batch_config() -> String {
 /// scanning no range it had scanned before.
 #[tokio::test]
 async fn daemon_stop_mid_scan_finishes_the_batch_and_restart_does_not_rescan() {
-    let _ = test_hub();
     let node = mined_node(300).await;
     let (running, mut c) = start_on(&node, &small_batch_config()).await;
     let batches = batch_ranges("row16");
@@ -2679,10 +2600,7 @@ async fn daemon_stop_mid_scan_finishes_the_batch_and_restart_does_not_rescan() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     let Running {
-        _home: home,
-        state,
-        task,
-        ..
+        home, state, task, ..
     } = running;
     assert!(
         !task.is_finished(),
@@ -2751,7 +2669,6 @@ async fn daemon_stop_mid_scan_finishes_the_batch_and_restart_does_not_rescan() {
 #[tokio::test]
 async fn three_keys_fetch_each_block_from_the_node_once() {
     const BLOCKS: usize = 60;
-    let _ = test_hub();
     let node = mined_node(BLOCKS as u32).await;
     let (running, mut c) = start_on(&node, &small_batch_config()).await;
     let getblocks = |node: &FakeNode| node.calls().iter().filter(|m| *m == "getblock").count();
@@ -2902,15 +2819,9 @@ async fn fund_and_shield(
 ) -> Vec<SendEvent> {
     fund(node, state, c, key_id, z).await;
     unlock_daemon(c, key_id).await;
-    let events = collect_events(
-        c.shield_funds(ShieldFundsRequest {
-            key_id: key_id.into(),
-            ..Default::default()
-        })
-        .await,
-    )
-    .await
-    .unwrap();
+    let events = collect_events(c.shield_funds(shield_req(key_id)).await)
+        .await
+        .unwrap();
     assert_eq!(
         event_names(&events).last(),
         Some(&"broadcast"),
@@ -2938,7 +2849,7 @@ async fn current_address(c: &mut GygesClient<Channel>, key_id: &str) -> String {
     .address
 }
 
-/// Fund a transparent receiver, shield it, spend Orchard to the key's own
+/// Fund a transparent receiver, shield it, spend Ironwood to the key's own
 /// unified address through the inline-unlock session, pay a transparent
 /// recipient with `max`, and see the balance move at every step; also the
 /// documented refusals (insufficient funds, memo to a t-addr, tex1, node
@@ -2946,7 +2857,6 @@ async fn current_address(c: &mut GygesClient<Channel>, key_id: &str) -> String {
 #[tokio::test]
 async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_node() {
     use gyges_proto::v1::Pool;
-    let _ = test_hub();
     let node = mined_node(10).await;
     let (running, mut c) = start_on(&node, ONE_CONF_CONFIG).await;
     let state = &running.state;
@@ -2972,13 +2882,8 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
 
     // Empty wallet: INSUFFICIENT_FUNDS arrives as the stream's error.
     let err = collect_events(
-        c.send_transaction(SendTransactionRequest {
-            key_id: "main".into(),
-            to: t_recipient.clone(),
-            amount: zats(1_000),
-            ..Default::default()
-        })
-        .await,
+        c.send_transaction(send_req("main", &t_recipient, 1_000))
+            .await,
     )
     .await
     .unwrap_err();
@@ -3005,11 +2910,8 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
     ] {
         let Err(err) = c
             .send_transaction(SendTransactionRequest {
-                key_id: "main".into(),
-                to,
-                amount: zats(1_000),
                 memo,
-                ..Default::default()
+                ..send_req("main", &to, 1_000)
             })
             .await
         else {
@@ -3030,9 +2932,8 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
     unlock_daemon(&mut c, "main").await;
     let dry = collect_events(
         c.shield_funds(ShieldFundsRequest {
-            key_id: "main".into(),
             dry_run: true,
-            ..Default::default()
+            ..shield_req("main")
         })
         .await,
     )
@@ -3048,15 +2949,9 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
     assert!(p.expiry_height > p.anchor_height, "{p:?}");
     assert!(!p.upstream_proposal.is_empty());
 
-    let events = collect_events(
-        c.shield_funds(ShieldFundsRequest {
-            key_id: "main".into(),
-            ..Default::default()
-        })
-        .await,
-    )
-    .await
-    .unwrap();
+    let events = collect_events(c.shield_funds(shield_req("main")).await)
+        .await
+        .unwrap();
     assert_eq!(
         event_names(&events),
         ["proposed", "proving", "proving", "signed", "broadcast"],
@@ -3067,12 +2962,7 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
         node.mempool(),
         vec![gyges_chain::parse_display_hash(&shield_txid).unwrap()]
     );
-    c.lock_key(LockKeyRequest {
-        key_id: "main".into(),
-        all: false,
-    })
-    .await
-    .unwrap();
+    lock(&mut c, "main").await;
 
     // Mined: the transparent value is gone and the change is Ironwood (the
     // live Orchard-protocol pool after NU6.3; see OVERVIEW.md §4.3).
@@ -3080,10 +2970,10 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
     wait_spendable(&mut c, "main").await;
     let b = balance(&mut c, "main").await;
     assert_eq!(balance_of(&b, Pool::Transparent), (0, 0), "{b:?}");
-    let orchard_after_shield = 100_000_000 - shield_fee;
+    let ironwood_after_shield = 100_000_000 - shield_fee;
     assert_eq!(
         balance_of(&b, Pool::Ironwood),
-        (orchard_after_shield, 0),
+        (ironwood_after_shield, 0),
         "{b:?}"
     );
     assert_eq!(balance_of(&b, Pool::Orchard), (0, 0), "{b:?}");
@@ -3097,17 +2987,14 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
         assert_eq!(h, Some(BlockHeight::from_u32(13)), "shield mined at 13");
     }
 
-    // An Orchard spend to our own unified address through the session
+    // An Ironwood spend to our own unified address through the session
     // flow: a wrong passphrase is refused (and rate-limited) without ending
     // the stream, then the right one signs.
     let ua = current_address(&mut c, "main").await;
     let mut s = c
         .send_transaction(SendTransactionRequest {
-            key_id: "main".into(),
-            to: ua.clone(),
-            amount: zats(30_000_000),
             memo: b"to myself".to_vec(),
-            ..Default::default()
+            ..send_req("main", &ua, 30_000_000)
         })
         .await
         .unwrap()
@@ -3139,51 +3026,24 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
                 assert_eq!(sessions.len(), 1);
                 assert_eq!(sessions[0].session_id, r.session_id);
                 assert_eq!(sessions[0].status(), SessionStatus::AwaitingSignature);
-                let err = c
-                    .unlock_key(UnlockKeyRequest {
-                        key_id: "main".into(),
-                        passphrase: "wrong".into(),
-                        session_id: r.session_id.clone(),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap_err();
+                let answer = |passphrase: &str| UnlockKeyRequest {
+                    key_id: "main".into(),
+                    passphrase: passphrase.into(),
+                    session_id: r.session_id.clone(),
+                    ..Default::default()
+                };
+                let err = c.unlock_key(answer("wrong")).await.unwrap_err();
                 assert_eq!(reason(&err), ErrorReason::InvalidPassphrase);
-                let err = c
-                    .unlock_key(UnlockKeyRequest {
-                        key_id: "main".into(),
-                        passphrase: "pw".into(),
-                        session_id: r.session_id.clone(),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap_err();
+                let err = c.unlock_key(answer("pw")).await.unwrap_err();
                 assert_eq!(reason(&err), ErrorReason::RateLimited);
                 tokio::time::sleep(Duration::from_millis(1100)).await;
-                let resp = c
-                    .unlock_key(UnlockKeyRequest {
-                        key_id: "main".into(),
-                        passphrase: "pw".into(),
-                        session_id: r.session_id.clone(),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap()
-                    .into_inner();
+                let resp = c.unlock_key(answer("pw")).await.unwrap().into_inner();
                 assert!(
                     resp.session_token.is_empty(),
                     "a session unlock returns no token"
                 );
                 // Satisfied once only.
-                let err = c
-                    .unlock_key(UnlockKeyRequest {
-                        key_id: "main".into(),
-                        passphrase: "pw".into(),
-                        session_id: r.session_id.clone(),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap_err();
+                let err = c.unlock_key(answer("pw")).await.unwrap_err();
                 assert_eq!(reason(&err), ErrorReason::SessionNotFound);
             }
             Some(send_event::Event::Proving(_)) => names.push("proving"),
@@ -3223,10 +3083,10 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
     node.mine(2);
     wait_spendable(&mut c, "main").await;
     let b = balance(&mut c, "main").await;
-    let orchard_after_self_send = orchard_after_shield - send_fee;
+    let ironwood_after_self_send = ironwood_after_shield - send_fee;
     assert_eq!(
         balance_of(&b, Pool::Ironwood),
-        (orchard_after_self_send, 0),
+        (ironwood_after_self_send, 0),
         "a send to ourselves costs the fee only: {b:?}"
     );
 
@@ -3234,12 +3094,7 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
     node.set_reject_broadcasts(Some("tx-expired-test".into()));
     let err = send_with_session(
         &mut c,
-        SendTransactionRequest {
-            key_id: "main".into(),
-            to: t_recipient.clone(),
-            amount: zats(1_000_000),
-            ..Default::default()
-        },
+        send_req("main", &t_recipient, 1_000_000),
         "pw",
         |_| {},
     )
@@ -3262,12 +3117,7 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
 
     // An aborted session ends its stream with CANCELLED.
     let mut s = c
-        .send_transaction(SendTransactionRequest {
-            key_id: "main".into(),
-            to: t_recipient.clone(),
-            amount: zats(1_000_000),
-            ..Default::default()
-        })
+        .send_transaction(send_req("main", &t_recipient, 1_000_000))
         .await
         .unwrap()
         .into_inner();
@@ -3310,13 +3160,9 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
     // change), and `wait_for_mined` keeps the stream open until the block
     // that includes it is scanned: mine once Broadcast has been seen.
     let max = SendTransactionRequest {
-        key_id: "main".into(),
-        to: t_recipient.clone(),
-        amount: Some(gyges_proto::v1::Amount {
-            value: Some(gyges_proto::v1::amount::Value::Max(true)),
-        }),
+        amount: max_amount(),
         wait_for_mined: true,
-        ..Default::default()
+        ..send_req("main", &t_recipient, 0)
     };
     let events = send_with_session(&mut c, max, "pw", |ev| {
         if let Some(send_event::Event::Broadcast(_)) = ev.event {
@@ -3332,7 +3178,7 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
         .find(|o| o.address == t_recipient)
         .expect("the payment")
         .value;
-    assert_eq!(paid + p.total_fee, orchard_after_self_send, "{p:?}");
+    assert_eq!(paid + p.total_fee, ironwood_after_self_send, "{p:?}");
     // Upstream always carries an Ironwood change output in a shielded
     // spend, zero-valued when there is nothing left; `max` leaves no value
     // behind.
@@ -3371,7 +3217,6 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
 #[tokio::test]
 async fn a_fully_transparent_send_is_marked_mined_from_the_node() {
     use gyges_proto::v1::Pool;
-    let _ = test_hub();
     let node = mined_node(10).await;
     let (running, mut c) = start_on(&node, ONE_CONF_CONFIG).await;
     let state = &running.state;
@@ -3384,13 +3229,9 @@ async fn a_fully_transparent_send_is_marked_mined_from_the_node() {
 
     // `wait_for_mined`: each event within 60 s, or it never ended.
     let max = SendTransactionRequest {
-        key_id: "tsend".into(),
-        to: t_recipient(),
-        amount: Some(gyges_proto::v1::Amount {
-            value: Some(gyges_proto::v1::amount::Value::Max(true)),
-        }),
+        amount: max_amount(),
         wait_for_mined: true,
-        ..Default::default()
+        ..send_req("tsend", &t_recipient(), 0)
     };
     let events = send_with_session(&mut c, max, "pw", |ev| {
         if let Some(send_event::Event::Broadcast(b)) = &ev.event {
@@ -3475,17 +3316,9 @@ async fn sender_and_recipient(config: &str) -> (FakeNode, Running, GygesClient<C
 /// `main` pays `bob` `amount` and the transaction stays in the mempool.
 async fn pay_bob_unmined(node: &FakeNode, c: &mut GygesClient<Channel>, amount: i64) -> String {
     let to = current_address(c, "bob").await;
-    let events = collect_events(
-        c.send_transaction(SendTransactionRequest {
-            key_id: "main".into(),
-            to,
-            amount: zats(amount),
-            ..Default::default()
-        })
-        .await,
-    )
-    .await
-    .unwrap();
+    let events = collect_events(c.send_transaction(send_req("main", &to, amount)).await)
+        .await
+        .unwrap();
     let txid = broadcast_txid(&events);
     assert_eq!(
         node.mempool(),
@@ -3500,7 +3333,6 @@ async fn pay_bob_unmined(node: &FakeNode, c: &mut GygesClient<Channel>, amount: 
 #[tokio::test]
 async fn the_mempool_loop_shows_an_unmined_payment_as_pending() {
     const AMOUNT: i64 = 10_000_000;
-    let _ = test_hub();
     let (node, running, mut c) = sender_and_recipient(ONE_CONF_CONFIG).await;
     pay_bob_unmined(&node, &mut c, AMOUNT).await;
 
@@ -3556,7 +3388,6 @@ async fn the_mempool_loop_shows_an_unmined_payment_as_pending() {
 #[tokio::test]
 async fn scan_mempool_forces_a_pass_when_the_loop_is_off() {
     const AMOUNT: i64 = 20_000_000;
-    let _ = test_hub();
     let config = format!("{ONE_CONF_CONFIG}[mempool]\nscan = false\n");
     let (node, running, mut c) = sender_and_recipient(&config).await;
     pay_bob_unmined(&node, &mut c, AMOUNT).await;
@@ -3692,10 +3523,8 @@ fn tex_queued(events: &[SendEvent]) -> (String, String) {
 #[tokio::test]
 async fn zip320_sends_through_the_fake_node() {
     use gyges_proto::v1::{AbortTexTransferRequest, Pool, ResumeTexTransferRequest, TexState};
-    let _ = test_hub();
     let node = mined_node(10).await;
-    let config = format!("{ONE_CONF_CONFIG}[tex]\nrebroadcast_interval = \"1s\"\n");
-    let (running, mut c) = start_on(&node, &config).await;
+    let (running, mut c) = start_on(&node, &tex_config()).await;
     let state = &running.state;
     let params = Network::Regtest.consensus_params();
 
@@ -3703,16 +3532,16 @@ async fn zip320_sends_through_the_fake_node() {
     init_key(&mut c, "main").await;
     wait_spendable(&mut c, "main").await;
     fund_and_shield(&node, state, &mut c, "main", 300_000_000).await;
-    c.lock_key(LockKeyRequest {
-        key_id: "main".into(),
-        all: false,
-    })
-    .await
-    .unwrap();
+    lock(&mut c, "main").await;
     node.mine(2);
     wait_spendable(&mut c, "main").await;
     let ironwood = async |c: &mut GygesClient<Channel>| {
         balance_of(&balance(c, "main").await, Pool::Ironwood).0
+    };
+    let resume = |step1_txid: &str| ResumeTexTransferRequest {
+        key_id: "main".into(),
+        step1_txid: step1_txid.into(),
+        session_token: Vec::new(),
     };
     let funded = ironwood(&mut c).await;
     assert!(funded > 299_000_000 && funded < 300_000_000, "{funded}");
@@ -3724,11 +3553,8 @@ async fn zip320_sends_through_the_fake_node() {
     // --dry-run: both steps, every fee (ARCHITECTURE.md §3.3 step 4).
     let dry = collect_events(
         c.send_transaction(SendTransactionRequest {
-            key_id: "main".into(),
-            to: tex_addr.clone(),
-            amount: zats(50_000_000),
             dry_run: true,
-            ..Default::default()
+            ..send_req("main", &tex_addr, 50_000_000)
         })
         .await,
     )
@@ -3764,12 +3590,7 @@ async fn zip320_sends_through_the_fake_node() {
     //    offered at once and mined in the same block.
     let events = send_with_session(
         &mut c,
-        SendTransactionRequest {
-            key_id: "main".into(),
-            to: tex_addr.clone(),
-            amount: zats(50_000_000),
-            ..Default::default()
-        },
+        send_req("main", &tex_addr, 50_000_000),
         "pw",
         |_| {},
     )
@@ -3832,14 +3653,7 @@ async fn zip320_sends_through_the_fake_node() {
         ))
     );
     // Nothing to resume on a finished transfer.
-    let err = c
-        .resume_tex_transfer(ResumeTexTransferRequest {
-            key_id: "main".into(),
-            step1_txid: s1.clone(),
-            session_token: Vec::new(),
-        })
-        .await
-        .unwrap_err();
+    let err = c.resume_tex_transfer(resume(&s1)).await.unwrap_err();
     assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
     // That answer depends on neither the scan nor the node: with the node
     // unreachable (it now wants a cookie the daemon does not send), a
@@ -3853,14 +3667,7 @@ async fn zip320_sends_through_the_fake_node() {
     };
     node.set_cookie(Some("rotated".into()));
     wait_connected(false).await;
-    let err = c
-        .resume_tex_transfer(ResumeTexTransferRequest {
-            key_id: "main".into(),
-            step1_txid: s1.clone(),
-            session_token: Vec::new(),
-        })
-        .await
-        .unwrap_err();
+    let err = c.resume_tex_transfer(resume(&s1)).await.unwrap_err();
     assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
     assert!(err.message().contains("nothing to resume"), "{err:?}");
     node.set_cookie(None);
@@ -3878,12 +3685,7 @@ async fn zip320_sends_through_the_fake_node() {
     node.set_reject_transparent_only(Some("bad-txns-inputs-missingorspent".into()));
     let events = send_with_session(
         &mut c,
-        SendTransactionRequest {
-            key_id: "main".into(),
-            to: tex_addr.clone(),
-            amount: zats(20_000_000),
-            ..Default::default()
-        },
+        send_req("main", &tex_addr, 20_000_000),
         "pw",
         |_| {},
     )
@@ -3918,12 +3720,7 @@ async fn zip320_sends_through_the_fake_node() {
     node.set_reject_transparent_only(Some("bad-txns-inputs-missingorspent".into()));
     let events = send_with_session(
         &mut c,
-        SendTransactionRequest {
-            key_id: "main".into(),
-            to: tex_addr.clone(),
-            amount: zats(10_000_000),
-            ..Default::default()
-        },
+        send_req("main", &tex_addr, 10_000_000),
         "pw",
         |_| {},
     )
@@ -3941,14 +3738,7 @@ async fn zip320_sends_through_the_fake_node() {
     wait_spendable(&mut c, "main").await;
     node.set_reject_transparent_only(None);
     // Without a key: a session, answered with the passphrase.
-    let err = c
-        .resume_tex_transfer(ResumeTexTransferRequest {
-            key_id: "main".into(),
-            step1_txid: s1.clone(),
-            session_token: Vec::new(),
-        })
-        .await
-        .unwrap_err();
+    let err = c.resume_tex_transfer(resume(&s1)).await.unwrap_err();
     assert_eq!(reason(&err), ErrorReason::SignatureRequired, "{err:?}");
     let session_id = GygesError::from_status(&err).unwrap().session_id;
     assert_eq!(session_id.len(), 32);
@@ -3969,11 +3759,7 @@ async fn zip320_sends_through_the_fake_node() {
     assert_eq!(s.status(), SessionStatus::AwaitingSignature);
     // A second resume while the session is pending does not open another.
     let row = c
-        .resume_tex_transfer(ResumeTexTransferRequest {
-            key_id: "main".into(),
-            step1_txid: s1.clone(),
-            session_token: Vec::new(),
-        })
+        .resume_tex_transfer(resume(&s1))
         .await
         .unwrap()
         .into_inner();
@@ -4082,27 +3868,6 @@ fn varint(mut v: u64) -> Vec<u8> {
     }
 }
 
-/// A PCZT with the one occurrence of the value `old` replaced by `new`
-/// (same encoded length), which is what a tampered file looks like
-/// (TESTING.md §3 row 13): the bytes still parse, only an output value
-/// differs from the approved proposal.
-fn tamper_value(bytes: &[u8], old: u64, new: u64) -> Vec<u8> {
-    let from = varint(old);
-    let to = varint(new);
-    assert_eq!(from.len(), to.len(), "pick values of equal varint length");
-    let hits: Vec<usize> = (0..=bytes.len() - from.len())
-        .filter(|&i| bytes[i..i + from.len()] == from[..])
-        .collect();
-    assert_eq!(
-        hits.len(),
-        1,
-        "expected the value once in the file: {hits:?}"
-    );
-    let mut out = bytes.to_vec();
-    out[hits[0]..hits[0] + to.len()].copy_from_slice(&to);
-    out
-}
-
 /// Drive `SignPczt` to its signed bytes, answering `SignatureRequired`
 /// with `passphrase` through `UnlockKey { session_id }`.
 async fn sign_pczt_with_session(
@@ -4142,11 +3907,7 @@ async fn sign_pczt_with_session(
 /// a tex1 recipient, garbage).
 #[tokio::test]
 async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
-    use gyges_proto::v1::{
-        BroadcastPcztRequest, CombinePcztRequest, CreatePcztRequest, InspectPcztRequest, PcztRole,
-        Pool, ProvePcztRequest,
-    };
-    let _ = test_hub();
+    use gyges_proto::v1::{CombinePcztRequest, InspectPcztRequest, PcztRole, Pool};
     let node = mined_node(10).await;
     let (running, mut c) = start_on(&node, ONE_CONF_CONFIG).await;
     let state = &running.state;
@@ -4164,18 +3925,11 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
     node.mine(1);
     wait_spendable(&mut c, "main").await;
     wait_spendable(&mut c, "second").await;
-    let create = |key_id: &str, to: &str, z: i64| CreatePcztRequest {
-        key_id: key_id.into(),
-        to: to.into(),
-        amount: zats(z),
-        memo: Vec::new(),
-        min_confirmations: 0,
-    };
 
     // Create: one PCZT, the proposal, the session id; the expiry is the
     // file's long one.
     let created = c
-        .create_pczt(create("main", &t_recipient, 50_000_000))
+        .create_pczt(create_req("main", &t_recipient, 50_000_000))
         .await
         .unwrap()
         .into_inner();
@@ -4273,28 +4027,10 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
     assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
 
     // Prove (no key), and broadcasting before signing is refused by name.
-    let proven = c
-        .prove_pczt(ProvePcztRequest {
-            pczt: unsigned.clone(),
-            session_token: Vec::new(),
-            key_id: String::new(),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .pczt;
+    let proven = prove(&mut c, unsigned.clone()).await.unwrap();
     let insp = inspect(&mut c, proven.clone(), "").await.unwrap();
     assert!(insp.completed_roles().any(|r| r == PcztRole::Prover));
     assert!(pool(&insp, Pool::Ironwood).proofs_present);
-    let broadcast = |c: &mut GygesClient<Channel>, pczt: Vec<u8>| {
-        let req = BroadcastPcztRequest {
-            pczt,
-            via_tor: false,
-            key_id: String::new(),
-        };
-        let mut c = c.clone();
-        async move { c.broadcast_pczt(req).await.map(|r| r.into_inner()) }
-    };
     let err = broadcast(&mut c, proven.clone()).await.unwrap_err();
     assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
     assert!(err.message().contains("not fully signed"), "{err:?}");
@@ -4338,7 +4074,7 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
         .unwrap_err();
     assert_eq!(reason(&err), ErrorReason::InvalidArgument);
     let other = c
-        .create_pczt(create("second", &t_recipient, 10_000_000))
+        .create_pczt(create_req("second", &t_recipient, 10_000_000))
         .await
         .unwrap()
         .into_inner();
@@ -4352,8 +4088,9 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
     assert_eq!(reason(&err), ErrorReason::KeyMismatch, "{err:?}");
 
     // A tampered file: one output value changed on the way, which inspect
-    // shows and the Verifier refuses (exit 6), nothing broadcast.
-    let tampered = tamper_value(&unsigned, 50_000_000, 50_000_001);
+    // shows and the Verifier refuses (exit 6), nothing broadcast
+    // (TESTING.md §3 row 13). The bytes still parse.
+    let tampered = replace_once(&unsigned, &varint(50_000_000), &varint(50_000_001));
     let insp = inspect(&mut c, tampered.clone(), "").await.unwrap();
     assert!(
         insp.summary.as_ref().unwrap().steps[0]
@@ -4362,16 +4099,7 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
             .any(|o| o.value == 50_000_001),
         "{insp:?}"
     );
-    let tampered_proven = c
-        .prove_pczt(ProvePcztRequest {
-            pczt: tampered,
-            session_token: Vec::new(),
-            key_id: String::new(),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .pczt;
+    let tampered_proven = prove(&mut c, tampered).await.unwrap();
     let (tampered_signed, _) = sign_pczt_with_session(&mut c, tampered_proven, "pw")
         .await
         .unwrap();
@@ -4389,7 +4117,7 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
         .broadcast_pczt(BroadcastPcztRequest {
             pczt: combined.clone(),
             via_tor: true,
-            key_id: String::new(),
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -4398,7 +4126,7 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
 
     // The genuine one: broadcast, mined, the balance moves; twice is
     // refused.
-    let txid = broadcast(&mut c, combined.clone()).await.unwrap().txid;
+    let txid = broadcast(&mut c, combined.clone()).await.unwrap();
     assert_eq!(txid.len(), 64);
     wait_in_mempool(&node, &txid).await;
     let err = broadcast(&mut c, combined).await.unwrap_err();
@@ -4416,7 +4144,7 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
 
     // A ZIP 320 recipient is refused at create (single-step PCZTs only).
     let err = c
-        .create_pczt(create(
+        .create_pczt(create_req(
             "main",
             &zcash_keys::address::Address::Tex([9; 20]).encode(&params),
             1_000,
@@ -4456,7 +4184,6 @@ async fn addresses_notes_and_history_through_the_fake_node() {
         StatusSource, TransactionStatus,
     };
     use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
-    let _ = test_hub();
     let node = mined_node(10).await;
     let (running, mut c) = start_on(&node, ONE_CONF_CONFIG).await;
     let state = &running.state;
@@ -4662,15 +4389,9 @@ async fn addresses_notes_and_history_through_the_fake_node() {
 
     // Shield it (daemon-scoped unlock: no session round trip).
     unlock_daemon(&mut c, "main").await;
-    let events = collect_events(
-        c.shield_funds(ShieldFundsRequest {
-            key_id: "main".into(),
-            ..Default::default()
-        })
-        .await,
-    )
-    .await
-    .unwrap();
+    let events = collect_events(c.shield_funds(shield_req("main")).await)
+        .await
+        .unwrap();
     let shield_txid = broadcast_txid(&events);
     let shield_fee = proposal_of(&events).total_fee;
 
@@ -4737,11 +4458,8 @@ async fn addresses_notes_and_history_through_the_fake_node() {
     // A memo'd payment to the labelled address of our own.
     let events = collect_events(
         c.send_transaction(SendTransactionRequest {
-            key_id: "main".into(),
-            to: labelled.address.clone(),
-            amount: zats(30_000_000),
             memo: b"hello".to_vec(),
-            ..Default::default()
+            ..send_req("main", &labelled.address, 30_000_000)
         })
         .await,
     )
@@ -5047,7 +4765,7 @@ async fn a_fallback_serving_a_fork_is_refused_and_marked_untrusted() {
     assert_eq!(info.fallback.unwrap().trust(), FallbackTrust::Untrusted);
     assert!(
         running
-            ._home
+            .home
             .path()
             .join("regtest/fallback_trust.json")
             .exists()
@@ -5142,7 +4860,7 @@ async fn a_fallback_whose_tree_state_the_wallet_refuses_is_marked_untrusted() {
     assert_eq!(info.fallback.unwrap().trust(), FallbackTrust::Untrusted);
     assert!(
         running
-            ._home
+            .home
             .path()
             .join("regtest/fallback_trust.json")
             .exists()
@@ -5236,11 +4954,8 @@ async fn via_tor_broadcasts_through_the_fallback_endpoint_and_never_falls_back_t
     wait_spendable(&mut c, "main").await;
     let Err(err) = c
         .send_transaction(SendTransactionRequest {
-            key_id: "main".into(),
-            to: t_recipient.clone(),
-            amount: zats(1_000),
             via_tor: true,
-            ..Default::default()
+            ..send_req("main", &t_recipient, 1_000)
         })
         .await
     else {
@@ -5266,11 +4981,12 @@ async fn via_tor_broadcasts_through_the_fallback_endpoint_and_never_falls_back_t
     // node.
     let Err(err) = c
         .send_transaction(SendTransactionRequest {
-            key_id: "main".into(),
-            to: zcash_keys::address::Address::Tex([9; 20]).encode(&params),
-            amount: zats(1_000),
             via_tor: true,
-            ..Default::default()
+            ..send_req(
+                "main",
+                &zcash_keys::address::Address::Tex([9; 20]).encode(&params),
+                1_000,
+            )
         })
         .await
     else {
@@ -5281,11 +4997,8 @@ async fn via_tor_broadcasts_through_the_fallback_endpoint_and_never_falls_back_t
 
     let events = collect_events(
         c.send_transaction(SendTransactionRequest {
-            key_id: "main".into(),
-            to: t_recipient,
-            amount: zats(10_000_000),
             via_tor: true,
-            ..Default::default()
+            ..send_req("main", &t_recipient, 10_000_000)
         })
         .await,
     )
@@ -5307,14 +5020,15 @@ async fn via_tor_broadcasts_through_the_fallback_endpoint_and_never_falls_back_t
     lwd.set_reject_broadcasts(Some("bad-txns-inputs-spent".into()));
     let err = collect_events(
         c.send_transaction(SendTransactionRequest {
-            key_id: "main".into(),
-            to: zcash_keys::address::Address::Transparent(
-                transparent::address::TransparentAddress::PublicKeyHash([0x43; 20]),
-            )
-            .encode(&params),
-            amount: zats(1_000_000),
             via_tor: true,
-            ..Default::default()
+            ..send_req(
+                "main",
+                &zcash_keys::address::Address::Transparent(
+                    transparent::address::TransparentAddress::PublicKeyHash([0x43; 20]),
+                )
+                .encode(&params),
+                1_000_000,
+            )
         })
         .await,
     )
@@ -5334,7 +5048,7 @@ async fn via_tor_broadcasts_through_the_fallback_endpoint_and_never_falls_back_t
 /// refused by the offline signer.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_airgapped_signer_only_daemon_signs_transparent_inputs() {
-    use gyges_proto::v1::{BroadcastPcztRequest, CreatePcztRequest, Pool, ProvePcztRequest};
+    use gyges_proto::v1::Pool;
     let node = mined_node(10).await;
     let t_recipient = t_recipient();
 
@@ -5353,7 +5067,7 @@ async fn an_airgapped_signer_only_daemon_signs_transparent_inputs() {
         .mnemonic;
     assert!(
         !offline
-            ._home
+            .home
             .path()
             .join("regtest/keys/main/wallet.sqlite")
             .exists()
@@ -5383,30 +5097,12 @@ async fn an_airgapped_signer_only_daemon_signs_transparent_inputs() {
     let creator = on.clone();
     let create_and_prove = |key_id: &'static str| {
         let mut on = creator.clone();
-        let to = t_recipient.clone();
+        let req = create_req(key_id, &t_recipient, 50_000_000);
         async move {
-            let created = on
-                .create_pczt(CreatePcztRequest {
-                    key_id: key_id.into(),
-                    to,
-                    amount: zats(50_000_000),
-                    memo: Vec::new(),
-                    min_confirmations: 0,
-                })
-                .await
-                .unwrap()
-                .into_inner();
+            let created = on.create_pczt(req).await.unwrap().into_inner();
             let p = created.proposal.unwrap();
             assert_eq!(p.steps[0].inputs[0].pool(), Pool::Transparent, "{p:?}");
-            on.prove_pczt(ProvePcztRequest {
-                pczt: created.pczts[0].clone(),
-                session_token: Vec::new(),
-                key_id: String::new(),
-            })
-            .await
-            .unwrap()
-            .into_inner()
-            .pczt
+            prove(&mut on, created.pczts[0].clone()).await.unwrap()
         }
     };
 
@@ -5419,8 +5115,8 @@ async fn an_airgapped_signer_only_daemon_signs_transparent_inputs() {
     let txid = on
         .broadcast_pczt(BroadcastPcztRequest {
             pczt: signed,
-            via_tor: false,
             key_id: "main".into(),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -5455,9 +5151,7 @@ async fn an_airgapped_signer_only_daemon_signs_transparent_inputs() {
 /// recipient's Sapling balance moves.
 #[tokio::test(flavor = "multi_thread")]
 async fn sapling_payments_pass_the_output_checks() {
-    use gyges_proto::v1::{
-        BroadcastPcztRequest, CreatePcztRequest, NewAddressRequest, Pool, ProvePcztRequest,
-    };
+    use gyges_proto::v1::{NewAddressRequest, Pool};
     // Sapling outputs need ZIP 212 enforced for a PCZT ([`ZIP212_ON`]).
     let node = mined_node(32_300).await;
     let (running, mut c) = start_on(&node, ONE_CONF_CONFIG).await;
@@ -5487,17 +5181,9 @@ async fn sapling_payments_pass_the_output_checks() {
         .clone();
 
     // tx send: proven, signed (check_change), verified, broadcast.
-    let events = collect_events(
-        c.send_transaction(SendTransactionRequest {
-            key_id: "main".into(),
-            to: zs.clone(),
-            amount: zats(20_000_000),
-            ..Default::default()
-        })
-        .await,
-    )
-    .await
-    .unwrap();
+    let events = collect_events(c.send_transaction(send_req("main", &zs, 20_000_000)).await)
+        .await
+        .unwrap();
     assert_eq!(
         event_names(&events).last(),
         Some(&"broadcast"),
@@ -5508,37 +5194,13 @@ async fn sapling_payments_pass_the_output_checks() {
 
     // The PCZT pipeline to the same address.
     let created = c
-        .create_pczt(CreatePcztRequest {
-            key_id: "main".into(),
-            to: zs,
-            amount: zats(10_000_000),
-            memo: Vec::new(),
-            min_confirmations: 0,
-        })
+        .create_pczt(create_req("main", &zs, 10_000_000))
         .await
         .unwrap()
         .into_inner();
-    let proven = c
-        .prove_pczt(ProvePcztRequest {
-            pczt: created.pczts[0].clone(),
-            session_token: Vec::new(),
-            key_id: String::new(),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .pczt;
+    let proven = prove(&mut c, created.pczts[0].clone()).await.unwrap();
     let (signed, _) = sign_pczt_with_session(&mut c, proven, "pw").await.unwrap();
-    let txid = c
-        .broadcast_pczt(BroadcastPcztRequest {
-            pczt: signed,
-            via_tor: false,
-            key_id: String::new(),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .txid;
+    let txid = broadcast(&mut c, signed).await.unwrap();
     wait_in_mempool(&node, &txid).await;
     node.mine(2);
     wait_spendable(&mut c, "bob").await;
@@ -5588,7 +5250,7 @@ fn replace_once(bytes: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
 /// although the value, the fee and every payment are unchanged.
 #[tokio::test(flavor = "multi_thread")]
 async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
-    use gyges_proto::v1::{BroadcastPcztRequest, CreatePcztRequest, ProvePcztRequest};
+    use orchard::keys::Scope;
     let node = mined_node(10).await;
     let params = Network::Regtest.consensus_params();
     let (running, mut c) = start_on(&node, ONE_CONF_CONFIG).await;
@@ -5596,44 +5258,41 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
         init_key(&mut c, id).await;
         wait_spendable(&mut c, id).await;
     }
-    let internal = |id: &str| {
+    let ufvk = |id: &str| {
         let encoded = running.state.registry.resolve(id).unwrap().ufvk().unwrap();
-        let ufvk = zcash_keys::keys::UnifiedFullViewingKey::decode(&params, &encoded).unwrap();
-        ufvk.orchard()
+        zcash_keys::keys::UnifiedFullViewingKey::decode(&params, &encoded).unwrap()
+    };
+    let thief = ufvk("thief");
+    // The thief's Orchard address at index `j`, external or internal.
+    let thief_at = |j: u32, external: bool| {
+        let scope = if external {
+            Scope::External
+        } else {
+            Scope::Internal
+        };
+        thief
+            .orchard()
             .unwrap()
-            .address_at(0u32, orchard::keys::Scope::Internal)
+            .address_at(j, scope)
             .to_raw_address_bytes()
     };
-    let (ours, theirs) = (internal("main"), internal("thief"));
+    let ours = ufvk("main")
+        .orchard()
+        .unwrap()
+        .address_at(0u32, Scope::Internal)
+        .to_raw_address_bytes();
+    let theirs = thief_at(0, false);
     fund(&node, &running.state, &mut c, "main", 100_000_000).await;
 
     let t_recipient = t_recipient();
     let created = c
-        .create_pczt(CreatePcztRequest {
-            key_id: "main".into(),
-            to: t_recipient,
-            amount: zats(10_000_000),
-            memo: Vec::new(),
-            min_confirmations: 0,
-        })
+        .create_pczt(create_req("main", &t_recipient, 10_000_000))
         .await
         .unwrap()
         .into_inner();
-    let prove = |pczt: Vec<u8>| {
-        let mut c = c.clone();
-        async move {
-            c.prove_pczt(ProvePcztRequest {
-                pczt,
-                session_token: Vec::new(),
-                key_id: String::new(),
-            })
-            .await
-            .unwrap()
-            .into_inner()
-            .pczt
-        }
-    };
-    let proven = prove(created.pczts[0].clone()).await;
+    let fee = u64::try_from(created.proposal.as_ref().unwrap().total_fee).unwrap();
+    let change_value = 100_000_000 - 10_000_000 - fee;
+    let proven = prove(&mut c, created.pczts[0].clone()).await.unwrap();
 
     // The recipient field alone rewritten to another key's address: it no
     // longer matches the note commitment, so the signer refuses the file.
@@ -5685,18 +5344,6 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
     {
         use proptest::prelude::*;
         use proptest::test_runner::{Config, TestRunner};
-        let fee = u64::try_from(created.proposal.as_ref().unwrap().total_fee).unwrap();
-        let change_value = 100_000_000 - 10_000_000 - fee;
-        let thief = {
-            let encoded = running
-                .state
-                .registry
-                .resolve("thief")
-                .unwrap()
-                .ufvk()
-                .unwrap();
-            zcash_keys::keys::UnifiedFullViewingKey::decode(&params, &encoded).unwrap()
-        };
         unlock_daemon(&mut c, "main").await;
         let strategy = prop_oneof![
             (0u32..1_000, any::<bool>()).prop_map(|(j, ext)| (0u8, j, ext, [0u8; 20], 0u64)),
@@ -5713,19 +5360,10 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
         runner
             .run(&strategy, |(kind, j, external, h, v)| {
                 let (bytes, want) = match kind {
-                    0 => {
-                        let scope = if external {
-                            orchard::keys::Scope::External
-                        } else {
-                            orchard::keys::Scope::Internal
-                        };
-                        let to = thief
-                            .orchard()
-                            .unwrap()
-                            .address_at(j, scope)
-                            .to_raw_address_bytes();
-                        (replace_all(&proven, &ours, &to), "note commitment")
-                    }
+                    0 => (
+                        replace_all(&proven, &ours, &thief_at(j, external)),
+                        "note commitment",
+                    ),
                     1 if v != change_value => (
                         replace_all(&proven, &varint(change_value), &varint(v)),
                         "commitment",
@@ -5754,12 +5392,7 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
             tried.into_inner() >= 20,
             "the mutations were mostly skipped"
         );
-        c.lock_key(LockKeyRequest {
-            key_id: "main".into(),
-            all: false,
-        })
-        .await
-        .unwrap();
+        lock(&mut c, "main").await;
     }
 
     // Signed as created, then rewritten: the Verifier refuses each at
@@ -5778,14 +5411,7 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
             "label does not match",
         ),
     ] {
-        let err = c
-            .broadcast_pczt(BroadcastPcztRequest {
-                pczt: bytes,
-                via_tor: false,
-                key_id: String::new(),
-            })
-            .await
-            .unwrap_err();
+        let err = broadcast(&mut c, bytes).await.unwrap_err();
         assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
         assert!(err.message().contains(want), "{err:?}");
     }
@@ -5807,18 +5433,7 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
             /// The payment goes to another pubkey hash.
             Payment([u8; 20]),
         }
-        let fee = u64::try_from(created.proposal.as_ref().unwrap().total_fee).unwrap();
-        let values = [10_000_000u64, 100_000_000 - 10_000_000 - fee, 100_000_000];
-        let thief = {
-            let encoded = running
-                .state
-                .registry
-                .resolve("thief")
-                .unwrap()
-                .ufvk()
-                .unwrap();
-            zcash_keys::keys::UnifiedFullViewingKey::decode(&params, &encoded).unwrap()
-        };
+        let values = [10_000_000u64, change_value, 100_000_000];
         let strategy = prop_oneof![
             (0usize..3, (1u64 << 21)..(1u64 << 28)).prop_map(|(t, v)| Mutation::Value(t, v)),
             (0u32..1_000, any::<bool>()).prop_map(|(j, ext)| Mutation::Change(j, ext)),
@@ -5839,17 +5454,7 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
                         replace_all(&signed, &varint(values[t]), &varint(v))
                     }
                     Mutation::Change(j, external) => {
-                        let scope = if external {
-                            orchard::keys::Scope::External
-                        } else {
-                            orchard::keys::Scope::Internal
-                        };
-                        let to = thief
-                            .orchard()
-                            .unwrap()
-                            .address_at(j, scope)
-                            .to_raw_address_bytes();
-                        replace_all(&signed, &ours, &to)
+                        replace_all(&signed, &ours, &thief_at(j, external))
                     }
                     Mutation::Payment(h) if h != [0x42; 20] => {
                         replace_all(&signed, &[0x42; 20], &h)
@@ -5858,20 +5463,10 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
                 };
                 tried.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut c = c.clone();
-                let result = tokio::task::block_in_place(|| {
-                    handle.block_on(c.broadcast_pczt(BroadcastPcztRequest {
-                        pczt: bytes,
-                        via_tor: false,
-                        key_id: String::new(),
-                    }))
-                });
+                let result =
+                    tokio::task::block_in_place(|| handle.block_on(broadcast(&mut c, bytes)));
                 let err = match result {
-                    Ok(r) => {
-                        return Err(TestCaseError::fail(format!(
-                            "broadcast {:?}",
-                            r.into_inner().txid
-                        )));
-                    }
+                    Ok(txid) => return Err(TestCaseError::fail(format!("broadcast {txid:?}"))),
                     Err(e) => e,
                 };
                 prop_assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{:?}", err);
@@ -5886,16 +5481,7 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
     }
 
     // The genuine file still goes through.
-    let txid = c
-        .broadcast_pczt(BroadcastPcztRequest {
-            pczt: signed,
-            via_tor: false,
-            key_id: String::new(),
-        })
-        .await
-        .unwrap()
-        .into_inner()
-        .txid;
+    let txid = broadcast(&mut c, signed).await.unwrap();
     wait_in_mempool(&node, &txid).await;
     running.task.abort();
 }
@@ -5938,8 +5524,7 @@ async fn restore_below_the_window_recovers_transparent_outputs_and_discards_fabr
     assert_eq!(mid.height, 35);
     node.mine(15);
     node.set_prune_height(Some(30));
-    let lwd = FakeLightwalletd::from_node(&node);
-    let lwd = lwd.await;
+    let lwd = FakeLightwalletd::from_node(&node).await;
     let enc = |a| {
         gyges_chain::compact::encode_transparent_address(
             zcash_protocol::consensus::NetworkType::Regtest,
@@ -6001,7 +5586,7 @@ async fn restore_below_the_window_recovers_transparent_outputs_and_discards_fabr
     let report: serde_json::Value = serde_json::from_slice(
         &std::fs::read(
             running
-                ._home
+                .home
                 .path()
                 .join("regtest/keys/copy/transparent_recovery.json"),
         )
@@ -6028,34 +5613,11 @@ async fn restore_below_the_window_recovers_transparent_outputs_and_discards_fabr
 #[tokio::test]
 async fn zip320_send_treats_already_known_as_accepted() {
     use gyges_proto::v1::TexState;
-    let _ = test_hub();
-    let node = FakeNode::start(regtest_params()).await;
-    node.mine(10);
-    let url = node.url().to_string();
-    let running = start_with(
-        "[vault]\nscrypt_work_factor = 10\n[zakura_rpc]\npoll_interval_secs = 1\n\
-         [policy]\nmin_confirmations = 1\n[tex]\nrebroadcast_interval = \"1s\"\n",
-        |o| o.zakura_rpc = Some(url),
-    )
-    .await;
-    let mut c = client(&running.socket).await;
+    let node = mined_node(10).await;
+    let (running, mut c) = start_on(&node, &tex_config()).await;
     init_key(&mut c, "known").await;
     wait_spendable(&mut c, "known").await;
-    let receiver = transparent_receiver(&running.state, "known");
-    node.mine_with_payments(&[(receiver, 300_000_000)]);
-    node.mine(1);
-    wait_spendable(&mut c, "known").await;
-    unlock_daemon(&mut c, "known").await;
-    let shield = collect_events(
-        c.shield_funds(ShieldFundsRequest {
-            key_id: "known".into(),
-            ..Default::default()
-        })
-        .await,
-    )
-    .await
-    .unwrap();
-    let _ = broadcast_txid(&shield);
+    fund_and_shield(&node, &running.state, &mut c, "known", 300_000_000).await;
     node.mine(2);
     wait_spendable(&mut c, "known").await;
 
@@ -6064,12 +5626,7 @@ async fn zip320_send_treats_already_known_as_accepted() {
     node.set_reject_broadcasts(Some("transaction already in mempool".into()));
     let events = send_with_session(
         &mut c,
-        SendTransactionRequest {
-            key_id: "known".into(),
-            to: tex_addr,
-            amount: zats(50_000_000),
-            ..Default::default()
-        },
+        send_req("known", &tex_addr, 50_000_000),
         "pw",
         |_| {},
     )
@@ -6123,10 +5680,7 @@ fn files_under(dir: &std::path::Path) -> Vec<PathBuf> {
 async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
     use gyges_core::pczt_io::{self, Tags};
     use gyges_core::tx::{self as core_tx, AmountSpec};
-    use gyges_proto::v1::{
-        CreatePcztRequest, NewAddressRequest, Pool, ProvePcztRequest, SignPcztRequest,
-    };
-    let _ = test_hub();
+    use gyges_proto::v1::{NewAddressRequest, Pool, SignPcztRequest};
     let node = mined_node(ZIP212_ON + 10).await;
     let (running, mut c) = start_on(&node, ONE_CONF_CONFIG).await;
     let state = &running.state;
@@ -6159,17 +5713,9 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
         .address;
     // Two notes, so that one is left for the ZIP 320 send.
     for z in [200_000_000, 150_000_000] {
-        let events = collect_events(
-            c.send_transaction(SendTransactionRequest {
-                key_id: "main".into(),
-                to: bob_sapling.clone(),
-                amount: zats(z),
-                ..Default::default()
-            })
-            .await,
-        )
-        .await
-        .unwrap();
+        let events = collect_events(c.send_transaction(send_req("main", &bob_sapling, z)).await)
+            .await
+            .unwrap();
         let _ = broadcast_txid(&events);
         node.mine(1);
         wait_spendable(&mut c, "main").await;
@@ -6182,13 +5728,7 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
 
     // A PCZT file leaves Sapling out, and says why.
     let err = c
-        .create_pczt(CreatePcztRequest {
-            key_id: "bob".into(),
-            to: t_recipient(),
-            amount: zats(10_000_000),
-            memo: Vec::new(),
-            min_confirmations: 0,
-        })
+        .create_pczt(create_req("bob", &t_recipient(), 10_000_000))
         .await
         .unwrap_err();
     assert_eq!(reason(&err), ErrorReason::InsufficientFunds, "{err:?}");
@@ -6223,14 +5763,7 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
         },
     ))
     .unwrap();
-    let err = c
-        .prove_pczt(ProvePcztRequest {
-            pczt: tagged.clone(),
-            session_token: Vec::new(),
-            key_id: String::new(),
-        })
-        .await
-        .unwrap_err();
+    let err = prove(&mut c, tagged.clone()).await.unwrap_err();
     assert_eq!(reason(&err), ErrorReason::UnsupportedPool, "{err:?}");
     assert!(err.message().contains("Sapling"), "{err:?}");
     // Refused at the call, so no `SignatureRequired` is ever sent.
@@ -6262,11 +5795,8 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
     let events = send_with_session(
         &mut c,
         SendTransactionRequest {
-            key_id: "bob".into(),
-            to: t_recipient(),
-            amount: zats(120_000_000),
             wait_for_mined: true,
-            ..Default::default()
+            ..send_req("bob", &t_recipient(), 120_000_000)
         },
         "pw",
         |ev| {
@@ -6313,12 +5843,8 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
     let events = send_with_session(
         &mut c,
         SendTransactionRequest {
-            key_id: "bob".into(),
-            to: t_recipient(),
-            amount: Some(gyges_proto::v1::Amount {
-                value: Some(gyges_proto::v1::amount::Value::Max(true)),
-            }),
-            ..Default::default()
+            amount: max_amount(),
+            ..send_req("bob", &t_recipient(), 0)
         },
         "pw",
         |_| {},
@@ -6341,13 +5867,8 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
     // ZIP 320 from a fresh Sapling note: `create_proposed_transactions`
     // proves step 1's Sapling spend with the same key.
     let events = collect_events(
-        c.send_transaction(SendTransactionRequest {
-            key_id: "main".into(),
-            to: bob_sapling.clone(),
-            amount: zats(100_000_000),
-            ..Default::default()
-        })
-        .await,
+        c.send_transaction(send_req("main", &bob_sapling, 100_000_000))
+            .await,
     )
     .await
     .unwrap();
@@ -6355,19 +5876,9 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
     node.mine(2);
     wait_spendable(&mut c, "bob").await;
     let tex = zcash_keys::address::Address::Tex([0x42; 20]).encode(&params);
-    let events = send_with_session(
-        &mut c,
-        SendTransactionRequest {
-            key_id: "bob".into(),
-            to: tex,
-            amount: zats(60_000_000),
-            ..Default::default()
-        },
-        "pw",
-        |_| {},
-    )
-    .await
-    .unwrap();
+    let events = send_with_session(&mut c, send_req("bob", &tex, 60_000_000), "pw", |_| {})
+        .await
+        .unwrap();
     let names = event_names(&events);
     assert!(
         names.ends_with(&["broadcast", "tex_queued", "broadcast"]),
@@ -6395,7 +5906,7 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
     .into_iter()
     .flat_map(|b| [b.to_vec(), hex::encode(b).into_bytes()])
     .collect();
-    let home = running._home.path();
+    let home = running.home.path();
     let files = files_under(home);
     assert!(
         files.iter().any(|f| f.ends_with("wallet.sqlite")),

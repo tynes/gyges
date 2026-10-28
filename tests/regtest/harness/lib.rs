@@ -165,6 +165,12 @@ impl Cmd {
         self
     }
 
+    /// More arguments, after the ones given so far.
+    pub fn args(mut self, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Self {
+        self.cmd.args(args);
+        self
+    }
+
     /// Feed `text` on standard input (which is otherwise `/dev/null`).
     pub fn stdin(mut self, text: impl Into<Vec<u8>>) -> Self {
         self.stdin = Some(text.into());
@@ -402,7 +408,7 @@ pub fn poll_until<T>(
 
 /// Postcard's unsigned varint (LEB128: seven bits per byte, low bits
 /// first, high bit set on every byte but the last).
-pub fn varint(mut v: u64) -> Vec<u8> {
+fn varint(mut v: u64) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
         let byte = (v & 0x7f) as u8;

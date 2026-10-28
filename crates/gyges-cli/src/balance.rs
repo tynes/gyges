@@ -1,6 +1,8 @@
 //! `gyges balance` (CLI_SPEC.md §2.4): spendable and pending value per
 //! pool from `GetBalance`.
 
+use std::fmt::Write as _;
+
 use clap::Args;
 use gyges_proto::v1::{GetBalanceRequest, GetBalanceResponse, Pool};
 
@@ -40,7 +42,6 @@ pub fn pool_name(pool: Pool) -> &'static str {
 
 /// Human-readable table.
 pub fn render(b: &GetBalanceResponse) -> String {
-    use std::fmt::Write as _;
     let mut s = String::new();
     let _ = writeln!(s, "{:<12} {:>20} {:>20}", "POOL", "SPENDABLE", "PENDING");
     for p in &b.pools {

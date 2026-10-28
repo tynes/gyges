@@ -108,18 +108,18 @@ struct RpcErrorObject {
 /// `getblockchaininfo`, the fields Gyges reads (unknown ones are ignored).
 #[derive(Clone, Debug, Deserialize)]
 struct BlockchainInfo {
-    pub chain: String,
-    pub blocks: u32,
-    pub bestblockhash: String,
+    chain: String,
+    blocks: u32,
+    bestblockhash: String,
     #[serde(default)]
-    pub pruned: bool,
+    pruned: bool,
     /// Present only when `pruned`.
     #[serde(default)]
-    pub pruneheight: Option<u32>,
+    pruneheight: Option<u32>,
     /// Network upgrades keyed by consensus branch id (eight hex digits),
     /// pending ones included.
     #[serde(default)]
-    pub upgrades: std::collections::HashMap<String, UpgradeInfo>,
+    upgrades: std::collections::HashMap<String, UpgradeInfo>,
 }
 
 /// One entry of `getblockchaininfo.upgrades`.
@@ -151,15 +151,13 @@ pub(crate) fn branch_key(nu: NetworkUpgrade) -> String {
 
 impl BlockchainInfo {
     /// Reduce to [`NodeBounds`] (SYNC.md §1).
-    pub fn bounds(&self) -> Result<NodeBounds, ChainError> {
+    fn bounds(&self) -> Result<NodeBounds, ChainError> {
         Ok(NodeBounds {
             tip_height: BlockHeight::from_u32(self.blocks),
             tip_hash: parse_display_hash(&self.bestblockhash)?,
-            retained_from: BlockHeight::from_u32(if self.pruned {
-                self.pruneheight.unwrap_or(0)
-            } else {
-                0
-            }),
+            retained_from: BlockHeight::from_u32(
+                self.pruneheight.filter(|_| self.pruned).unwrap_or(0),
+            ),
         })
     }
 }
@@ -179,11 +177,11 @@ struct BlockObject {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct Trees {
     #[serde(default)]
-    pub sapling: Option<TreeSize>,
+    sapling: Option<TreeSize>,
     #[serde(default)]
-    pub orchard: Option<TreeSize>,
+    orchard: Option<TreeSize>,
     #[serde(default)]
-    pub ironwood: Option<TreeSize>,
+    ironwood: Option<TreeSize>,
 }
 
 /// Zebra serialises a tree size as `{"size": N}`; accept a bare number too.
@@ -452,21 +450,6 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
         Ok(())
     }
 
-    /// `getblockhash(height)`, internal byte order.
-    async fn get_block_hash(&self, height: BlockHeight) -> Result<[u8; 32], ChainError> {
-        let hash: String = self
-            .call("getblockhash", vec![json!(u32::from(height))])
-            .await
-            .map_err(|e| match e {
-                RpcFailure::Json { .. } => ChainError::BlockUnavailable { height },
-                other => self.chain_error("getblockhash", other),
-            })?;
-        parse_display_hash(&hash)
-    }
-
-    /// `getblock(height, verbosity)`: the raw block as hex (0) or the
-    /// [`BlockObject`] (1); [`ChainError::BlockUnavailable`] when the node
-    /// has no body for it.
     /// `getrawtransaction(txid, 1)`; `None` for a txid the node has neither
     /// mined nor in its mempool (code -5).
     async fn raw_tx_verbose(&self, txid: [u8; 32]) -> Result<Option<VerboseTx>, ChainError> {
@@ -481,6 +464,9 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
         }
     }
 
+    /// `getblock(height, verbosity)`: the raw block as hex (0) or the
+    /// [`BlockObject`] (1); [`ChainError::BlockUnavailable`] when the node
+    /// has no body for it.
     async fn getblock<T: DeserializeOwned>(
         &self,
         height: BlockHeight,
@@ -535,23 +521,20 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
             )));
         }
         let tree = |pool: &str, nu: NetworkUpgrade, c: Commitments| -> String {
-            match c.final_state {
-                Some(hex_tree) => hex_tree,
-                None => {
-                    if self.params.is_nu_active(nu, height) {
-                        // The pool is active, yet the node sent no frontier.
-                        // An empty tree is the only reading; say so loudly
-                        // because a wrong frontier makes notes unspendable
-                        // until a rescan (SYNC.md §9, needs verification).
-                        tracing::warn!(
-                            %height,
-                            pool,
-                            "z_gettreestate omitted the frontier of an active pool; assuming an empty tree"
-                        );
-                    }
-                    String::new()
+            c.final_state.unwrap_or_else(|| {
+                if self.params.is_nu_active(nu, height) {
+                    // The pool is active, yet the node sent no frontier. An
+                    // empty tree is the only reading; say so loudly because
+                    // a wrong frontier makes notes unspendable until a
+                    // rescan (SYNC.md §9, needs verification).
+                    tracing::warn!(
+                        %height,
+                        pool,
+                        "z_gettreestate omitted the frontier of an active pool; assuming an empty tree"
+                    );
                 }
-            }
+                String::new()
+            })
         };
         let state = TreeState {
             network: chain_name(self.params.network_type()).into(),
@@ -565,54 +548,6 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
         state
             .to_chain_state()
             .map_err(|e| ChainError::Rpc(format!("z_gettreestate({height}) does not parse: {e}")))
-    }
-
-    /// `z_getsubtreesbyindex(pool, start_index, limit)`: completed 2^16-leaf
-    /// subtree roots, raw node bytes as hex. The node answers for every
-    /// index it has built, pruned bodies or not, because the commitment
-    /// tree is consensus state (SYNC.md §5.2, **needs verification** on a
-    /// pruned node). `limit` 0 means all.
-    async fn get_subtrees_by_index(
-        &self,
-        pool: ShieldedPool,
-        start_index: u32,
-        limit: u32,
-    ) -> Result<Vec<SubtreeRoot>, ChainError> {
-        let name = pool_name(pool);
-        let mut params = vec![json!(name), json!(start_index)];
-        if limit > 0 {
-            params.push(json!(limit));
-        }
-        let obj: SubtreesObject = self
-            .call("z_getsubtreesbyindex", params)
-            .await
-            .map_err(|e| self.chain_error("z_getsubtreesbyindex", e))?;
-        if !obj.pool.is_empty() && obj.pool != name {
-            return Err(ChainError::Rpc(format!(
-                "z_getsubtreesbyindex({name}) answered for pool {}",
-                obj.pool
-            )));
-        }
-        if !obj.subtrees.is_empty() && obj.start_index != start_index {
-            return Err(ChainError::Rpc(format!(
-                "z_getsubtreesbyindex({name}, {start_index}) answered from index {}",
-                obj.start_index
-            )));
-        }
-        obj.subtrees
-            .into_iter()
-            .enumerate()
-            .map(|(i, st)| {
-                let root = hex32(&st.root, "z_getsubtreesbyindex: root")?;
-                Ok(SubtreeRoot {
-                    pool,
-                    index: start_index + i as u32,
-                    root,
-                    end_height: BlockHeight::from_u32(st.end_height),
-                    end_hash: None,
-                })
-            })
-            .collect()
     }
 
     /// One compact block: `getblock(h, 0)` parsed with `zcash_primitives`,
@@ -669,10 +604,10 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
 
     fn node_bounds(&self) -> BoxFuture<'_, Result<NodeBounds, ChainError>> {
         Box::pin(async move {
-            let outcome = match self.get_blockchain_info().await {
-                Ok(info) => info.bounds().map(|b| (b, info.pruned)),
-                Err(e) => Err(e),
-            };
+            let outcome = self
+                .get_blockchain_info()
+                .await
+                .and_then(|info| info.bounds().map(|b| (b, info.pruned)));
             self.status.record(outcome)
         })
     }
@@ -685,8 +620,18 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
         Box::pin(self.get_tree_state(height))
     }
 
+    /// `getblockhash(height)`, internal byte order.
     fn block_hash(&self, height: BlockHeight) -> BoxFuture<'_, Result<[u8; 32], ChainError>> {
-        Box::pin(self.get_block_hash(height))
+        Box::pin(async move {
+            let hash: String = self
+                .call("getblockhash", vec![json!(u32::from(height))])
+                .await
+                .map_err(|e| match e {
+                    RpcFailure::Json { .. } => ChainError::BlockUnavailable { height },
+                    other => self.chain_error("getblockhash", other),
+                })?;
+            parse_display_hash(&hash)
+        })
     }
 
     /// `sendrawtransaction(hex)`; the node answers the txid as display hex.
@@ -782,13 +727,54 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
         })
     }
 
+    /// `z_getsubtreesbyindex(pool, start_index, max_entries)`: completed
+    /// 2^16-leaf subtree roots, raw node bytes as hex. The node answers for
+    /// every index it has built, pruned bodies or not, because the
+    /// commitment tree is consensus state (SYNC.md §5.2, **needs
+    /// verification** on a pruned node). `max_entries` 0 means all.
     fn subtree_roots(
         &self,
         pool: ShieldedPool,
         start_index: u32,
         max_entries: u32,
     ) -> BoxFuture<'_, Result<Vec<SubtreeRoot>, ChainError>> {
-        Box::pin(self.get_subtrees_by_index(pool, start_index, max_entries))
+        Box::pin(async move {
+            let name = pool_name(pool);
+            let mut params = vec![json!(name), json!(start_index)];
+            if max_entries > 0 {
+                params.push(json!(max_entries));
+            }
+            let obj: SubtreesObject = self
+                .call("z_getsubtreesbyindex", params)
+                .await
+                .map_err(|e| self.chain_error("z_getsubtreesbyindex", e))?;
+            if !obj.pool.is_empty() && obj.pool != name {
+                return Err(ChainError::Rpc(format!(
+                    "z_getsubtreesbyindex({name}) answered for pool {}",
+                    obj.pool
+                )));
+            }
+            if !obj.subtrees.is_empty() && obj.start_index != start_index {
+                return Err(ChainError::Rpc(format!(
+                    "z_getsubtreesbyindex({name}, {start_index}) answered from index {}",
+                    obj.start_index
+                )));
+            }
+            obj.subtrees
+                .into_iter()
+                .enumerate()
+                .map(|(i, st)| {
+                    let root = hex32(&st.root, "z_getsubtreesbyindex: root")?;
+                    Ok(SubtreeRoot {
+                        pool,
+                        index: start_index + i as u32,
+                        root,
+                        end_height: BlockHeight::from_u32(st.end_height),
+                        end_hash: None,
+                    })
+                })
+                .collect()
+        })
     }
 }
 

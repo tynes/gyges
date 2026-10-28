@@ -27,8 +27,8 @@ use gyges_core::tx::{self as core_tx, Expected, TxError};
 use gyges_core::{KeyEntry, SigningMode, pczt_io};
 use gyges_proto::v1::{
     self, CompleteKeystoneSignRequest, CompleteKeystoneSignResponse, ErrorReason, GygesError,
-    SessionPurpose, SessionStatus, SignatureKind, SignatureRequired, SigningSession, TxidList,
-    complete_keystone_sign_response,
+    SendEvent, SessionPurpose, SessionStatus, SignatureKind, SignatureRequired, SigningSession,
+    TxidList, complete_keystone_sign_response,
 };
 use pczt::Pczt;
 use prost::Message as _;
@@ -38,7 +38,8 @@ use zcash_protocol::TxId;
 
 use crate::keys::AUDIT_TARGET;
 use crate::service::DaemonState;
-use crate::tx::{self, Prepared, tx_error, with_wallet};
+use crate::tx::{self, Prepared, tx_error, wallet_rpc};
+use crate::with_wallet;
 
 /// What a waiting stream is told when its session ends.
 type Outcome = Result<TxId, GygesError>;
@@ -100,10 +101,6 @@ impl Drop for Claim {
     }
 }
 
-fn session_error(e: impl std::fmt::Display) -> TxError {
-    TxError::Internal(e.to_string())
-}
-
 fn kind_of(protocol: Protocol) -> SignatureKind {
     match protocol {
         Protocol::KeystoneBatch => SignatureKind::KeystoneBatch,
@@ -147,8 +144,7 @@ fn expire_if_due(wallet: &mut Wallet, row: &SessionRow) -> Result<bool, TxError>
         &row.session_id,
         SessionState::Expired,
         Some("no answer from the device in time"),
-    )
-    .map_err(session_error)?;
+    )?;
     Ok(true)
 }
 
@@ -160,7 +156,7 @@ fn key_sessions(
     include_finished: bool,
 ) -> Result<Vec<SigningSession>, TxError> {
     let mut out = Vec::new();
-    for mut row in sessions::list(wallet, true).map_err(session_error)? {
+    for mut row in sessions::list(wallet, true)? {
         if !matches!(
             row.protocol,
             Protocol::KeystoneBatch | Protocol::KeystonePczt
@@ -173,8 +169,7 @@ fn key_sessions(
         if !include_finished && row.state != SessionState::AwaitingSignature {
             continue;
         }
-        let payload = sessions::get_keystone(wallet, &row.session_id)
-            .map_err(session_error)?
+        let payload = sessions::get_keystone(wallet, &row.session_id)?
             .map(|k| k.payload)
             .unwrap_or_default();
         out.push(proto_session(key_id, &row, payload));
@@ -229,14 +224,12 @@ async fn find(
 ) -> Result<Option<(Arc<KeyEntry>, SessionRow, KeystoneRow)>, Status> {
     for key in keystone_keys(state, "") {
         let sid = session_id.to_string();
-        let kid = key.key_id().to_string();
-        let found = with_wallet(&key, move |w| {
-            let row = sessions::get(w, &sid).map_err(session_error)?;
-            let ks = sessions::get_keystone(w, &sid).map_err(session_error)?;
+        let found = wallet_rpc(&key, move |w| {
+            let row = sessions::get(w, &sid)?;
+            let ks = sessions::get_keystone(w, &sid)?;
             Ok(row.zip(ks))
         })
-        .await
-        .map_err(|e| tx_error(e, &kid).into_status())?;
+        .await?;
         if let Some((row, ks)) = found {
             return Ok(Some((key, row, ks)));
         }
@@ -254,16 +247,12 @@ pub async fn abort(
         return Ok(None);
     };
     let kid = key.key_id().to_string();
-    let sid = session_id.to_string();
-    let left = with_wallet(&key, move |w| {
-        sessions::leave_awaiting(
-            w,
-            &sid,
-            SessionState::Aborted,
-            Some("aborted by the client"),
-        )
-        .map_err(session_error)
-    })
+    let left = tx::leave_awaiting(
+        &key,
+        session_id,
+        SessionState::Aborted,
+        Some("aborted by the client"),
+    )
     .await
     .map_err(|e| tx_error(e, &kid).into_status())?;
     let mut row = row;
@@ -288,7 +277,7 @@ pub async fn abort(
 /// broadcast it; `Ok(None)` when the client left (the session lives on and
 /// is completed with `CompleteKeystoneSign`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn await_device<E: Send + 'static>(
+pub(crate) async fn await_device(
     state: &Arc<DaemonState>,
     prepared: &Prepared,
     summary: &v1::Proposal,
@@ -296,8 +285,7 @@ pub(crate) async fn await_device<E: Send + 'static>(
     proven: Pczt,
     request: DeviceRequest,
     via_tor: bool,
-    tx: &mpsc::Sender<Result<E, Status>>,
-    wrap: impl Fn(SignatureRequired) -> E,
+    tx: &mpsc::Sender<Result<SendEvent, Status>>,
 ) -> Result<Option<TxId>, Status> {
     let key = &prepared.key;
     let key_id = key.key_id().to_string();
@@ -328,11 +316,7 @@ pub(crate) async fn await_device<E: Send + 'static>(
     // Registered before the row exists, so a completion that races the
     // event below still finds the stream.
     let rx = state.keystone.wait(&session_id);
-    with_wallet(key, move |w| {
-        sessions::insert_keystone(w, &row, &ks).map_err(session_error)
-    })
-    .await
-    .map_err(err)?;
+    wallet_rpc(key, move |w| Ok(sessions::insert_keystone(w, &row, &ks)?)).await?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "session_created");
     tracing::info!(
         key_id,
@@ -349,7 +333,10 @@ pub(crate) async fn await_device<E: Send + 'static>(
         step: 1,
         summary: Some(summary.clone()),
     };
-    if tx::send(tx, wrap(required)).await.is_err() {
+    if tx::send(tx, tx::signature_required(required))
+        .await
+        .is_err()
+    {
         state.keystone.forget(&session_id);
         return Ok(None);
     }
@@ -361,16 +348,12 @@ pub(crate) async fn await_device<E: Send + 'static>(
             Ok(Err(_)) => Err(tx::cancelled()),
             Err(_elapsed) => {
                 state.keystone.forget(&session_id);
-                let sid = session_id.clone();
-                let _ = with_wallet(key, move |w| {
-                    sessions::leave_awaiting(
-                        w,
-                        &sid,
-                        SessionState::Expired,
-                        Some("no answer from the device in time"),
-                    )
-                    .map_err(session_error)
-                })
+                let _ = tx::leave_awaiting(
+                    key,
+                    &session_id,
+                    SessionState::Expired,
+                    Some("no answer from the device in time"),
+                )
                 .await;
                 Err(GygesError::new(
                     ErrorReason::SessionNotFound,
@@ -416,10 +399,7 @@ pub async fn complete_keystone_sign(
     };
     {
         let r = row.clone();
-        if with_wallet(&key, move |w| expire_if_due(w, &r))
-            .await
-            .map_err(err)?
-        {
+        if wallet_rpc(&key, move |w| expire_if_due(w, &r)).await? {
             state.keystone.notify(
                 &session_id,
                 Err(typed(
@@ -447,13 +427,7 @@ pub async fn complete_keystone_sign(
              mined, start over",
             ks.expiry_height
         );
-        let sid = session_id.clone();
-        let d = detail.clone();
-        let _ = with_wallet(&key, move |w| {
-            sessions::leave_awaiting(w, &sid, SessionState::Expired, Some(&d))
-                .map_err(session_error)
-        })
-        .await;
+        let _ = tx::leave_awaiting(&key, &session_id, SessionState::Expired, Some(&detail)).await;
         state.keystone.notify(
             &session_id,
             Err(typed(ErrorReason::NotSynced, detail.clone())),
@@ -470,7 +444,7 @@ pub async fn complete_keystone_sign(
         let error = typed(ErrorReason::HardwareSigner, detail.clone());
         async move {
             let _ = with_wallet(&key, move |w| {
-                sessions::note_error(w, &sid, &detail).map_err(session_error)
+                sessions::note_error(w, &sid, &detail).map_err(TxError::from)
             })
             .await;
             error.into_status()
@@ -507,9 +481,7 @@ pub async fn complete_keystone_sign(
     }
     let expected = Expected::from_json(&row.expected).map_err(err)?;
     let owner_params = state.registry.params();
-    let owner = with_wallet(&key, move |w| core_tx::Owner::of_wallet(&owner_params, w))
-        .await
-        .map_err(err)?;
+    let owner = wallet_rpc(&key, move |w| core_tx::Owner::of_wallet(&owner_params, w)).await?;
     let verified = match core_tx::verify(signed, &expected, &owner) {
         Ok(p) => p,
         Err(e) => {
@@ -521,12 +493,9 @@ pub async fn complete_keystone_sign(
     };
 
     // Claim the row for good, then extract, record and broadcast.
-    let sid = session_id.clone();
-    let claimed = with_wallet(&key, move |w| {
-        sessions::leave_awaiting(w, &sid, SessionState::Signed, None).map_err(session_error)
-    })
-    .await
-    .map_err(err)?;
+    let claimed = tx::leave_awaiting(&key, &session_id, SessionState::Signed, None)
+        .await
+        .map_err(err)?;
     if !claimed {
         return Err(not_found(
             "the Keystone session was aborted or completed meanwhile",
@@ -543,12 +512,13 @@ pub async fn complete_keystone_sign(
             // Claimed but not recorded: say so on the row and to the stream,
             // which would otherwise wait for an answer that already came.
             let error = tx_error(e, &key_id).with_session(&session_id);
-            let text = error.detail.clone();
-            let sid = session_id.clone();
-            let _ = with_wallet(&key, move |w| {
-                sessions::set_state(w, &sid, SessionState::Signed, None, Some(&text))
-                    .map_err(session_error)
-            })
+            let _ = tx::set_session_state(
+                &key,
+                &session_id,
+                SessionState::Signed,
+                None,
+                Some(&error.detail),
+            )
             .await;
             state.keystone.notify(&session_id, Err(error.clone()));
             return Err(error.into_status());
@@ -556,26 +526,17 @@ pub async fn complete_keystone_sign(
     };
     tracing::info!(target: AUDIT_TARGET, key_id, event = "sign", via = "keystone");
     let raw_txid = *txid.as_ref();
-    if let Err(e) = route.send(&chain, raw, &key_id).await {
-        let text = if e.node_error.is_empty() {
-            e.detail.clone()
-        } else {
-            e.node_error.clone()
-        };
-        let sid = session_id.clone();
-        let _ = with_wallet(&key, move |w| {
-            sessions::set_state(w, &sid, SessionState::Signed, None, Some(&text))
-                .map_err(session_error)
-        })
-        .await;
+    if let Err(e) = tx::broadcast_signed(&key, &chain, &route, &session_id, raw).await {
         state.keystone.notify(&session_id, Err(e.clone()));
         return Err(e.into_status());
     }
-    let sid = session_id.clone();
-    with_wallet(&key, move |w| {
-        sessions::set_state(w, &sid, SessionState::Broadcast, Some(raw_txid), None)
-            .map_err(session_error)
-    })
+    tx::set_session_state(
+        &key,
+        &session_id,
+        SessionState::Broadcast,
+        Some(raw_txid),
+        None,
+    )
     .await
     .map_err(err)?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());

@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use age::secrecy::SecretString;
 use gyges_chain::{ChainBackend, ChainError};
+use gyges_core::sessions::{self, SessionState};
 use gyges_core::tx::{self as core_tx, AmountSpec, Expected, ProposalSummary, TxError};
 use gyges_core::vault::manager::{Auth, Token};
 use gyges_core::{KeyEntry, SigningMode};
@@ -49,7 +50,8 @@ use zcash_protocol::value::Zatoshis;
 use crate::conn::ConnInfo;
 use crate::keys::{AUDIT_TARGET, proto_pool, vault_error};
 use crate::service::{DaemonState, invalid, unix_now};
-use crate::tex::{self, DriveError, Offered, queue_error};
+use crate::tex::{self, DriveError, Offered};
+use crate::with_wallet;
 
 /// The server-streaming response type for `SendTransaction` / `ShieldFunds`.
 pub type SendStream = tonic::codegen::BoxStream<SendEvent>;
@@ -257,6 +259,70 @@ pub fn tx_error(e: TxError, key_id: &str) -> GygesError {
         }
     };
     err.with_key(key_id)
+}
+
+/// [`with_wallet`] for an RPC: a failure is the key's typed error.
+pub(crate) async fn wallet_rpc<T: Send + 'static>(
+    key: &Arc<KeyEntry>,
+    f: impl FnOnce(&mut gyges_core::registry::Wallet) -> Result<T, TxError> + Send + 'static,
+) -> Result<T, Status> {
+    with_wallet(key, f)
+        .await
+        .map_err(|e| tx_error(e, key.key_id()).into_status())
+}
+
+/// [`sessions::set_state`] on the key's wallet.
+pub(crate) async fn set_session_state(
+    key: &Arc<KeyEntry>,
+    session_id: &str,
+    to: SessionState,
+    txid: Option<[u8; 32]>,
+    error: Option<&str>,
+) -> Result<(), TxError> {
+    let sid = session_id.to_string();
+    let error = error.map(str::to_string);
+    with_wallet(key, move |w| {
+        Ok(sessions::set_state(w, &sid, to, txid, error.as_deref())?)
+    })
+    .await
+}
+
+/// [`sessions::leave_awaiting`] on the key's wallet: `true` when the row
+/// was still awaiting a signature.
+pub(crate) async fn leave_awaiting(
+    key: &Arc<KeyEntry>,
+    session_id: &str,
+    to: SessionState,
+    error: Option<&str>,
+) -> Result<bool, TxError> {
+    let sid = session_id.to_string();
+    let error = error.map(str::to_string);
+    with_wallet(key, move |w| {
+        Ok(sessions::leave_awaiting(w, &sid, to, error.as_deref())?)
+    })
+    .await
+}
+
+/// Broadcast a signed session's transaction over `route`. A failure is
+/// recorded on the row (still `Signed`, with the node's text when it gave
+/// one) and returned.
+pub(crate) async fn broadcast_signed(
+    key: &Arc<KeyEntry>,
+    chain: &Arc<dyn ChainBackend>,
+    route: &Route,
+    session_id: &str,
+    raw: Vec<u8>,
+) -> Result<(), GygesError> {
+    let Err(e) = route.send(chain, raw, key.key_id()).await else {
+        return Ok(());
+    };
+    let text = if e.node_error.is_empty() {
+        &e.detail
+    } else {
+        &e.node_error
+    };
+    let _ = set_session_state(key, session_id, SessionState::Signed, None, Some(text)).await;
+    Err(e)
 }
 
 pub(crate) fn broadcast_error(e: ChainError, key_id: &str) -> GygesError {
@@ -725,13 +791,8 @@ pub fn shield_funds(
     // No per-request flag: `broadcast_via_tor` decides.
     let route = broadcast_route(&state, false, prepared.key.key_id())?;
     let params = state.registry.params();
-    let threshold = u64::try_from(req.threshold).map_err(|_| {
-        GygesError::new(
-            ErrorReason::InvalidArgument,
-            "the threshold must not be negative",
-        )
-        .into_status()
-    })?;
+    let threshold =
+        u64::try_from(req.threshold).map_err(|_| invalid("the threshold must not be negative"))?;
     let keystone = is_keystone(&prepared);
     if keystone && !req.dry_run {
         refuse_if_pending(&prepared)?;
@@ -881,22 +942,6 @@ pub(crate) fn connected_chain(
     Ok(chain)
 }
 
-/// Run `f` with the key's wallet on a blocking thread.
-pub(crate) async fn with_wallet<T: Send + 'static>(
-    key: &Arc<KeyEntry>,
-    f: impl FnOnce(&mut gyges_core::registry::Wallet) -> Result<T, TxError> + Send + 'static,
-) -> Result<T, TxError> {
-    let key = key.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut guard = key
-            .wallet()
-            .ok_or_else(|| TxError::Internal("this profile has no wallet".into()))?;
-        f(&mut guard)
-    })
-    .await
-    .map_err(|e| TxError::Internal(format!("wallet task failed: {e}")))?
-}
-
 pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, TxError> + Send + 'static,
 ) -> Result<T, TxError> {
@@ -920,7 +965,7 @@ async fn pipeline(
     let err = |e: TxError| tx_error(e, &key_id).into_status();
 
     // 1–3. Propose (and, unless dry-run, build the PCZT) under the wallet lock.
-    let (summary, rest) = with_wallet(key, propose).await.map_err(err)?;
+    let (summary, rest) = wallet_rpc(key, propose).await?;
     let proto = proto_proposal(&summary);
     emit(tx, send_event::Event::Proposed(proto.clone())).await?;
     let (expected, pczt) = match rest {
@@ -935,7 +980,7 @@ async fn pipeline(
     };
     // A Keystone is shown the PCZT before it is proven (as Zodl does); the
     // proven copy is what its answer is applied to.
-    let device_request = if key.profile().signing_mode == SigningMode::KeystoneQr {
+    let device_request = if is_keystone(prepared) {
         Some(gyges_core::keystone::device_request(&pczt).map_err(|e| {
             GygesError::new(ErrorReason::Internal, e.to_string())
                 .with_key(&key_id)
@@ -963,12 +1008,7 @@ async fn pipeline(
         .with_key(&key_id)
         .into_status());
     } else {
-        Some(
-            obtain_key(state, prepared, &proto, tx, 1, |r| SendEvent {
-                event: Some(send_event::Event::SignatureRequired(r)),
-            })
-            .await?,
-        )
+        Some(obtain_key(state, prepared, &proto, tx, 1, signature_required).await?)
     };
     let pools: Vec<(v1::Pool, u32)> = [
         (v1::Pool::Orchard, work.orchard_actions),
@@ -1004,77 +1044,46 @@ async fn pipeline(
         "proposal proven"
     );
 
-    // 5 (Keystone). A persisted session; the completion broadcasts.
-    if let Some(request) = device_request {
+    let txid = if let Some(request) = device_request {
+        // 5 (Keystone). A persisted session; the completion broadcasts.
         let via_tor = matches!(route, Route::Endpoint(_));
         let Some(txid) = crate::keystone::await_device(
-            state,
-            prepared,
-            &proto,
-            &expected,
-            pczt,
-            request,
-            via_tor,
-            tx,
-            |r| SendEvent {
-                event: Some(send_event::Event::SignatureRequired(r)),
-            },
+            state, prepared, &proto, &expected, pczt, request, via_tor, tx,
         )
         .await?
         else {
             return Ok(());
         };
         emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
-        let txid_hex = txid.to_string();
-        emit_broadcast(tx, 1, txid_hex.clone()).await?;
-        if wait_for_mined {
-            let raw_txid = *txid.as_ref();
-            loop {
-                if let Some(h) = crate::sync::mined_height(key, raw_txid).await {
-                    return emit_mined(tx, 1, txid_hex, u32::from(h)).await;
-                }
-                state.sync.wake();
-                idle_or_closed(tx).await?;
-            }
-        }
-        return Ok(());
-    }
+        txid
+    } else {
+        // 5. The spending key: token, daemon unlock, or a session (already
+        // in hand when the proposal spends Sapling).
+        let usk = match early_key {
+            Some(usk) => usk,
+            None => obtain_key(state, prepared, &proto, tx, 1, signature_required).await?,
+        };
+        let signer = core_tx::SignerId::of(key.profile(), &state.registry.params()).map_err(err)?;
+        let pczt = wallet_rpc(key, move |w| core_tx::sign(Some(&*w), pczt, &usk, &signer)).await?;
+        // `usk` was moved into the signing task and dropped there.
 
-    // 5. The spending key: token, daemon unlock, or a session (already in
-    // hand when the proposal spends Sapling).
-    let usk = match early_key {
-        Some(usk) => usk,
-        None => {
-            obtain_key(state, prepared, &proto, tx, 1, |r| SendEvent {
-                event: Some(send_event::Event::SignatureRequired(r)),
-            })
-            .await?
-        }
+        // 6. Verify against the approved proposal (Q-K7).
+        let owner_params = state.registry.params();
+        let owner = wallet_rpc(key, move |w| core_tx::Owner::of_wallet(&owner_params, w)).await?;
+        let pczt = core_tx::verify(pczt, &expected, &owner).map_err(err)?;
+
+        // 7. Extract, record in the wallet, and broadcast.
+        let provers = state.provers.clone();
+        let (txid, raw) =
+            wallet_rpc(key, move |w| core_tx::extract_and_store(w, pczt, &provers)).await?;
+        emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
+        route.send(prepared.chain()?, raw, &key_id).await?;
+        tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());
+        tracing::info!(key_id, via = route.name(), "transaction broadcast");
+        state.sync.wake();
+        txid
     };
-    let signer = core_tx::SignerId::of(key.profile(), &state.registry.params()).map_err(err)?;
-    let pczt = with_wallet(key, move |w| core_tx::sign(Some(&*w), pczt, &usk, &signer))
-        .await
-        .map_err(err)?;
-    // `usk` was moved into the signing task and dropped there.
-
-    // 6. Verify against the approved proposal (Q-K7).
-    let owner_params = state.registry.params();
-    let owner = with_wallet(key, move |w| core_tx::Owner::of_wallet(&owner_params, w))
-        .await
-        .map_err(err)?;
-    let pczt = core_tx::verify(pczt, &expected, &owner).map_err(err)?;
-
-    // 7. Extract, record in the wallet, and broadcast.
-    let provers = state.provers.clone();
-    let (txid, raw) = with_wallet(key, move |w| core_tx::extract_and_store(w, pczt, &provers))
-        .await
-        .map_err(err)?;
-    emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
     let txid_hex = txid.to_string();
-    route.send(prepared.chain()?, raw, &key_id).await?;
-    tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());
-    tracing::info!(key_id, via = route.name(), "transaction broadcast");
-    state.sync.wake();
     emit_broadcast(tx, 1, txid_hex.clone()).await?;
 
     if wait_for_mined {
@@ -1132,6 +1141,13 @@ pub(crate) fn key_from_unlock(
             Ok(None)
         }
         Err(e) => Err(vault_error(e, &key_id).into_status()),
+    }
+}
+
+/// `SignatureRequired` as a `tx send` stream event.
+pub(crate) fn signature_required(r: SignatureRequired) -> SendEvent {
+    SendEvent {
+        event: Some(send_event::Event::SignatureRequired(r)),
     }
 }
 
@@ -1242,10 +1258,7 @@ async fn tex_pipeline(
 
     // One signature prompt per send: the key is obtained once and used for
     // both steps inside the builder.
-    let usk = obtain_key(state, prepared, &proto, tx, 1, |r| SendEvent {
-        event: Some(send_event::Event::SignatureRequired(r)),
-    })
-    .await?;
+    let usk = obtain_key(state, prepared, &proto, tx, 1, signature_required).await?;
     let chain = prepared.chain()?.clone();
     let pools: Vec<(v1::Pool, u32)> = proto
         .steps
@@ -1262,12 +1275,11 @@ async fn tex_pipeline(
     let params = state.registry.params();
     let provers = state.provers.clone();
     let t0 = std::time::Instant::now();
-    let built = with_wallet(key, move |w| {
+    let built = wallet_rpc(key, move |w| {
         let account = core_tx::account_of(w)?;
         core_tx::create_tex_transactions(w, &params, account, &proposal, usk, &provers)
     })
-    .await
-    .map_err(err)?;
+    .await?;
     emit_proving(tx, &pools, true).await?;
     tracing::info!(
         key_id,
@@ -1296,9 +1308,7 @@ async fn tex_pipeline(
         attempts: 0,
         last_error: None,
     };
-    with_wallet(key, move |w| core_tex::insert(w, &row).map_err(queue_error))
-        .await
-        .map_err(err)?;
+    wallet_rpc(key, move |w| Ok(core_tex::insert(w, &row)?)).await?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "tex_queued");
     let step1_hex = built.step1_txid.to_string();
     let step2_hex = built.step2_txid.to_string();
@@ -1364,9 +1374,7 @@ async fn tex_pipeline(
                 step1_done = true;
                 emit_mined(tx, 1, step1_hex.clone(), u32::from(h)).await?;
             }
-            let row = with_wallet(key, move |w| core_tex::get(w, id).map_err(queue_error))
-                .await
-                .map_err(err)?;
+            let row = wallet_rpc(key, move |w| Ok(core_tex::get(w, id)?)).await?;
             let Some(row) = row else {
                 return Err(Status::internal("the tex queue row disappeared"));
             };
@@ -1521,10 +1529,7 @@ pub async fn get_balance(
         "a signer-only profile has no wallet and no balance",
     )?;
     let min_confirmations = state.min_confirmations(req.min_confirmations);
-    let key_id = key.key_id().to_string();
-    let b = with_wallet(&key, move |w| core_tx::balance(w, min_confirmations))
-        .await
-        .map_err(|e| tx_error(e, &key_id).into_status())?;
+    let b = wallet_rpc(&key, move |w| core_tx::balance(w, min_confirmations)).await?;
     Ok(GetBalanceResponse {
         pools: b
             .pools

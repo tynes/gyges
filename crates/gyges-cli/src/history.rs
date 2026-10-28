@@ -2,6 +2,8 @@
 //! (`GetTransactionStatus`), CLI_SPEC.md §2.5. `tx status --pir` exits 1
 //! as not implemented, before any RPC is sent.
 
+use std::fmt::Write as _;
+
 use clap::Args;
 use gyges_proto::v1::{
     GetTransactionStatusRequest, GetTransactionStatusResponse, ListTransactionsRequest,
@@ -111,7 +113,6 @@ fn memo_text(memo: &[u8]) -> Option<String> {
 }
 
 fn render_one(s: &mut String, t: &TransactionSummary) {
-    use std::fmt::Write as _;
     let when = if t.timestamp == 0 {
         "-".to_string()
     } else {
@@ -163,7 +164,6 @@ fn render_one(s: &mut String, t: &TransactionSummary) {
 /// `tx list` for a terminal: one line per transaction, then its
 /// non-change outputs and its ZIP 320 row.
 pub fn render_list(r: &ListTransactionsResponse) -> String {
-    use std::fmt::Write as _;
     if r.transactions.is_empty() {
         return "no transactions\n".to_string();
     }

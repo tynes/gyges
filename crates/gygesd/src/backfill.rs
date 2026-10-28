@@ -37,12 +37,14 @@ use zcash_protocol::ShieldedPool;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::service::DaemonState;
-use crate::sync::{Scheduler, with_wallet};
+use crate::sync::Scheduler;
+use crate::with_wallet;
 
 /// What the daemon knows about the fallback endpoint (`GetInfo.fallback`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Trust {
     /// No backfill has been validated against the node yet.
+    #[default]
     Untested,
     /// A backfill from it passed the handoff checks.
     Verified,
@@ -58,7 +60,7 @@ struct TrustFile {
     marked_at: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct TrustInner {
     trust: Trust,
     endpoint: String,
@@ -66,21 +68,9 @@ struct TrustInner {
 }
 
 /// The endpoint's trust state, shared by the scheduler and `GetInfo`.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TrustHub {
     inner: Mutex<TrustInner>,
-}
-
-impl Default for TrustHub {
-    fn default() -> Self {
-        Self {
-            inner: Mutex::new(TrustInner {
-                trust: Trust::Untested,
-                endpoint: String::new(),
-                path: None,
-            }),
-        }
-    }
 }
 
 impl TrustHub {
@@ -867,7 +857,8 @@ impl Scheduler {
             "the fallback endpoint failed handoff validation against the node ({reason}); \
              set another fallback_lightwalletd.grpc_url to backfill"
         );
-        self.stall(key_id, StallReason::UntrustedBackfill, detail);
+        self.hub()
+            .stall(key_id, StallReason::UntrustedBackfill, detail);
     }
 
     /// The endpoint failed to answer (`SyncError::Fallback`): stalled
@@ -875,7 +866,8 @@ impl Scheduler {
     pub(crate) fn stall_fallback(&self, key_id: &str, e: &ChainError) {
         tracing::warn!(key_id, error = %e, "fallback endpoint unavailable; retrying next tick");
         let detail = format!("fallback endpoint unavailable, retrying: {e}");
-        self.stall(key_id, StallReason::FallbackUnreachable, detail);
+        self.hub()
+            .stall(key_id, StallReason::FallbackUnreachable, detail);
     }
 }
 

@@ -1,4 +1,5 @@
-//! The key RPCs (`ListKeys`, `InitKey`, `RestoreKey`) and the mapping from
+//! The key RPCs (`ListKeys`, `InitKey`, `RestoreKey`, `ImportKeystone`,
+//! `UnlockKey`, `LockKey`, `ExportUfvk`, `ExportSeed`) and the mapping from
 //! `gyges-core` errors to `GygesError` (API.md §3, §4).
 //!
 //! Passphrases and mnemonics arrive as plain strings in the request message
@@ -33,7 +34,7 @@ use crate::conn::ConnInfo;
 use crate::service::{DaemonState, invalid};
 
 /// Security-relevant events, key id and time only (OVERVIEW.md Q-O1). The
-/// target lets the audit appender (ROADMAP.md M1, last item) pick them out.
+/// target is how `logs` routes them to `audit.log`.
 pub const AUDIT_TARGET: &str = "gyges::audit";
 
 /// The literal `ExportSeed.confirmation` must equal (CLI_SPEC.md §2.2).
@@ -59,6 +60,10 @@ pub fn proto_pool(pool: gyges_core::Pool) -> v1::Pool {
     }
 }
 
+fn proto_pools(pools: &[gyges_core::Pool]) -> Vec<i32> {
+    pools.iter().map(|&p| proto_pool(p) as i32).collect()
+}
+
 /// One `KeySummary` row. `locked` is false only for a daemon-scoped unlock:
 /// connection-scoped ones are usable by nobody else and are not shown
 /// (API.md §6.3).
@@ -73,16 +78,8 @@ pub fn summary(entry: &KeyEntry, default_key: &str, unlocks: &[UnlockState]) -> 
         unlock_expires_at: unlock.map_or(0, |u| gyges_core::profile::unix_secs(u.expires_at)),
         birthday_height: p.birthday_height.unwrap_or(0),
         scanned_tip: entry.scanned_tip(),
-        spend_pools: p
-            .spend_pools
-            .iter()
-            .map(|&x| proto_pool(x) as i32)
-            .collect(),
-        receive_pools: p
-            .receive_pools
-            .iter()
-            .map(|&x| proto_pool(x) as i32)
-            .collect(),
+        spend_pools: proto_pools(&p.spend_pools),
+        receive_pools: proto_pools(&p.receive_pools),
         device_version: p.device_version.clone().unwrap_or_default(),
         seed_fingerprint: p.seed_fingerprint.clone().unwrap_or_default(),
         transparent_best_effort_below: crate::backfill::load_report(entry)
@@ -380,9 +377,7 @@ async fn resolve_import_birthday(
             height,
             retained_from,
         }) => {
-            let (b, n) = below_retention(state, height, retained_from, allow_backfill)
-                .await
-                .map_err(GygesError::into_status)?;
+            let (b, n) = below_retention(state, height, retained_from, allow_backfill).await?;
             let warning = format!(
                 "transparent history below height {retained_from} comes from the fallback \
                  endpoint and is best-effort: an output it leaves out cannot be detected \
@@ -408,8 +403,7 @@ pub async fn import_keystone(
         &req.payload,
         req.account_index,
         req.allow_unknown_firmware,
-    )
-    .map_err(GygesError::into_status)?;
+    )?;
 
     let requested = if req.birthday_height == 0 {
         state.network.nu5_activation_height()
@@ -452,11 +446,7 @@ pub async fn import_keystone(
         seed_fingerprint: profile.seed_fingerprint.clone().unwrap_or_default(),
         device_version: export.device_version,
         ufvk: entry.ufvk().unwrap_or_default(),
-        spend_pools: profile
-            .spend_pools
-            .iter()
-            .map(|p| proto_pool(*p) as i32)
-            .collect(),
+        spend_pools: proto_pools(&profile.spend_pools),
         birthday_height: height,
         backfill_blocks,
         warnings,

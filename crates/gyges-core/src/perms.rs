@@ -31,82 +31,65 @@ pub enum PermissionError {
 /// Bits that must be clear on everything under `GYGES_HOME`.
 const GROUP_OTHER: u32 = 0o077;
 
+/// `TooWide` when `mode` has group or other bits.
+fn private(path: &Path, mode: u32, want: u32) -> Result<(), PermissionError> {
+    if mode & GROUP_OTHER != 0 {
+        return Err(PermissionError::TooWide {
+            path: path.to_path_buf(),
+            mode,
+            want,
+        });
+    }
+    Ok(())
+}
+
 /// Walk `root` (itself included) and fail on the first directory or regular
 /// file readable by group or other. Symlinks are inspected, not followed;
 /// sockets are skipped because `gygesd.sock` has its own rule (0660 with
 /// `daemon.socket_group`).
 pub fn check_tree(root: &Path) -> Result<(), PermissionError> {
-    let meta = fs::symlink_metadata(root).map_err(|source| PermissionError::Io {
+    let io_err = |source| PermissionError::Io {
         path: root.to_path_buf(),
         source,
-    })?;
+    };
+    let meta = fs::symlink_metadata(root).map_err(io_err)?;
     let ft = meta.file_type();
     let mode = meta.mode() & 0o7777;
     if ft.is_dir() {
-        if mode & GROUP_OTHER != 0 {
-            return Err(PermissionError::TooWide {
-                path: root.to_path_buf(),
-                mode,
-                want: 0o700,
-            });
-        }
-        let entries = fs::read_dir(root).map_err(|source| PermissionError::Io {
-            path: root.to_path_buf(),
-            source,
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|source| PermissionError::Io {
-                path: root.to_path_buf(),
-                source,
-            })?;
-            check_tree(&entry.path())?;
+        private(root, mode, 0o700)?;
+        for entry in fs::read_dir(root).map_err(io_err)? {
+            check_tree(&entry.map_err(io_err)?.path())?;
         }
         Ok(())
     } else if ft.is_socket() || ft.is_fifo() {
         Ok(())
-    } else if mode & GROUP_OTHER != 0 {
-        Err(PermissionError::TooWide {
-            path: root.to_path_buf(),
-            mode,
-            want: 0o600,
-        })
     } else {
-        Ok(())
+        private(root, mode, 0o600)
     }
 }
 
 /// Create `dir` (and its parents) with mode `0700`, or verify an existing
 /// one is no wider.
 pub fn ensure_private_dir(dir: &Path) -> Result<(), PermissionError> {
+    let io_err = |source| PermissionError::Io {
+        path: dir.to_path_buf(),
+        source,
+    };
     if !dir.exists() {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(dir)
-            .map_err(|source| PermissionError::Io {
-                path: dir.to_path_buf(),
-                source,
-            })?;
+            .map_err(io_err)?;
     }
-    let meta = fs::symlink_metadata(dir).map_err(|source| PermissionError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    let mode = meta.mode() & 0o7777;
+    let meta = fs::symlink_metadata(dir).map_err(io_err)?;
     if !meta.is_dir() {
-        return Err(PermissionError::Io {
-            path: dir.to_path_buf(),
-            source: io::Error::new(io::ErrorKind::NotADirectory, "not a directory"),
-        });
+        return Err(io_err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "not a directory",
+        )));
     }
-    if mode & GROUP_OTHER != 0 {
-        return Err(PermissionError::TooWide {
-            path: dir.to_path_buf(),
-            mode,
-            want: 0o700,
-        });
-    }
-    Ok(())
+    private(dir, meta.mode() & 0o7777, 0o700)
 }
 
 /// Open (create or truncate) a file with mode `0600`.

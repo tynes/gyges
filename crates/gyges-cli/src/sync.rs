@@ -2,6 +2,7 @@
 //!
 //! `status`, `wait`, `run` and `mempool` (SYNC.md §7).
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
@@ -9,7 +10,6 @@ use gyges_proto::v1::{
     ErrorReason, GetSyncStatusRequest, GygesError, KeySyncStatus, RunSyncRequest,
     ScanMempoolRequest, StallReason, SyncProgress, SyncState, SyncTarget, WaitSyncRequest,
 };
-use tokio_stream::StreamExt as _;
 
 use crate::client::Ctx;
 use crate::exit::CliError;
@@ -150,7 +150,6 @@ pub fn state_word(k: &KeySyncStatus) -> String {
 
 /// Human-readable `sync status`.
 pub fn render_status(keys: &[KeySyncStatus]) -> String {
-    use std::fmt::Write as _;
     if keys.is_empty() {
         return "no keys with a wallet; create one with `gyges key init --id main`\n".to_string();
     }
@@ -197,13 +196,13 @@ pub fn progress_line(p: &SyncProgress) -> String {
         k.chain_tip
     );
     if k.blocks_remaining > 0 {
-        line.push_str(&format!(", {} to go", k.blocks_remaining));
+        let _ = write!(line, ", {} to go", k.blocks_remaining);
     }
     if k.blocks_per_sec > 0.0 {
-        line.push_str(&format!(" ({:.0} blk/s)", k.blocks_per_sec));
+        let _ = write!(line, " ({:.0} blk/s)", k.blocks_per_sec);
     }
     if p.confirmations > 0 {
-        line.push_str(&format!(", {} confirmations", p.confirmations));
+        let _ = write!(line, ", {} confirmations", p.confirmations);
     }
     line
 }
@@ -275,7 +274,7 @@ async fn follow(
     let mut last: Option<SyncProgress> = None;
     loop {
         let next = tokio::select! {
-            item = stream.next() => item,
+            item = stream.message() => item,
             _ = tokio::signal::ctrl_c() => return Err(CliError::Cancelled),
             () = async {
                 match deadline {
@@ -298,7 +297,7 @@ async fn follow(
                 return Err(CliError::Daemon(err));
             }
         };
-        match next.transpose()? {
+        match next? {
             None => return Ok(()),
             Some(p) => {
                 ctx.report(&p, || {

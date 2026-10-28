@@ -4,7 +4,7 @@
 //! An account born at height `h` needs the note commitment tree state as of
 //! the end of block `h - 1`. Below Sapling activation both trees are empty,
 //! so no node is needed; above it the local node's `z_gettreestate` is the
-//! only source in this milestone, and a pruned node can answer only for
+//! primary source, and a pruned node can answer only for
 //! `h - 1 >= retained_from`. Below that, [`resolve_from_fallback`] takes the
 //! tree state from the fallback endpoint instead, and the Case B backfill
 //! validates it at the handoff (SYNC.md §5).

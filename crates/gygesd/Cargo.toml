@@ -27,7 +27,6 @@ zcash_keys = { workspace = true }
 zip32 = { workspace = true }
 pczt = { workspace = true }
 age = { workspace = true }
-rand = { workspace = true }
 hex = { workspace = true }
 zeroize = { workspace = true }
 tokio = { workspace = true }

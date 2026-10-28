@@ -9,10 +9,9 @@
 //!   49205 and 49207 to and from their CBOR bodies;
 //! * [`Animation`]: the 8 FPS loop that shows a multi-frame payload;
 //! * [`firmware`]: the device version a pairing export reports, and the
-//!   minimum Gyges accepts.
-//!
-//! Frames from a camera arrive with M5's `qr-scan`; the CLI's `qr-export`,
-//! `qr-import` and `sign --qr-out` with the signing protocols.
+//!   minimum Gyges accepts;
+//! * [`scan`]: decoded camera frames fed to an [`Assembler`] until the
+//!   answer reassembles; `camera` (feature `camera`) supplies the frames.
 
 #![forbid(unsafe_code)]
 

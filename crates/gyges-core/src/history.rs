@@ -255,32 +255,8 @@ pub fn notes(wallet: &mut Wallet) -> Result<Vec<NoteRow>, TxError> {
             is_change: r.change.unwrap_or(0) != 0,
         });
     }
-    out.sort_by(|a, b| {
-        (
-            a.height.is_none(),
-            a.height,
-            a.txid,
-            pool_rank(a.pool),
-            a.output_index,
-        )
-            .cmp(&(
-                b.height.is_none(),
-                b.height,
-                b.txid,
-                pool_rank(b.pool),
-                b.output_index,
-            ))
-    });
+    out.sort_by_key(|n| (n.height.is_none(), n.height, n.txid, n.pool, n.output_index));
     Ok(out)
-}
-
-fn pool_rank(p: Pool) -> u8 {
-    match p {
-        Pool::Transparent => 0,
-        Pool::Sapling => 2,
-        Pool::Orchard => 3,
-        Pool::Ironwood => 4,
-    }
 }
 
 #[derive(Deserialize)]
@@ -320,17 +296,14 @@ fn sorted_summaries(wallet: &Wallet) -> Result<Vec<TxRow>, TxError> {
             tx_index: s.tx_index,
         })
         .collect();
-    rows.sort_by(|a, b| {
-        let key = |r: &TxRow| {
-            (
-                r.mined_height.is_none(),
-                r.mined_height,
-                r.tx_index,
-                r.timestamp,
-                r.txid,
-            )
-        };
-        key(b).cmp(&key(a))
+    rows.sort_by_key(|r| {
+        std::cmp::Reverse((
+            r.mined_height.is_none(),
+            r.mined_height,
+            r.tx_index,
+            r.timestamp,
+            r.txid,
+        ))
     });
     Ok(rows)
 }

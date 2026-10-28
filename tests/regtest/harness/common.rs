@@ -69,19 +69,26 @@ pub fn burn_tex_address() -> String {
     zcash_keys::address::Address::Tex(BURN_PKH).encode(&regtest())
 }
 
+/// The BIP 39 seed of [`mnemonic`], with no passphrase.
+fn test_seed() -> [u8; 64] {
+    bip0039::Mnemonic::<bip0039::English>::from_phrase(mnemonic())
+        .unwrap()
+        .to_seed("")
+}
+
+/// Account 0's spending key for [`test_seed`].
+fn test_usk(seed: &[u8]) -> zcash_keys::keys::UnifiedSpendingKey {
+    zcash_keys::keys::UnifiedSpendingKey::from_seed(&regtest(), seed, zip32::AccountId::ZERO)
+        .unwrap()
+}
+
 /// Account 0's first external transparent address for [`mnemonic`], the
 /// way the wallet derives it (`zcash_client_sqlite` → ZIP 32 account key →
 /// external chain, index 0), so the node can mine to it before the key
 /// exists in Gyges.
 pub fn test_key_transparent() -> TransparentAddress {
     use transparent::keys::IncomingViewingKey as _;
-    let seed = bip0039::Mnemonic::<bip0039::English>::from_phrase(mnemonic())
-        .unwrap()
-        .to_seed("");
-    let usk =
-        zcash_keys::keys::UnifiedSpendingKey::from_seed(&regtest(), &seed, zip32::AccountId::ZERO)
-            .unwrap();
-    let (addr, _) = usk
+    let (addr, _) = test_usk(&test_seed())
         .transparent()
         .to_account_pubkey()
         .derive_external_ivk()
@@ -96,12 +103,8 @@ pub fn test_key_transparent() -> TransparentAddress {
 /// transparent items, no Sapling.
 pub fn keystone_export(device_version: Option<&str>) -> String {
     use zcash_address::unified::{Container as _, Encoding as _, Fvk, Ufvk};
-    let seed = bip0039::Mnemonic::<bip0039::English>::from_phrase(mnemonic())
-        .unwrap()
-        .to_seed("");
-    let usk =
-        zcash_keys::keys::UnifiedSpendingKey::from_seed(&regtest(), &seed, zip32::AccountId::ZERO)
-            .unwrap();
+    let seed = test_seed();
+    let usk = test_usk(&seed);
     let payload = gyges_qr::Payload::Accounts(gyges_qr::Accounts {
         seed_fingerprint: zip32::fingerprint::SeedFingerprint::from_seed(&seed)
             .unwrap()
@@ -138,16 +141,9 @@ pub fn keystone_export(device_version: Option<&str>) -> String {
 /// The Keystone that [`keystone_export`] pairs: [`mnemonic`]'s account 0,
 /// as `gyges_core::keystone::emulator` signs with it.
 pub fn keystone_device() -> gyges_core::keystone::emulator::Device {
-    let seed = bip0039::Mnemonic::<bip0039::English>::from_phrase(mnemonic())
-        .unwrap()
-        .to_seed("");
+    let seed = test_seed();
     gyges_core::keystone::emulator::Device {
-        usk: zcash_keys::keys::UnifiedSpendingKey::from_seed(
-            &regtest(),
-            &seed,
-            zip32::AccountId::ZERO,
-        )
-        .unwrap(),
+        usk: test_usk(&seed),
         fingerprint: zip32::fingerprint::SeedFingerprint::from_seed(&seed).unwrap(),
         coin_type: 1,
     }
@@ -192,9 +188,9 @@ pub fn sync_wait(fx: &Fixture, key: &str, extra: &[&str]) {
 /// `sync wait` with a timeout of the CLI's form (`"600s"`).
 #[track_caller]
 pub fn sync_wait_within(fx: &Fixture, key: &str, timeout: &str, extra: &[&str]) {
-    let mut args = vec!["-k", key, "sync", "wait", "--timeout", timeout];
-    args.extend_from_slice(extra);
-    fx.gyges(&args).ok();
+    fx.gyges(&["-k", key, "sync", "wait", "--timeout", timeout])
+        .args(extra)
+        .ok();
 }
 
 /// `sync wait --txid` until `txid` has `confirmations`.

@@ -107,26 +107,21 @@ impl Assembler {
     /// (scanners often report alphanumeric QR text in uppercase).
     pub fn receive(&mut self, frame: &str) -> Result<(), QrError> {
         let frame = frame.trim().to_ascii_lowercase();
-        let ur_type = frame
-            .strip_prefix("ur:")
-            .and_then(|rest| rest.split_once('/'))
-            .map(|(t, _)| t.to_string())
-            .ok_or_else(|| QrError::Ur("not a ur: frame".into()))?;
-        match &self.ur_type {
-            Some(expected) if *expected != ur_type => {
-                return Err(QrError::MixedTypes {
-                    expected: expected.clone(),
-                    got: ur_type,
-                });
-            }
-            _ => {}
+        let ur_type = ur_type_of(&frame).ok_or_else(|| QrError::Ur("not a ur: frame".into()))?;
+        if let Some(expected) = &self.ur_type
+            && expected != ur_type
+        {
+            return Err(QrError::MixedTypes {
+                expected: expected.clone(),
+                got: ur_type.to_string(),
+            });
         }
         let (kind, data) = ur::decode(&frame).map_err(ur_error)?;
         match kind {
             ur::ur::Kind::SinglePart => self.single = Some(data),
             ur::ur::Kind::MultiPart => self.decoder.receive(&frame).map_err(ur_error)?,
         }
-        self.ur_type = Some(ur_type);
+        self.ur_type = Some(ur_type.to_string());
         Ok(())
     }
 
@@ -165,6 +160,11 @@ impl Assembler {
             .map_err(ur_error)?
             .map(|data| (ur_type, data)))
     }
+}
+
+/// The type of a trimmed, lowercased `ur:<type>/...` frame.
+pub(crate) fn ur_type_of(frame: &str) -> Option<&str> {
+    frame.strip_prefix("ur:")?.split_once('/').map(|(t, _)| t)
 }
 
 fn ur_error(e: ur::ur::Error) -> QrError {

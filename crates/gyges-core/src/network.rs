@@ -173,7 +173,6 @@ mod tests {
 
     #[test]
     fn serde_uses_lowercase_names() {
-        let s = toml::to_string(&Network::Regtest).unwrap_or_default();
         // A bare enum is not a TOML document; check through a wrapper.
         #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
         struct W {
@@ -182,6 +181,5 @@ mod tests {
         let w: W = toml::from_str("network = \"testnet\"").unwrap();
         assert_eq!(w.network, Network::Testnet);
         assert_eq!(toml::to_string(&w).unwrap().trim(), "network = \"testnet\"");
-        let _ = s;
     }
 }
