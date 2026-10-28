@@ -1,6 +1,8 @@
 //! `gyges notes` (CLI_SPEC.md §2.4): decrypted notes and UTXOs from
 //! `ListNotes`, with heights, values, memo previews and witness readiness.
 
+use std::fmt::Write as _;
+
 use clap::{Args, ValueEnum};
 use gyges_proto::v1::{ListNotesRequest, ListNotesResponse, Note, Pool, SpentFilter};
 
@@ -87,7 +89,6 @@ fn flags(n: &Note) -> String {
 
 /// Human-readable table, oldest first.
 pub fn render(r: &ListNotesResponse) -> String {
-    use std::fmt::Write as _;
     if r.notes.is_empty() {
         return "no notes\n".to_string();
     }

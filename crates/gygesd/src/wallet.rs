@@ -25,7 +25,7 @@ use zcash_protocol::consensus::{NetworkType, Parameters as _};
 use crate::keys::proto_pool;
 use crate::service::{DaemonState, invalid, proto_network};
 use crate::tex;
-use crate::tx::{tx_error, with_wallet};
+use crate::tx::wallet_rpc;
 
 /// `ListTransactions.limit = 0` (API.md).
 pub const DEFAULT_TX_LIMIT: usize = 50;
@@ -87,11 +87,9 @@ pub async fn get_current_address(
     req: GetCurrentAddressRequest,
 ) -> Result<AddressInfo, Status> {
     let key = wallet_key(&state, &req.key_id)?;
-    let key_id = key.key_id().to_string();
-    with_wallet(&key, addresses::current)
+    wallet_rpc(&key, addresses::current)
         .await
         .map(proto_address)
-        .map_err(|e| tx_error(e, &key_id).into_status())
 }
 
 /// The receivers `address new` uses without `--receivers` (CLI_SPEC.md
@@ -137,12 +135,10 @@ pub async fn new_address(
         }
     }
     let label = (!req.label.is_empty()).then(|| req.label.clone());
-    let key_id = key.key_id().to_string();
-    let info = with_wallet(&key, move |w| {
+    let info = wallet_rpc(&key, move |w| {
         addresses::new_address(w, &pools, label.as_deref())
     })
-    .await
-    .map_err(|e| tx_error(e, &key_id).into_status())?;
+    .await?;
     Ok(proto_address(info))
 }
 
@@ -232,10 +228,7 @@ pub async fn list_notes(
         Ok(SpentFilter::All) => None,
         Err(_) => return Err(invalid("unknown spent filter")),
     };
-    let key_id = key.key_id().to_string();
-    let notes = with_wallet(&key, history::notes)
-        .await
-        .map_err(|e| tx_error(e, &key_id).into_status())?;
+    let notes = wallet_rpc(&key, history::notes).await?;
     Ok(ListNotesResponse {
         notes: notes
             .iter()
@@ -321,18 +314,16 @@ pub async fn list_transactions(
     } else {
         Some(parse_txid(&req.before_txid, "before_txid")?)
     };
-    let key_id = key.key_id().to_string();
-    let (rows, tex_rows) = with_wallet(&key, move |w| {
+    let (rows, tex_rows) = wallet_rpc(&key, move |w| {
         let rows = history::transactions(w, limit, before)?;
-        let tex_rows = core_tex::list(w, true).map_err(tex::queue_error)?;
+        let tex_rows = core_tex::list(w, true)?;
         Ok((rows, tex_rows))
     })
-    .await
-    .map_err(|e| tx_error(e, &key_id).into_status())?;
+    .await?;
     Ok(ListTransactionsResponse {
         transactions: rows
             .iter()
-            .map(|r| proto_summary(&key_id, r, &tex_rows))
+            .map(|r| proto_summary(key.key_id(), r, &tex_rows))
             .collect(),
     })
 }
@@ -358,13 +349,12 @@ pub async fn get_transaction_status(
         GygesError::new(ErrorReason::Airgapped, "air-gapped: no node interface").into_status()
     })?;
     let key_id = key.key_id().to_string();
-    let (row, tex_row) = with_wallet(&key, move |w| {
+    let (row, tex_row) = wallet_rpc(&key, move |w| {
         let row = history::transaction(w, txid)?;
-        let tex_rows = core_tex::list(w, true).map_err(tex::queue_error)?;
+        let tex_rows = core_tex::list(w, true)?;
         Ok((row, tex_row_of(&tex_rows, &txid).cloned()))
     })
-    .await
-    .map_err(|e| tx_error(e, &key_id).into_status())?;
+    .await?;
 
     let node = chain.transaction_status(txid).await.map_err(|e| {
         tracing::debug!(key_id, error = %e, "transaction status from the node failed");

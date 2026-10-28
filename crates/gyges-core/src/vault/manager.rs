@@ -329,13 +329,9 @@ impl VaultManager {
                     _ => false,
                 }
         });
-        match unlock {
-            Some(u) => {
-                u.last_used = now;
-                Ok(f(&u.entropy))
-            }
-            None => Err(VaultError::Locked),
-        }
+        let u = unlock.ok_or(VaultError::Locked)?;
+        u.last_used = now;
+        Ok(f(&u.entropy))
     }
 
     /// Drop every unlock of `key_id`. Returns whether there was one.
@@ -401,7 +397,7 @@ impl VaultManager {
             .collect()
     }
 
-    /// Number of live unlocks of any scope (tests, `Debug`).
+    /// Number of live unlocks of any scope (tests).
     pub fn unlock_count(&self) -> usize {
         let mut inner = self.inner();
         inner.evict_expired(Instant::now());

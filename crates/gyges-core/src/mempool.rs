@@ -51,22 +51,17 @@ pub fn scan_tx(
     let ufvks = wallet.get_unified_full_viewing_keys().map_err(wallet_err)?;
     let mined_height = wallet.get_tx_height(tx.txid()).map_err(wallet_err)?;
     let decrypted = decrypt_transaction(params, mined_height, Some(chain_tip), tx, &ufvks);
-    let received = |t: TransferType| t != TransferType::Outgoing;
-    let notes = decrypted
-        .sapling_outputs()
-        .iter()
-        .filter(|o| received(o.transfer_type()))
-        .count()
-        + decrypted
-            .orchard_outputs()
-            .iter()
-            .filter(|o| received(o.transfer_type()))
-            .count()
-        + decrypted
-            .ironwood_outputs()
-            .iter()
-            .filter(|o| received(o.transfer_type()))
-            .count();
+    let notes = received(decrypted.sapling_outputs())
+        + received(decrypted.orchard_outputs())
+        + received(decrypted.ironwood_outputs());
     wallet.store_decrypted_tx(decrypted).map_err(wallet_err)?;
     Ok(notes)
+}
+
+/// How many of `outputs` were received rather than sent.
+fn received<N, A>(outputs: &[zcash_client_backend::DecryptedOutput<N, A>]) -> usize {
+    outputs
+        .iter()
+        .filter(|o| o.transfer_type() != TransferType::Outgoing)
+        .count()
 }

@@ -13,6 +13,10 @@
 //! source the session is aborted and the command exits 4 naming the fix
 //! (CLI_SPEC.md §1.2).
 
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+use anyhow::anyhow;
 use clap::{Args, Subcommand};
 use gyges_proto::v1::{
     AbortSigningSessionRequest, AbortTexTransferRequest, ErrorReason, GygesError,
@@ -20,7 +24,6 @@ use gyges_proto::v1::{
     SendTransactionRequest, SessionStatus, ShieldFundsRequest, SignatureKind, SignatureRequired,
     SigningSession, TexQueueEntry, TexState, UnlockKeyRequest, UnlockScope, send_event,
 };
-use tokio_stream::StreamExt as _;
 
 use crate::amount::{MemoArg, ParsedAmount, format_zec, parse_amount, parse_memo, parse_zatoshis};
 use crate::balance::pool_name;
@@ -57,21 +60,14 @@ pub struct SendArgs {
     /// UTF-8 text (at most 512 bytes) or 0x-prefixed hex; shielded recipients only.
     #[arg(long, value_name = "TEXT_OR_HEX", value_parser = parse_memo)]
     pub memo: Option<MemoArg>,
-    /// Broadcast over an isolated Tor circuit (not available in this milestone).
+    /// Broadcast through the fallback endpoint over Tor (exit 7 when none is configured; never the node).
     #[arg(long)]
     pub via_tor: bool,
     /// Print the full proposal (every step, every fee) and exit without signing.
     #[arg(long)]
     pub dry_run: bool,
-    /// Skip the confirmation prompt.
-    #[arg(long)]
-    pub yes: bool,
-    /// Keep the stream open until the transaction is mined.
-    #[arg(long)]
-    pub wait: bool,
-    /// Keystone keys: write the request's UR frames here (one per line) and exit 4 instead of animating them.
-    #[arg(long, value_name = "FILE")]
-    pub qr_out: Option<std::path::PathBuf>,
+    #[command(flatten)]
+    pub flow: SignFlow,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -82,6 +78,13 @@ pub struct ShieldArgs {
     /// Print the proposal and exit without signing.
     #[arg(long)]
     pub dry_run: bool,
+    #[command(flatten)]
+    pub flow: SignFlow,
+}
+
+// The flags `tx send` and `tx shield` share after `--dry-run`.
+#[derive(Debug, Clone, Args)]
+pub struct SignFlow {
     /// Skip the confirmation prompt.
     #[arg(long)]
     pub yes: bool,
@@ -90,7 +93,7 @@ pub struct ShieldArgs {
     pub wait: bool,
     /// Keystone keys: write the request's UR frames here (one per line) and exit 4 instead of animating them.
     #[arg(long, value_name = "FILE")]
-    pub qr_out: Option<std::path::PathBuf>,
+    pub qr_out: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -135,18 +138,10 @@ async fn send(ctx: &Ctx, args: SendArgs) -> Result<(), CliError> {
             dry_run,
             session_token: Vec::new(),
             min_confirmations: 0,
-            wait_for_mined: args.wait,
+            wait_for_mined: args.flow.wait,
         })
     };
-    run_send(
-        ctx,
-        "Send",
-        args.dry_run,
-        args.yes,
-        args.qr_out.as_deref(),
-        request,
-    )
-    .await
+    run_send(ctx, "Send", args.dry_run, &args.flow, request).await
 }
 
 async fn shield(ctx: &Ctx, args: ShieldArgs) -> Result<(), CliError> {
@@ -156,18 +151,10 @@ async fn shield(ctx: &Ctx, args: ShieldArgs) -> Result<(), CliError> {
             threshold: i64::try_from(args.threshold.unwrap_or(0)).unwrap_or(i64::MAX),
             dry_run,
             session_token: Vec::new(),
-            wait_for_mined: args.wait,
+            wait_for_mined: args.flow.wait,
         })
     };
-    run_send(
-        ctx,
-        "Shield",
-        args.dry_run,
-        args.yes,
-        args.qr_out.as_deref(),
-        request,
-    )
-    .await
+    run_send(ctx, "Shield", args.dry_run, &args.flow, request).await
 }
 
 enum SendOrShield {
@@ -183,20 +170,19 @@ async fn run_send(
     ctx: &Ctx,
     verb: &str,
     dry_run: bool,
-    yes: bool,
-    qr_out: Option<&std::path::Path>,
+    flow: &SignFlow,
     request: impl Fn(bool) -> SendOrShield,
 ) -> Result<(), CliError> {
     let mut conn = ctx.connect().await?;
     let mut shown = false;
-    if !dry_run && !yes {
+    if !dry_run && !flow.yes {
         let proposal = proposal_of(open(&mut conn, request(true)).await?).await?;
         confirm(ctx, &proposal, verb)?;
         shown = true;
     }
     let stream = open(&mut conn, request(dry_run)).await?;
     let key = shown_key(&ctx.key, &conn);
-    follow(ctx, &mut conn, &key, stream, shown, qr_out).await
+    follow(ctx, &mut conn, &key, stream, shown, flow.qr_out.as_deref()).await
 }
 
 async fn open(conn: &mut Conn, req: SendOrShield) -> Result<tonic::Streaming<SendEvent>, CliError> {
@@ -209,15 +195,12 @@ async fn open(conn: &mut Conn, req: SendOrShield) -> Result<tonic::Streaming<Sen
 
 /// The proposal a dry run's stream starts with.
 async fn proposal_of(mut stream: tonic::Streaming<SendEvent>) -> Result<Proposal, CliError> {
-    while let Some(item) = stream.next().await {
-        let ev = item?;
+    while let Some(ev) = stream.message().await? {
         if let Some(send_event::Event::Proposed(p)) = ev.event {
             return Ok(p);
         }
     }
-    Err(CliError::Other(anyhow::anyhow!(
-        "the daemon ended the dry run without a proposal"
-    )))
+    Err(anyhow!("the daemon ended the dry run without a proposal").into())
 }
 
 /// Show the proposal and ask (`--yes` skips; no terminal is exit 4).
@@ -241,12 +224,9 @@ async fn follow(
     key: &str,
     mut stream: tonic::Streaming<SendEvent>,
     proposal_shown: bool,
-    qr_out: Option<&std::path::Path>,
+    qr_out: Option<&Path>,
 ) -> Result<(), CliError> {
-    loop {
-        let Some(ev) = Ctx::next_or_cancel(&mut stream).await? else {
-            return Ok(());
-        };
+    while let Some(ev) = Ctx::next_or_cancel(&mut stream).await? {
         if ctx.json {
             println!("{}", to_json(&ev)?);
         }
@@ -256,19 +236,14 @@ async fn follow(
                     eprint!("{}", render_proposal(&p));
                 }
             }
-            Some(send_event::Event::Proving(p)) => {
-                if !ctx.quiet && !ctx.json {
-                    if p.actions_done == 0 {
-                        eprintln!(
-                            "proving {} {} action(s)…",
-                            p.actions_total,
-                            pool_name(p.pool())
-                        );
-                    } else {
-                        eprintln!("proven");
-                    }
-                }
+            Some(send_event::Event::Proving(p)) if p.actions_done == 0 => {
+                ctx.note(format_args!(
+                    "proving {} {} action(s)…",
+                    p.actions_total,
+                    pool_name(p.pool())
+                ));
             }
+            Some(send_event::Event::Proving(_)) => ctx.note("proven"),
             Some(send_event::Event::SignatureRequired(req)) => match req.kind() {
                 SignatureKind::KeystoneBatch | SignatureKind::KeystoneSinglePczt => {
                     crate::keystone::satisfy(ctx, key, &req, qr_out).await?;
@@ -290,13 +265,13 @@ async fn follow(
                     t.step1_txid, t.step2_txid
                 ));
             }
-            Some(send_event::Event::Mined(m)) if !ctx.quiet && !ctx.json => {
-                eprintln!("step {} mined at height {}", m.step, m.height);
+            Some(send_event::Event::Mined(m)) => {
+                ctx.note(format_args!("step {} mined at height {}", m.step, m.height));
             }
-            Some(send_event::Event::Mined(_)) => {}
             None => {}
         }
     }
+    Ok(())
 }
 
 /// How many wrong passphrases a terminal user may enter per session.
@@ -406,7 +381,6 @@ async fn abort_session(conn: &mut Conn, session_id: &str) {
 /// CLI_SPEC.md §2.5: inputs per pool, outputs, the ZIP 317 fee per step,
 /// the total debit, then the anchor, expiry and confirmations line.
 pub fn render_proposal(p: &Proposal) -> String {
-    use std::fmt::Write as _;
     let mut s = render_steps(p);
     let _ = writeln!(
         s,
@@ -419,7 +393,6 @@ pub fn render_proposal(p: &Proposal) -> String {
 /// The steps and the total debit (shared with `pczt inspect`, whose file
 /// knows no anchor height).
 pub fn render_steps(p: &Proposal) -> String {
-    use std::fmt::Write as _;
     let mut s = String::new();
     let n = p.steps.len();
     for step in &p.steps {
@@ -502,7 +475,6 @@ pub fn tex_state_name(s: TexState) -> &'static str {
 
 /// CLI_SPEC.md §2.5: the ZIP 320 rows under the sessions.
 pub fn render_tex(rows: &[TexQueueEntry]) -> String {
-    use std::fmt::Write as _;
     if rows.is_empty() {
         return String::new();
     }
@@ -533,19 +505,13 @@ pub fn render_tex(rows: &[TexQueueEntry]) -> String {
 }
 
 fn print_tex(ctx: &Ctx, entry: &TexQueueEntry) -> Result<(), CliError> {
-    if ctx.json {
-        println!("{}", to_json(entry)?);
-    } else {
-        println!("{}", entry.step2_txid);
-        if !ctx.quiet {
-            eprintln!(
-                "tex transfer {}: {} (step 2 {})",
-                entry.step1_txid,
-                tex_state_name(entry.state()),
-                entry.step2_txid
-            );
-        }
-    }
+    ctx.print(entry, || format!("{}\n", entry.step2_txid))?;
+    ctx.note(format_args!(
+        "tex transfer {}: {} (step 2 {})",
+        entry.step1_txid,
+        tex_state_name(entry.state()),
+        entry.step2_txid
+    ));
     Ok(())
 }
 
@@ -553,10 +519,9 @@ fn parse_txid_arg(id: &str) -> Result<(), CliError> {
     if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
         Ok(())
     } else {
-        Err(CliError::Daemon(GygesError::new(
-            ErrorReason::InvalidArgument,
+        Err(CliError::invalid(
             "expected the 64-hex step-1 txid `tx send` printed",
-        )))
+        ))
     }
 }
 
@@ -634,9 +599,9 @@ async fn resume(ctx: &Ctx, txid: String) -> Result<(), CliError> {
             return print_tex(ctx, row);
         }
         if tokio::time::Instant::now() > deadline {
-            return Err(CliError::Other(anyhow::anyhow!(
-                "the daemon is still building step 2; check `gyges tx sessions`"
-            )));
+            return Err(
+                anyhow!("the daemon is still building step 2; check `gyges tx sessions`").into(),
+            );
         }
         tokio::select! {
             () = tokio::time::sleep(std::time::Duration::from_millis(300)) => {}
@@ -646,7 +611,6 @@ async fn resume(ctx: &Ctx, txid: String) -> Result<(), CliError> {
 }
 
 pub fn render_sessions(sessions: &[SigningSession]) -> String {
-    use std::fmt::Write as _;
     if sessions.is_empty() {
         return "no signing sessions\n".to_string();
     }
@@ -689,33 +653,26 @@ pub fn render_sessions(sessions: &[SigningSession]) -> String {
 }
 
 async fn abort(ctx: &Ctx, id: String) -> Result<(), CliError> {
-    let is_hex = id.bytes().all(|b| b.is_ascii_hexdigit());
-    match id.len() {
-        32 if is_hex => {}
-        64 if is_hex => {
-            // A ZIP 320 transfer still `built` (API.md §4.3).
-            let mut conn = ctx.connect().await?;
-            let entry = conn
-                .client
-                .abort_tex_transfer(AbortTexTransferRequest {
-                    key_id: ctx.key.clone(),
-                    step1_txid: id,
-                })
-                .await?
-                .into_inner();
-            ctx.report(&entry, || {
-                eprintln!("tex transfer {} aborted", entry.step1_txid);
-            })?;
-            return Ok(());
-        }
-        _ => {
-            return Err(CliError::Daemon(GygesError::new(
-                ErrorReason::InvalidArgument,
-                "expected a 32-hex session id or a 64-hex txid",
-            )));
-        }
+    if !matches!(id.len(), 32 | 64) || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(CliError::invalid(
+            "expected a 32-hex session id or a 64-hex txid",
+        ));
     }
     let mut conn = ctx.connect().await?;
+    if id.len() == 64 {
+        // A ZIP 320 transfer still `built` (API.md §4.3).
+        let entry = conn
+            .client
+            .abort_tex_transfer(AbortTexTransferRequest {
+                key_id: ctx.key.clone(),
+                step1_txid: id,
+            })
+            .await?
+            .into_inner();
+        return ctx.report(&entry, || {
+            eprintln!("tex transfer {} aborted", entry.step1_txid);
+        });
+    }
     let resp = conn
         .client
         .abort_signing_session(AbortSigningSessionRequest { session_id: id })

@@ -4,9 +4,10 @@
 //! `CompleteKeystoneSign`.
 //!
 //! On a terminal `tx send` and `tx shield` do it in place: the request
-//! loops until Enter, then the answer's frames are pasted one per line (a
-//! phone's QR reader gives them as text; the camera path is `qr-scan`,
-//! ROADMAP.md M5 fourth item). Without a terminal, or with `--qr-out`, the
+//! loops until Enter, then the answer is read with the camera (feature
+//! `camera`, unless `GYGES_NO_CAMERA` is set), falling back to its frames
+//! pasted one per line (a phone's QR reader gives them as text). Without a
+//! terminal, or with `--qr-out`, the
 //! frames are printed or written and the command exits 4 leaving the
 //! session open: `pczt qr-export --session` shows them again and
 //! `pczt qr-import --session` completes it.
@@ -17,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use anyhow::anyhow;
 use gyges_proto::v1::{
     CompleteKeystoneSignRequest, CompleteKeystoneSignResponse, ErrorReason, GygesError,
     SignatureKind, SignatureRequired, complete_keystone_sign_response,
@@ -41,9 +43,7 @@ pub(crate) fn ur_types(kind: SignatureKind) -> Result<(&'static str, &'static st
             gyges_qr::ur_types::ZCASH_PCZT,
             gyges_qr::ur_types::ZCASH_PCZT,
         )),
-        other => Err(CliError::Other(anyhow::anyhow!(
-            "not a Keystone signature kind: {other:?}"
-        ))),
+        other => Err(anyhow!("not a Keystone signature kind: {other:?}").into()),
     }
 }
 
@@ -81,7 +81,7 @@ pub(crate) async fn animate_until_enter(frames: Frames, fps: u32) -> Result<(), 
         if single {
             // Drawn once; it stays on screen until Enter.
             while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
         Ok::<_, gyges_qr::QrError>(())
@@ -128,16 +128,14 @@ pub(crate) fn assemble<'a>(
     lines: impl IntoIterator<Item = &'a str>,
     answer: &str,
 ) -> Result<Vec<u8>, CliError> {
-    let invalid =
-        |detail: String| CliError::Daemon(GygesError::new(ErrorReason::InvalidArgument, detail));
     let mut asm = Assembler::new();
     for line in lines {
         for frame in line.split_whitespace() {
             asm.receive(frame)
-                .map_err(|e| invalid(format!("not the device's answer: {e}")))?;
+                .map_err(|e| CliError::invalid(format!("not the device's answer: {e}")))?;
         }
     }
-    finish(&asm, answer).map_err(invalid)
+    finish(&asm, answer).map_err(CliError::invalid)
 }
 
 fn finish(asm: &Assembler, answer: &str) -> Result<Vec<u8>, String> {
@@ -182,8 +180,7 @@ fn read_answer(answer: &str) -> Result<Vec<u8>, CliError> {
             }
         }
         if asm.is_complete() {
-            return finish(&asm, answer)
-                .map_err(|d| CliError::Daemon(GygesError::new(ErrorReason::InvalidArgument, d)));
+            return finish(&asm, answer).map_err(CliError::invalid);
         }
         let (resolved, total) = asm.progress();
         if total > 0 {
@@ -370,8 +367,7 @@ pub(crate) async fn scan(
     });
     let request = request.to_vec();
     let outcome = tokio::task::spawn_blocking(move || {
-        let mut camera = gyges_qr::camera::Camera::open(index)
-            .map_err(|e| CliError::Other(anyhow::anyhow!("{e}")))?;
+        let mut camera = gyges_qr::camera::Camera::open(index).map_err(|e| anyhow!("{e}"))?;
         eprintln!(
             "Point {} at the Keystone's answer (Ctrl-C to stop; GYGES_NO_CAMERA=1 skips the camera).",
             camera.name()
@@ -392,7 +388,7 @@ pub(crate) async fn scan(
         );
         got.map_err(|e| match e {
             gyges_qr::ScanEnd::Stopped => CliError::Cancelled,
-            other => CliError::Other(anyhow::anyhow!("{other}")),
+            other => anyhow!("{other}").into(),
         })
     })
     .await;
@@ -408,10 +404,11 @@ pub(crate) async fn scan(
     _request: &[u8],
     _timeout: Duration,
 ) -> Result<Vec<u8>, CliError> {
-    Err(CliError::Other(anyhow::anyhow!(
+    Err(anyhow!(
         "this gyges was built without the camera; rebuild with `--features camera`, or use \
          `gyges pczt qr-import`"
-    )))
+    )
+    .into())
 }
 
 /// Whether the terminal can show an animation.

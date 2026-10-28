@@ -125,12 +125,7 @@ impl BlockDb {
                 },
             )?;
         }
-        let db = Self {
-            path: path.to_path_buf(),
-            conn: Mutex::new(conn),
-        };
-        db.init(network)?;
-        Ok(db)
+        Self::new(path.to_path_buf(), conn, network)
     }
 
     /// An in-memory cache, for tests.
@@ -140,6 +135,10 @@ impl BlockDb {
             path: path.clone(),
             source,
         })?;
+        Self::new(path, conn, network)
+    }
+
+    fn new(path: PathBuf, conn: Connection, network: &str) -> Result<Self, CacheError> {
         let db = Self {
             path,
             conn: Mutex::new(conn),
@@ -175,13 +174,15 @@ impl BlockDb {
         )
         .map_err(|e| self.sqlite(e))?;
 
-        let found_network: String = conn
-            .query_row(
-                "SELECT value FROM cache_meta WHERE key = 'network'",
-                [],
+        let meta = |key: &str| -> Result<String, CacheError> {
+            conn.query_row(
+                "SELECT value FROM cache_meta WHERE key = ?1",
+                params![key],
                 |r| r.get(0),
             )
-            .map_err(|e| self.sqlite(e))?;
+            .map_err(|e| self.sqlite(e))
+        };
+        let found_network = meta("network")?;
         if found_network != network {
             return Err(CacheError::NetworkMismatch {
                 path: self.path.clone(),
@@ -189,14 +190,7 @@ impl BlockDb {
                 found: found_network,
             });
         }
-        let version: String = conn
-            .query_row(
-                "SELECT value FROM cache_meta WHERE key = 'schema_version'",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| self.sqlite(e))?;
-        let version: u32 = version.parse().unwrap_or(u32::MAX);
+        let version: u32 = meta("schema_version")?.parse().unwrap_or(u32::MAX);
         if version > SCHEMA_VERSION {
             return Err(CacheError::SchemaTooNew {
                 path: self.path.clone(),
@@ -216,10 +210,6 @@ impl BlockDb {
             path: self.path.clone(),
             source,
         }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Insert (or replace) blocks tagged with where they came from. The
@@ -272,17 +262,16 @@ impl BlockDb {
     /// Lowest and highest cached heights, `None` when empty.
     pub fn bounds(&self) -> Result<Option<(BlockHeight, BlockHeight)>, CacheError> {
         let conn = self.lock();
-        let row: (Option<u32>, Option<u32>) = conn
+        let (lo, hi): (Option<u32>, Option<u32>) = conn
             .query_row(
                 "SELECT MIN(height), MAX(height) FROM compact_blocks",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(|e| self.sqlite(e))?;
-        Ok(match row {
-            (Some(lo), Some(hi)) => Some((BlockHeight::from_u32(lo), BlockHeight::from_u32(hi))),
-            _ => None,
-        })
+        Ok(lo
+            .zip(hi)
+            .map(|(lo, hi)| (BlockHeight::from_u32(lo), BlockHeight::from_u32(hi))))
     }
 
     /// Number of cached blocks.
@@ -351,16 +340,13 @@ impl BlockDb {
     ) -> Result<Vec<CompactBlock>, CacheError> {
         let conn = self.lock();
         let start = match from {
-            Some(h) => u32::from(h),
-            None => {
-                let lo: Option<u32> = conn
-                    .query_row("SELECT MIN(height) FROM compact_blocks", [], |r| r.get(0))
-                    .map_err(|e| self.sqlite(e))?;
-                match lo {
-                    Some(lo) => lo,
-                    None => return Ok(Vec::new()),
-                }
-            }
+            Some(h) => Some(u32::from(h)),
+            None => conn
+                .query_row("SELECT MIN(height) FROM compact_blocks", [], |r| r.get(0))
+                .map_err(|e| self.sqlite(e))?,
+        };
+        let Some(start) = start else {
+            return Ok(Vec::new());
         };
         let limit = limit.map_or(i64::MAX, |l| i64::try_from(l).unwrap_or(i64::MAX));
         let mut stmt = conn
@@ -418,20 +404,17 @@ impl BlockSource for BlockDb {
 impl BlockCache for BlockDb {
     fn get_tip_height(&self, range: Option<&ScanRange>) -> Result<Option<BlockHeight>, CacheError> {
         let conn = self.lock();
-        let max: Option<u32> = match range {
-            None => conn
-                .query_row("SELECT MAX(height) FROM compact_blocks", [], |r| r.get(0))
-                .map_err(|e| self.sqlite(e))?,
-            Some(range) => {
-                let Range { start, end } = range.block_range().clone();
-                conn.query_row(
-                    "SELECT MAX(height) FROM compact_blocks WHERE height >= ?1 AND height < ?2",
-                    params![u32::from(start), u32::from(end)],
-                    |r| r.get(0),
-                )
-                .map_err(|e| self.sqlite(e))?
-            }
-        };
+        let (lo, hi) = range.map_or((0, i64::MAX), |range| {
+            let Range { start, end } = range.block_range();
+            (i64::from(u32::from(*start)), i64::from(u32::from(*end)))
+        });
+        let max: Option<u32> = conn
+            .query_row(
+                "SELECT MAX(height) FROM compact_blocks WHERE height >= ?1 AND height < ?2",
+                params![lo, hi],
+                |r| r.get(0),
+            )
+            .map_err(|e| self.sqlite(e))?;
         Ok(max.map(BlockHeight::from_u32))
     }
 

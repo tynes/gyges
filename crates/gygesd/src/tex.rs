@@ -15,12 +15,12 @@
 //!   past the expiry height, `expired`; a rejection the node explains is
 //!   `failed` with its text.
 //!
-//! Mined heights are also handed to the wallet (`set_transaction_status`),
-//! which is how a fully transparent step 2 is ever marked mined: the
-//! scanner cannot see it (no `TransactionDataRequest` handling yet,
-//! ROADMAP.md M1). Nothing here signs: both transactions were signed in the
-//! send's session, and a restart replays bytes, never keys (TESTING.md §3
-//! row 12).
+//! Mined heights are also handed to the wallet (`set_transaction_status`)
+//! as soon as the queue sees them, without waiting for the scheduler's
+//! `sync::Scheduler::check_status` pass, which records the node's answer for
+//! a fully transparent step 2 the scanner cannot see. Nothing here signs:
+//! both transactions were signed in the send's session, and a restart
+//! replays bytes, never keys (TESTING.md §3 row 12).
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use gyges_chain::{ChainBackend, ChainError, TxStatus, display_hash, parse_display_hash};
 use gyges_core::sync as core_sync;
-use gyges_core::tex::{self as core_tex, TexQueueError, TexRow};
+use gyges_core::tex::{self as core_tex, TexRow};
 use gyges_core::tx::{self as core_tx, TxError};
 use gyges_core::{KeyEntry, TexState};
 use gyges_proto::v1::{
@@ -43,9 +43,9 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::conn::ConnInfo;
 use crate::keys::AUDIT_TARGET;
-use crate::service::{DaemonState, unix_now};
-use crate::sync;
-use crate::tx::{self, tx_error};
+use crate::service::{DaemonState, invalid, unix_now};
+use crate::tx::{self, tx_error, wallet_rpc};
+use crate::with_wallet;
 
 /// The queue's wake-up and the rows a `tx resume` is rebuilding.
 #[derive(Debug, Default)]
@@ -98,8 +98,8 @@ pub async fn tick(state: &Arc<DaemonState>, chain: &dyn ChainBackend) {
         return;
     }
     for key in state.wallet_keys() {
-        let ids = match tx::with_wallet(&key, |w| {
-            core_tex::list_ids(w, &ACTIVE).map_err(queue_error)
+        let ids = match with_wallet(&key, |w| {
+            core_tex::list_ids(w, &ACTIVE).map_err(TxError::from)
         })
         .await
         {
@@ -118,10 +118,6 @@ pub async fn tick(state: &Arc<DaemonState>, chain: &dyn ChainBackend) {
             }
         }
     }
-}
-
-pub(crate) fn queue_error(e: TexQueueError) -> TxError {
-    TxError::Internal(e.to_string())
 }
 
 /// Why one row could not be driven this pass; retried next pass.
@@ -144,7 +140,7 @@ pub(crate) fn already_known(text: &str) -> bool {
 /// wallet may learn it from the scanner too.
 async fn mark_mined(key: &Arc<KeyEntry>, txid: [u8; 32], height: BlockHeight) {
     let status = TxStatus::Mined(height);
-    let outcome = sync::with_wallet(key, move |w| core_sync::record_status(w, txid, status)).await;
+    let outcome = with_wallet(key, move |w| core_sync::record_status(w, txid, status)).await;
     if let Err(e) = outcome {
         tracing::debug!(key_id = key.key_id(), error = %e, "could not record a mined height");
     }
@@ -156,8 +152,8 @@ pub(crate) async fn set_state(
     state: TexState,
     error: Option<String>,
 ) -> Result<(), DriveError> {
-    tx::with_wallet(key, move |w| {
-        core_tex::set_state(w, id, state, error.as_deref()).map_err(queue_error)
+    with_wallet(key, move |w| {
+        core_tex::set_state(w, id, state, error.as_deref()).map_err(TxError::from)
     })
     .await?;
     tracing::info!(
@@ -174,8 +170,8 @@ async fn record_attempt(
     error: Option<String>,
 ) -> Result<(), DriveError> {
     let now = unix_now();
-    tx::with_wallet(key, move |w| {
-        core_tex::record_attempt(w, id, now, error.as_deref()).map_err(queue_error)
+    with_wallet(key, move |w| {
+        core_tex::record_attempt(w, id, now, error.as_deref()).map_err(TxError::from)
     })
     .await?;
     Ok(())
@@ -231,8 +227,7 @@ async fn drive(
     key: &Arc<KeyEntry>,
     id: [u8; 32],
 ) -> Result<(), DriveError> {
-    let Some(row) =
-        tx::with_wallet(key, move |w| core_tex::get(w, id).map_err(queue_error)).await?
+    let Some(row) = with_wallet(key, move |w| core_tex::get(w, id).map_err(TxError::from)).await?
     else {
         return Ok(());
     };
@@ -379,8 +374,8 @@ pub async fn list(state: &DaemonState, key_id: &str, include_finished: bool) -> 
         if !key_id.is_empty() && key.key_id() != key_id {
             continue;
         }
-        let rows = tx::with_wallet(&key, move |w| {
-            core_tex::list(w, include_finished).map_err(queue_error)
+        let rows = with_wallet(&key, move |w| {
+            core_tex::list(w, include_finished).map_err(TxError::from)
         })
         .await;
         match rows {
@@ -396,26 +391,19 @@ pub async fn list(state: &DaemonState, key_id: &str, include_finished: bool) -> 
 // ---------------------------------------------------------------------------
 
 fn parse_txid(s: &str) -> Result<[u8; 32], Status> {
-    parse_display_hash(s).map_err(|_| {
-        GygesError::new(
-            ErrorReason::InvalidArgument,
-            "step1_txid must be the 64-hex txid `tx send` printed",
-        )
-        .into_status()
-    })
+    parse_display_hash(s)
+        .map_err(|_| invalid("step1_txid must be the 64-hex txid `tx send` printed"))
 }
 
 async fn load_row(key: &Arc<KeyEntry>, id: [u8; 32]) -> Result<TexRow, Status> {
-    let key_id = key.key_id().to_string();
-    tx::with_wallet(key, move |w| core_tex::get(w, id).map_err(queue_error))
-        .await
-        .map_err(|e| tx_error(e, &key_id).into_status())?
+    wallet_rpc(key, move |w| Ok(core_tex::get(w, id)?))
+        .await?
         .ok_or_else(|| {
             GygesError::new(
                 ErrorReason::InvalidArgument,
                 "no ZIP 320 transfer of this key has that step-1 txid",
             )
-            .with_key(key_id)
+            .with_key(key.key_id())
             .into_status()
         })
 }
@@ -441,12 +429,11 @@ pub async fn abort_tex_transfer(
         .with_key(&key_id)
         .into_status());
     }
-    tx::with_wallet(&key, move |w| {
+    wallet_rpc(&key, move |w| {
         core_tex::set_state(w, id, TexState::Aborted, Some("aborted by the client"))
-            .map_err(queue_error)
+            .map_err(TxError::from)
     })
-    .await
-    .map_err(|e| tx_error(e, &key_id).into_status())?;
+    .await?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "tex_aborted");
     let row = load_row(&key, id).await?;
     Ok(to_proto(&key_id, &row))
@@ -592,7 +579,7 @@ async fn rebuild(
         .into_status());
     }
     let r = row.clone();
-    let built = tx::with_wallet(key, move |w| {
+    let built = with_wallet(key, move |w| {
         let (txid, raw, expiry) = core_tx::build_tex_step2(
             w,
             &params,
@@ -606,8 +593,7 @@ async fn rebuild(
             tip,
         )?;
         core_tex::replace_step2(w, r.step1_txid, *txid.as_ref(), &raw, expiry)
-            .map_err(queue_error)?;
-        Ok(())
+            .map_err(TxError::from)
     })
     .await;
     match built {
@@ -620,9 +606,9 @@ async fn rebuild(
         Err(e) => {
             let detail = e.to_string();
             let id = row.step1_txid;
-            let _ = tx::with_wallet(key, move |w| {
+            let _ = with_wallet(key, move |w| {
                 core_tex::set_state(w, id, TexState::Step2Failed, Some(&detail))
-                    .map_err(queue_error)
+                    .map_err(TxError::from)
             })
             .await;
             Err(tx_error(e, &key_id).into_status())

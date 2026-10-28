@@ -364,10 +364,7 @@ pub fn tree_refusal(e: &SqliteClientError) -> Option<String> {
 }
 
 /// Credit every transparent output in the cached blocks of `range` that pays
-/// one of the key's receivers (external, change and ephemeral) through
-/// `put_received_transparent_utxo` (SYNC.md §2.1). Finding an output can
-/// advance the gap limit and reveal new receivers, so the pass repeats
-/// until a pass finds nothing new.
+/// one of the key's receivers through [`credit_transparent`] (SYNC.md §2.1).
 pub fn index_transparent(
     cache: &BlockDb,
     wallet: &mut Wallet,
@@ -621,7 +618,6 @@ pub fn record_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zcash_client_backend::data_api::scanning::ScanPriority;
 
     #[test]
     fn node_answers_map_to_upstream_statuses() {

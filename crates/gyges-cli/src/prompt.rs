@@ -9,6 +9,7 @@
 use std::fs::File;
 use std::io::{self, BufRead as _, BufReader, IsTerminal as _, Read as _, Write as _};
 
+use anyhow::anyhow;
 use gyges_proto::v1::{ErrorReason, GygesError};
 use zeroize::Zeroizing;
 
@@ -53,33 +54,28 @@ impl Prompter {
         if let Some(src) = self.passphrase_source() {
             let p = src.read()?;
             if p.is_empty() {
-                return Err(CliError::Other(anyhow::anyhow!(
-                    "the passphrase source is empty"
-                )));
+                return Err(anyhow!("the passphrase source is empty").into());
             }
             return Ok(p);
         }
         if !self.interactive() {
-            return Err(CliError::Daemon(GygesError::new(
+            return Err(GygesError::new(
                 ErrorReason::VaultLocked,
                 format!(
                     "a passphrase is needed and no terminal is available; pass --passphrase-fd N \
                      or set {PASSPHRASE_FILE_ENV}"
                 ),
-            )));
+            )
+            .into());
         }
         let first = Zeroizing::new(rpassword::prompt_password(format!("{prompt}: "))?);
         if first.is_empty() {
-            return Err(CliError::Other(anyhow::anyhow!(
-                "the passphrase must not be empty"
-            )));
+            return Err(anyhow!("the passphrase must not be empty").into());
         }
         if confirm {
             let again = Zeroizing::new(rpassword::prompt_password(format!("{prompt} (again): "))?);
             if *first != *again {
-                return Err(CliError::Other(anyhow::anyhow!(
-                    "the passphrases do not match"
-                )));
+                return Err(anyhow!("the passphrases do not match").into());
             }
         }
         Ok(first)
@@ -89,9 +85,8 @@ impl Prompter {
     /// terminal.
     pub fn hidden_line(&self, prompt: &str) -> Result<Zeroizing<String>, CliError> {
         if !self.interactive() {
-            return Err(CliError::Daemon(GygesError::new(
-                ErrorReason::ConfirmationRequired,
-                format!("{prompt} needs a terminal; pass --stdin to read it from standard input"),
+            return Err(CliError::confirmation_required(format!(
+                "{prompt} needs a terminal; pass --stdin to read it from standard input"
             )));
         }
         Ok(Zeroizing::new(rpassword::prompt_password(format!(
@@ -102,9 +97,8 @@ impl Prompter {
     /// A visible single-line input.
     pub fn line(&self, prompt: &str) -> Result<String, CliError> {
         if !self.interactive() {
-            return Err(CliError::Daemon(GygesError::new(
-                ErrorReason::ConfirmationRequired,
-                format!("{prompt} needs a terminal"),
+            return Err(CliError::confirmation_required(format!(
+                "{prompt} needs a terminal"
             )));
         }
         let mut err = io::stderr();
@@ -124,9 +118,8 @@ impl Prompter {
             return Ok(());
         }
         if !self.interactive() {
-            return Err(CliError::Daemon(GygesError::new(
-                ErrorReason::ConfirmationRequired,
-                format!("{question} (pass {flag} to confirm non-interactively)"),
+            return Err(CliError::confirmation_required(format!(
+                "{question} (pass {flag} to confirm non-interactively)"
             )));
         }
         let answer = self.line(&format!("{question} [y/N]"))?;
@@ -155,21 +148,21 @@ impl PassphraseSource {
     fn read(self) -> Result<Zeroizing<String>, CliError> {
         let reader: Box<dyn io::Read> = match self {
             PassphraseSource::Fd(fd) => {
-                let fd = i32::try_from(fd).map_err(|_| {
-                    CliError::Other(anyhow::anyhow!("--passphrase-fd {fd} is out of range"))
-                })?;
+                let fd = i32::try_from(fd)
+                    .map_err(|_| anyhow!("--passphrase-fd {fd} is out of range"))?;
                 // `File::from_raw_fd` is unsafe (and the crate forbids
                 // unsafe); /dev/fd opens the descriptor like any path on
                 // both macOS and Linux.
-                Box::new(File::open(format!("/dev/fd/{fd}")).map_err(|e| {
-                    CliError::Other(anyhow::anyhow!("cannot read --passphrase-fd {fd}: {e}"))
-                })?)
+                Box::new(
+                    File::open(format!("/dev/fd/{fd}"))
+                        .map_err(|e| anyhow!("cannot read --passphrase-fd {fd}: {e}"))?,
+                )
             }
             PassphraseSource::File(path) => Box::new(File::open(&path).map_err(|e| {
-                CliError::Other(anyhow::anyhow!(
+                anyhow!(
                     "cannot read {PASSPHRASE_FILE_ENV}={}: {e}",
                     path.to_string_lossy()
-                ))
+                )
             })?),
         };
         let mut line = Zeroizing::new(String::new());

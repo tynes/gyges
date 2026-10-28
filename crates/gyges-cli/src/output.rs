@@ -8,32 +8,22 @@ use crate::exit::CliError;
 /// Serialise `value` and add `"schema_version"`. Streaming RPCs call this
 /// once per element, giving one object per line.
 pub fn to_json<T: serde::Serialize>(value: &T) -> Result<String, CliError> {
-    let v = serde_json::to_value(value)?;
-    let mut map = match v {
+    let mut map = match serde_json::to_value(value)? {
         Value::Object(map) => map,
-        other => {
-            let mut map = Map::new();
-            map.insert("value".into(), other);
-            map
-        }
+        other => Map::from_iter([("value".into(), other)]),
     };
     map.insert(
         "schema_version".into(),
-        Value::String(gyges_proto::schema_version().into()),
+        gyges_proto::schema_version().into(),
     );
-    Ok(serde_json::to_string(&Value::Object(map))?)
+    Ok(Value::Object(map).to_string())
 }
 
 /// `{"schema_version": …, "error": <GygesError>}`.
 pub fn error_json(err: &CliError) -> String {
     let error = serde_json::to_value(err.as_gyges_error()).unwrap_or(Value::Null);
-    let mut map = Map::new();
-    map.insert(
-        "schema_version".into(),
-        Value::String(gyges_proto::schema_version().into()),
-    );
-    map.insert("error".into(), error);
-    Value::Object(map).to_string()
+    serde_json::json!({ "schema_version": gyges_proto::schema_version(), "error": error })
+        .to_string()
 }
 
 /// Unix seconds as RFC 3339, for human output.

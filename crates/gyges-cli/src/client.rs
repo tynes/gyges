@@ -171,9 +171,10 @@ pub fn gyges_home() -> Result<PathBuf, CliError> {
         _ => std::env::home_dir()
             .map(|h| h.join(".gyges"))
             .ok_or_else(|| {
-                CliError::Other(anyhow::anyhow!(
+                anyhow::anyhow!(
                     "cannot determine the home directory; set GYGES_HOME or pass --socket"
-                ))
+                )
+                .into()
             }),
     }
 }

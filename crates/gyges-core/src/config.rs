@@ -259,8 +259,6 @@ pub enum ConfigError {
     BroadcastViaTorUnavailable,
     #[error("[vault] scrypt_work_factor must be between 10 and 30 (log2 N), got {0}")]
     ScryptWorkFactor(u8),
-    #[error("[daemon] log_level is not a valid tracing filter: {0}")]
-    LogLevel(String),
 }
 
 /// The commented `config.toml` the daemon writes on first start when none

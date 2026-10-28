@@ -148,15 +148,12 @@ impl DaemonState {
             default_min_confirmations: self.config.policy.min_confirmations,
         }
     }
-}
 
-impl DaemonState {
     /// Resolve a request's key id (empty: the default key).
     pub(crate) fn resolve_key(&self, key_id: &str) -> Result<Arc<KeyEntry>, Status> {
-        Ok(self
-            .registry
+        self.registry
             .resolve(key_id)
-            .map_err(keys::registry_error)?)
+            .map_err(|e| keys::registry_error(e).into())
     }
 
     /// [`Self::resolve_key`], refusing a profile without a wallet with `why`.
@@ -185,14 +182,7 @@ impl DaemonState {
             requested
         }
     }
-}
 
-/// An `INVALID_ARGUMENT` status with `detail`.
-pub(crate) fn invalid(detail: impl Into<String>) -> Status {
-    GygesError::new(ErrorReason::InvalidArgument, detail).into()
-}
-
-impl DaemonState {
     /// `GetInfo.node` from the backend's last poll (API.md `NodeStatus`).
     /// Air-gapped: not connected, with the reason.
     pub fn node_status(&self) -> NodeStatus {
@@ -225,6 +215,11 @@ impl DaemonState {
             node_version: String::new(),
         }
     }
+}
+
+/// An `INVALID_ARGUMENT` status with `detail`.
+pub(crate) fn invalid(detail: impl Into<String>) -> Status {
+    GygesError::new(ErrorReason::InvalidArgument, detail).into()
 }
 
 /// `gyges_core::Network` → wire enum.
@@ -433,8 +428,8 @@ impl Gyges for GygesService {
     ) -> Result<Response<ShutdownResponse>, Status> {
         // In-flight sends end with their streams when the server stops (a
         // proof in progress finishes on its blocking thread and is dropped);
-        // there is no TexQueue to drain yet, so graceful and forced shutdown
-        // behave the same.
+        // the TexQueue's rows persist in `wallet.sqlite` and the next start
+        // resumes them, so graceful and forced shutdown behave the same.
         tracing::info!(
             graceful = request.get_ref().graceful,
             "shutdown requested over RPC"

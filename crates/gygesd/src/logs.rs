@@ -263,31 +263,9 @@ impl Visit for Fields {
         self.set(field, value.to_string());
     }
 
-    fn record_i64(&mut self, field: &Field, value: i64) {
-        self.set(field, value.to_string());
-    }
-
-    fn record_u64(&mut self, field: &Field, value: u64) {
-        self.set(field, value.to_string());
-    }
-
-    fn record_i128(&mut self, field: &Field, value: i128) {
-        self.set(field, value.to_string());
-    }
-
-    fn record_u128(&mut self, field: &Field, value: u128) {
-        self.set(field, value.to_string());
-    }
-
+    // Integers, bools and errors use the defaults: their `Debug` is their
+    // `Display`. A float's is not (`1.0`, not `1`), nor a string's (quoted).
     fn record_f64(&mut self, field: &Field, value: f64) {
-        self.set(field, value.to_string());
-    }
-
-    fn record_bool(&mut self, field: &Field, value: bool) {
-        self.set(field, value.to_string());
-    }
-
-    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
         self.set(field, value.to_string());
     }
 }

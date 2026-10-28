@@ -93,6 +93,16 @@ impl CliError {
         }
     }
 
+    /// Exit 6: a client-side `INVALID_ARGUMENT`.
+    pub fn invalid(detail: impl Into<String>) -> Self {
+        GygesError::new(ErrorReason::InvalidArgument, detail).into()
+    }
+
+    /// Exit 4: a client-side `CONFIRMATION_REQUIRED` (no terminal to ask on).
+    pub fn confirmation_required(detail: impl Into<String>) -> Self {
+        GygesError::new(ErrorReason::ConfirmationRequired, detail).into()
+    }
+
     pub fn exit(&self) -> Exit {
         match self {
             CliError::Unreachable { .. } => Exit::DaemonUnreachable,
@@ -155,6 +165,12 @@ impl CliError {
 impl From<tonic::Status> for CliError {
     fn from(status: tonic::Status) -> Self {
         Self::from_status(status)
+    }
+}
+
+impl From<GygesError> for CliError {
+    fn from(err: GygesError) -> Self {
+        CliError::Daemon(err)
     }
 }
 

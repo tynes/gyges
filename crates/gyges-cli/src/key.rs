@@ -1,12 +1,14 @@
 //! `gyges key …` (CLI_SPEC.md §2.2, API.md §7).
 //!
-//! Implemented: `list`, `init`, `restore`. The rest of the group is declared
+//! Implemented: `list`, `init`, `restore`, `import-keystone`, `unlock`,
+//! `lock`, `export-ufvk` and `export-seed`. The rest of the group is declared
 //! so that `--help` matches the spec and exits 1 ("not implemented").
 
 use std::ffi::OsString;
-
+use std::fmt::Write as _;
 use std::io::IsTerminal as _;
 
+use anyhow::anyhow;
 use clap::{Args, Subcommand};
 use gyges_proto::v1::{
     ErrorReason, ExportSeedRequest, ExportUfvkRequest, GetInfoResponse, GygesError,
@@ -171,7 +173,6 @@ async fn list(ctx: &Ctx) -> Result<(), CliError> {
 
 /// Human-readable `key list`.
 pub fn render_list(keys: &[KeySummary]) -> String {
-    use std::fmt::Write as _;
     if keys.is_empty() {
         return "no keys; create one with `gyges key init --id main`\n".to_string();
     }
@@ -189,15 +190,12 @@ pub fn render_list(keys: &[KeySummary]) -> String {
         } else {
             "UNLOCKED".to_string()
         };
-        let birthday = if k.signing_mode() == SigningMode::SignerOnly {
-            "-".to_string()
-        } else {
-            k.birthday_height.to_string()
-        };
-        let scanned = if k.signing_mode() == SigningMode::SignerOnly {
-            "-".to_string()
-        } else {
-            k.scanned_tip.to_string()
+        let dash_if_signer = |v: u32| {
+            if k.signing_mode() == SigningMode::SignerOnly {
+                "-".to_string()
+            } else {
+                v.to_string()
+            }
         };
         let _ = writeln!(
             s,
@@ -205,8 +203,8 @@ pub fn render_list(keys: &[KeySummary]) -> String {
             k.key_id,
             mode_name(k.signing_mode()),
             state,
-            birthday,
-            scanned,
+            dash_if_signer(k.birthday_height),
+            dash_if_signer(k.scanned_tip),
             if k.is_default { "  (default)" } else { "" }
         );
     }
@@ -233,11 +231,10 @@ pub fn mode_name(mode: SigningMode) -> &'static str {
 async fn init(ctx: &Ctx, args: InitArgs) -> Result<(), CliError> {
     let scripted = ctx.json && ctx.prompter.has_passphrase_source();
     if !scripted && !ctx.prompter.interactive() {
-        return Err(CliError::Daemon(gyges_proto::v1::GygesError::new(
-            gyges_proto::v1::ErrorReason::ConfirmationRequired,
+        return Err(CliError::confirmation_required(
             "key init shows the mnemonic on a terminal; run it interactively, or use --json with \
              --passphrase-fd for a scripted setup",
-        )));
+        ));
     }
     let mut conn = ctx.connect().await?;
     let passphrase = ctx
@@ -286,20 +283,19 @@ async fn init(ctx: &Ctx, args: InitArgs) -> Result<(), CliError> {
             .line(&format!("Word #{}", idx + 1))?
             .to_lowercase();
         if answer != words[idx] {
-            return Err(CliError::Other(anyhow::anyhow!(
+            return Err(anyhow!(
                 "word #{} did not match; the key '{}' was created, but verify your backup with \
                  `gyges key export-seed` before funding it",
                 idx + 1,
                 resp.key_id
-            )));
+            )
+            .into());
         }
     }
     drop(mnemonic);
     if !ctx.quiet {
         eprintln!("key '{}' created; backup verified", resp.key_id);
-        if args.set_default {
-            note_set_default(&resp.key_id);
-        }
+        note_created(&resp.key_id, &[], args.set_default);
     }
     Ok(())
 }
@@ -326,9 +322,8 @@ async fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<(), CliError> {
     };
     let words = mnemonic.split_whitespace().count();
     if words != 24 {
-        return Err(CliError::Daemon(gyges_proto::v1::GygesError::new(
-            gyges_proto::v1::ErrorReason::InvalidArgument,
-            format!("expected a 24-word mnemonic, got {words} words"),
+        return Err(CliError::invalid(format!(
+            "expected a 24-word mnemonic, got {words} words"
         )));
     }
     let network = conn.info.network();
@@ -375,12 +370,7 @@ async fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<(), CliError> {
                 String::new()
             }
         );
-        for w in &resp.warnings {
-            eprintln!("warning: {w}");
-        }
-        if args.set_default {
-            note_set_default(&resp.key_id);
-        }
+        note_created(&resp.key_id, &resp.warnings, args.set_default);
     })
 }
 
@@ -450,12 +440,7 @@ async fn import_keystone(ctx: &Ctx, args: ImportKeystoneArgs) -> Result<(), CliE
                 String::new()
             }
         );
-        for w in &resp.warnings {
-            eprintln!("warning: {w}");
-        }
-        if args.set_default {
-            note_set_default(&resp.key_id);
-        }
+        note_created(&resp.key_id, &resp.warnings, args.set_default);
     })
 }
 
@@ -678,16 +663,14 @@ async fn export_ufvk(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
 /// passphrase is always asked, `reveal seed` typed back.
 async fn export_seed(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
     if ctx.json {
-        return Err(CliError::Daemon(GygesError::new(
-            ErrorReason::InvalidArgument,
+        return Err(CliError::invalid(
             "key export-seed prints to a terminal only and has no --json form",
-        )));
+        ));
     }
     if !ctx.prompter.interactive() || !std::io::stdout().is_terminal() {
-        return Err(CliError::Daemon(GygesError::new(
-            ErrorReason::ConfirmationRequired,
+        return Err(CliError::confirmation_required(
             "key export-seed needs an interactive terminal on stdin, stdout and stderr",
-        )));
+        ));
     }
     let mut conn = ctx.connect().await?;
     let key_id = args.resolve(ctx);
@@ -734,10 +717,16 @@ fn mnemonic_grid(mnemonic: &str, mut emit: impl FnMut(&str)) {
     }
 }
 
-fn note_set_default(key_id: &str) {
-    eprintln!(
-        "note: --set-default lasts until the daemon restarts; set default_key = \"{key_id}\" in config.toml to persist it"
-    );
+/// The daemon's warnings about a new key, then the `--set-default` note.
+fn note_created(key_id: &str, warnings: &[String], set_default: bool) {
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
+    if set_default {
+        eprintln!(
+            "note: --set-default lasts until the daemon restarts; set default_key = \"{key_id}\" in config.toml to persist it"
+        );
+    }
 }
 
 /// Default restore birthday per network (DATA_MODEL.md §3). Duplicated
@@ -762,22 +751,22 @@ pub fn nu5_activation(network: Network) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn endpoint_notes_prefer_onion() {
-        let notes = super::endpoint_notes("https://zec.rocks:443", true);
+        let notes = endpoint_notes("https://zec.rocks:443", true);
         assert_eq!(notes.len(), 2);
         assert!(
             notes[1].contains("zec.rocks is a clearnet host"),
             "{notes:?}"
         );
-        let notes = super::endpoint_notes("http://user@abcdef.ONION:9067/x", true);
+        let notes = endpoint_notes("http://user@abcdef.ONION:9067/x", true);
         assert_eq!(notes.len(), 1, "{notes:?}");
-        let notes = super::endpoint_notes("http://127.0.0.1:9067", false);
+        let notes = endpoint_notes("http://127.0.0.1:9067", false);
         assert!(notes[1].contains("use_tor = false"), "{notes:?}");
         assert!(notes[0].contains("transparent addresses"));
     }
-
-    use super::*;
 
     #[test]
     fn list_rendering() {

@@ -144,10 +144,9 @@ impl Payload {
     /// The payload an assembler has completed, or `None` while frames are
     /// still missing.
     pub fn from_assembler(asm: &Assembler) -> Result<Option<Self>, QrError> {
-        match asm.message()? {
-            Some((ur_type, cbor)) => Self::from_cbor(&ur_type, cbor).map(Some),
-            None => Ok(None),
-        }
+        asm.message()?
+            .map(|(ur_type, cbor)| Self::from_cbor(&ur_type, cbor))
+            .transpose()
     }
 }
 

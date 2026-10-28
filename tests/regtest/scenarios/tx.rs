@@ -1,13 +1,13 @@
 //! `gyges balance`, `gyges tx send` and `gyges tx shield` through the
 //! binaries against the in-process fake `zakurad` (TESTING.md §3 rows 1–3
-//! and 14 in miniature; the real-node versions wait for the harness item).
+//! and 14 in miniature; the real-node versions are in `scenarios/node.rs`).
 //!
 //! Covers: the zero balance of a fresh key, the funded transparent balance,
 //! `--dry-run --json` (the `Proposal` message with `schema_version`), the
 //! exit-4 refusal of a locked key with no terminal and no passphrase source
 //! (JSON carries `reason` and `session_id`), the exit-5 insufficient funds,
 //! the exit-6 memo-to-transparent refusal, a non-interactive shield with
-//! `GYGES_PASSPHRASE_FILE`, and the Orchard balance after mining.
+//! `GYGES_PASSPHRASE_FILE`, and the Ironwood balance after mining.
 
 use std::time::Duration;
 
@@ -34,11 +34,13 @@ fn balance_send_and_shield_through_the_binaries() {
 
     // Insufficient funds is exit 5, before any passphrase is asked.
     let t_addr = burn_t_address();
-    fx.gyges(&[
-        "-k", "main", "tx", "send", "--to", &t_addr, "--amount", "0.5", "--yes",
-    ])
-    .code(5)
-    .stderr_has("insufficient funds");
+    let send = |extra: &[&str]| {
+        fx.gyges(&[
+            "-k", "main", "tx", "send", "--to", &t_addr, "--amount", "0.5",
+        ])
+        .args(extra)
+    };
+    send(&["--yes"]).code(5).stderr_has("insufficient funds");
 
     // Fund 1 ZEC transparent and confirm it.
     fund_transparent(&n, &fx, 100_000_000);
@@ -46,28 +48,10 @@ fn balance_send_and_shield_through_the_binaries() {
     assert_eq!(run.json()["total_spendable"], "100000000", "{run:?}");
 
     // A memo to a transparent recipient is exit 6, never dropped.
-    let run = fx
-        .gyges(&[
-            "-k", "main", "tx", "send", "--to", &t_addr, "--amount", "0.5", "--memo", "hi", "--yes",
-        ])
-        .code(6);
-    run.stderr_has("memo");
+    send(&["--memo", "hi", "--yes"]).code(6).stderr_has("memo");
 
     // `--dry-run --json` prints the proposal only.
-    let run = fx
-        .gyges(&[
-            "-k",
-            "main",
-            "tx",
-            "send",
-            "--to",
-            &t_addr,
-            "--amount",
-            "0.5",
-            "--dry-run",
-            "--json",
-        ])
-        .ok();
+    let run = send(&["--dry-run", "--json"]).ok();
     let lines = run.json_lines();
     assert_eq!(lines.len(), 1, "{}", run.stdout);
     let proposed = &lines[0]["proposed"];
@@ -88,19 +72,11 @@ fn balance_send_and_shield_through_the_binaries() {
     assert_eq!(lines[0]["schema_version"], "0.1");
 
     // The confirmation prompt needs a terminal or --yes (exit 4).
-    fx.gyges(&[
-        "-k", "main", "tx", "send", "--to", &t_addr, "--amount", "0.5",
-    ])
-    .code(4)
-    .stderr_has("--yes");
+    send(&[]).code(4).stderr_has("--yes");
 
     // Locked key, no terminal, no passphrase source: exit 4 with the fix,
     // the session aborted, JSON carrying reason and session_id.
-    let run = fx
-        .gyges(&[
-            "-k", "main", "tx", "send", "--to", &t_addr, "--amount", "0.5", "--yes", "--json",
-        ])
-        .code(4);
+    let run = send(&["--yes", "--json"]).code(4);
     let last: serde_json::Value = serde_json::from_str(run.stdout.lines().last().unwrap()).unwrap();
     assert_eq!(last["error"]["reason"], "ERROR_REASON_VAULT_LOCKED");
     assert_eq!(last["error"]["session_id"].as_str().unwrap().len(), 32);
@@ -129,8 +105,8 @@ fn balance_send_and_shield_through_the_binaries() {
         vec![gyges_chain::parse_display_hash(&txid).unwrap()]
     );
 
-    // Mined: the Orchard balance is the input minus the fee the proposal
-    // showed, and `sync wait --txid` sees the confirmations.
+    // Mined: the input, less a fee, is Ironwood, and `sync wait --txid`
+    // sees the confirmations.
     n.node.mine(2);
     wait_for_txid(&fx, "main", &txid, 2);
     let b = wait_balance(&fx, "main", |b| {
@@ -138,20 +114,16 @@ fn balance_send_and_shield_through_the_binaries() {
     });
     let ironwood = spendable(&b, "POOL_IRONWOOD");
     assert!(ironwood > 99_000_000 && ironwood < 100_000_000, "{b}");
-    assert!(
-        b["pools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|p| p["pool"] != "POOL_ORCHARD" || p.get("spendable").is_none())
-    );
-    assert!(
-        b["pools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|p| p["pool"] != "POOL_TRANSPARENT" || p.get("spendable").is_none())
-    );
+    for pool in ["POOL_ORCHARD", "POOL_TRANSPARENT"] {
+        assert!(
+            b["pools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["pool"] != pool || p.get("spendable").is_none()),
+            "{pool}: {b}"
+        );
+    }
     fx.gyges(&["-k", "main", "balance"])
         .run()
         .stdout_has("ironwood");
@@ -270,38 +242,19 @@ fn zip320_send_survives_a_daemon_crash() {
     wait_spendable(&fx);
 
     let tex_addr = burn_tex_address();
+    let send = |extra: &[&str]| {
+        fx.gyges(&[
+            "-k", "main", "tx", "send", "--to", &tex_addr, "--amount", "0.5",
+        ])
+        .args(extra)
+    };
 
     // The dry run shows both steps and both fees.
-    let run = fx
-        .gyges(&[
-            "-k",
-            "main",
-            "tx",
-            "send",
-            "--to",
-            &tex_addr,
-            "--amount",
-            "0.5",
-            "--dry-run",
-        ])
-        .ok();
+    let run = send(&["--dry-run"]).ok();
     run.stderr_has("Step 1 of 2").stderr_has("Step 2 of 2");
     run.stderr_has("ephemeral");
     run.stderr_has(&tex_addr);
-    let run = fx
-        .gyges(&[
-            "-k",
-            "main",
-            "tx",
-            "send",
-            "--to",
-            &tex_addr,
-            "--amount",
-            "0.5",
-            "--dry-run",
-            "--json",
-        ])
-        .ok();
+    let run = send(&["--dry-run", "--json"]).ok();
     let proposed = &run.json()["proposed"];
     assert_eq!(proposed["steps"].as_array().unwrap().len(), 2, "{proposed}");
     assert_eq!(proposed["steps"][1]["transparent_only"], true, "{proposed}");
@@ -310,12 +263,7 @@ fn zip320_send_survives_a_daemon_crash() {
     // `tex pending` and one txid on stdout.
     n.node
         .set_reject_transparent_only(Some("bad-txns-inputs-missingorspent".into()));
-    let run = fx
-        .gyges(&[
-            "-k", "main", "tx", "send", "--to", &tex_addr, "--amount", "0.5", "--yes",
-        ])
-        .env("GYGES_PASSPHRASE_FILE", &pw)
-        .ok();
+    let run = send(&["--yes"]).env("GYGES_PASSPHRASE_FILE", &pw).ok();
     let (s1, s2) = parse_tex_txids(&run);
     assert_eq!(
         run.stdout.lines().count(),

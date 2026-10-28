@@ -29,13 +29,6 @@ impl Animation {
         &self.frames
     }
 
-    /// The next frame's text and its rendered QR code.
-    pub fn next_rendered(&mut self) -> Result<(String, String), QrError> {
-        let frame = self.frames.next_frame()?;
-        let qr = render_frame(&frame)?;
-        Ok((frame, qr))
-    }
-
     /// Draw frames to `out` until `stop` returns true. A single-frame
     /// payload is drawn once and returns at once: there is nothing to
     /// animate, and the caller decides how long it stays on screen.
@@ -47,7 +40,7 @@ impl Animation {
         let period = Duration::from_secs(1) / self.fps;
         let mut drawn_lines = 0;
         while !stop() {
-            let (_, qr) = self.next_rendered()?;
+            let qr = render_frame(&self.frames.next_frame()?)?;
             if drawn_lines > 0 {
                 // Up to the first line of the previous code, then clear
                 // everything below it.

@@ -1,5 +1,5 @@
 //! The amount grammar (CLI_SPEC.md §1.4) and memo rules (§1.5), shared by
-//! `tx send`, `tx shield --threshold` and, later, `pczt create`.
+//! `tx send`, `tx shield --threshold` and `pczt create`.
 
 use gyges_proto::v1::{Amount, amount};
 

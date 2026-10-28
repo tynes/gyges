@@ -8,14 +8,16 @@
 //! the current address or one given (checked with `InspectAddress` first,
 //! so a mistyped address is never rendered).
 
+use std::fmt::Write as _;
+
 use clap::{Args, Subcommand, ValueEnum};
 use gyges_proto::v1::{
-    AddressInfo, AddressKind, ErrorReason, GetCurrentAddressRequest, GygesError,
-    InspectAddressRequest, InspectAddressResponse, Network, NewAddressRequest, Pool, Receiver,
+    AddressInfo, AddressKind, GetCurrentAddressRequest, InspectAddressRequest,
+    InspectAddressResponse, Network, NewAddressRequest, Pool, Receiver,
 };
 
 use crate::balance::pool_name;
-use crate::client::Ctx;
+use crate::client::{Conn, Ctx};
 use crate::exit::CliError;
 use crate::output::to_json;
 
@@ -70,20 +72,10 @@ pub struct NewArgs {
 }
 
 pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
+    let mut conn = ctx.connect().await?;
     match cmd {
-        AddressCmd::Current(a) => {
-            let mut conn = ctx.connect().await?;
-            let info = conn
-                .client
-                .get_current_address(GetCurrentAddressRequest {
-                    key_id: ctx.key.clone(),
-                })
-                .await?
-                .into_inner();
-            print_address(ctx, &info, a.qr)
-        }
+        AddressCmd::Current(a) => print_address(ctx, &current_address(ctx, &mut conn).await?, a.qr),
         AddressCmd::Qr { address } => {
-            let mut conn = ctx.connect().await?;
             let address = match address {
                 Some(address) => {
                     let resp = conn
@@ -94,39 +86,18 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
                         .await?
                         .into_inner();
                     if !resp.valid {
-                        return Err(CliError::Daemon(GygesError::new(
-                            ErrorReason::InvalidArgument,
-                            if resp.error.is_empty() {
-                                "not a valid address".to_string()
-                            } else {
-                                resp.error
-                            },
-                        )));
+                        return Err(invalid_address(resp));
                     }
                     address
                 }
-                None => {
-                    conn.client
-                        .get_current_address(GetCurrentAddressRequest {
-                            key_id: ctx.key.clone(),
-                        })
-                        .await?
-                        .into_inner()
-                        .address
-                }
+                None => current_address(ctx, &mut conn).await?.address,
             };
             let qr = qr_code(&address)?;
-            if ctx.json {
-                let v = serde_json::json!({ "address": address, "qr": qr });
-                println!("{}", to_json(&v)?);
-            } else {
-                print!("{qr}");
-                println!("{address}");
-            }
-            Ok(())
+            ctx.print(&serde_json::json!({ "address": address, "qr": qr }), || {
+                format!("{qr}{address}\n")
+            })
         }
         AddressCmd::New(a) => {
-            let mut conn = ctx.connect().await?;
             let info = conn
                 .client
                 .new_address(NewAddressRequest {
@@ -139,7 +110,6 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
             print_address(ctx, &info, a.qr)
         }
         AddressCmd::Inspect { address } => {
-            let mut conn = ctx.connect().await?;
             let resp = conn
                 .client
                 .inspect_address(InspectAddressRequest { address })
@@ -151,18 +121,30 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
                 if !ctx.json && resp.kind != AddressKind::Unspecified as i32 {
                     print!("{}", render_inspection(&resp));
                 }
-                return Err(CliError::Daemon(GygesError::new(
-                    ErrorReason::InvalidArgument,
-                    if resp.error.is_empty() {
-                        "not a valid address".to_string()
-                    } else {
-                        resp.error.clone()
-                    },
-                )));
+                return Err(invalid_address(resp));
             }
             ctx.print(&resp, || render_inspection(&resp))
         }
     }
+}
+
+async fn current_address(ctx: &Ctx, conn: &mut Conn) -> Result<AddressInfo, CliError> {
+    Ok(conn
+        .client
+        .get_current_address(GetCurrentAddressRequest {
+            key_id: ctx.key.clone(),
+        })
+        .await?
+        .into_inner())
+}
+
+/// Exit 6 with the daemon's reason an address did not parse.
+fn invalid_address(resp: InspectAddressResponse) -> CliError {
+    CliError::invalid(if resp.error.is_empty() {
+        "not a valid address".to_string()
+    } else {
+        resp.error
+    })
 }
 
 /// The address on stdout (or `AddressInfo` with `--json`); the details,
@@ -197,7 +179,6 @@ fn receiver_line(r: &Receiver) -> String {
 
 /// Receivers, diversifier index and label (stderr).
 pub fn render_details(info: &AddressInfo) -> String {
-    use std::fmt::Write as _;
     let mut s = String::new();
     for (i, r) in info.receivers.iter().enumerate() {
         let head = if i == 0 { "receivers:" } else { "" };
@@ -225,7 +206,6 @@ fn kind_name(k: AddressKind) -> &'static str {
 
 /// `address inspect` for a terminal.
 pub fn render_inspection(r: &InspectAddressResponse) -> String {
-    use std::fmt::Write as _;
     let mut s = String::new();
     let _ = writeln!(s, "{:<11} {}", "valid:", if r.valid { "yes" } else { "no" });
     if r.network != Network::Unspecified as i32 {

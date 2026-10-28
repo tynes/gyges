@@ -39,13 +39,13 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::backfill;
 use crate::node;
-use crate::service::DaemonState;
-use crate::{lock, read, write};
+use crate::service::{DaemonState, invalid};
+use crate::{lock, read, with_wallet, write};
 
 /// What the RPC handlers and the scheduler share: the latest progress per
 /// key, a change counter for streams to wait on, a wake-up for the
 /// scheduler, and pending rewind requests.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SyncHub {
     progress: RwLock<BTreeMap<String, KeyProgress>>,
     generation: watch::Sender<u64>,
@@ -75,20 +75,6 @@ struct MempoolRequest {
 /// included), so a burst cannot hold up block sync or outlast
 /// `ScanMempool`'s wait; the rest are taken next pass.
 const MEMPOOL_MAX_NEW: usize = 500;
-
-impl Default for SyncHub {
-    fn default() -> Self {
-        Self {
-            progress: RwLock::new(BTreeMap::new()),
-            generation: watch::Sender::new(0),
-            wake: Notify::new(),
-            rewinds: Mutex::new(BTreeMap::new()),
-            ticks: Mutex::new((0, 0)),
-            stop: watch::Sender::new(false),
-            mempool_requests: Mutex::new(Vec::new()),
-        }
-    }
-}
 
 impl SyncHub {
     pub fn get(&self, key_id: &str) -> Option<KeyProgress> {
@@ -332,7 +318,7 @@ impl Scheduler {
             for key in &keys {
                 if down_for > self.state.config.daemon.offline_grace {
                     let detail = format!("node unreachable for {}s: {err}", down_for.as_secs());
-                    self.stall(key.key_id(), StallReason::Offline, detail);
+                    self.hub().stall(key.key_id(), StallReason::Offline, detail);
                 } else {
                     self.hub().update(key.key_id(), |p| {
                         p.detail = format!("node unreachable, retrying: {err}");
@@ -569,11 +555,8 @@ impl Scheduler {
             retained_from,
             "key stalled: pruned past scan tip"
         );
-        self.stall(key_id, StallReason::PrunedPastScanTip, detail);
-    }
-
-    pub(crate) fn stall(&self, key_id: &str, reason: StallReason, detail: String) {
-        self.hub().stall(key_id, reason, detail);
+        self.hub()
+            .stall(key_id, StallReason::PrunedPastScanTip, detail);
     }
 
     /// How many leading blocks of `range` the cache already holds. A gap
@@ -931,7 +914,8 @@ impl Scheduler {
                     detected_at = u32::from(at_height),
                     "key stalled: chain inconsistent"
                 );
-                self.stall(&key_id, StallReason::ChainInconsistent, detail);
+                self.hub()
+                    .stall(&key_id, StallReason::ChainInconsistent, detail);
                 Ok(())
             }
         }
@@ -1020,30 +1004,10 @@ fn notes_for(key_id: Option<&str>, notes: &BTreeMap<String, u32>) -> u32 {
 
 /// The height the key's wallet saw `txid` mined at, if any.
 pub(crate) async fn mined_height(key: &Arc<KeyEntry>, txid: [u8; 32]) -> Option<BlockHeight> {
-    let key = key.clone();
-    tokio::task::spawn_blocking(move || {
-        key.wallet()
-            .and_then(|w| core_sync::tx_height(&w, txid).ok().flatten())
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-/// Run `f` with the key's wallet on a blocking thread.
-pub(crate) async fn with_wallet<T: Send + 'static>(
-    key: &Arc<KeyEntry>,
-    f: impl FnOnce(&mut gyges_core::registry::Wallet) -> Result<T, SyncError> + Send + 'static,
-) -> Result<T, SyncError> {
-    let key = key.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut guard = key
-            .wallet()
-            .ok_or_else(|| SyncError::Wallet("this profile has no wallet".into()))?;
-        f(&mut guard)
-    })
-    .await
-    .map_err(|e| SyncError::Wallet(format!("scan task failed: {e}")))?
+    with_wallet(key, move |w| core_sync::tx_height(w, txid))
+        .await
+        .ok()
+        .flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,7 +1055,7 @@ pub fn to_proto(p: &KeyProgress) -> KeySyncStatus {
         spendable: p.spendable,
         blocks_per_sec: p.blocks_per_sec,
         blocks_remaining: p.blocks_remaining,
-        // ShardTree witness health arrives with `ListNotes`.
+        // Not computed; `ListNotes` reports `witness_ready` per note.
         notes_awaiting_witness: 0,
         detail: if p.detail.is_empty() {
             p.state.name()
@@ -1193,9 +1157,8 @@ pub fn wait_sync(state: Arc<DaemonState>, req: WaitSyncRequest) -> Result<Progre
             SyncTarget::Spendable | SyncTarget::Unspecified => Until::Spendable,
         }
     } else {
-        let txid = gyges_chain::parse_display_hash(&req.txid).map_err(|e| {
-            GygesError::new(ErrorReason::InvalidArgument, format!("txid: {e}")).into_status()
-        })?;
+        let txid = gyges_chain::parse_display_hash(&req.txid)
+            .map_err(|e| invalid(format!("txid: {e}")))?;
         Until::Confirmations {
             txid,
             wanted: req.confirmations.max(1),
@@ -1209,11 +1172,7 @@ pub fn wait_sync(state: Arc<DaemonState>, req: WaitSyncRequest) -> Result<Progre
 pub fn run_sync(state: Arc<DaemonState>, req: RunSyncRequest) -> Result<ProgressStream, Status> {
     let key = resolve_synced_key(&state, &req.key_id)?;
     if req.to_height != 0 || req.force_tor_lwd {
-        return Err(GygesError::new(
-            ErrorReason::InvalidArgument,
-            "--to and --force-tor-lwd are not supported in this milestone (ROADMAP.md M2)",
-        )
-        .into_status());
+        return Err(invalid("--to and --force-tor-lwd are not supported yet"));
     }
     if req.from_height != 0 {
         let current = state.sync.progress(key.key_id()).scanned_tip;

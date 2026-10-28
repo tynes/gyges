@@ -15,10 +15,11 @@
 //!
 //! The endpoint is untrusted (THREAT_MODEL.md B3): every block batch must
 //! carry the heights asked for and link by `prev_hash`, and the handoff
-//! validation of SYNC.md §5.2 (a later ROADMAP.md M2 item) checks the result
-//! against the local node before the wallet relies on it. What this module
-//! guarantees is only that a batch is internally consistent and that a
-//! stalled or short stream is reported rather than waited on forever.
+//! validation of SYNC.md §5.2 (`gyges_core::handoff`, run by
+//! `gygesd::backfill`) checks the result against the local node before the
+//! wallet relies on it. What this module guarantees is only that a batch is
+//! internally consistent and that a stalled or short stream is reported
+//! rather than waited on forever.
 //!
 //! Nothing is contacted at construction. The connection (and the Tor
 //! client) is made on first use and dropped on any transport failure, so the
@@ -27,7 +28,7 @@
 use std::error::Error as _;
 use std::fmt;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -210,12 +211,6 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         *self.tor_state.write().unwrap_or_else(|e| e.into_inner()) = state;
     }
 
-    /// Drop the connection (and keep the Tor client); the next call
-    /// reconnects.
-    pub async fn disconnect(&self) {
-        self.conn.lock().await.client = None;
-    }
-
     /// The connected client, connecting (and bootstrapping Tor) on first
     /// use. `GetLightdInfo` is checked once per connection so that an
     /// endpoint for another chain is refused before any block is taken
@@ -232,21 +227,14 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                     conn.tor = Some(self.bootstrap_tor(tor_dir).await?);
                 }
                 let tor = conn.tor.as_ref().expect("set above");
-                match tor
-                    .connect_lightwalletd_channel(self.endpoint.clone(), self.is_onion())
+                // A failed circuit is the common case; a client that lost its
+                // directory is re-bootstrapped by the next attempt
+                // (`ensure_bootstrapped`), so keep it.
+                tor.connect_lightwalletd_channel(self.endpoint.clone(), self.is_onion())
                     .await
-                {
-                    Ok(channel) => channel,
-                    Err(e) => {
-                        // A failed circuit is the common case; a client that
-                        // lost its directory is re-bootstrapped by the next
-                        // attempt (`ensure_bootstrapped`), so keep it.
-                        return Err(ChainError::Unreachable(format!(
-                            "{} over Tor: {e}",
-                            self.endpoint
-                        )));
-                    }
-                }
+                    .map_err(|e| {
+                        ChainError::Unreachable(format!("{} over Tor: {e}", self.endpoint))
+                    })?
             }
         };
         let mut client = CompactTxStreamerClient::new(channel);
@@ -274,7 +262,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         })
     }
 
-    async fn bootstrap_tor(&self, tor_dir: &PathBuf) -> Result<tor::Client, ChainError> {
+    async fn bootstrap_tor(&self, tor_dir: &Path) -> Result<tor::Client, ChainError> {
         if let Err(e) = std::fs::create_dir_all(tor_dir) {
             let msg = format!("cannot create {}: {e}", tor_dir.display());
             self.set_tor_state(TorState::Failed(msg.clone()));
@@ -404,7 +392,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         let client = self.client().await?;
         let result = f(client).await;
         if matches!(result, Err(ChainError::Unreachable(_))) {
-            self.disconnect().await;
+            self.conn.lock().await.client = None;
         }
         result
     }
@@ -423,27 +411,6 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                 tip_hash: bytes32(&id.hash, "GetLatestBlock: hash")?,
                 retained_from: BlockHeight::from_u32(0),
             })
-        })
-        .await
-    }
-
-    /// `GetBlock(height)`: one compact block; [`ChainError::BlockUnavailable`]
-    /// when the endpoint has none at that height.
-    async fn compact_block(&self, height: BlockHeight) -> Result<CompactBlock, ChainError> {
-        self.call(|mut client| async move {
-            let block = client
-                .get_block(block_id(u32::from(height)))
-                .await
-                .map_err(|s| self.block_error("GetBlock", height, s))?
-                .into_inner();
-            if block.height != u64::from(u32::from(height)) {
-                return Err(ChainError::Rpc(format!(
-                    "GetBlock({height}) at {} answered height {}",
-                    self.endpoint, block.height
-                )));
-            }
-            bytes32(&block.hash, "GetBlock: hash")?;
-            Ok(block)
         })
         .await
     }
@@ -572,12 +539,11 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
             ShieldedPool::Ironwood => ShieldedProtocol::Ironwood,
         };
         self.call(|mut client| async move {
-            let mut request = GetSubtreeRootsArg {
+            let request = GetSubtreeRootsArg {
                 start_index,
-                shielded_protocol: 0,
+                shielded_protocol: protocol as i32,
                 max_entries,
             };
-            request.set_shielded_protocol(protocol);
             let mut stream = client
                 .get_subtree_roots(request)
                 .await
@@ -599,14 +565,9 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                     break;
                 };
                 let index = start_index + roots.len() as u32;
-                let end_hash = if root.completing_block_hash.is_empty() {
-                    None
-                } else {
-                    Some(bytes32(
-                        &root.completing_block_hash,
-                        "GetSubtreeRoots: hash",
-                    )?)
-                };
+                let end_hash = (!root.completing_block_hash.is_empty())
+                    .then(|| bytes32(&root.completing_block_hash, "GetSubtreeRoots: hash"))
+                    .transpose()?;
                 roots.push(SubtreeRoot {
                     pool,
                     index,
@@ -632,41 +593,36 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         if addresses.is_empty() {
             return Ok(Vec::new());
         }
-        self.call(|mut client| {
-            let addresses = addresses.clone();
-            async move {
-                let reply = client
-                    .get_address_utxos(GetAddressUtxosArg {
-                        addresses,
-                        start_height: u64::from(u32::from(start)),
-                        max_entries: 0,
+        self.call(|mut client| async move {
+            let reply = client
+                .get_address_utxos(GetAddressUtxosArg {
+                    addresses,
+                    start_height: u64::from(u32::from(start)),
+                    max_entries: 0,
+                })
+                .await
+                .map_err(|s| self.status_error("GetAddressUtxos", s))?
+                .into_inner();
+            reply
+                .address_utxos
+                .into_iter()
+                .map(|u| {
+                    let bad = |what: &str| {
+                        ChainError::Rpc(format!("GetAddressUtxos at {}: {what}", self.endpoint))
+                    };
+                    Ok(AddressUtxo {
+                        txid: bytes32(
+                            &u.txid,
+                            format_args!("GetAddressUtxos at {}: txid", self.endpoint),
+                        )?,
+                        index: u32::try_from(u.index).map_err(|_| bad("negative output index"))?,
+                        value_zat: u64::try_from(u.value_zat).map_err(|_| bad("negative value"))?,
+                        height: height_of(u.height, "GetAddressUtxos")?,
+                        address: u.address,
+                        script_pubkey: u.script,
                     })
-                    .await
-                    .map_err(|s| self.status_error("GetAddressUtxos", s))?
-                    .into_inner();
-                reply
-                    .address_utxos
-                    .into_iter()
-                    .map(|u| {
-                        let bad = |what: &str| {
-                            ChainError::Rpc(format!("GetAddressUtxos at {}: {what}", self.endpoint))
-                        };
-                        Ok(AddressUtxo {
-                            txid: bytes32(
-                                &u.txid,
-                                format_args!("GetAddressUtxos at {}: txid", self.endpoint),
-                            )?,
-                            index: u32::try_from(u.index)
-                                .map_err(|_| bad("negative output index"))?,
-                            value_zat: u64::try_from(u.value_zat)
-                                .map_err(|_| bad("negative value"))?,
-                            height: height_of(u.height, "GetAddressUtxos")?,
-                            address: u.address,
-                            script_pubkey: u.script,
-                        })
-                    })
-                    .collect()
-            }
+                })
+                .collect()
         })
         .await
     }
@@ -674,7 +630,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
     /// `GetTransaction(txid)`: the raw bytes and the height the endpoint
     /// reports (0 for its mempool, `u64::MAX` for a fork); `None` when it
     /// does not have the transaction (lightwalletd's NOT_FOUND, or zaino's
-    /// `Internal` carrying the node's -5, see [`zaino_tx_not_found`]).
+    /// `Internal` carrying the node's -5).
     pub async fn raw_transaction(
         &self,
         txid: [u8; 32],
@@ -707,8 +663,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
     /// passed through as [`ChainError::Rejected`]. zaino answers a refusal
     /// as `Internal` instead; [`zaino_rejection`] picks the node's text out
     /// of it.
-    async fn send_transaction(&self, raw: &[u8]) -> Result<[u8; 32], ChainError> {
-        let raw = raw.to_vec();
+    async fn send_transaction(&self, raw: Vec<u8>) -> Result<[u8; 32], ChainError> {
         self.call(|mut client| async move {
             let resp = client
                 .send_transaction(RawTransaction {
@@ -847,11 +802,23 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ArtiTorLwdBackend<P
         Box::pin(self.tree_state(height))
     }
 
+    /// `GetBlock(height)`; [`ChainError::BlockUnavailable`] when the
+    /// endpoint has no block at that height.
     fn block_hash(&self, height: BlockHeight) -> BoxFuture<'_, Result<[u8; 32], ChainError>> {
-        Box::pin(async move {
-            let block = self.compact_block(height).await?;
+        Box::pin(self.call(move |mut client| async move {
+            let block = client
+                .get_block(block_id(u32::from(height)))
+                .await
+                .map_err(|s| self.block_error("GetBlock", height, s))?
+                .into_inner();
+            if block.height != u64::from(u32::from(height)) {
+                return Err(ChainError::Rpc(format!(
+                    "GetBlock({height}) at {} answered height {}",
+                    self.endpoint, block.height
+                )));
+            }
             bytes32(&block.hash, "GetBlock: hash")
-        })
+        }))
     }
 
     fn compact_blocks(
@@ -862,7 +829,7 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ArtiTorLwdBackend<P
     }
 
     fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<[u8; 32], ChainError>> {
-        Box::pin(async move { self.send_transaction(&raw).await })
+        Box::pin(self.send_transaction(raw))
     }
 
     /// `GetTransaction(txid)`: lightwalletd reports `height` 0 for the

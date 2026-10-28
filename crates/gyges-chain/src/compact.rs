@@ -24,7 +24,7 @@ use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::{BlockHeight, NetworkType, Parameters};
 
 /// Length of the compact note ciphertext prefix the scanner trial-decrypts.
-pub const COMPACT_CIPHERTEXT_LEN: usize = 52;
+const COMPACT_CIPHERTEXT_LEN: usize = 52;
 
 /// Note commitment tree sizes as of the end of a block
 /// (`getblock(h, 1).trees`), carried as `ChainMetadata`. The scanner needs
@@ -70,14 +70,9 @@ pub fn from_raw<P: Parameters>(
             claimed: block.claimed_height(),
         });
     }
-    Ok(from_block(&block, sizes))
-}
-
-/// The compact form of an already parsed block.
-pub fn from_block(block: &Block, sizes: Option<TreeSizes>) -> CompactBlock {
     let header = block.header();
-    CompactBlock {
-        height: u64::from(u32::from(block.claimed_height())),
+    Ok(CompactBlock {
+        height: u64::from(u32::from(height)),
         hash: header.hash().0.to_vec(),
         prev_hash: header.prev_block.0.to_vec(),
         time: header.time,
@@ -94,12 +89,12 @@ pub fn from_block(block: &Block, sizes: Option<TreeSizes>) -> CompactBlock {
             orchard_commitment_tree_size: s.orchard,
             ironwood_commitment_tree_size: s.ironwood,
         }),
-    }
+    })
 }
 
 /// One transaction's compact form. `index` is its position in the block;
 /// the coinbase's null input is omitted as the proto requires.
-pub fn compact_tx(index: u64, tx: &Transaction) -> CompactTx {
+fn compact_tx(index: u64, tx: &Transaction) -> CompactTx {
     let mut ctx = CompactTx {
         index,
         txid: tx.txid().as_ref().to_vec(),

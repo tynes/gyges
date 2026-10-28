@@ -64,7 +64,19 @@ pub enum SigningMode {
 }
 
 /// Shielded and transparent pools, as data rather than code paths (Q-D7).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// The variant order is the order `notes` lists a transaction's outputs in.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Pool {
     #[default]
@@ -139,26 +151,4 @@ impl TexState {
             TexState::Step2Mined | TexState::Expired | TexState::Failed | TexState::Aborted
         )
     }
-}
-
-/// Compile-time proof that the upstream APIs the design relies on exist under
-/// the `package =` renames in `Cargo.toml` (OVERVIEW.md §2.1, Q-D4, Q-K3, Q-T1).
-#[allow(unused_imports)]
-mod paths_compile {
-    use pczt::Pczt;
-    use pczt::roles::{
-        combiner::Combiner, io_finalizer::IoFinalizer, prover::Prover, redactor::Redactor,
-        signer::Signer, spend_finalizer::SpendFinalizer, tx_extractor::TransactionExtractor,
-        updater::Updater, verifier::Verifier,
-    };
-    use zcash_address::ZcashAddress;
-    use zcash_client_backend::data_api::wallet::{
-        create_pczt_from_proposal, create_proposed_transactions,
-        extract_and_store_transaction_from_pczt, propose_standard_transfer_to_address,
-        propose_transfer,
-    };
-    use zcash_client_backend::data_api::{WalletRead, WalletWrite};
-    use zcash_client_sqlite::WalletDb;
-    use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
-    use zcash_proofs::prover::LocalTxProver;
 }

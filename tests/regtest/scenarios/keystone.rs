@@ -82,20 +82,14 @@ fn keystone_signing_through_the_binaries() {
     assert!(!request.is_empty(), "{run:?}");
     assert!(request[0].starts_with("ur:zcash-pczt/"), "{}", request[0]);
     let sid = pending_session(&fx);
+    let burn = burn_t_address();
+    let send = |amount: &str| {
+        fx.gyges(&[
+            "-k", "ks", "tx", "send", "--to", &burn, "--amount", amount, "--yes",
+        ])
+    };
     // A second spend waits for this one.
-    fx.gyges(&[
-        "-k",
-        "ks",
-        "tx",
-        "send",
-        "--to",
-        &burn_t_address(),
-        "--amount",
-        "0.1",
-        "--yes",
-    ])
-    .code(4)
-    .stderr_has(&sid);
+    send("0.1").code(4).stderr_has(&sid);
     // This build has no camera (feature `camera` is off by default).
     fx.gyges(&["pczt", "qr-scan", "--session", &sid])
         .code(1)
@@ -128,21 +122,11 @@ fn keystone_signing_through_the_binaries() {
     // Send with `--qr-out`: the request in a file, the batch answer as
     // positional frames.
     let req_path = fx.home().join("request.txt");
-    fx.gyges(&[
-        "-k",
-        "ks",
-        "tx",
-        "send",
-        "--to",
-        &burn_t_address(),
-        "--amount",
-        "0.5",
-        "--yes",
-        "--qr-out",
-    ])
-    .arg(&req_path)
-    .code(4)
-    .stderr_has("written to");
+    send("0.5")
+        .arg("--qr-out")
+        .arg(&req_path)
+        .code(4)
+        .stderr_has("written to");
     let request = ur_lines(&std::fs::read_to_string(&req_path).unwrap());
     assert!(
         request[0].starts_with("ur:zcash-sign-batch/"),
@@ -150,46 +134,22 @@ fn keystone_signing_through_the_binaries() {
         request[0]
     );
     let sid = pending_session(&fx);
-    let mut args = vec![
-        "pczt".to_string(),
-        "qr-import".into(),
-        "--session".into(),
-        sid.clone(),
-    ];
-    args.extend(device_answer(&request));
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let run = fx.gyges(&refs).ok();
+    let run = fx
+        .gyges(&["pczt", "qr-import", "--session", &sid])
+        .args(device_answer(&request))
+        .ok();
     assert!(is_txid(run.stdout.trim()), "{run:?}");
 
     n.node.mine(1);
     sync_wait_within(&fx, "ks", "60s", &[]);
 
     // An aborted session cannot be completed.
-    let run = fx
-        .gyges(&[
-            "-k",
-            "ks",
-            "tx",
-            "send",
-            "--to",
-            &burn_t_address(),
-            "--amount",
-            "0.1",
-            "--yes",
-        ])
-        .code(4);
+    let run = send("0.1").code(4);
     let request = ur_lines(&run.stdout);
     let sid = pending_session(&fx);
     fx.gyges(&["tx", "abort", &sid]).ok();
-    let mut args = vec![
-        "pczt".to_string(),
-        "qr-import".into(),
-        "--session".into(),
-        sid,
-    ];
-    args.extend(device_answer(&request));
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    fx.gyges(&refs)
+    fx.gyges(&["pczt", "qr-import", "--session", &sid])
+        .args(device_answer(&request))
         .code(6)
         .stderr_has("no Keystone signing session");
 }

@@ -71,6 +71,40 @@ pub(crate) fn write<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<
     l.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The error a wallet task returns when the profile has no wallet or the
+/// blocking task fails.
+pub(crate) trait WalletTaskError: Send + 'static {
+    fn wallet_task(detail: String) -> Self;
+}
+
+impl WalletTaskError for gyges_core::TxError {
+    fn wallet_task(detail: String) -> Self {
+        Self::Internal(detail)
+    }
+}
+
+impl WalletTaskError for gyges_core::SyncError {
+    fn wallet_task(detail: String) -> Self {
+        Self::Wallet(detail)
+    }
+}
+
+/// Run `f` with the key's wallet on a blocking thread.
+pub(crate) async fn with_wallet<T: Send + 'static, E: WalletTaskError>(
+    key: &Arc<gyges_core::KeyEntry>,
+    f: impl FnOnce(&mut gyges_core::registry::Wallet) -> Result<T, E> + Send + 'static,
+) -> Result<T, E> {
+    let key = key.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut wallet = key
+            .wallet()
+            .ok_or_else(|| E::wallet_task("this profile has no wallet".into()))?;
+        f(&mut wallet)
+    })
+    .await
+    .map_err(|e| E::wallet_task(format!("wallet task failed: {e}")))?
+}
+
 /// What the command line decided (CLI_SPEC.md §2.1 `gyges daemon start`).
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -148,7 +182,7 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Steps 1–3 of the startup order. Synchronous so that the daemoniser in
+    /// Steps 1–5 of the startup order. Synchronous so that the daemoniser in
     /// `main` can run it before forking and report problems on its own stderr.
     pub fn prepare(opts: Options) -> anyhow::Result<Self> {
         let home = opts.home.clone();
@@ -274,7 +308,7 @@ impl Daemon {
         self.home.socket_path(self.network)
     }
 
-    /// Step 5: bind the socket and serve until `shutdown` resolves or the
+    /// Step 6: bind the socket and serve until `shutdown` resolves or the
     /// `Shutdown` RPC is called. Removes the socket file afterwards; the pid
     /// file goes when `self` is dropped.
     pub async fn serve(self, shutdown: impl Future<Output = ()> + Send) -> anyhow::Result<()> {

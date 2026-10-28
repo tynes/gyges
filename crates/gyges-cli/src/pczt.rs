@@ -5,21 +5,23 @@
 //! Implemented: `create`, `inspect`, `prove`, `sign`, `combine` and
 //! `broadcast`. The key is read from the file's `gyges.key_id`; `--key` is
 //! an assertion the daemon checks (`KEY_MISMATCH`, exit 6). `qr-export
-//! --session` and `qr-import --session` show and complete a Keystone
-//! signing session (`crate::keystone`); the same for PCZT files, and the
-//! camera (`qr-scan`), wait for later M5 items.
+//! --session` shows a Keystone signing session's request, and `qr-scan
+//! --session` (camera) and `qr-import --session` (frames) complete it
+//! (`crate::keystone`); the same for PCZT files waits for a later M5 item.
 //!
 //! With `--json` every command prints its RPC response (the PCZT bytes as
 //! base64 inside it) on stdout and writes the file only when `-o` is given.
 
+use std::fmt::Write as _;
 use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use anyhow::anyhow;
 use clap::{Args, Subcommand};
 use gyges_proto::v1::{
-    BroadcastPcztRequest, CombinePcztRequest, CreatePcztRequest, ErrorReason, GygesError,
-    InspectPcztRequest, InspectPcztResponse, Network, PcztRole, ProvePcztRequest, SignPcztRequest,
-    sign_pczt_event,
+    BroadcastPcztRequest, CombinePcztRequest, CompleteKeystoneSignResponse, CreatePcztRequest,
+    ErrorReason, GygesError, InspectPcztRequest, InspectPcztResponse, ListSigningSessionsRequest,
+    Network, PcztRole, Pool, ProvePcztRequest, SignPcztRequest, SigningSession, sign_pczt_event,
 };
 
 use crate::amount::{MemoArg, ParsedAmount, parse_amount, parse_memo};
@@ -146,7 +148,7 @@ pub struct CombineArgs {
 pub struct BroadcastArgs {
     /// The signed PCZT; stdin when absent or `-`.
     pub file: Option<PathBuf>,
-    /// Broadcast over an isolated Tor circuit (not available in this milestone).
+    /// Broadcast through the fallback endpoint over Tor (exit 7 when none is configured; never the node).
     #[arg(long)]
     pub via_tor: bool,
 }
@@ -165,61 +167,59 @@ pub async fn run(ctx: &Ctx, cmd: PcztCmd) -> Result<(), CliError> {
     }
 }
 
-fn is_stdio(path: Option<&Path>) -> bool {
-    path.is_none_or(|p| p.as_os_str() == "-")
+/// The file a path argument names; `None` for stdin/stdout (absent or `-`).
+fn file_arg(path: Option<&Path>) -> Option<&Path> {
+    path.filter(|p| p.as_os_str() != "-")
 }
 
 /// The whole file, or all of stdin.
 fn read_pczt(path: Option<&Path>) -> Result<Vec<u8>, CliError> {
-    let bytes = if is_stdio(path) {
-        let mut buf = Vec::new();
-        std::io::stdin().lock().read_to_end(&mut buf).map_err(|e| {
-            CliError::Other(anyhow::anyhow!("cannot read the PCZT from stdin: {e}"))
-        })?;
-        buf
-    } else {
-        let path = path.expect("not stdio");
-        std::fs::read(path)
-            .map_err(|e| CliError::Other(anyhow::anyhow!("cannot read {}: {e}", path.display())))?
+    let file = file_arg(path);
+    let bytes = match file {
+        None => {
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .lock()
+                .read_to_end(&mut buf)
+                .map_err(|e| anyhow!("cannot read the PCZT from stdin: {e}"))?;
+            buf
+        }
+        Some(path) => {
+            std::fs::read(path).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?
+        }
     };
     if bytes.is_empty() {
-        return Err(CliError::Daemon(GygesError::new(
-            ErrorReason::InvalidArgument,
-            if is_stdio(path) {
-                "no PCZT on stdin (pass a file, or pipe one in)".to_string()
-            } else {
-                format!("{} is empty", path.expect("not stdio").display())
-            },
-        )));
+        return Err(CliError::invalid(match file {
+            None => "no PCZT on stdin (pass a file, or pipe one in)".to_string(),
+            Some(path) => format!("{} is empty", path.display()),
+        }));
     }
     Ok(bytes)
 }
 
 /// To `-o FILE` (mode 0600) or stdout; a terminal gets nothing binary.
 fn write_pczt(path: Option<&Path>, bytes: &[u8]) -> Result<(), CliError> {
-    if is_stdio(path) {
+    let Some(path) = file_arg(path) else {
         let mut out = std::io::stdout().lock();
         if out.is_terminal() {
-            return Err(CliError::Daemon(GygesError::new(
-                ErrorReason::InvalidArgument,
+            return Err(CliError::invalid(
                 "refusing to write a binary PCZT to the terminal; pass -o FILE or pipe it",
-            )));
+            ));
         }
-        out.write_all(bytes)
+        return out
+            .write_all(bytes)
             .and_then(|()| out.flush())
-            .map_err(|e| CliError::Other(anyhow::anyhow!("cannot write the PCZT to stdout: {e}")))
-    } else {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let path = path.expect("not stdio");
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .and_then(|mut f| f.write_all(bytes))
-            .map_err(|e| CliError::Other(anyhow::anyhow!("cannot write {}: {e}", path.display())))
-    }
+            .map_err(|e| anyhow!("cannot write the PCZT to stdout: {e}").into());
+    };
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut f| f.write_all(bytes))
+        .map_err(|e| anyhow!("cannot write {}: {e}", path.display()).into())
 }
 
 /// Where a result goes after the RPC: JSON of `resp` on stdout when
@@ -232,13 +232,11 @@ fn deliver<T: serde::Serialize>(
 ) -> Result<(), CliError> {
     if ctx.json {
         println!("{}", to_json(resp)?);
-        if !is_stdio(out) {
-            write_pczt(out, bytes)?;
+        if file_arg(out).is_none() {
+            return Ok(());
         }
-        Ok(())
-    } else {
-        write_pczt(out, bytes)
     }
+    write_pczt(out, bytes)
 }
 
 async fn create(ctx: &Ctx, args: CreateArgs) -> Result<(), CliError> {
@@ -255,9 +253,7 @@ async fn create(ctx: &Ctx, args: CreateArgs) -> Result<(), CliError> {
         .await?
         .into_inner();
     let Some(bytes) = resp.pczts.first() else {
-        return Err(CliError::Other(anyhow::anyhow!(
-            "the daemon returned no PCZT"
-        )));
+        return Err(anyhow!("the daemon returned no PCZT").into());
     };
     if !ctx.json && !ctx.quiet {
         if let Some(p) = &resp.proposal {
@@ -302,7 +298,6 @@ pub fn role_name(r: PcztRole) -> &'static str {
 /// The tags, the proposal the file implies (same layout as `tx send
 /// --dry-run`), the roles and the per-pool state.
 pub fn render_inspection(r: &InspectPcztResponse) -> String {
-    use std::fmt::Write as _;
     let mut s = String::new();
     let _ = writeln!(s, "Key:     {}", r.key_id);
     let _ = writeln!(
@@ -333,7 +328,7 @@ pub fn render_inspection(r: &InspectPcztResponse) -> String {
             pool_name(p.pool()),
             p.spends,
             p.outputs,
-            if p.pool() == gyges_proto::v1::Pool::Transparent {
+            if p.pool() == Pool::Transparent {
                 "n/a"
             } else if p.proofs_present {
                 "present"
@@ -361,8 +356,7 @@ async fn prove(ctx: &Ctx, args: InOutArgs) -> Result<(), CliError> {
         .await?
         .into_inner();
     ctx.note("proven");
-    let pczt = resp.pczt.clone();
-    deliver(ctx, args.out.as_deref(), &resp, &pczt)
+    deliver(ctx, args.out.as_deref(), &resp, &resp.pczt)
 }
 
 async fn sign(ctx: &Ctx, args: SignArgs) -> Result<(), CliError> {
@@ -381,12 +375,7 @@ async fn sign(ctx: &Ctx, args: SignArgs) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    loop {
-        let Some(ev) = Ctx::next_or_cancel(&mut stream).await? else {
-            return Err(CliError::Other(anyhow::anyhow!(
-                "the daemon ended the signing stream without a signed PCZT"
-            )));
-        };
+    while let Some(ev) = Ctx::next_or_cancel(&mut stream).await? {
         match ev.event {
             Some(sign_pczt_event::Event::SignatureRequired(req)) => {
                 satisfy(ctx, &mut conn, &key, &req).await?;
@@ -398,14 +387,12 @@ async fn sign(ctx: &Ctx, args: SignArgs) -> Result<(), CliError> {
             None => {}
         }
     }
+    Err(anyhow!("the daemon ended the signing stream without a signed PCZT").into())
 }
 
 async fn combine(ctx: &Ctx, args: CombineArgs) -> Result<(), CliError> {
     if args.files.iter().filter(|p| p.as_os_str() == "-").count() > 1 {
-        return Err(CliError::Daemon(GygesError::new(
-            ErrorReason::InvalidArgument,
-            "stdin (`-`) can be read once",
-        )));
+        return Err(CliError::invalid("stdin (`-`) can be read once"));
     }
     let mut pczts = Vec::with_capacity(args.files.len());
     for f in &args.files {
@@ -420,8 +407,7 @@ async fn combine(ctx: &Ctx, args: CombineArgs) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    let pczt = resp.pczt.clone();
-    deliver(ctx, args.out.as_deref(), &resp, &pczt)
+    deliver(ctx, args.out.as_deref(), &resp, &resp.pczt)
 }
 
 async fn broadcast(ctx: &Ctx, args: BroadcastArgs) -> Result<(), CliError> {
@@ -436,14 +422,8 @@ async fn broadcast(ctx: &Ctx, args: BroadcastArgs) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-    } else {
-        println!("{}", resp.txid);
-        if !ctx.quiet {
-            eprintln!("broadcast");
-        }
-    }
+    ctx.print(&resp, || format!("{}\n", resp.txid))?;
+    ctx.note("broadcast");
     Ok(())
 }
 
@@ -454,14 +434,11 @@ fn session_arg(session: Option<String>, what: &'static str) -> Result<String, Cl
 }
 
 /// The pending Keystone session `session_id`, from any key.
-async fn pending_session(
-    ctx: &Ctx,
-    session_id: &str,
-) -> Result<gyges_proto::v1::SigningSession, CliError> {
+async fn pending_session(ctx: &Ctx, session_id: &str) -> Result<SigningSession, CliError> {
     let mut conn = ctx.connect().await?;
     let all = conn
         .client
-        .list_signing_sessions(gyges_proto::v1::ListSigningSessionsRequest {
+        .list_signing_sessions(ListSigningSessionsRequest {
             key_id: String::new(),
             include_finished: false,
         })
@@ -526,17 +503,7 @@ async fn qr_scan(ctx: &Ctx, args: QrScanArgs) -> Result<(), CliError> {
     let (_, answer) = crate::keystone::ur_types(session.kind())?;
     let cbor = crate::keystone::scan(args.camera, answer, &session.payload, args.timeout).await?;
     let resp = crate::keystone::complete(ctx, &session_id, cbor).await?;
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-        return Ok(());
-    }
-    for txid in crate::keystone::txids(&resp) {
-        println!("{txid}");
-    }
-    ctx.note(format_args!(
-        "session {session_id} signed on the Keystone and broadcast"
-    ));
-    Ok(())
+    print_completed(ctx, &session_id, &resp)
 }
 
 /// `pczt qr-import --session ID`: the device's answer from positional
@@ -557,13 +524,22 @@ async fn qr_import(ctx: &Ctx, args: QrImportArgs) -> Result<(), CliError> {
     };
     let cbor = crate::keystone::assemble(text.lines(), answer)?;
     let resp = crate::keystone::complete(ctx, &session_id, cbor).await?;
-    if ctx.json {
-        println!("{}", to_json(&resp)?);
-        return Ok(());
-    }
-    for txid in crate::keystone::txids(&resp) {
-        println!("{txid}");
-    }
+    print_completed(ctx, &session_id, &resp)
+}
+
+/// The txids a `CompleteKeystoneSign` broadcast, one per line (or the
+/// response with `--json`).
+fn print_completed(
+    ctx: &Ctx,
+    session_id: &str,
+    resp: &CompleteKeystoneSignResponse,
+) -> Result<(), CliError> {
+    ctx.print(resp, || {
+        crate::keystone::txids(resp)
+            .iter()
+            .map(|txid| format!("{txid}\n"))
+            .collect()
+    })?;
     ctx.note(format_args!(
         "session {session_id} signed on the Keystone and broadcast"
     ));
@@ -573,7 +549,7 @@ async fn qr_import(ctx: &Ctx, args: QrImportArgs) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gyges_proto::v1::{PcztPoolState, Pool, Proposal, ProposalStep, ProposedOutput};
+    use gyges_proto::v1::{PcztPoolState, Proposal, ProposalStep, ProposedOutput};
 
     #[test]
     fn inspection_rendering_lists_tags_roles_and_pools() {

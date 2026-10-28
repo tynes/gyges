@@ -34,8 +34,8 @@ use zcash_protocol::local_consensus::LocalNetwork;
 
 use crate::node::versions;
 use crate::process::{
-    KeptDir, download_verified, env_bin, free_port, kill, log_tail, move_into_place,
-    regtest_bin_dir, spawn_logged, untar, wait_ready,
+    KeptDir, download_verified, env_bin, free_port, kill, move_into_place, regtest_bin_dir,
+    spawn_logged, untar, wait_ready,
 };
 use crate::{Node, NodeOpts, zakurad_binary};
 
@@ -162,17 +162,12 @@ impl Zaino {
         format!("http://127.0.0.1:{}", self.grpc_port)
     }
 
-    pub fn log_path(&self) -> PathBuf {
+    fn log_path(&self) -> PathBuf {
         self.dir.path().join("zainod.log")
     }
 
     fn config_path(&self) -> PathBuf {
         self.dir.path().join("zindexer.toml")
-    }
-
-    /// The last lines of zaino's log, for failure messages.
-    pub fn log_tail(&self) -> String {
-        log_tail(&self.log_path())
     }
 
     /// The configuration of `OVERVIEW.md` §4.5's smoke test.
@@ -349,7 +344,7 @@ impl Fallback {
     /// Copy every block the archive node lacks from the wallet's node. The
     /// archive node's tip must still be on the wallet node's chain (the
     /// harness does not follow reorgs here).
-    pub fn mirror(&self) -> anyhow::Result<()> {
+    fn mirror(&self) -> anyhow::Result<()> {
         let from = self.archive.tip_height();
         let to = self.node.tip_height();
         if from > 0 && self.archive.block_hash(from) != self.node.block_hash(from) {
@@ -368,7 +363,7 @@ impl Fallback {
     }
 
     /// Wait until zaino serves the archive node's tip.
-    pub fn sync_zaino(&mut self) {
+    fn sync_zaino(&mut self) {
         let tip = self.archive.tip_height();
         self.zaino
             .wait_for_tip(tip, Duration::from_secs(120))

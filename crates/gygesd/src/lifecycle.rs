@@ -48,12 +48,11 @@ impl PidLock {
             Err(TryLockError::WouldBlock) => {
                 let mut pid = String::new();
                 let _ = file.read_to_string(&mut pid);
-                let pid = pid.trim().to_string();
-                let pid = if pid.is_empty() {
-                    "unknown".to_string()
-                } else {
-                    pid
-                };
+                let pid = match pid.trim() {
+                    "" => "unknown",
+                    p => p,
+                }
+                .to_string();
                 return Err(PidLockError::AlreadyRunning { pid });
             }
             Err(TryLockError::Error(source)) => return Err(io(source)),

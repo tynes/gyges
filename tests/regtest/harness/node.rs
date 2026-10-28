@@ -33,7 +33,7 @@ use crate::process::{
 };
 
 /// `tests/regtest/versions.toml`.
-pub const VERSIONS: &str = include_str!("../versions.toml");
+const VERSIONS: &str = include_str!("../versions.toml");
 
 /// The transparent address Zakura itself uses as the default regtest miner
 /// address; coinbases paid here belong to nobody in the scenarios.
@@ -206,7 +206,7 @@ impl Node {
     /// backup at most every five seconds after a change and only while
     /// running; a stop before that loses the blocks. Finalized blocks are
     /// on disk already and leave the backup.
-    pub fn wait_for_backup(&self) {
+    fn wait_for_backup(&self) {
         let tip = self.tip_height();
         let first = (tip + 1).saturating_sub(FINALITY_DEPTH).max(1);
         let hashes: Vec<String> = (first..=tip).map(|h| self.block_hash(h)).collect();

@@ -16,7 +16,7 @@
 use rusqlite::{OptionalExtension as _, named_params};
 use uuid::Uuid;
 
-use crate::ext::{ExtTable, query_ids, with_ext};
+use crate::ext::{Ext, ExtTable, query_ids, with_ext};
 use crate::registry::Wallet;
 
 /// The external migration's id (random, fixed forever).
@@ -144,18 +144,23 @@ pub enum SessionError {
     NotFound(String),
 }
 
+impl From<SessionError> for crate::TxError {
+    fn from(e: SessionError) -> Self {
+        Self::Internal(e.to_string())
+    }
+}
+
 fn read_row(r: &rusqlite::Row<'_>) -> Result<SessionRow, SessionError> {
     let session_id: String = r.get(0)?;
     let protocol: String = r.get(1)?;
     let status: String = r.get(2)?;
-    let txid: Option<Vec<u8>> = r.get(7)?;
-    let txid = match txid {
-        None => None,
-        Some(v) => Some(
+    let txid = r
+        .get::<_, Option<Vec<u8>>>(7)?
+        .map(|v| {
             <[u8; 32]>::try_from(v)
-                .map_err(|v| SessionError::BadColumn(session_id.clone(), "txid", hex::encode(v)))?,
-        ),
-    };
+                .map_err(|v| SessionError::BadColumn(session_id.clone(), "txid", hex::encode(v)))
+        })
+        .transpose()?;
     Ok(SessionRow {
         protocol: Protocol::parse(&protocol)
             .ok_or_else(|| SessionError::BadColumn(session_id.clone(), "protocol", protocol))?,
@@ -174,28 +179,30 @@ fn read_row(r: &rusqlite::Row<'_>) -> Result<SessionRow, SessionError> {
 const COLUMNS: &str =
     "session_id, protocol, status, created_at, expires_at, proposal, expected, txid, last_error";
 
+fn insert_row(ext: &Ext<'_>, row: &SessionRow) -> Result<(), SessionError> {
+    ext.execute(
+        &format!(
+            "INSERT INTO {TABLE} ({COLUMNS})
+         VALUES (:session_id, :protocol, :status, :created_at, :expires_at,
+             :proposal, :expected, :txid, :last_error)"
+        ),
+        named_params! {
+        ":session_id": row.session_id,
+        ":protocol": row.protocol.as_str(),
+        ":status": row.state.as_str(),
+        ":created_at": row.created_at,
+        ":expires_at": row.expires_at,
+        ":proposal": row.proposal,
+        ":expected": row.expected,
+        ":txid": row.txid.as_ref().map(|t| t.to_vec()),
+        ":last_error": row.last_error,
+        },
+    )?;
+    Ok(())
+}
+
 pub fn insert(wallet: &mut Wallet, row: &SessionRow) -> Result<(), SessionError> {
-    with_ext(wallet, |ext| {
-        ext.execute(
-            &format!(
-                "INSERT INTO {TABLE} ({COLUMNS})
-                 VALUES (:session_id, :protocol, :status, :created_at, :expires_at,
-                         :proposal, :expected, :txid, :last_error)"
-            ),
-            named_params! {
-                ":session_id": row.session_id,
-                ":protocol": row.protocol.as_str(),
-                ":status": row.state.as_str(),
-                ":created_at": row.created_at,
-                ":expires_at": row.expires_at,
-                ":proposal": row.proposal,
-                ":expected": row.expected,
-                ":txid": row.txid.as_ref().map(|t| t.to_vec()),
-                ":last_error": row.last_error,
-            },
-        )?;
-        Ok(())
-    })
+    with_ext(wallet, |ext| insert_row(ext, row))
 }
 
 pub fn get(wallet: &mut Wallet, session_id: &str) -> Result<Option<SessionRow>, SessionError> {
@@ -243,18 +250,15 @@ pub fn set_state(
 /// `include_finished`.
 pub fn list(wallet: &mut Wallet, include_finished: bool) -> Result<Vec<SessionRow>, SessionError> {
     let filter = if include_finished {
-        String::new()
+        ""
     } else {
-        " WHERE status = 'awaiting-signature'".to_string()
+        " WHERE status = 'awaiting-signature'"
     };
     let rest = format!("FROM {TABLE}{filter} ORDER BY created_at DESC, session_id");
-    let mut rows = Vec::new();
-    for id in query_ids(wallet, "session_id", &rest)? {
-        if let Some(row) = get(wallet, &id)? {
-            rows.push(row);
-        }
-    }
-    Ok(rows)
+    query_ids(wallet, "session_id", &rest)?
+        .iter()
+        .filter_map(|id| get(wallet, id).transpose())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -319,24 +323,7 @@ pub fn insert_keystone(
 ) -> Result<(), SessionError> {
     debug_assert_eq!(row.session_id, keystone.session_id);
     with_ext(wallet, |ext| {
-        ext.execute(
-            &format!(
-                "INSERT INTO {TABLE} ({COLUMNS})
-                 VALUES (:session_id, :protocol, :status, :created_at, :expires_at,
-                         :proposal, :expected, :txid, :last_error)"
-            ),
-            named_params! {
-                ":session_id": row.session_id,
-                ":protocol": row.protocol.as_str(),
-                ":status": row.state.as_str(),
-                ":created_at": row.created_at,
-                ":expires_at": row.expires_at,
-                ":proposal": row.proposal,
-                ":expected": row.expected,
-                ":txid": row.txid.as_ref().map(|t| t.to_vec()),
-                ":last_error": row.last_error,
-            },
-        )?;
+        insert_row(ext, row)?;
         ext.execute(
             &format!(
                 "INSERT INTO {KEYSTONE_TABLE}

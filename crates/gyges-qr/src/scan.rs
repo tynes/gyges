@@ -10,13 +10,13 @@
 //! answer are both `zcash-pczt`, and the camera may have caught the
 //! terminal before the device.
 //!
-//! The camera itself is behind the `camera` feature ([`crate::camera`]);
+//! The camera itself is behind the `camera` feature (module `camera`);
 //! everything here is plain Rust that tests drive with synthetic frames.
 
 use std::time::{Duration, Instant};
 
 use crate::QrError;
-use crate::fountain::Assembler;
+use crate::fountain::{Assembler, ur_type_of};
 
 /// One greyscale frame, row-major, one byte per pixel.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,17 +40,14 @@ const MAX_WIDTH: usize = 960;
 /// the scanner starts over with a fresh one.
 const RESET_AFTER: u32 = 3;
 
-/// The text of every QR code in `frame`. A frame where codes are found but
-/// none decodes is tried mirrored too, as some webcams deliver it.
+/// The text of every QR code in `frame`. When nothing decodes, the frame is
+/// tried mirrored too, as some webcams deliver it.
 pub fn decode(frame: &LumaFrame) -> Vec<String> {
     let found = decode_once(frame, false);
-    if found.is_empty() {
-        let mirrored = decode_once(frame, true);
-        if !mirrored.is_empty() {
-            return mirrored;
-        }
+    if !found.is_empty() {
+        return found;
     }
-    found
+    decode_once(frame, true)
 }
 
 fn decode_once(frame: &LumaFrame, mirror: bool) -> Vec<String> {
@@ -109,11 +106,7 @@ impl Scanner {
     /// Take one decoded text. `Some(payload)` once the answer is complete.
     pub fn take(&mut self, text: &str) -> Option<Vec<u8>> {
         let frame = text.trim().to_ascii_lowercase();
-        let is_expected = frame
-            .strip_prefix("ur:")
-            .and_then(|r| r.split_once('/'))
-            .is_some_and(|(t, _)| t == self.expected);
-        if !is_expected {
+        if ur_type_of(&frame) != Some(self.expected.as_str()) {
             return None;
         }
         self.progress.taken += 1;

@@ -373,7 +373,7 @@ impl State {
             sizes.orchard += b.orchard_cmxs.len() as u32;
             sizes.ironwood += b.ironwood_cmxs.len() as u32;
         }
-        (sizes.sapling > 0 || sizes.orchard > 0 || sizes.ironwood > 0).then_some(sizes)
+        (sizes != TreeSizes::default()).then_some(sizes)
     }
 
     /// `finalState` hex of each pool's legacy `CommitmentTree` after block
@@ -822,9 +822,6 @@ fn dispatch(st: &mut State, method: &str, params: &[Value]) -> RpcResult {
                 .first()
                 .and_then(Value::as_i64)
                 .ok_or((-32602, "missing height".to_string()))?;
-            if h < 0 {
-                return Err((-32602, "Provided index is not valid".into()));
-            }
             let h = u32::try_from(h)
                 .map_err(|_| (-32602, "Provided index is not valid".to_string()))?;
             if h > tip {
@@ -888,12 +885,9 @@ fn dispatch(st: &mut State, method: &str, params: &[Value]) -> RpcResult {
         }
         "z_gettreestate" => {
             let h = height_param(params.first())?;
-            let Some(block) = st.blocks.get(&h) else {
+            let Some(block) = st.blocks.get(&h).filter(|_| !st.pruned(h)) else {
                 return Err((-8, "the requested block is not in the main chain".into()));
             };
-            if st.pruned(h) {
-                return Err((-8, "the requested block is not in the main chain".into()));
-            }
             // Explicit frontiers for every pool (all are active from height
             // 1 on regtest); `sprout` is the `{}` an inactive pool gets.
             let (sapling, orchard, ironwood) = st.frontiers_at(h);
@@ -993,7 +987,7 @@ fn dispatch(st: &mut State, method: &str, params: &[Value]) -> RpcResult {
         "getrawmempool" => Ok(json!(
             st.mempool
                 .iter()
-                .map(|(id, _)| crate::display_hash(id))
+                .map(|(id, _)| display_hash(id))
                 .collect::<Vec<_>>()
         )),
         _ => Err((-32601, format!("Method not found: {method}"))),

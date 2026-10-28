@@ -69,6 +69,7 @@ pub struct FakeUtxo {
     pub height: u32,
 }
 
+#[derive(Default)]
 struct LwdState {
     chain_name: String,
     blocks: BTreeMap<u32, CompactBlock>,
@@ -124,16 +125,8 @@ impl FakeLightwalletd {
         let state = Arc::new(Mutex::new(LwdState {
             chain_name: chain_name.to_string(),
             blocks: by_height(blocks, |b| b.height),
-            transactions: BTreeMap::new(),
-            utxos: Vec::new(),
             tree_states: by_height(tree_states, |t| t.height),
-            subtree_roots: BTreeMap::new(),
-            omitted: BTreeSet::new(),
-            hang_after: None,
-            reject_broadcasts: None,
-            zaino_errors: false,
-            broadcasts: Vec::new(),
-            calls: Vec::new(),
+            ..LwdState::default()
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -264,25 +257,22 @@ impl FakeLightwalletd {
             tree_states,
             ..
         } = &mut *st;
-        let mut prev: Option<Vec<u8>> = None;
-        for (h, block) in blocks.range_mut(height..) {
-            let mut hash = block.hash.clone();
-            if let Some(first) = hash.first_mut() {
+        let flip = |bytes: &mut [u8]| {
+            if let Some(first) = bytes.first_mut() {
                 *first ^= 0x80;
             }
+        };
+        let mut prev: Option<Vec<u8>> = None;
+        for (h, block) in blocks.range_mut(height..) {
+            flip(&mut block.hash);
             match prev.take() {
                 Some(p) => block.prev_hash = p,
-                None => {
-                    if let Some(first) = block.prev_hash.first_mut() {
-                        *first ^= 0x80;
-                    }
-                }
+                None => flip(&mut block.prev_hash),
             }
-            block.hash = hash.clone();
             if let Some(ts) = tree_states.get_mut(h) {
-                ts.hash = display_hash(&hash);
+                ts.hash = display_hash(&block.hash);
             }
-            prev = Some(hash);
+            prev = Some(block.hash.clone());
         }
     }
 
@@ -447,10 +437,9 @@ impl CompactTxStreamer for Service {
         let items: Vec<Result<SubtreeRoot, Status>> = roots
             .into_iter()
             .skip(arg.start_index as usize)
-            .take(if arg.max_entries == 0 {
-                usize::MAX
-            } else {
-                arg.max_entries as usize
+            .take(match arg.max_entries {
+                0 => usize::MAX,
+                n => n as usize,
             })
             .map(|r| {
                 Ok(SubtreeRoot {
@@ -538,9 +527,9 @@ impl CompactTxStreamer for Service {
             }));
         }
         // lightwalletd answers the node's txid as display hex; the fake
-        // does not parse transactions, so it reports the double-SHA256 of
-        // the bytes in that place (not a real txid; the backend does not
-        // rely on it).
+        // does not parse transactions, so it reports a hash of the bytes
+        // (8 bytes of `DefaultHasher`, zero-padded) in that place: not a
+        // real txid, though the backend returns it as one.
         let txid = {
             use std::hash::{Hash as _, Hasher as _};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();

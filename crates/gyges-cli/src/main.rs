@@ -1,11 +1,12 @@
 //! `gyges` – thin gRPC client for `gygesd` (CLI_SPEC.md, API.md).
 //!
 //! The CLI reads flags and environment variables only, never `config.toml`
-//! (OVERVIEW.md Q-C1). Every invocation connects to the Unix socket, runs the
-//! `GetInfo` handshake (API version, network), then issues exactly one RPC.
-//! The command groups below `daemon` are declared so that `gyges --help`
-//! matches CLI_SPEC.md; those not yet implemented exit 1 with a pointer to
-//! ROADMAP.md.
+//! (OVERVIEW.md Q-C1). Every command that talks to the daemon first connects
+//! to the Unix socket and runs the `GetInfo` handshake (API version,
+//! network). Subcommands not implemented yet (`daemon install` /
+//! `uninstall`, `key import-ufvk` / `backup` / `import-backup` / `delete`,
+//! `tx status --pir`, `pczt sign --qr-out`, `pczt qr-export FILE`, and
+//! `pczt qr-*` without `--session`) exit 1 with a pointer to ROADMAP.md.
 
 #![forbid(unsafe_code)]
 // Printing to stdout is this binary's purpose.
@@ -231,7 +232,7 @@ mod tests {
                     && a.amount == crate::amount::ParsedAmount::Zatoshis(125_000_000)
                     && a.memo.as_ref().map(|m| m.0.as_slice()) == Some(b"hi".as_slice())
                     && a.dry_run
-                    && !a.yes
+                    && !a.flow.yes
         ));
         assert!(
             Cli::try_parse_from(["gyges", "tx", "send", "--to", "u1x", "--amount", "1,000"])
@@ -243,7 +244,7 @@ mod tests {
             Cli::try_parse_from(["gyges", "tx", "shield", "--threshold", "0.5", "--yes"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Tx(tx::TxCmd::Shield(ref a)) if a.threshold == Some(50_000_000) && a.yes
+            Command::Tx(tx::TxCmd::Shield(ref a)) if a.threshold == Some(50_000_000) && a.flow.yes
         ));
         assert!(Cli::try_parse_from(["gyges", "tx", "shield", "--threshold", "max"]).is_err());
         let cli = Cli::try_parse_from(["gyges", "balance", "--min-conf", "3"]).unwrap();
