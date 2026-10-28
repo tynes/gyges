@@ -188,7 +188,7 @@ Decrypted notes and UTXOs with heights, values, memo previews and witness readin
 
 #### `gyges tx send --to <ADDR> --amount <AMOUNT>`
 Proposes, proves, signs and broadcasts. The proposal summary (inputs per pool, outputs, ZIP 317 fee per step, total debit) is printed before any signature prompt; without `--yes` it comes from a dry run and is confirmed before the real send starts (no terminal: exit 4, `CONFIRMATION_REQUIRED`). The txid goes to stdout; progress goes to stderr.
-- **Inline unlock (`local-seed`):** on `SignatureRequired`, prompts for the passphrase, creates a connection-scoped session and continues; the key is dropped after signing.
+- **Inline unlock (`local-seed`):** on `SignatureRequired`, prompts for the passphrase, creates a connection-scoped session and continues; the key is dropped after signing. A send that spends Sapling notes asks before `proving …` rather than after, because the Sapling proofs need the key (ROADMAP.md M6, first item).
 - **Keystone (`keystone-qr`):** renders the animated UR QR (batch protocol for shielded-only sends, single-PCZT when transparent inputs are present) and reads the result from the camera (`qr-scan`), a file, stdin or pasted frames.
 - **ZIP 320 (`tex1`):** runs the two-step plan through the durable `TexQueue`; the passphrase prompt comes before proving (both steps are built together, API.md §9), each step's txid goes to stdout as the node takes it, and `tex pending (step 2 of 2): <step1> then <step2>` goes to stderr. A node that will not take Step 2 while Step 1 is unmined leaves one txid on stdout; the queue finishes the transfer and `tx sessions` shows its state.
 ```text
@@ -230,7 +230,7 @@ gyges pczt create --to u1q... --amount 2.5 \
 
 - `gyges pczt create --to <ADDR> --amount <AMOUNT> [--memo <TEXT_OR_HEX>] [-o <FILE>]`
 - `gyges pczt inspect [<FILE>]`
-- `gyges pczt prove [<FILE>] [-o <OUT_FILE>]` (Orchard and transparent while locked; Sapling inputs require an unlock first)
+- `gyges pczt prove [<FILE>] [-o <OUT_FILE>]` (no key needed: a file never spends Sapling. `pczt create` leaves Sapling notes out, saying so when they are all that is left, and `prove` / `sign` refuse a Sapling spend with exit 6, `UNSUPPORTED_POOL`; `tx send` spends Sapling notes, ROADMAP.md M6)
 - `gyges pczt sign [<FILE>] [-o <OUT_FILE>] [--qr-out <FILE>]`
 - `gyges pczt qr-export --session <ID> [--fps <N>] [-o <FILE>]` (animates the pending Keystone session's `ur:zcash-pczt` / `ur:zcash-sign-batch` request; `<FILE>` instead of `--session` is not supported yet)
 - `gyges pczt qr-scan --session <ID> [--camera <N>] [--timeout <DURATION>]` (laptop camera, feeds the fountain decoder until complete; needs a build with the `camera` feature; without `--session`, for a PCZT file, not supported yet)

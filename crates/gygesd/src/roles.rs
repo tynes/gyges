@@ -149,7 +149,16 @@ pub async fn create_pczt(
     let to = core_tx::parse_recipient(&params, &req.to).map_err(err)?;
     let memo = core_tx::memo_for(&to, &req.memo).map_err(err)?;
     let amount = tx::parse_amount(req.amount)?;
-    let spend_pools = prepared.key.profile().spend_pools.clone();
+    // Sapling notes stay out of a file: proving one needs the proof
+    // generation key, which never leaves the `tx send` stream that derives
+    // it (THREAT_MODEL.md §6 item 1).
+    let profile_pools = &prepared.key.profile().spend_pools;
+    let sapling_left_out = profile_pools.contains(&gyges_core::Pool::Sapling);
+    let spend_pools: Vec<_> = profile_pools
+        .iter()
+        .copied()
+        .filter(|p| *p != gyges_core::Pool::Sapling)
+        .collect();
     let min_confirmations = prepared.min_confirmations;
     let network = state.network;
     let ttl = i64::try_from(state.config.vault.signing_session_ttl.as_secs()).unwrap_or(i64::MAX);
@@ -208,7 +217,16 @@ pub async fn create_pczt(
         Ok((proto, bytes, session_id))
     })
     .await
-    .map_err(err)?;
+    .map_err(|e| match e {
+        TxError::InsufficientFunds { .. } if sapling_left_out => {
+            let mut g = tx_error(e, &key_id);
+            g.detail.push_str(
+                " (Sapling notes are not spent from a PCZT file; spend them with `gyges tx send`)",
+            );
+            g.into_status()
+        }
+        e => err(e),
+    })?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "session_created");
     tracing::info!(key_id, "pczt created");
     Ok(CreatePcztResponse {
@@ -269,6 +287,10 @@ pub fn sign_pczt(
         Purpose::SignPczt,
     )?;
     let key_id = prepared.key.key_id().to_string();
+    // Refused before any passphrase is asked for (THREAT_MODEL.md §6
+    // item 1).
+    let pczt = core_tx::refuse_unkeyed_sapling_spends(pczt)
+        .map_err(|e| tx_error(e, &key_id).into_status())?;
     let insp = pczt_io::inspect(&state.registry.params(), &pczt)
         .map_err(|e| tx_error(e, &key_id).into_status())?;
     let summary = proto_proposal(&insp.summary);

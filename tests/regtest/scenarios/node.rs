@@ -11,8 +11,8 @@ use std::time::Duration;
 use gyges_regtest::{
     BURN_MINER_ADDRESS, Fixture, NODE_CONFIG, Node, NodeOpts, PASSPHRASE, Run, balance,
     funded_wallet, parse_tex_txids, poll_until, regtest, send, shield, spendable, start_daemon,
-    sweep_logs, sync_wait, test_key_miner, test_key_transparent, test_key_transparent_address,
-    tex_row, wait_balance, wait_for_txid, wait_tex_state,
+    sweep_logs, sync_wait, sync_wait_within, test_key_miner, test_key_transparent,
+    test_key_transparent_address, tex_row, wait_balance, wait_for_txid, wait_tex_state,
 };
 use transparent::address::TransparentAddress;
 
@@ -444,5 +444,101 @@ fn zip320_against_the_real_node() {
             "50000000",
             BURN_MINER_ADDRESS,
         ],
+    );
+}
+
+/// The first regtest height at which the wallet builds Sapling outputs:
+/// ZIP 212 is enforced from Canopy (height 1) plus its 32,256-block grace
+/// period, and a Sapling spend always pads its bundle with two outputs.
+const ZIP212_ON: u32 = 1 + 32_256;
+
+/// ROADMAP.md M6, first item (THREAT_MODEL.md §6 item 1), on the real node:
+/// past ZIP 212, a second key paid at a Sapling-only address spends that
+/// note with `tx send` (the key is asked for before proving, the proof
+/// generation key inserted, the PCZT proven and signed in the stream), and
+/// the node takes the transaction.
+#[test]
+fn sapling_spend_against_the_real_node() {
+    // Fund and shield while the chain is young (regtest's subsidy halves
+    // every few hundred blocks, so a coinbase past ZIP 212 pays nothing).
+    // An archive node, so that nothing is pruned while the daemon scans
+    // the long chain behind the miner.
+    let archive = |opts: NodeOpts| NodeOpts {
+        archive: true,
+        ..opts
+    };
+    let Some(mut node) = Node::start_or_skip(archive(test_key_miner())) else {
+        return;
+    };
+    node.mine(2);
+    node.restart(archive(NodeOpts::default())).unwrap();
+    node.mine(100);
+    let log = node.log_path();
+    let (fx, pw, _) = funded_wallet(&node);
+    let keys = fx.gyges(&["key", "list", "--json"]).ok().json();
+    assert!(
+        keys["keys"][0]["spend_pools"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|x| x == "POOL_SAPLING")),
+        "{keys}"
+    );
+    let (shield_txid, _) = shield(&fx, &pw, &log, |txid| {
+        assert_eq!(node.mempool(), vec![txid], "the node accepted it");
+        node.mine(1);
+    });
+    while node.tip_height() < ZIP212_ON {
+        node.mine((ZIP212_ON - node.tip_height()).min(2_000));
+    }
+    sync_wait_within(&fx, "main", "900s", &["--until", "spendable"]);
+
+    // bob, born now, paid at a Sapling-only address.
+    fx.gyges(&["key", "init", "--id", "bob", "--json"])
+        .env("GYGES_PASSPHRASE_FILE", &pw)
+        .ok();
+    let bob_sapling = fx
+        .gyges(&["-k", "bob", "address", "new", "--receivers", "sapling"])
+        .ok()
+        .stdout
+        .trim()
+        .to_string();
+    let pay = send(&fx, &pw, &log, &bob_sapling, "1")
+        .stdout
+        .trim()
+        .to_string();
+    assert_eq!(node.mempool(), vec![pay.clone()], "the node accepted it");
+    node.mine(1);
+    let b = wait_balance(&fx, "bob", |b| spendable(b, "POOL_SAPLING") == 100_000_000);
+    assert_eq!(b["total_spendable"], "100000000", "{b}");
+
+    // bob spends it: a Sapling spend the node must accept.
+    let run = fx
+        .gyges(&[
+            "-k",
+            "bob",
+            "tx",
+            "send",
+            "--to",
+            &gyges_regtest::burn_t_address(),
+            "--amount",
+            "0.5",
+            "--yes",
+        ])
+        .env("GYGES_PASSPHRASE_FILE", &pw)
+        .ok_with_log(&log);
+    let spend = run.stdout.trim().to_string();
+    assert_eq!(node.mempool(), vec![spend.clone()], "the node accepted it");
+    node.mine(1);
+    wait_for_txid(&fx, "bob", &spend, 1);
+    let b = wait_balance(&fx, "bob", |b| {
+        b["total_spendable"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .is_some_and(|t| t > 49_900_000 && t < 50_000_000)
+    });
+    assert_eq!(spendable(&b, "POOL_TRANSPARENT"), 0, "{b}");
+
+    sweep_logs(
+        &fx.network_dir().join("logs"),
+        &[&shield_txid, &pay, &spend, &bob_sapling, PASSPHRASE],
     );
 }

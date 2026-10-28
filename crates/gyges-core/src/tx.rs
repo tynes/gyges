@@ -14,7 +14,10 @@
 //! 3. [`build_pczt`] — Creator, Constructor, IO Finalizer and Updater, all
 //!    inside `create_pczt_from_proposal`;
 //! 4. [`prove`] — the Prover role, which needs no secret for Orchard and
-//!    transparent (Q-K3) and so runs while the vault is locked;
+//!    transparent (Q-K3) and so runs while the vault is locked. A Sapling
+//!    spend is the exception: its proof needs the proof generation key,
+//!    which [`insert_proof_generation_keys`] derives from the unlocked
+//!    spending key first (THREAT_MODEL.md §6 item 1);
 //! 5. [`sign`] — the Signer role with the `UnifiedSpendingKey` derived from
 //!    the decrypted entropy; the key lives for this call only;
 //! 6. [`verify`] — the Verifier role against what was proposed: a PCZT
@@ -37,6 +40,7 @@ use orchard::circuit::{OrchardCircuitVersion, ProvingKey, VerifyingKey};
 use pczt::Pczt;
 use pczt::roles::prover::Prover;
 use pczt::roles::signer::Signer;
+use pczt::roles::updater::Updater;
 use pczt::roles::verifier::Verifier;
 use prost::Message as _;
 use secrecy::ExposeSecret as _;
@@ -179,9 +183,10 @@ pub fn account_of(wallet: &Wallet) -> Result<AccountUuid, TxError> {
         .ok_or_else(|| TxError::Internal("the wallet has no account".into()))
 }
 
-/// Which pools a key may fund a send from, as the upstream policy. Sapling
-/// is receive-only in the MVP (ROADMAP.md "Pools are data"), so a profile
-/// without it in `spend_pools` never spends Sapling notes.
+/// Which pools a key may fund a send from, as the upstream policy. A
+/// profile without Sapling in `spend_pools` (Keystone, and `local-seed`
+/// keys made before M6 until their profile is upgraded on load) never
+/// spends Sapling notes.
 fn spend_policy(spend_pools: &[Pool]) -> SpendPolicy {
     let shielded = spend_pools.iter().filter_map(|p| match p {
         Pool::Sapling => Some(ShieldedPool::Sapling),
@@ -662,19 +667,119 @@ pub fn proving_work(pczt: &Pczt) -> ProvingWork {
     }
 }
 
+/// Why a Sapling spend without its proof generation key goes no further:
+/// the key is derived from the seed and never leaves the stream that
+/// unlocked it (THREAT_MODEL.md §6 item 1), so only `tx send` proves and
+/// signs one.
+const SAPLING_SPEND_IN_STREAM_ONLY: &str = "a Sapling spend is proven and signed only inside `gyges tx send` on the key that owns it (THREAT_MODEL.md §6 item 1)";
+
+/// The Sapling spends that carry no proof generation key: every real spend
+/// before [`insert_proof_generation_keys`]; a dummy carries its own.
+fn unkeyed_sapling_spends(pczt: Pczt) -> Result<(Pczt, usize), TxError> {
+    if pczt.sapling().spends().is_empty() {
+        return Ok((pczt, 0));
+    }
+    let mut unkeyed = 0;
+    let verifier = Verifier::new(pczt)
+        .with_sapling::<Infallible, _>(|bundle| {
+            unkeyed = bundle
+                .spends()
+                .iter()
+                .filter(|s| s.proof_generation_key().is_none())
+                .count();
+            Ok(())
+        })
+        .map_err(|e| TxError::InvalidArgument(format!("sapling bundle: {e:?}")))?;
+    Ok((verifier.finish(), unkeyed))
+}
+
+/// `UNSUPPORTED_POOL` for a PCZT with a Sapling spend that does not carry
+/// its proof generation key: [`prove`] and [`sign`] call it, and so does
+/// `SignPczt` before it asks for a passphrase.
+pub fn refuse_unkeyed_sapling_spends(pczt: Pczt) -> Result<Pczt, TxError> {
+    let (pczt, unkeyed) = unkeyed_sapling_spends(pczt)?;
+    if unkeyed > 0 {
+        return Err(TxError::UnsupportedPool(format!(
+            "this PCZT spends {unkeyed} Sapling note(s); {SAPLING_SPEND_IN_STREAM_ONLY}"
+        )));
+    }
+    Ok(pczt)
+}
+
+/// The Sapling full viewing key and proof generation key of the account in
+/// each ZIP 32 scope, external first. Internal keys share `ask` with the
+/// external ones but not `nsk`, so a note received at an internal address
+/// needs the internal proof generation key.
+fn sapling_scopes(
+    usk: &UnifiedSpendingKey,
+) -> [(sapling::keys::FullViewingKey, sapling::ProofGenerationKey); 2] {
+    let external = usk.sapling();
+    let internal = external.derive_internal();
+    [external, &internal].map(|k| {
+        (
+            sapling::keys::FullViewingKey::from_expanded_spending_key(&k.expsk),
+            k.expsk.proof_generation_key(),
+        )
+    })
+}
+
+/// Step 4a, for a proposal that spends Sapling notes (Q-K3,
+/// THREAT_MODEL.md §6 item 1): the Updater role sets each spend's
+/// `proof_generation_key` from the unlocked spending key. A spend that
+/// already carries one (a dummy) keeps it. Every other spend must be a note
+/// of this account: its nullifier is recomputed under the external and then
+/// the internal key, and the key that reproduces it is the one inserted
+/// (upstream's setter checks nothing). A spend neither reproduces is
+/// refused. The result holds `nsk`: it is proven and signed in memory and
+/// never written anywhere.
+pub fn insert_proof_generation_keys(pczt: Pczt, usk: &UnifiedSpendingKey) -> Result<Pczt, TxError> {
+    if pczt.sapling().spends().is_empty() {
+        return Ok(pczt);
+    }
+    let scopes = sapling_scopes(usk);
+    let mut foreign = None;
+    let updater = Updater::new(pczt)
+        .update_sapling_with(|mut u| {
+            let mut picks = Vec::new();
+            for (i, spend) in u.bundle().spends().iter().enumerate() {
+                if spend.proof_generation_key().is_some() {
+                    continue;
+                }
+                match scopes
+                    .iter()
+                    .position(|(fvk, _)| spend.verify_nullifier(Some(fvk)).is_ok())
+                {
+                    Some(scope) => picks.push((i, scope)),
+                    None => {
+                        foreign = Some(i);
+                        return Ok(());
+                    }
+                }
+            }
+            for (i, scope) in picks {
+                let pgk = scopes[scope].1.clone();
+                u.update_spend_with(i, |mut s| s.set_proof_generation_key(pgk))?;
+            }
+            Ok(())
+        })
+        .map_err(|e| TxError::Internal(format!("updating the Sapling bundle: {e:?}")))?;
+    if let Some(i) = foreign {
+        return Err(TxError::InvalidArgument(format!(
+            "Sapling spend {i} is not a note of this key; it cannot be proven here"
+        )));
+    }
+    Ok(updater.finish())
+}
+
 /// Step 4: the Prover role. Orchard and Ironwood bundles share the Orchard
 /// circuit and proving key. Refuses PCZTs whose consensus branch needs a
-/// circuit this build cannot prove, and Sapling *spends* (their proof
-/// generation key would have to come from the unlocked seed first, Q-K3;
-/// Sapling is receive-only in the MVP so none are ever proposed).
+/// circuit this build cannot prove, and Sapling spends that do not carry
+/// their proof generation key yet ([`insert_proof_generation_keys`] runs
+/// first, inside `tx send` only).
 pub fn prove(pczt: Pczt, provers: &Provers) -> Result<Pczt, TxError> {
     let branch = BranchId::try_from(*pczt.global().consensus_branch_id())
         .map_err(|e| TxError::Internal(format!("unknown consensus branch in the PCZT: {e}")))?;
-    if !pczt.sapling().spends().is_empty() {
-        return Err(TxError::UnsupportedPool(
-            "Sapling spends are not supported in this milestone (ROADMAP.md M6)".into(),
-        ));
-    }
+    let pczt = refuse_unkeyed_sapling_spends(pczt)?;
     let mut prover = Prover::new(pczt);
     if prover.requires_orchard_proof() || prover.requires_ironwood_proof() {
         let version = bundle_version_for_branch(branch, orchard::ValuePool::Orchard)
@@ -801,7 +906,9 @@ fn transparent_derivations(
 /// Step 5: the Signer role. Orchard and Ironwood spends are signed with the
 /// account's spend authorizing key (every action is tried; the ones that
 /// are not ours or are dummies answer `WrongSpendAuthorizingKey` and are
-/// skipped, as upstream does). Transparent inputs are
+/// skipped, as upstream does). Sapling spends are signed the same way once
+/// [`insert_proof_generation_keys`] has run; a PCZT whose Sapling spends
+/// lack their key is refused. Transparent inputs are
 /// signed with the key their BIP 44 derivation names (upstream writes it on
 /// every input of an HD account, which is how Gyges imports accounts), so
 /// no wallet is needed and a `signer-only` profile signs them too; an input
@@ -859,6 +966,10 @@ pub fn sign(
         pczt
     };
 
+    // A Sapling spend is signed only once its proof generation key is in
+    // (the Signer role needs it), which happens inside `tx send` alone.
+    let pczt = refuse_unkeyed_sapling_spends(pczt)?;
+
     // The outputs are checked, and change that is not ours refused, before
     // anything is signed.
     let pczt = check_change(pczt, &Owner::of_usk(&signer.params, usk, wallet)?)?;
@@ -880,6 +991,17 @@ pub fn sign(
             Ok(())
             | Err(SignErr::IronwoodSign(orchard::pczt::SignerError::WrongSpendAuthorizingKey)) => {}
             Err(e) => return Err(TxError::Internal(format!("ironwood signing failed: {e:?}"))),
+        }
+    }
+    // Sapling: one `ask` for both scopes (ZIP 32 internal keys keep it);
+    // dummies, signed by the IO Finalizer, answer `WrongSpendAuthorizingKey`.
+    let sapling_ask = &usk.sapling().expsk.ask;
+    for index in 0.. {
+        match signer.sign_sapling(index, sapling_ask) {
+            Err(SignErr::InvalidIndex) => break,
+            Ok(())
+            | Err(SignErr::SaplingSign(sapling::pczt::SignerError::WrongSpendAuthorizingKey)) => {}
+            Err(e) => return Err(TxError::Internal(format!("sapling signing failed: {e:?}"))),
         }
     }
     for (index, sk) in &transparent_keys {
@@ -987,12 +1109,32 @@ impl Owner {
             .is_some_and(|a| fvk.scope_for_address(&a).is_some())
     }
 
+    /// A Sapling address of this account, in either scope: the scope's
+    /// incoming viewing key gives the same address for its diversifier.
+    /// (Upstream's `decrypt_diversifier` rebuilds an internal candidate
+    /// with the external key, so it never recognises internal change.)
     pub fn owns_sapling(&self, raw: &[u8; 43]) -> bool {
         let Some(dfvk) = self.ufvk.sapling() else {
             return false;
         };
-        sapling::PaymentAddress::from_bytes(raw)
-            .is_some_and(|a| dfvk.decrypt_diversifier(&a).is_some())
+        sapling::PaymentAddress::from_bytes(raw).is_some_and(|a| {
+            [zip32::Scope::External, zip32::Scope::Internal]
+                .into_iter()
+                .any(|s| dfvk.to_ivk(s).to_payment_address(*a.diversifier()) == Some(a))
+        })
+    }
+
+    /// A Sapling spend of a note of this account, in either scope: its
+    /// nullifier is reproduced under the account's external or internal
+    /// viewing key.
+    pub fn owns_sapling_spend(&self, spend: &sapling::pczt::Spend) -> bool {
+        let Some(dfvk) = self.ufvk.sapling() else {
+            return false;
+        };
+        spend.verify_nullifier(Some(dfvk.fvk())).is_ok()
+            || spend
+                .verify_nullifier(Some(&dfvk.to_internal_fvk()))
+                .is_ok()
     }
 
     /// A transparent script paying this account: one of the wallet's
@@ -1320,9 +1462,10 @@ mod address_pairs {
 /// Step 6: the Verifier role (Q-K7). Every transparent output, every
 /// Orchard-protocol (Orchard or Ironwood bundle) and Sapling payment
 /// (recipient and value), the change totals, the fee (inputs minus
-/// outputs) and the expiry must match `expected`, and every change output
-/// must belong to `owner` (THREAT_MODEL.md §6 item 8); otherwise the PCZT
-/// is refused and nothing is broadcast.
+/// outputs) and the expiry must match `expected`, every change output
+/// must belong to `owner` (THREAT_MODEL.md §6 item 8), and every Sapling
+/// spend must open its value commitment and spend a note of `owner`;
+/// otherwise the PCZT is refused and nothing is broadcast.
 pub fn verify(pczt: Pczt, expected: &Expected, owner: &Owner) -> Result<Pczt, TxError> {
     // The output fields are authenticated (note and value commitments,
     // address labels) before the matching below relies on them.
@@ -1405,12 +1548,11 @@ pub fn verify(pczt: Pczt, expected: &Expected, owner: &Owner) -> Result<Pczt, Tx
     if !sapling_payments.is_empty() || sapling_change != expected.sapling_change {
         return Err(mismatch("a Sapling output"));
     }
-    // Sapling spends are refused before proving (Q-K3), so none can be
-    // here; if one is, the PCZT did not come from this pipeline.
-    if !pczt.sapling().spends().is_empty() {
-        return Err(mismatch("a Sapling spend (none was proposed)"));
-    }
-    let sapling_in: u64 = 0;
+    // Sapling spends: each real one (value above zero) must open its value
+    // commitment and be a note of this key; dummies carry zero.
+    let mut sapling_in = 0u64;
+    let mut foreign_spend = false;
+    let mut forged_value = false;
 
     // Orchard and Ironwood, through the parsed bundles the Verifier role
     // exposes; both carry Orchard-protocol actions.
@@ -1447,6 +1589,19 @@ pub fn verify(pczt: Pczt, expected: &Expected, owner: &Owner) -> Result<Pczt, Tx
         }
     };
     let verifier = Verifier::new(pczt)
+        .with_sapling::<Infallible, _>(|bundle| {
+            for spend in bundle.spends() {
+                let value = spend.value().as_ref().map_or(0, |v| v.inner());
+                if value == 0 {
+                    continue;
+                }
+                forged_value |= spend.verify_cv().is_err();
+                foreign_spend |= !owner.owns_sapling_spend(spend);
+                sapling_in += value;
+            }
+            Ok(())
+        })
+        .map_err(|e| TxError::Internal(format!("verifier: sapling bundle: {e:?}")))?
         .with_orchard::<String, _>(|bundle| {
             check_actions(bundle);
             Ok(())
@@ -1457,6 +1612,14 @@ pub fn verify(pczt: Pczt, expected: &Expected, owner: &Owner) -> Result<Pczt, Tx
             Ok(())
         })
         .map_err(|e| TxError::Internal(format!("verifier: ironwood bundle: {e:?}")))?;
+    if forged_value {
+        return Err(mismatch(
+            "a Sapling spend's value (it does not open its commitment)",
+        ));
+    }
+    if foreign_spend {
+        return Err(mismatch("a Sapling spend (not this key's note)"));
+    }
     if foreign_change {
         return Err(mismatch("an Orchard change output (not this key's)"));
     }
