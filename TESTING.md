@@ -203,4 +203,10 @@ GYGES_TEST_KEEP=1 cargo test -p gyges-regtest tex -- --nocapture
 ZAKURAD_BIN=/path/to/zakurad ZAINOD_BIN=/path/to/zainod cargo test -p gyges-regtest --test backfill -- --nocapture
 ```
 
+The hardened deployment (`THREAT_MODEL.md` §6 item 4) is checked in a container whose PID 1 is systemd, with real users on both sides of the socket. It needs Docker with privileged containers; the first run builds Linux binaries (about 20 minutes), later runs reuse the cached target directory:
+
+```bash
+tests/hardened/run.sh
+```
+
 The regtest crate downloads `zakurad` into `target/regtest-bin/` on first use, keyed by the versions in `tests/regtest/versions.toml`; Zakura publishes Linux x86_64 and aarch64 binaries only. `zainod` is built there from its pinned `.crate` on Linux when `GYGES_BUILD_ZAINOD=1`. Setting `ZAKURAD_BIN` (and `ZAINOD_BIN`) skips the download and the build.

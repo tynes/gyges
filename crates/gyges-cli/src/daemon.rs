@@ -43,9 +43,14 @@ pub enum DaemonCmd {
     },
     /// Write and start a launchd / systemd --user unit that runs gygesd
     /// --foreground; run it again after upgrading to restart the daemon.
-    Install,
+    Install(crate::service::InstallArgs),
     /// Stop gygesd and remove the unit written by `daemon install`.
-    Uninstall,
+    Uninstall {
+        /// Remove the system unit of `daemon install --hardened` (as root);
+        /// the `gyges` account and its home stay.
+        #[arg(long)]
+        hardened: bool,
+    },
 }
 
 /// Flags forwarded to `gygesd`.
@@ -84,8 +89,8 @@ pub async fn run(ctx: &Ctx, cmd: DaemonCmd) -> Result<(), CliError> {
             lines,
             audit,
         } => logs(ctx, follow, lines, audit).await,
-        DaemonCmd::Install => crate::service::install(ctx).await,
-        DaemonCmd::Uninstall => crate::service::uninstall(ctx).await,
+        DaemonCmd::Install(args) => crate::service::install(ctx, args).await,
+        DaemonCmd::Uninstall { hardened } => crate::service::uninstall(ctx, hardened).await,
     }
 }
 

@@ -39,6 +39,12 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
+    /// Non-empty: the socket's absolute path instead of
+    /// `<network dir>/gygesd.sock`. Its directory must be the daemon's and
+    /// closed to other users (`perms::check_socket_dir`). The hardened
+    /// deployment uses `/run/gyges/<network>/gygesd.sock`, because a group
+    /// member cannot reach a socket under the 0700 network directory.
+    pub socket_path: String,
     /// Non-empty: socket mode 0660 owned by this group (name or numeric gid).
     pub socket_group: String,
     /// Peer uids other than the daemon's own that may connect (API.md §1.2).
@@ -57,6 +63,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            socket_path: String::new(),
             socket_group: String::new(),
             allowed_uids: Vec::new(),
             log_level: "info".into(),
@@ -257,6 +264,8 @@ pub enum ConfigError {
         "[fallback_lightwalletd] broadcast_via_tor = true needs enabled = true and use_tor = true (use_tor = false is accepted on regtest only)"
     )]
     BroadcastViaTorUnavailable,
+    #[error("[daemon] socket_path must be an absolute path, got \"{0}\"")]
+    SocketPathRelative(String),
     #[error("[vault] scrypt_work_factor must be between 10 and 30 (log2 N), got {0}")]
     ScryptWorkFactor(u8),
 }
@@ -293,6 +302,7 @@ pub fn template(network: Network) -> String {
          # airgapped = false\n\
          \n\
          [daemon]\n\
+         # socket_path = \"\"\n\
          # socket_group = \"\"\n\
          # allowed_uids = []\n\
          # log_level = \"info\"\n\
@@ -386,11 +396,24 @@ impl Config {
         {
             return Err(ConfigError::BroadcastViaTorUnavailable);
         }
+        if let Some(p) = self.socket_path()
+            && !p.is_absolute()
+        {
+            return Err(ConfigError::SocketPathRelative(
+                self.daemon.socket_path.clone(),
+            ));
+        }
         let wf = self.vault.scrypt_work_factor;
         if !(10..=30).contains(&wf) {
             return Err(ConfigError::ScryptWorkFactor(wf));
         }
         Ok(())
+    }
+
+    /// `daemon.socket_path` with `~` expanded; `None` for the default.
+    pub fn socket_path(&self) -> Option<PathBuf> {
+        let p = self.daemon.socket_path.trim();
+        (!p.is_empty()).then(|| crate::paths::expand_tilde(p))
     }
 
     /// The zakurad cookie path with `~` expanded; `None` when unauthenticated.

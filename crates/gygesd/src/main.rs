@@ -48,6 +48,17 @@ struct Args {
     /// Reach the fallback endpoint directly instead of over Tor.
     #[arg(long)]
     no_tor: bool,
+    /// Socket path instead of `$GYGES_HOME/<network>/gygesd.sock`
+    /// (`daemon.socket_path`); its directory must be this user's, mode 0750 or narrower.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<String>,
+    /// Make the socket 0660 and owned by this group (`daemon.socket_group`).
+    #[arg(long, value_name = "GROUP")]
+    socket_group: Option<String>,
+    /// Admit this peer uid besides the daemon's own; repeatable, replaces
+    /// `daemon.allowed_uids`.
+    #[arg(long = "allow-uid", value_name = "UID")]
+    allowed_uids: Vec<u32>,
     /// Root directory; one subdirectory per network.
     #[arg(long, env = "GYGES_HOME", value_name = "DIR", default_value_os_t = default_home())]
     home: PathBuf,
@@ -71,6 +82,9 @@ impl Args {
         opts.zakura_cookie = self.zakura_cookie.clone();
         opts.fallback_lwd = self.fallback_lwd.clone();
         opts.no_tor = self.no_tor;
+        opts.socket = self.socket.clone();
+        opts.socket_group = self.socket_group.clone();
+        opts.allowed_uids = self.allowed_uids.clone();
         opts
     }
 }
@@ -175,11 +189,11 @@ fn init_logging(
 /// Validate the configuration here, where stderr is visible, then re-run
 /// ourselves detached with `--foreground` and wait for the socket to accept.
 fn daemonize(args: &Args) -> anyhow::Result<ExitCode> {
-    let opts = args.options();
-    let socket = opts.home.socket_path(opts.network);
     // Runs every startup check and takes the pid lock; dropping it releases
     // the lock (and removes the file) just before the child takes its own.
-    drop(Daemon::prepare(opts)?);
+    let prepared = Daemon::prepare(args.options())?;
+    let socket = prepared.socket_path();
+    drop(prepared);
 
     let exe = std::env::current_exe().context("cannot locate the gygesd executable")?;
     let mut child = Command::new(exe)

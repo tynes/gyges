@@ -38,7 +38,8 @@ One home per network (Q-C2). `GYGES_HOME` (default `~/.gyges`) is the root.
 |---|---|---|
 | every directory under `GYGES_HOME` | `0700` | daemon refuses to start on anything wider |
 | every file | `0600` | same |
-| `gygesd.sock` | `0600` (`0660` with `daemon.socket_group` set) | checked after bind |
+| `gygesd.sock` | `0600` (`0660` with `daemon.socket_group` set) | set after bind |
+| directory of `daemon.socket_path`, when set | owned by the daemon's uid, no bits beyond `0750` | daemon refuses to start otherwise (`perms::check_socket_dir`) |
 
 The refusal message names the path and the one-line `chmod` that fixes it. Tilde in any configured path is expanded by the daemon; the CLI never reads these files.
 
@@ -55,6 +56,7 @@ default_key = "main"             # substituted by the daemon when a request has 
 airgapped = false                # true disables every network interface (Tor, RPC, indexer)
 
 [daemon]
+socket_path = ""                 # non-empty: absolute socket path instead of <network dir>/gygesd.sock (hardened: /run/gyges/<network>/gygesd.sock)
 socket_group = ""                # non-empty: socket mode 0660 owned by this group (name or numeric gid)
 allowed_uids = []                # peer uids besides the daemon's own that may connect (API.md §1.2)
 log_level = "info"               # tracing filter; overridden by RUST_LOG

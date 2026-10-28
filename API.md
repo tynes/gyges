@@ -24,7 +24,10 @@ behaviour), Q-O1 (logs), Q-O3 (versioning).
   `tonic` server on a `tokio::net::UnixListener`; the CLI is a `tonic` client
   with a `tower::service_fn` connector that opens a `UnixStream`.
 - Socket mode is `0600` (owner only). In the hardened deployment (`gygesd`
-  running as its own user) it is `0660` with a `gyges` group.
+  running as its own user, `gyges daemon install --hardened`) it is `0660`
+  with a `gyges` group, at `/run/gyges/<network>/gygesd.sock`
+  (`daemon.socket_path`), since a group member cannot reach a socket inside
+  the 0700 network directory. Admitted users set `GYGES_SOCKET` to it.
 - Windows is out of scope for v1 (Q-O4); there is no named-pipe transport.
 
 ### 1.2 Peer credentials
