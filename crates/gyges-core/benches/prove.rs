@@ -21,6 +21,7 @@ use gyges_core::registry::Wallet;
 use gyges_core::sync::{self, ScanOutcome};
 use orchard::builder::{BundleType, UnauthorizedBundle};
 use orchard::bundle::BundleVersion;
+use orchard::circuit::{OrchardCircuitVersion, ProvingKey};
 use orchard::keys::{FullViewingKey, Scope, SpendingKey};
 use orchard::tree::Anchor;
 use orchard::value::NoteValue;
@@ -97,7 +98,8 @@ fn proving(c: &mut Criterion) {
     group.sampling_mode(SamplingMode::Flat);
     group.measurement_time(Duration::from_secs(20));
     // What the first `tx send` after a daemon start waits for before it can
-    // prove (`Provers::orchard`, shared by Orchard and Ironwood).
+    // prove (`Provers::orchard`, shared by Orchard and Ironwood): the key,
+    // its prepared commitment tables, and the verifying key.
     group.bench_function("build", |b| {
         b.iter_with_large_drop(|| {
             let provers = Provers::new();
@@ -111,8 +113,8 @@ fn proving(c: &mut Criterion) {
     group.sample_size(10);
     group.sampling_mode(SamplingMode::Flat);
     group.measurement_time(Duration::from_secs(20));
-    // The first proof on a freshly built key, which also fills the key's
-    // lazily built commitment tables. Key build is outside the timing.
+    // The first proof on a freshly built key. Key build is outside the
+    // timing.
     group.bench_function("first-after-key-build", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
@@ -136,6 +138,24 @@ fn proving(c: &mut Criterion) {
         .expect("the warm-up proof");
     let mut seed = 0;
     group.bench_function("steady", |b| {
+        b.iter_batched(
+            || {
+                seed += 1;
+                (two_action_bundle(&to, seed), proof_rng(seed))
+            },
+            |(bundle, rng)| bundle.create_proof(pk, rng).expect("proves"),
+            BatchSize::PerIteration,
+        )
+    });
+    // The same on a key without `Provers`' prepared commitment tables, for
+    // comparison: the tables pay only on pools of at most eight threads
+    // (ten on AArch64 macOS).
+    let pk = ProvingKey::build(OrchardCircuitVersion::PostNu6_3).expect("a proving key");
+    two_action_bundle(&to, u64::MAX)
+        .create_proof(&pk, proof_rng(u64::MAX))
+        .expect("the warm-up proof");
+    let pk = &pk;
+    group.bench_function("steady-unprepared", |b| {
         b.iter_batched(
             || {
                 seed += 1;

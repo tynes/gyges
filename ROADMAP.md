@@ -316,19 +316,21 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
 - [x] `perf` features with benchmarks in `docs/BENCHMARKS.md`; decide the release default once runtime CPU detection is confirmed. Landed reshaped, because two of the three features did nothing:
   - **What upstream already does.** A default build is already multi-threaded: `multicore` is a default feature of `zakura-orchard`, `zakura-halo2-proofs`, `zakura-proofs` and `zakura-client-sqlite`. On aarch64 Unix it also already uses the assembly: `zakura-halo2-proofs` turns on `zakura-pasta-curves/aarch64-asm` there. `cargo metadata` for x86-64 and aarch64 Linux showed `perf` adding nothing and `perf-asm-aarch64` adding only forwarding flags. Both are removed.
   - **The release default.** `zakura-pasta-curves`' x86-64 backend has no runtime CPU detection. Its `build.rs` selects the backend from the feature or from the target's compile-time `adx` and `bmi2`, and a CPU without them faults (`THREAT_MODEL.md` §6 item 2, now verified). So `perf-asm-x86_64` stays opt-in, now also on `gygesd`, and default and release builds use the portable code. The release-pipeline item below records that `target-cpu` must stay at the baseline.
-  - **`gyges-core/benches/prove.rs`** (Criterion) times four things through Gyges' own entry points:
+  - **Found on the way:** `Provers::orchard()` never called upstream's `ProvingKey::prepare_proving`, which upstream recommends for long-lived provers. It now does. The tables take about 30 MiB and 16 ms to build, and they make each proof 17–20% faster on Rayon pools of up to eight threads (ten on AArch64 macOS). Wider pools ignore them.
+  - **`gyges-core/benches/prove.rs`** (Criterion) times these through Gyges' own entry points:
     - `Provers::orchard()` building the key;
-    - a two-action Ironwood proof, first after the key build and steady;
-    - `sync::scan_range` over ten cached blocks of 1,000 Ironwood actions, of which 20 are the wallet's. A check confirms they are found.
-  - **Results** (`docs/BENCHMARKS.md`) on an Apple M4 Pro, 14 threads against 1:
+    - a two-action Ironwood proof: first after the key build, steady, and steady on an unprepared key;
+    - `sync::scan_range` over ten cached blocks of 1,000 Ironwood actions, of which 20 are the wallet's. A check confirms all 20 are found.
+  - **Results** (`docs/BENCHMARKS.md`) on an Apple M4 Pro:
 
-    | | 14 threads | 1 thread |
-    |---|---|---|
-    | Key build | 89 ms | 305 ms |
-    | Proof | 61 ms | 394 ms |
-    | Scan | 41.5 ms | 67.8 ms |
+    | | 14 threads | 8 threads | 1 thread |
+    |---|---|---|---|
+    | Key build | 99 ms | 93 ms | 351 ms |
+    | Proof | 62 ms | 50 ms | 315 ms |
+    | Proof, unprepared key | 64 ms | 60 ms | 395 ms |
+    | Scan | 40.7 ms | 40.6 ms | 67.8 ms |
 
-    The first proof costs the same as later ones.
+    The first proof costs the same as later ones. On this machine eight threads prove faster than the default fourteen; no smaller proving-only pool was tried.
 
   `ARCHITECTURE.md` §3.7, `OVERVIEW.md` Q-D6 and `TESTING.md` §1 describe this.
 
