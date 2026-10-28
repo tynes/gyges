@@ -152,8 +152,21 @@ impl BlockDb {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA busy_timeout = 5000;
-             CREATE TABLE IF NOT EXISTS compact_blocks (
+             PRAGMA busy_timeout = 5000;",
+        )
+        .map_err(|e| self.sqlite(e))?;
+        // The schema version is SQLite's `user_version`: 0 on a fresh file.
+        let version: u32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(|e| self.sqlite(e))?;
+        if version > SCHEMA_VERSION {
+            return Err(CacheError::SchemaTooNew {
+                path: self.path.clone(),
+                found: version,
+            });
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS compact_blocks (
                  height     INTEGER NOT NULL PRIMARY KEY,
                  hash       BLOB NOT NULL,
                  prev_hash  BLOB NOT NULL,
@@ -164,37 +177,28 @@ impl BlockDb {
              CREATE TABLE IF NOT EXISTS cache_meta (
                  key   TEXT NOT NULL PRIMARY KEY,
                  value TEXT NOT NULL
-             );
-             INSERT OR IGNORE INTO cache_meta (key, value) VALUES ('schema_version', '1');",
+             );",
         )
         .map_err(|e| self.sqlite(e))?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|e| self.sqlite(e))?;
         conn.execute(
             "INSERT OR IGNORE INTO cache_meta (key, value) VALUES ('network', ?1)",
             params![network],
         )
         .map_err(|e| self.sqlite(e))?;
-
-        let meta = |key: &str| -> Result<String, CacheError> {
-            conn.query_row(
-                "SELECT value FROM cache_meta WHERE key = ?1",
-                params![key],
+        let found_network: String = conn
+            .query_row(
+                "SELECT value FROM cache_meta WHERE key = 'network'",
+                [],
                 |r| r.get(0),
             )
-            .map_err(|e| self.sqlite(e))
-        };
-        let found_network = meta("network")?;
+            .map_err(|e| self.sqlite(e))?;
         if found_network != network {
             return Err(CacheError::NetworkMismatch {
                 path: self.path.clone(),
                 expected: network.to_string(),
                 found: found_network,
-            });
-        }
-        let version: u32 = meta("schema_version")?.parse().unwrap_or(u32::MAX);
-        if version > SCHEMA_VERSION {
-            return Err(CacheError::SchemaTooNew {
-                path: self.path.clone(),
-                found: version,
             });
         }
         Ok(())
@@ -617,11 +621,7 @@ mod tests {
         // A newer schema is refused too.
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute(
-                "UPDATE cache_meta SET value = '99' WHERE key = 'schema_version'",
-                [],
-            )
-            .unwrap();
+            conn.pragma_update(None, "user_version", 99).unwrap();
         }
         let err = BlockDb::open(&path, "regtest").unwrap_err();
         assert!(

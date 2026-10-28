@@ -1,7 +1,7 @@
 //! Keystone signing sessions (API.md §6, ROADMAP.md M5 third item).
 //!
 //! A `tx send` or `tx shield` from a `keystone-qr` key proves the PCZT,
-//! persists a session (`gyges_core::sessions::insert_keystone`) holding the
+//! persists a session (`gyges_core::sessions::insert`) holding the
 //! proven copy and what the device was shown, and emits `SignatureRequired`
 //! with that payload. `CompleteKeystoneSign` does the rest from any
 //! connection, after a restart too: apply the device's answer
@@ -157,10 +157,7 @@ fn key_sessions(
 ) -> Result<Vec<SigningSession>, TxError> {
     let mut out = Vec::new();
     for mut row in sessions::list(wallet, true)? {
-        if !matches!(
-            row.protocol,
-            Protocol::KeystoneBatch | Protocol::KeystonePczt
-        ) {
+        if !row.protocol.is_keystone() {
             continue;
         }
         if expire_if_due(wallet, &row)? {
@@ -169,9 +166,7 @@ fn key_sessions(
         if !include_finished && row.state != SessionState::AwaitingSignature {
             continue;
         }
-        let payload = sessions::get_keystone(wallet, &row.session_id)?
-            .map(|k| k.payload)
-            .unwrap_or_default();
+        let payload = row.keystone.take().map(|k| k.payload).unwrap_or_default();
         out.push(proto_session(key_id, &row, payload));
     }
     Ok(out)
@@ -225,9 +220,8 @@ async fn find(
     for key in keystone_keys(state, "") {
         let sid = session_id.to_string();
         let found = wallet_rpc(&key, move |w| {
-            let row = sessions::get(w, &sid)?;
-            let ks = sessions::get_keystone(w, &sid)?;
-            Ok(row.zip(ks))
+            // Split off the device-side half; a file session has none.
+            Ok(sessions::get(w, &sid)?.and_then(|mut row| row.keystone.take().map(|ks| (row, ks))))
         })
         .await?;
         if let Some((row, ks)) = found {
@@ -304,19 +298,18 @@ pub(crate) async fn await_device(
         expected: expected.to_json(),
         txid: None,
         last_error: None,
-    };
-    let ks = KeystoneRow {
-        session_id: session_id.clone(),
-        pczt: pczt_io::serialize(proven).map_err(err)?,
-        payload: request.payload.clone(),
-        request_id: request.request_id.clone(),
-        via_tor,
-        expiry_height: summary.expiry_height,
+        keystone: Some(KeystoneRow {
+            pczt: pczt_io::serialize(proven).map_err(err)?,
+            payload: request.payload.clone(),
+            request_id: request.request_id.clone(),
+            via_tor,
+            expiry_height: summary.expiry_height,
+        }),
     };
     // Registered before the row exists, so a completion that races the
     // event below still finds the stream.
     let rx = state.keystone.wait(&session_id);
-    wallet_rpc(key, move |w| Ok(sessions::insert_keystone(w, &row, &ks)?)).await?;
+    wallet_rpc(key, move |w| Ok(sessions::insert(w, &row)?)).await?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "session_created");
     tracing::info!(
         key_id,

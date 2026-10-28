@@ -7,10 +7,7 @@
 //! accounting as in `v_transactions`) but no production API for notes or
 //! per-transaction outputs. Those are read from upstream's documented views
 //! (`v_received_outputs`, `v_received_output_spends`, `v_tx_outputs`)
-//! through the extension handle, whose authorizer allows reads of any table
-//! and nothing else. The handle answers one row per statement, so each read
-//! is a single `json_group_array`; BLOB columns go through `hex()` because
-//! JSON cannot hold a BLOB.
+//! through the extension handle (`crate::db::history`).
 //!
 //! Two definitions the views leave to the reader:
 //! * a note is **spent** when a transaction spending it is mined, or is
@@ -27,12 +24,11 @@
 //! transaction enhancement fetches them (not yet: `TransactionDataRequest`
 //! handling is open, ROADMAP.md M1 SyncScheduler item).
 
-use serde::Deserialize;
 use zcash_client_backend::data_api::WalletRead as _;
 use zcash_protocol::memo::{Memo, MemoBytes};
 
 use crate::Pool;
-use crate::ext::with_ext;
+use crate::db::{self, with_db};
 use crate::registry::Wallet;
 use crate::tx::{TxError, account_of, internal};
 
@@ -147,20 +143,6 @@ fn memo_bytes(memo: Option<&Memo>) -> Vec<u8> {
     }
 }
 
-/// One aggregate read through the extension handle, decoded from JSON.
-fn read_json<T: serde::de::DeserializeOwned>(
-    wallet: &mut Wallet,
-    sql: &str,
-    params: impl rusqlite::Params,
-) -> Result<Vec<T>, TxError> {
-    let json: Option<String> = with_ext(wallet, |ext| ext.query_row(sql, params, |r| r.get(0)))
-        .map_err(|e: rusqlite::Error| internal("reading the wallet", e))?;
-    match json {
-        None => Ok(Vec::new()),
-        Some(s) => serde_json::from_str(&s).map_err(|e| internal("decoding the wallet read", e)),
-    }
-}
-
 /// The wallet's tip and fully scanned height, 0 before the first scan.
 fn heights(wallet: &Wallet) -> Result<(u32, u32), TxError> {
     let tip = wallet
@@ -174,63 +156,14 @@ fn heights(wallet: &Wallet) -> Result<(u32, u32), TxError> {
     Ok((tip, scanned))
 }
 
-#[derive(Deserialize)]
-struct RawNote {
-    pool: i64,
-    txid: String,
-    idx: u32,
-    value: u64,
-    height: Option<u32>,
-    memo: String,
-    change: Option<i64>,
-    scope: Option<i64>,
-    pos: Option<i64>,
-    spent: Option<String>,
-}
-
 /// Upstream's `key_scope` for ZIP 320 ephemeral addresses.
 const EPHEMERAL_SCOPE: i64 = 2;
-
-/// "Not expired" for a transaction row aliased `t`, against `:tip`.
-const LIVE: &str = "(t.mined_height IS NOT NULL OR t.expiry_height IS NULL \
-                    OR t.expiry_height = 0 OR t.expiry_height > :tip)";
 
 /// Every note and UTXO the account received, oldest first (unmined last).
 pub fn notes(wallet: &mut Wallet) -> Result<Vec<NoteRow>, TxError> {
     let (tip, scanned) = heights(wallet)?;
-    let spend_live = LIVE.replace("t.", "st.");
-    let sql = format!(
-        "SELECT json_group_array(json_object(
-            'pool', pool, 'txid', txid, 'idx', idx, 'value', value, 'height', height,
-            'memo', memo, 'change', change, 'scope', scope, 'pos', pos, 'spent', spent))
-         FROM (
-            SELECT ro.pool AS pool, hex(t.txid) AS txid, ro.output_index AS idx,
-                   ro.value AS value, t.mined_height AS height,
-                   hex(COALESCE(ro.memo,
-                                (SELECT memo FROM sent_notes WHERE id = ro.sent_note_id))) AS memo,
-                   ro.is_change AS change, a.key_scope AS scope,
-                   CASE ro.pool
-                       WHEN 2 THEN (SELECT commitment_tree_position FROM sapling_received_notes
-                                    WHERE id = ro.id_within_pool_table)
-                       WHEN 3 THEN (SELECT commitment_tree_position FROM orchard_received_notes
-                                    WHERE id = ro.id_within_pool_table)
-                       WHEN 4 THEN (SELECT commitment_tree_position FROM ironwood_received_notes
-                                    WHERE id = ro.id_within_pool_table)
-                   END AS pos,
-                   (SELECT hex(st.txid)
-                    FROM v_received_output_spends s
-                    JOIN transactions st ON st.id_tx = s.transaction_id
-                    WHERE s.pool = ro.pool AND s.received_output_id = ro.id_within_pool_table
-                      AND {spend_live}
-                    ORDER BY st.mined_height IS NULL, st.mined_height
-                    LIMIT 1) AS spent
-            FROM v_received_outputs ro
-            JOIN transactions t ON t.id_tx = ro.transaction_id
-            LEFT JOIN addresses a ON a.id = ro.address_id
-            WHERE {LIVE}
-         )"
-    );
-    let raw: Vec<RawNote> = read_json(wallet, &sql, rusqlite::named_params! {":tip": tip})?;
+    let raw = with_db(wallet, |db| db::history::received_outputs(db, tip))
+        .map_err(|e| internal("reading the wallet", e))?;
     let mut out = Vec::with_capacity(raw.len());
     for r in raw {
         let (Some(pool), Some(txid)) = (pool_of_code(r.pool), txid_from_hex(&r.txid)) else {
@@ -257,17 +190,6 @@ pub fn notes(wallet: &mut Wallet) -> Result<Vec<NoteRow>, TxError> {
     }
     out.sort_by_key(|n| (n.height.is_none(), n.height, n.txid, n.pool, n.output_index));
     Ok(out)
-}
-
-#[derive(Deserialize)]
-struct RawOutput {
-    txid: String,
-    pool: i64,
-    address: Option<String>,
-    value: u64,
-    change: Option<i64>,
-    memo: String,
-    scope: Option<i64>,
 }
 
 /// The account's transactions, newest first: unmined ones (by the time the
@@ -313,20 +235,9 @@ fn add_outputs(wallet: &mut Wallet, rows: &mut [TxRow]) -> Result<(), TxError> {
     if rows.is_empty() {
         return Ok(());
     }
-    // Literals built from our own bytes; nothing user-supplied is spliced.
-    let ids = rows
-        .iter()
-        .map(|r| format!("x'{}'", hex::encode(r.txid)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT json_group_array(json_object(
-            'txid', hex(txid), 'pool', output_pool, 'address', to_address, 'value', value,
-            'change', is_change, 'memo', hex(memo), 'scope', recipient_key_scope))
-         FROM (SELECT * FROM v_tx_outputs WHERE txid IN ({ids})
-               ORDER BY output_pool, output_index)"
-    );
-    let raw: Vec<RawOutput> = read_json(wallet, &sql, [])?;
+    let txids: Vec<[u8; 32]> = rows.iter().map(|r| r.txid).collect();
+    let raw = with_db(wallet, |db| db::history::tx_outputs(db, &txids))
+        .map_err(|e| internal("reading the wallet", e))?;
     for o in raw {
         let (Some(pool), Some(txid)) = (pool_of_code(o.pool), txid_from_hex(&o.txid)) else {
             continue;

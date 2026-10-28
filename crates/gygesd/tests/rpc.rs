@@ -5913,7 +5913,13 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
         "{files:?}"
     );
     for f in &files {
-        let bytes = std::fs::read(f).unwrap();
+        // The daemon is still running: a `wallet.sqlite-journal` listed
+        // above can be gone by now, and what no longer exists holds nothing.
+        let bytes = match std::fs::read(f) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("{}: {e}", f.display()),
+        };
         for s in &secrets {
             assert!(
                 !bytes.windows(s.len()).any(|w| w == s.as_slice()),

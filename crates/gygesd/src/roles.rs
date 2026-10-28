@@ -208,6 +208,7 @@ pub async fn create_pczt(
                 expected: expected.to_json(),
                 txid: None,
                 last_error: None,
+                keystone: None,
             },
         )?;
         Ok((proto, bytes, session_id))
