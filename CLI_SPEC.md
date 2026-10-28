@@ -75,7 +75,13 @@ Flags:
 The CLI locates `gygesd` through `GYGES_DAEMON_BIN`, then next to its own executable, then on `PATH`. Without `--foreground` the daemon detaches itself after validating its configuration, so configuration and permission errors are reported by `daemon start` (exit 1). Running `daemon start` against an already running daemon is a no-op (exit 0). The CLI does not start the daemon implicitly (exit 3 when the socket is absent) unless `GYGES_AUTOSTART=1` is set for development.
 
 #### `gyges daemon install` / `gyges daemon uninstall`
-Writes or removes a `launchd` user agent (macOS) or `systemd --user` unit (Linux) that runs `gygesd --foreground` for `--network` and restarts it after upgrades.
+Writes or removes a per-user service that runs `gygesd --foreground` for `--network`: a `launchd` agent `~/Library/LaunchAgents/org.gyges.gygesd.<network>.plist` (macOS) or a `systemd --user` unit `$XDG_CONFIG_HOME/systemd/user/gygesd-<network>.service` (Linux). One service per network.
+
+- **`install`** writes the unit with the absolute path of `gygesd` (found as for `daemon start`; a bare name is resolved on `PATH` now, since a service manager has none) and `GYGES_HOME` when it is set, loads it (`launchctl bootstrap gui/<uid>`, or `systemctl --user enable --now`), and waits up to 60 s for the daemon to answer. It refuses (exit 1) while a daemon started by hand is answering on the socket, since the unit's daemon would fail on the pid lock.
+- **Restarts.** The service restarts the daemon after a failure (`KeepAlive.SuccessfulExit = false`, `Restart=on-failure`), but not after `daemon stop`, which exits 0 and leaves it stopped until the next login. A `systemd` unit gives up after five failed starts in five minutes. Nothing restarts a running daemon when its binary is replaced: **run `daemon install` again after upgrading**, which stops the service, rewrites the unit and starts it.
+- **`uninstall`** stops the daemon, removes the unit and exits 0 when there is nothing to remove.
+- **Linux.** A user unit stops when the user's last session ends unless lingering is on (`loginctl enable-linger $USER`); `install` says so.
+- **`--json`** prints `{manager, unit_path, network, running}`.
 
 #### `gyges daemon stop`
 Finishes the current scan batch, checkpoints SQLite WAL, aborts in-progress proving, leaves pending ZIP 320 and signing-session rows to resume on next start, and zeroizes all unlocked keys before exit.
