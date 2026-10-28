@@ -3,10 +3,10 @@
 //! The CLI reads flags and environment variables only, never `config.toml`
 //! (OVERVIEW.md Q-C1). Every command that talks to the daemon first connects
 //! to the Unix socket and runs the `GetInfo` handshake (API version,
-//! network). Subcommands not implemented yet (`daemon install` /
-//! `uninstall`, `key import-ufvk` / `backup` / `import-backup` / `delete`,
-//! `tx status --pir`, `pczt sign --qr-out`, `pczt qr-export FILE`, and
-//! `pczt qr-*` without `--session`) exit 1 with a pointer to ROADMAP.md.
+//! network). Subcommands not implemented yet (`key import-ufvk` /
+//! `backup` / `import-backup` / `delete`, `tx status --pir`,
+//! `pczt sign --qr-out`, `pczt qr-export FILE`, and `pczt qr-*` without
+//! `--session`) exit 1 with a pointer to ROADMAP.md.
 
 #![forbid(unsafe_code)]
 // Printing to stdout is this binary's purpose.
@@ -25,6 +25,7 @@ mod notes;
 mod output;
 mod pczt;
 mod prompt;
+mod service;
 mod sync;
 mod tx;
 

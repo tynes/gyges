@@ -81,8 +81,9 @@ Compatibility policy (Q-O3):
   `minor` is newer than its own ("some features may be unavailable").
 - The daemon accepts clients of its own `major` and of the previous `major`
   for one release cycle, after which the old major is dropped.
-- `gyges` and `gygesd` ship as one release artifact; the `daemon install`
-  service unit restarts the daemon after an upgrade, so mismatches are rare.
+- `gyges` and `gygesd` ship as one release artifact; running
+  `daemon install` again after an upgrade restarts the service's daemon on
+  the new binary, so mismatches are rare.
 - JSON output (§5) carries `schema_version` = `"<major>.<minor>"`.
 
 The first released API version is `1.0`. Until then the number is `0.x` and
@@ -560,7 +561,7 @@ Every command maps to exactly one RPC, or to none when it is purely local.
 | `daemon stop` | `Shutdown` | `graceful = true` by default; `--force` sets false |
 | `daemon status` | `GetInfo` | Prints node bounds, Tor state, fallback trust, per-key summary |
 | `daemon logs` | `StreamLogs` | `--follow`, `--lines`, `--audit` |
-| `daemon install` / `uninstall` | — | Writes a launchd / systemd user unit (Q-C5) |
+| `daemon install` / `uninstall` | — | Writes and loads, or stops and removes, a launchd / systemd user unit (Q-C5); `install` then waits for `GetInfo` |
 | `key list` | `ListKeys` | |
 | `key init` | `InitKey` | CLI shows the mnemonic once and requires three words typed back |
 | `key restore` | `RestoreKey` | CLI prompts for backfill consent using `GetInfo.fallback` and `node.retained_from` |

@@ -586,6 +586,8 @@ Grouped by area. Each question is a checkbox; it is checked when a concrete prop
 
   **Proposed solution.** Not by default: implicit background processes are hard to discover and stop, and would start with whatever network and config the first command happened to use. The CLI exits 3 with "gygesd is not running; start it with `gyges daemon start` or install a service with `gyges daemon install`". Add `gyges daemon install` / `uninstall`, which write a `launchd` user agent on macOS or a `systemd --user` unit on Linux. `GYGES_AUTOSTART=1` enables auto-start for development.
 
+  **Landed (ROADMAP.md M6, `daemon install` item)** as `gyges-cli`'s `service` module, with one reinterpretation: the spec said the unit "restarts it after upgrades", but no service manager restarts a process when its binary is replaced. The unit restarts the daemon only after a failure, so `daemon stop` stays stopped, and running `daemon install` again is the upgrade step (CLI_SPEC.md §2.1).
+
 - [x] **Q-C6.** Which `--key` is used by `pczt` subcommands reading from stdin, and is the key id embedded in the PCZT?
 
   **Proposed solution.** Embed it. ZIP 374 PCZTs carry a global `proprietary` map; `pczt create` writes `gyges.key_id`, `gyges.network` and `gyges.session_id` there, and `prove`, `sign`, `combine` and `broadcast` read the key id from the stream, using `--key` only as an assertion that fails with exit 6 on mismatch. `combine` refuses inputs whose key ids differ. The Redactor strips the proprietary map before the PCZT goes to a Keystone so no local identifiers leave the host.

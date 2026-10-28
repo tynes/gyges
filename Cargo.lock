@@ -2498,6 +2498,7 @@ dependencies = [
  "gyges-qr",
  "hex",
  "humantime",
+ "nix",
  "rand 0.10.3",
  "rpassword",
  "serde",

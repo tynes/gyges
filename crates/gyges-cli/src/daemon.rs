@@ -41,9 +41,10 @@ pub enum DaemonCmd {
         #[arg(long)]
         audit: bool,
     },
-    /// Write a launchd / systemd --user unit that runs gygesd --foreground.
+    /// Write and start a launchd / systemd --user unit that runs gygesd
+    /// --foreground; run it again after upgrading to restart the daemon.
     Install,
-    /// Remove the unit written by `daemon install`.
+    /// Stop gygesd and remove the unit written by `daemon install`.
     Uninstall,
 }
 
@@ -83,8 +84,8 @@ pub async fn run(ctx: &Ctx, cmd: DaemonCmd) -> Result<(), CliError> {
             lines,
             audit,
         } => logs(ctx, follow, lines, audit).await,
-        DaemonCmd::Install => Err(CliError::NotImplemented("daemon install")),
-        DaemonCmd::Uninstall => Err(CliError::NotImplemented("daemon uninstall")),
+        DaemonCmd::Install => crate::service::install(ctx).await,
+        DaemonCmd::Uninstall => crate::service::uninstall(ctx).await,
     }
 }
 

@@ -26,6 +26,7 @@ zeroize = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
+nix = { workspace = true }  # uid for the launchd domain
 
 [features]
 # `pczt qr-scan` and the camera step of `tx send` (ROADMAP.md M5, fourth
