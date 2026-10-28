@@ -134,6 +134,7 @@ pbjson-build      = "0.9"
 
 # --- Tests ---
 tempfile       = "3"
+criterion      = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }  # gyges-core/benches (docs/BENCHMARKS.md)
 proptest   = { version = "1", default-features = false, features = ["std"] }  # property tests of the PCZT role pipeline
 hyper          = { version = "1", features = ["server", "http1"] }   # fake zakurad JSON-RPC server (gyges-chain `test-util`)
 http-body-util = "0.1"

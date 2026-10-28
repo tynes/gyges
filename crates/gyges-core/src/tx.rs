@@ -599,9 +599,10 @@ pub fn build_pczt<N: fmt::Display>(
     .map_err(|e| wallet_api_error(e, "no anchor available", "building the PCZT"))
 }
 
-/// The proving and verifying keys, built on first use (seconds for Orchard;
-/// the bundled Sapling parameters are tens of megabytes) and kept for the
-/// daemon's lifetime.
+/// The proving and verifying keys, built on first use (about 0.1 s for
+/// Orchard in a release build, `docs/BENCHMARKS.md`, with its commitment
+/// tables prepared; the bundled Sapling
+/// parameters are tens of megabytes) and kept for the daemon's lifetime.
 #[derive(Default)]
 pub struct Provers {
     orchard: OnceLock<(ProvingKey, VerifyingKey)>,
@@ -628,8 +629,18 @@ impl Provers {
             let version = OrchardCircuitVersion::PostNu6_3;
             let t0 = std::time::Instant::now();
             let pk = ProvingKey::build(version).expect("the current circuit supports proving");
+            // Commitment tables (about 30 MiB, kept with the key) that make
+            // each proof some 20% faster on pools of at most eight threads,
+            // ten on AArch64 macOS; wider pools ignore them
+            // (docs/BENCHMARKS.md). Not called from a Rayon worker: `prove`
+            // runs on a blocking thread.
+            let prepared = pk.prepare_proving();
             let vk = VerifyingKey::build(version);
-            tracing::info!(ms = t0.elapsed().as_millis(), "orchard proving key built");
+            tracing::info!(
+                ms = t0.elapsed().as_millis(),
+                prepared,
+                "orchard proving key built"
+            );
             (pk, vk)
         })
     }

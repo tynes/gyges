@@ -1,6 +1,6 @@
 # Gyges Testing Strategy (`TESTING.md`)
 
-How Gyges is tested, from unit tests to a nightly run through a real Tor network. Derived from the Q-O1, Q-O2 and Q-O5 proposals in `OVERVIEW.md`. Most of what it describes exists (§2 says what runs today); what does not is marked planned where it matters: the Tor tier (M2, deferred: see §1), the Keystone fixtures (M5), the migration fixtures and the benchmarks (M6).
+How Gyges is tested, from unit tests to a nightly run through a real Tor network. Derived from the Q-O1, Q-O2 and Q-O5 proposals in `OVERVIEW.md`. Most of what it describes exists (§2 says what runs today); what does not is marked planned where it matters: the Tor tier (M2, deferred: see §1), the Keystone fixtures (M5) and the migration fixtures (M6).
 
 ---
 
@@ -12,7 +12,7 @@ How Gyges is tested, from unit tests to a nightly run through a real Tor network
 | Crate integration | `crates/*/tests/` | every PR | in-process SQLite, recorded fixtures | yes |
 | Regtest end-to-end | `tests/regtest/` | every PR | pinned `zakurad` and `zainod` (`versions.toml`); no Tor | yes |
 | Nightly Tor | same scenarios, `use_tor = true` against a local Tor test network | nightly | `chutney`-style test network | no (opens an issue on failure) |
-| Benchmarks | `crates/gyges-core/benches/` (planned, Criterion) | manual and on release tags | release build with `perf` | no |
+| Benchmarks | `crates/gyges-core/benches/prove.rs` (Criterion; `docs/BENCHMARKS.md`) | manual | `cargo bench`, optionally `RAYON_NUM_THREADS` or `--features perf-asm-x86_64` | no |
 
 ---
 

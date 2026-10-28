@@ -10,12 +10,14 @@ publish = false
 
 [features]
 default = []
-# Multi-threaded proving and trial decryption (OVERVIEW.md Q-D6). Enabled by
-# the release workflow; the assembly back-ends are selected per target there
-# because Cargo features cannot be conditioned on `target_arch`.
-perf = ["pasta_curves/multicore", "orchard/multicore", "zcash_proofs/multicore"]
-perf-asm-x86_64 = ["perf", "pasta_curves/x86_64-asm", "orchard/x86_64-asm"]
-perf-asm-aarch64 = ["perf", "pasta_curves/aarch64-asm", "orchard/aarch64-asm"]
+# The x86-64 assembly field arithmetic (MULX, ADCX/ADOX) for proving and
+# trial decryption (OVERVIEW.md Q-D6, docs/BENCHMARKS.md). Off by default:
+# upstream has no runtime CPU detection, so the binary needs BMI2 and ADX
+# (Broadwell / Zen or newer) and faults with an illegal instruction without
+# them. Multi-threading and the AArch64 assembly need no feature: upstream's
+# defaults turn on `multicore`, and `zakura-halo2-proofs` turns on
+# `aarch64-asm` for every aarch64 Unix target.
+perf-asm-x86_64 = ["pasta_curves/x86_64-asm", "orchard/x86_64-asm"]
 # `keystone::emulator`: a Keystone in software for the tests (gygesd's and
 # the regtest crate's).
 test-util = []
@@ -62,6 +64,12 @@ prost = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = { workspace = true }
+
+# Proving and trial-decryption timings (docs/BENCHMARKS.md).
+[[bench]]
+name = "prove"
+harness = false
 
 [lints]
 workspace = true
