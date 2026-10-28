@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gyges_chain::{ChainBackend, ChainError, TxStatus, display_hash, parse_display_hash};
+use gyges_core::db::tex::{self as core_tex, TexRow};
 use gyges_core::sync as core_sync;
-use gyges_core::tex::{self as core_tex, TexRow};
 use gyges_core::tx::{self as core_tx, TxError};
 use gyges_core::{KeyEntry, TexState};
 use gyges_proto::v1::{

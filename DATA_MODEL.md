@@ -199,7 +199,7 @@ The CHECK lists in `schema.sql` repeat the enums' spellings, and `db` tests inse
 
 ### 5.1 `ext_gyges_tex_queue` (Q-T1)
 
-`gyges_core::db::tex` (re-exported as `gyges_core::tex`). One row per ZIP 320 transfer, holding both signed steps.
+`gyges_core::db::tex`. One row per ZIP 320 transfer, holding both signed steps.
 
 ```sql
 CREATE TABLE ext_gyges_tex_queue (
@@ -235,7 +235,7 @@ The row is inserted as `built` before the first broadcast, so a crash between th
 
 ### 5.2 `ext_gyges_signing_sessions` (Q-K4, Q-C4)
 
-`gyges_core::db::sessions` (re-exported as `gyges_core::sessions`). One row per signing session that outlives a connection: a PCZT file (`file`) or a Keystone session (`keystone-batch`, `keystone-pczt`). Passphrase sessions of `tx send` are memory-only (API.md §6.1).
+`gyges_core::db::sessions`. One row per signing session that outlives a connection: a PCZT file (`file`) or a Keystone session (`keystone-batch`, `keystone-pczt`). Passphrase sessions of `tx send` are memory-only (API.md §6.1).
 
 ```sql
 CREATE TABLE ext_gyges_signing_sessions (

@@ -36,8 +36,6 @@ pub mod sync;
 pub mod tx;
 pub mod vault;
 
-pub use db::{sessions, tex};
-
 pub use birthday::{BirthdayError, ResolvedBirthday};
 pub use config::{Config, ConfigError};
 pub use log::Sensitive;

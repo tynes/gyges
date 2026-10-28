@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use age::secrecy::SecretString;
 use gyges_chain::{ChainBackend, ChainError};
-use gyges_core::sessions::{self, SessionState};
+use gyges_core::db::sessions::{self, SessionState};
 use gyges_core::tx::{self as core_tx, AmountSpec, Expected, ProposalSummary, TxError};
 use gyges_core::vault::manager::{Auth, Token};
 use gyges_core::{KeyEntry, SigningMode};
@@ -1250,7 +1250,7 @@ async fn tex_pipeline(
     tx: &mpsc::Sender<Result<SendEvent, Status>>,
 ) -> Result<(), Status> {
     use gyges_core::TexState;
-    use gyges_core::tex::{self as core_tex, TexRow};
+    use gyges_core::db::tex::{self as core_tex, TexRow};
 
     let key = &prepared.key;
     let key_id = key.key_id().to_string();

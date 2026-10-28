@@ -1,7 +1,7 @@
 //! Keystone signing sessions (API.md §6, ROADMAP.md M5 third item).
 //!
 //! A `tx send` or `tx shield` from a `keystone-qr` key proves the PCZT,
-//! persists a session (`gyges_core::sessions::insert`) holding the
+//! persists a session (`gyges_core::db::sessions::insert`) holding the
 //! proven copy and what the device was shown, and emits `SignatureRequired`
 //! with that payload. `CompleteKeystoneSign` does the rest from any
 //! connection, after a restart too: apply the device's answer
@@ -19,10 +19,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use gyges_core::db::sessions::{self, KeystoneRow, Protocol, SessionRow, SessionState};
 use gyges_core::keystone::{self as core_keystone, DeviceRequest};
 use gyges_core::profile::unix_now;
 use gyges_core::registry::Wallet;
-use gyges_core::sessions::{self, KeystoneRow, Protocol, SessionRow, SessionState};
 use gyges_core::tx::{self as core_tx, Expected, TxError};
 use gyges_core::{KeyEntry, SigningMode, pczt_io};
 use gyges_proto::v1::{

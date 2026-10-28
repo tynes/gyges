@@ -1454,8 +1454,8 @@ async fn the_device_never_sees_gyges_tags() {
         "the fixture must carry the tags"
     );
     for protocol in [
-        gyges_core::sessions::Protocol::KeystoneBatch,
-        gyges_core::sessions::Protocol::KeystonePczt,
+        gyges_core::db::sessions::Protocol::KeystoneBatch,
+        gyges_core::db::sessions::Protocol::KeystonePczt,
     ] {
         let view = gyges_core::keystone::device_view(&tagged, protocol);
         let keys: Vec<&String> = view.global().proprietary().keys().collect();

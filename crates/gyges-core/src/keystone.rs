@@ -31,8 +31,8 @@ use zcash_client_backend::data_api::wallet::{
     SignerView, redact_pczt_for_batch_signer, redact_pczt_for_signer,
 };
 
+use crate::db::sessions::Protocol;
 use crate::pczt_io::{TAG_KEY_ID, TAG_NETWORK, TAG_SESSION_ID};
-use crate::sessions::Protocol;
 
 /// Why a device's answer was refused. The session stays open: the user can
 /// scan the device again.

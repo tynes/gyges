@@ -20,8 +20,8 @@
 
 use std::sync::Arc;
 
+use gyges_core::db::sessions::{self, Protocol, SessionRow, SessionState};
 use gyges_core::pczt_io::{self, Inspection, Role, Tags};
-use gyges_core::sessions::{self, Protocol, SessionRow, SessionState};
 use gyges_core::tx::{self as core_tx, Expected, TxError};
 use gyges_proto::v1::{
     self, BroadcastPcztRequest, BroadcastPcztResponse, CombinePcztRequest, CombinePcztResponse,
