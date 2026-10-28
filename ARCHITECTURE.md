@@ -114,7 +114,7 @@ A PCZT produced online after the Constructor and Updater roles carries, per spen
 - **Logs.** `logs/gygesd.<date>.log` (daily rotation, seven files, filtered by `daemon.log_level` or `RUST_LOG`) and `logs/audit.log` (one JSON object per line for every `gyges::audit` event, whatever the configured level: unlock, lock, export, session created/completed/aborted, sign, broadcast and rewind, with key id and time only; never rotated). `gyges daemon logs [--audit]` reads the daemon's in-memory tail of either log through the `StreamLogs` RPC (`gygesd::logs`). Sensitive values are wrapped in `gyges_core::Sensitive<T>` whose `Debug`/`Display` print `[redacted]`.
 
 ### 3.7 Performance features
-Multi-threaded proving and trial decryption are behind the `gyges-core` features `perf`, `perf-asm-x86_64` and `perf-asm-aarch64` (`multicore` plus the `*-asm` back-ends of `zakura-pasta-curves` and `zakura-orchard`). Release binaries ship with `portable` until runtime CPU-feature detection in the assembly paths is confirmed. Speed-up claims belong in `docs/BENCHMARKS.md` with a per-CPU table, not here.
+Every build proves and trial-decrypts on all cores: `multicore` is a default feature of the upstream crates, and `RAYON_NUM_THREADS` caps it. On aarch64 (Apple Silicon, aarch64 Linux) every build also uses `zakura-pasta-curves`' assembly field arithmetic, which `zakura-halo2-proofs` turns on for those targets. On x86-64 the assembly is the opt-in feature `perf-asm-x86_64` (on `gygesd` and `gyges-core`): it needs BMI2 and ADX and has no runtime fallback (`THREAT_MODEL.md` §6 item 2), so default and release builds use the portable code. Timings belong in `docs/BENCHMARKS.md`, not here.
 
 ---
 

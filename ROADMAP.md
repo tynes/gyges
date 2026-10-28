@@ -313,10 +313,29 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
   - `scenarios/node.rs::sapling_spend_against_the_real_node`: on an archive `zakurad` mined past height 32,257, a second key paid at a Sapling-only address spends that note with `tx send`, and the node takes and mines it. The scenario funds and shields at the start of the chain, because regtest's block subsidy halves every few hundred blocks and a coinbase past ZIP 212 pays nothing. It runs in about 2 minutes, most of it mining 32,000 blocks while the daemon scans them.
 
   Not done: Sapling spends from a `signer-only` profile, which would mean writing a proof generation key into a file or proving on the air-gapped box from a file it did not build. The same goes for any PCZT file path that spends Sapling.
-- [ ] `perf` features with benchmarks in `docs/BENCHMARKS.md`; decide the release default once runtime CPU detection is confirmed.
+- [x] `perf` features with benchmarks in `docs/BENCHMARKS.md`; decide the release default once runtime CPU detection is confirmed. Landed reshaped, because two of the three features did nothing:
+  - **What upstream already does.** A default build is already multi-threaded: `multicore` is a default feature of `zakura-orchard`, `zakura-halo2-proofs`, `zakura-proofs` and `zakura-client-sqlite`. On aarch64 Unix it also already uses the assembly: `zakura-halo2-proofs` turns on `zakura-pasta-curves/aarch64-asm` there. `cargo metadata` for x86-64 and aarch64 Linux showed `perf` adding nothing and `perf-asm-aarch64` adding only forwarding flags. Both are removed.
+  - **The release default.** `zakura-pasta-curves`' x86-64 backend has no runtime CPU detection. Its `build.rs` selects the backend from the feature or from the target's compile-time `adx` and `bmi2`, and a CPU without them faults (`THREAT_MODEL.md` §6 item 2, now verified). So `perf-asm-x86_64` stays opt-in, now also on `gygesd`, and default and release builds use the portable code. The release-pipeline item below records that `target-cpu` must stay at the baseline.
+  - **`gyges-core/benches/prove.rs`** (Criterion) times four things through Gyges' own entry points:
+    - `Provers::orchard()` building the key;
+    - a two-action Ironwood proof, first after the key build and steady;
+    - `sync::scan_range` over ten cached blocks of 1,000 Ironwood actions, of which 20 are the wallet's. A check confirms they are found.
+  - **Results** (`docs/BENCHMARKS.md`) on an Apple M4 Pro, 14 threads against 1:
+
+    | | 14 threads | 1 thread |
+    |---|---|---|
+    | Key build | 89 ms | 305 ms |
+    | Proof | 61 ms | 394 ms |
+    | Scan | 41.5 ms | 67.8 ms |
+
+    The first proof costs the same as later ones.
+
+  `ARCHITECTURE.md` §3.7, `OVERVIEW.md` Q-D6 and `TESTING.md` §1 describe this.
+
+  Not done: x86-64 rows (portable, and `perf-asm-x86_64`). No x86-64 machine was available, so whether a separate BMI2/ADX release artifact pays is still open. Sapling proving is not benchmarked.
 - [ ] `daemon install/uninstall` units; hardened deployment (dedicated user, 0660 socket, `gyges` group, `daemon install --hardened`, `THREAT_MODEL.md` §6 item 4) documented and tested.
 - [ ] Optional SQLCipher for `wallet.sqlite` (database key in the OS keychain only, `THREAT_MODEL.md` §6 item 3); `key delete --wipe`; `key backup` / `import-backup`.
-- [ ] Release pipeline: `rust-toolchain.toml`-pinned matrix builds, `SHA256SUMS`, `minisign`, SLSA attestation. Release builds should enable `gyges-cli/camera` (M5, fourth item; Linux runners need libclang, since `v4l2-sys-mit` runs bindgen for the V4L2 bindings).
+- [ ] Release pipeline: `rust-toolchain.toml`-pinned matrix builds, `SHA256SUMS`, `minisign`, SLSA attestation. Release builds should enable `gyges-cli/camera` (M5, fourth item; Linux runners need libclang, since `v4l2-sys-mit` runs bindgen for the V4L2 bindings). They must not raise `target-cpu` above the target's baseline: on x86-64 that selects `zakura-pasta-curves`' assembly, which has no runtime fallback (`THREAT_MODEL.md` §6 item 2). An x86-64 build with `gygesd/perf-asm-x86_64` would be a separate artifact for BMI2 and ADX machines, worth shipping only if `docs/BENCHMARKS.md` shows it pays.
 - [ ] Nightly `audit` and `msrv` jobs (`TESTING.md` §7).
 - [ ] `tx status --pir` leaves experimental only with a documented server set and privacy guarantee.
 

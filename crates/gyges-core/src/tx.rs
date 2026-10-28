@@ -599,9 +599,9 @@ pub fn build_pczt<N: fmt::Display>(
     .map_err(|e| wallet_api_error(e, "no anchor available", "building the PCZT"))
 }
 
-/// The proving and verifying keys, built on first use (seconds for Orchard;
-/// the bundled Sapling parameters are tens of megabytes) and kept for the
-/// daemon's lifetime.
+/// The proving and verifying keys, built on first use (about 0.1 s for
+/// Orchard in a release build, `docs/BENCHMARKS.md`; the bundled Sapling
+/// parameters are tens of megabytes) and kept for the daemon's lifetime.
 #[derive(Default)]
 pub struct Provers {
     orchard: OnceLock<(ProvingKey, VerifyingKey)>,
