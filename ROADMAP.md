@@ -336,7 +336,7 @@ Design note: `ARCHITECTURE.md` §3.4; recorded UR fixtures in `TESTING.md`.
 
   Not done: x86-64 rows (portable, and `perf-asm-x86_64`). No x86-64 machine was available, so whether a separate BMI2/ADX release artifact pays is still open. Sapling proving is not benchmarked.
 - [ ] `daemon install/uninstall` units; hardened deployment (dedicated user, 0660 socket, `gyges` group, `daemon install --hardened`, `THREAT_MODEL.md` §6 item 4) documented and tested.
-  1. [x] Per-user units. Landed as `gyges-cli/src/service.rs`:
+  1. [x] Per-user units. Landed as [PR #52](https://github.com/tynes/gyges/pull/52), `gyges-cli/src/service.rs`:
      - `daemon install` writes a `launchd` agent (`org.gyges.gygesd.<network>`) or a `systemd --user` unit (`gygesd-<network>.service`) running `gygesd --network <network> --foreground`, with the absolute `gygesd` path (resolved on `PATH` if need be, symlinks kept) and `GYGES_HOME` when set. It loads the unit and waits for `GetInfo`. A daemon started by hand that is still answering is refused, because the unit's daemon would fail on the pid lock and restart forever.
      - The unit restarts the daemon only after a failure (`KeepAlive.SuccessfulExit = false`, `Restart=on-failure`; systemd gives up after five failures in five minutes). **Reinterpreted:** the spec's "restarts it after upgrades" is not something a service manager does, so re-running `daemon install` is the upgrade step: it stops the service, rewrites the unit and starts it.
      - No launchd `StandardOutPath`: a log file launchd creates inside `GYGES_HOME` would be 0644, and the next start would refuse it.
