@@ -144,16 +144,10 @@ impl KeyProfile {
             path: path.to_path_buf(),
             source,
         };
-        let tmp = path.with_extension("json.tmp");
-        let text = serde_json::to_string_pretty(self).map_err(|e| write(io::Error::other(e)))?;
-        {
-            use std::io::Write as _;
-            let mut f = perms::create_private_file(&tmp).map_err(write)?;
-            f.write_all(text.as_bytes()).map_err(write)?;
-            f.write_all(b"\n").map_err(write)?;
-            f.sync_all().map_err(write)?;
-        }
-        std::fs::rename(&tmp, path).map_err(write)
+        let mut text =
+            serde_json::to_string_pretty(self).map_err(|e| write(io::Error::other(e)))?;
+        text.push('\n');
+        perms::write_private_atomic(path, text.as_bytes()).map_err(write)
     }
 
     /// Bring a profile written by an older build up to date, in memory;

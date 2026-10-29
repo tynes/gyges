@@ -20,7 +20,9 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use gyges_chain::{BlockDb, CacheError, ChainBackend, ChainError, NodeBounds, Source, TxStatus};
+use gyges_chain::{
+    BlockDb, CacheError, ChainBackend, ChainError, FillError, NodeBounds, Source, TxStatus,
+};
 use gyges_core::KeyEntry;
 use gyges_core::sync::{
     self as core_sync, FINALITY_DEPTH, KeyProgress, ScanOutcome, StallReason, SyncError, SyncState,
@@ -753,7 +755,7 @@ impl Scheduler {
             ),
         );
 
-        self.ensure_cached(&range, bounds).await?;
+        self.ensure_cached(&range).await?;
         let prior = self.chain.chain_state(start - 1).await?;
         let t0 = Instant::now();
         let outcome = self.scan(key, &range, prior).await?;
@@ -798,46 +800,38 @@ impl Scheduler {
         }
     }
 
-    /// Make sure every block of `range` is in the cache, fetching in
-    /// `cache.fetch_batch` chunks and checking each chunk links to what the
-    /// cache already holds.
-    async fn ensure_cached(&self, range: &ScanRange, bounds: &NodeBounds) -> Result<(), SyncError> {
+    /// Make sure every block of `range` is in the cache, fetching from the
+    /// node through [`gyges_chain::fill_cache`]. A chunk that does not link
+    /// to the cached block below it means that block is off the node's
+    /// chain: drop it and let the next tick's reconciliation find the fork
+    /// point.
+    async fn ensure_cached(&self, range: &ScanRange) -> Result<(), SyncError> {
         let Range { start, end } = range.block_range().clone();
         let have = self.cached_prefix(range).await?;
-        let fetch_batch = self.state.config.cache.fetch_batch.max(1);
-        let mut next = start + have;
-        while next < end {
-            let chunk_end = (next + fetch_batch).min(end);
-            let blocks = self.chain.compact_blocks(next..chunk_end).await?;
-            let Some(first) = blocks.first() else {
-                return Err(SyncError::Chain(ChainError::BlockUnavailable {
-                    height: next,
-                }));
-            };
-            if next > BlockHeight::from_u32(0)
-                && let Some(prev) = self.cache.hash_at(next - 1)?
-                && first.prev_hash != prev
-            {
-                // The cache's block at `next - 1` is off the node's chain.
-                // Drop it and let the next tick's reconciliation find the
-                // fork point.
-                self.cache.truncate((next - 1).saturating_sub(1)).await?;
-                return Err(SyncError::Scan(format!(
-                    "cached block {} is not on the node's chain; re-syncing",
-                    u32::from(next) - 1
-                )));
-            }
-            let fetched = blocks.len() as u32;
-            self.cache.insert_from(Source::Node, &blocks)?;
-            tracing::debug!(
-                from = u32::from(next),
-                to = u32::from(next) + fetched - 1,
-                tip = u32::from(bounds.tip_height),
-                "blocks cached"
-            );
-            next = next + fetched;
+        if start + have >= end {
+            return Ok(());
         }
-        Ok(())
+        let filled = gyges_chain::fill_cache(
+            self.chain.as_ref(),
+            &self.cache,
+            start + have..end,
+            self.state.config.cache.fetch_batch,
+        )
+        .await;
+        match filled {
+            Ok(_) => Ok(()),
+            Err(FillError::Chain(e)) => Err(e.into()),
+            Err(FillError::Cache(e)) => Err(e.into()),
+            Err(FillError::Unlinked { height, .. }) => {
+                let off_chain = height - 1;
+                self.cache
+                    .truncate(BlockHeight::from_u32(off_chain).saturating_sub(1))
+                    .await?;
+                Err(SyncError::Scan(format!(
+                    "cached block {off_chain} is not on the node's chain; re-syncing"
+                )))
+            }
+        }
     }
 
     /// SYNC.md §4.3: find the fork point by walking back from `at_height - 1`

@@ -150,6 +150,30 @@ pub fn create_private_file(path: &Path) -> io::Result<fs::File> {
         .open(path)
 }
 
+/// Replace `path` with `bytes` so that a crash leaves the old contents or
+/// the new, never a torn file: write `<path>.tmp` with mode `0600`, `fsync`
+/// it, rename it over `path`, then `fsync` the directory (best effort) so
+/// the rename itself survives a power loss.
+pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut f = create_private_file(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, path)?;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if let Ok(dir) = fs::File::open(dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 /// Set a path to exactly `mode`.
 pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
@@ -163,6 +187,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         set_mode(dir.path(), 0o700).unwrap();
         dir
+    }
+
+    #[test]
+    fn atomic_writes_replace_the_file_and_leave_it_private() {
+        let dir = tmp();
+        let f = dir.path().join("report.json");
+        write_private_atomic(&f, b"one").unwrap();
+        write_private_atomic(&f, b"two").unwrap();
+        assert_eq!(fs::read(&f).unwrap(), b"two");
+        assert_eq!(fs::metadata(&f).unwrap().mode() & 0o777, 0o600);
+        assert!(!dir.path().join("report.json.tmp").exists());
+        check_tree(dir.path()).unwrap();
     }
 
     #[test]
