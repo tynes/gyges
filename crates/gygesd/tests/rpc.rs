@@ -841,40 +841,16 @@ fn keystone_export_with(
     network: Network,
 ) -> (String, [u8; 32]) {
     use secrecy::ExposeSecret as _;
-    use zcash_address::unified::{Container as _, Encoding as _, Fvk, Ufvk};
     let seed = known_seed();
-    let params = network.consensus_params();
-    let accounts = accounts
-        .iter()
-        .map(|&index| {
-            let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
-                &params,
-                seed.expose_secret(),
-                zip32::AccountId::try_from(index).unwrap(),
-            )
-            .unwrap();
-            let full = usk.to_unified_full_viewing_key().encode(&params);
-            let (net, ufvk) = Ufvk::decode(&full).unwrap();
-            let items: Vec<Fvk> = ufvk
-                .items()
-                .into_iter()
-                .filter(|i| !matches!(i, Fvk::Sapling(_)))
-                .collect();
-            gyges_qr::Account {
-                ufvk: Ufvk::try_from_items(items).unwrap().encode(&net),
-                index,
-                name: Some(format!("Keystone {index}")),
-            }
-        })
-        .collect();
+    let payload = gyges_core::keystone::emulator::pairing_export(
+        network,
+        seed.expose_secret(),
+        accounts,
+        device_version,
+    );
     let fp = zip32::fingerprint::SeedFingerprint::from_seed(seed.expose_secret())
         .unwrap()
         .to_bytes();
-    let payload = gyges_qr::Payload::Accounts(gyges_qr::Accounts {
-        seed_fingerprint: fp.to_vec(),
-        accounts,
-        device_version: device_version.map(Into::into),
-    });
     (frames_of(&payload, gyges_qr::DEFAULT_FRAGMENT_LEN), fp)
 }
 
@@ -882,15 +858,7 @@ fn keystone_export_with(
 /// one per line.
 fn frames_of(payload: &gyges_qr::Payload, fragment_len: usize) -> String {
     let mut frames = payload.frames(fragment_len).unwrap();
-    let n = if frames.is_single() {
-        1
-    } else {
-        2 * frames.fragment_count()
-    };
-    (0..n)
-        .map(|_| frames.next_frame().unwrap())
-        .collect::<Vec<_>>()
-        .join("\n")
+    frames.take_loops(2).unwrap().join("\n")
 }
 
 fn keystone_req(key_id: &str, payload: &str, birthday_height: u32) -> ImportKeystoneRequest {

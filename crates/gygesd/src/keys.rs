@@ -24,7 +24,6 @@ use gyges_proto::v1::{
     InitKeyResponse, KeySummary, LockKeyRequest, LockKeyResponse, RestoreKeyRequest,
     RestoreKeyResponse, UnlockKeyRequest, UnlockKeyResponse, UnlockScope,
 };
-use gyges_qr::{Assembler, Payload};
 use tonic::Status;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zeroize::Zeroizing;
@@ -479,130 +478,43 @@ fn check_accounts_export(
     account_index: u32,
     allow_unknown_firmware: bool,
 ) -> Result<AccountsExport, GygesError> {
-    let bad = |detail: String| GygesError::new(ErrorReason::InvalidArgument, detail);
-    let device = |detail: String| GygesError::new(ErrorReason::HardwareSigner, detail);
-    let not_accounts = |what: &str| {
-        bad(format!(
-            "{what} carries no seed fingerprint, so the Keystone could not recognise its key in a \
-             PCZT; export the accounts from the device (Connect Software Wallet) and pass the \
-             ur:zcash-accounts QR"
-        ))
+    use gyges_qr::firmware::{self, FirmwareCheck, FirmwareRefusal};
+    let refused = |device_fault: bool, detail: String| {
+        let reason = if device_fault {
+            ErrorReason::HardwareSigner
+        } else {
+            ErrorReason::InvalidArgument
+        };
+        GygesError::new(reason, detail)
     };
-
-    let frames: Vec<&str> = payload.split_whitespace().collect();
-    let Some(first) = frames.first() else {
-        return Err(bad("no ur:zcash-accounts frame given".into()));
-    };
-    if first.to_ascii_lowercase().starts_with("uview") {
-        return Err(not_accounts("a bare UFVK"));
-    }
-    let mut asm = Assembler::new();
-    for f in &frames {
-        asm.receive(f)
-            .map_err(|e| bad(format!("not a Keystone accounts export: {e}")))?;
-    }
-    match asm.ur_type() {
-        Some(gyges_qr::ur_types::ZCASH_ACCOUNTS) => {}
-        Some(gyges_qr::ur_types::ZCASH_UNIFIED_FULL_VIEWING_KEY) => {
-            return Err(not_accounts("ur:zcash-unified-full-viewing-key"));
-        }
-        other => {
-            return Err(bad(format!(
-                "expected ur:zcash-accounts, got ur:{}",
-                other.unwrap_or("?")
-            )));
-        }
-    }
-    if !asm.is_complete() {
-        let (resolved, total) = asm.progress();
-        return Err(bad(format!(
-            "the accounts export is incomplete ({resolved} of {total} fragments); pass every frame"
-        )));
-    }
-    let accounts = match Payload::from_assembler(&asm) {
-        Ok(Some(Payload::Accounts(a))) => a,
-        Ok(_) => return Err(bad("the accounts export is incomplete".into())),
-        Err(e) => return Err(device(format!("the accounts export does not decode: {e}"))),
-    };
-
-    let fp: [u8; 32] = accounts
-        .seed_fingerprint
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            device(format!(
-                "the export's seed fingerprint is {} bytes, not the 32 of ZIP 32",
-                accounts.seed_fingerprint.len()
-            ))
-        })?;
-    let seed_fingerprint = SeedFingerprint::from_bytes(fp);
-
-    let mut indices: Vec<u32> = accounts.accounts.iter().map(|a| a.index).collect();
-    indices.sort_unstable();
-    if indices.windows(2).any(|w| w[0] == w[1]) {
-        return Err(device("the export lists an account index twice".into()));
-    }
-    let account = match accounts.accounts.as_slice() {
-        [] => return Err(device("the export lists no accounts".into())),
-        [only] if account_index == 0 || only.index == account_index => only,
-        list => list
-            .iter()
-            .find(|a| a.index == account_index)
-            .ok_or_else(|| {
-                let have: Vec<String> = indices.iter().map(u32::to_string).collect();
-                bad(format!(
-                    "account {account_index} is not in the export, which lists account {}; pass \
-                     --account",
-                    have.join(", ")
-                ))
-            })?,
-    };
-    let index = zip32::AccountId::try_from(account.index)
-        .map_err(|_| device(format!("account index {} is out of range", account.index)))?;
-    let ufvk =
-        UnifiedFullViewingKey::decode(&network.consensus_params(), &account.ufvk).map_err(|e| {
-            device(format!(
-                "account {}'s UFVK is not a {} viewing key: {e}",
-                account.index,
-                network.name()
-            ))
-        })?;
-    if ufvk.orchard().is_none() {
-        return Err(device(format!(
-            "account {}'s UFVK has no Orchard component, which every Keystone account has",
-            account.index
-        )));
-    }
-
-    use gyges_qr::firmware::{self, FirmwareCheck};
+    let accounts = gyges_qr::read_accounts_export(payload.split_whitespace())
+        .map_err(|e| refused(e.is_device_fault(), e.to_string()))?;
+    let paired = gyges_core::keystone::paired_account(network, &accounts, account_index)
+        .map_err(|e| refused(e.is_device_fault(), e.to_string()))?;
     let reported = accounts.device_version.as_deref();
-    let (device_version, warning) = match firmware::check(reported) {
-        FirmwareCheck::Supported(_) => (reported.unwrap_or_default().to_string(), None),
-        FirmwareCheck::TooOld(v) => return Err(device(firmware::too_old_message(v))),
-        FirmwareCheck::Unknown if allow_unknown_firmware => (
+    let (device_version, warning) = match firmware::admit(reported, allow_unknown_firmware) {
+        Ok(FirmwareCheck::Unknown) => (
             reported.unwrap_or("unknown").to_string(),
             Some(format!(
                 "{}; it was imported anyway (--allow-unknown-firmware)",
                 firmware::unknown_message(reported)
             )),
         ),
-        FirmwareCheck::Unknown => {
+        Ok(_) => (reported.unwrap_or_default().to_string(), None),
+        Err(e @ FirmwareRefusal::TooOld(_)) => return Err(refused(true, e.to_string())),
+        Err(e @ FirmwareRefusal::Unknown(_)) => {
             return Err(GygesError::new(
                 ErrorReason::ConfirmationRequired,
-                format!(
-                    "{}; update it and export again, or pass --allow-unknown-firmware to import \
-                     it anyway",
-                    firmware::unknown_message(reported)
-                ),
+                e.to_string(),
             ));
         }
     };
     Ok(AccountsExport {
-        ufvk,
-        seed_fingerprint,
-        account_index: index,
+        ufvk: paired.ufvk,
+        seed_fingerprint: paired.seed_fingerprint,
+        account_index: paired.account_index,
         device_version,
-        name: account.name.clone(),
+        name: paired.name,
         warning,
     })
 }

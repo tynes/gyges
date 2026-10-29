@@ -114,9 +114,60 @@ pub fn unknown_message(reported: Option<&str>) -> String {
     )
 }
 
+/// Why an export's firmware is not imported.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FirmwareRefusal {
+    /// Below the minimum: the device cannot sign (`HARDWARE_SIGNER`).
+    #[error("{}", too_old_message(*.0))]
+    TooOld(Firmware),
+    /// No readable version and no `--allow-unknown-firmware`
+    /// (`CONFIRMATION_REQUIRED`). Holds what the device reported.
+    #[error(
+        "{}; update it and export again, or pass --allow-unknown-firmware to import it anyway",
+        unknown_message(.0.as_deref())
+    )]
+    Unknown(Option<String>),
+}
+
+/// Whether an export reporting `device_version` may be imported: a
+/// supported version, or (with `allow_unknown`) one this release cannot
+/// read. Returns which of the two it was.
+pub fn admit(
+    device_version: Option<&str>,
+    allow_unknown: bool,
+) -> Result<FirmwareCheck, FirmwareRefusal> {
+    match check(device_version) {
+        FirmwareCheck::TooOld(v) => Err(FirmwareRefusal::TooOld(v)),
+        FirmwareCheck::Unknown if !allow_unknown => {
+            Err(FirmwareRefusal::Unknown(device_version.map(str::to_string)))
+        }
+        ok => Ok(ok),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admit_refuses_old_firmware_and_unknown_without_the_flag() {
+        assert!(matches!(
+            admit(Some("13.2.0"), false),
+            Ok(FirmwareCheck::Supported(_))
+        ));
+        assert!(matches!(
+            admit(Some("13.0.1"), true),
+            Err(FirmwareRefusal::TooOld(_))
+        ));
+        assert_eq!(admit(None, false), Err(FirmwareRefusal::Unknown(None)));
+        assert_eq!(admit(None, true), Ok(FirmwareCheck::Unknown));
+        let refusal = admit(Some("x"), false).unwrap_err().to_string();
+        assert!(refusal.contains("\"x\""), "{refusal}");
+        assert!(
+            refusal.ends_with("--allow-unknown-firmware to import it anyway"),
+            "{refusal}"
+        );
+    }
 
     #[test]
     fn parses_the_raw_triple_and_ignores_suffixes() {

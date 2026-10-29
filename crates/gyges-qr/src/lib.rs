@@ -8,6 +8,8 @@
 //! * [`Payload`]: the Keystone Zcash registry types 49201, 49203, 49204,
 //!   49205 and 49207 to and from their CBOR bodies;
 //! * [`Animation`]: the 8 FPS loop that shows a multi-frame payload;
+//! * [`read_accounts_export`]: a pairing export's frames checked and
+//!   decoded, shared by the CLI's pre-check and the daemon's import;
 //! * [`firmware`]: the device version a pairing export reports, and the
 //!   minimum Gyges accepts;
 //! * [`scan`]: decoded camera frames fed to an [`Assembler`] until the
@@ -20,12 +22,14 @@ mod animate;
 pub mod camera;
 pub mod firmware;
 mod fountain;
+mod pairing;
 mod registry;
 mod render;
 pub mod scan;
 
 pub use animate::{Animation, DEFAULT_FPS};
 pub use fountain::{Assembler, DEFAULT_FRAGMENT_LEN, Frames};
+pub use pairing::{ExportError, read_accounts_export};
 pub use registry::{Account, Accounts, Payload};
 pub use render::{render, render_frame, render_str};
 pub use scan::{FrameSource, LumaFrame, Progress, ScanEnd, Scanner, scan_answer};
