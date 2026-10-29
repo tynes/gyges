@@ -37,12 +37,12 @@ use tonic::Status;
 use zcash_protocol::TxId;
 
 use crate::broadcast::{self, broadcast_route, connected_chain};
-use crate::errors::tx_error;
+use crate::errors::{ForKey, tx_error};
 use crate::keys::AUDIT_TARGET;
 use crate::service::DaemonState;
 use crate::sessions::{leave_awaiting, set_session_state};
-use crate::tx::{self, Prepared, wallet_rpc};
-use crate::with_wallet;
+use crate::tx::{self, Prepared};
+use crate::{wallet_rpc, with_wallet};
 
 /// What a waiting stream is told when its session ends.
 type Outcome = Result<TxId, GygesError>;
@@ -210,8 +210,7 @@ pub(crate) fn pending_for(key: &KeyEntry) -> Result<Option<String>, Status> {
     let Some(mut wallet) = key.wallet() else {
         return Ok(None);
     };
-    let pending = key_sessions(&mut wallet, key.key_id(), false)
-        .map_err(|e| tx_error(e, key.key_id()).into_status())?;
+    let pending = key_sessions(&mut wallet, key.key_id(), false).for_key(key.key_id())?;
     Ok(pending.into_iter().next().map(|s| s.session_id))
 }
 
@@ -251,7 +250,7 @@ pub(crate) async fn abort(
         Some("aborted by the client"),
     )
     .await
-    .map_err(|e| tx_error(e, &kid).into_status())?;
+    .for_key(&kid)?;
     let mut row = row;
     if left {
         row.state = SessionState::Aborted;
@@ -286,7 +285,6 @@ pub(crate) async fn await_device(
 ) -> Result<Option<TxId>, Status> {
     let key = &prepared.key;
     let key_id = key.key_id().to_string();
-    let err = |e: TxError| tx_error(e, &key_id).into_status();
     let session_id = pczt_io::new_session_id();
     let ttl = state.config.vault.signing_session_ttl;
     let now = unix_now();
@@ -302,7 +300,7 @@ pub(crate) async fn await_device(
         txid: None,
         last_error: None,
         keystone: Some(KeystoneRow {
-            pczt: pczt_io::serialize(proven).map_err(err)?,
+            pczt: pczt_io::serialize(proven).for_key(&key_id)?,
             payload: request.payload.clone(),
             request_id: request.request_id.clone(),
             via_tor,
@@ -387,7 +385,6 @@ pub(crate) async fn complete_keystone_sign(
         return Err(not_found("no Keystone signing session has this id"));
     };
     let key_id = key.key_id().to_string();
-    let err = |e: TxError| tx_error(e, &key_id).into_status();
     let typed = |reason, detail: String| {
         GygesError::new(reason, detail)
             .with_key(&key_id)
@@ -446,7 +443,7 @@ pub(crate) async fn complete_keystone_sign(
             error.into_status()
         }
     };
-    let proven = pczt_io::parse(&ks.pczt).map_err(err)?;
+    let proven = pczt_io::parse(&ks.pczt).for_key(&key_id)?;
     let signed = match core_keystone::apply_answer(
         row.protocol,
         proven,
@@ -456,7 +453,7 @@ pub(crate) async fn complete_keystone_sign(
         Ok(p) => p,
         Err(e) => return Err(refuse(e.to_string()).await),
     };
-    let insp = pczt_io::inspect(&state.registry.params(), &signed).map_err(err)?;
+    let insp = pczt_io::inspect(&state.registry.params(), &signed).for_key(&key_id)?;
     if !insp.is_signed() {
         let missing: Vec<String> = insp
             .pools
@@ -475,7 +472,7 @@ pub(crate) async fn complete_keystone_sign(
         ))
         .await);
     }
-    let expected = Expected::from_json(&row.expected).map_err(err)?;
+    let expected = Expected::from_json(&row.expected).for_key(&key_id)?;
     let verified = match broadcast::verified(&state, &key, signed, expected).await? {
         Ok(p) => p,
         Err(e) => {
@@ -489,7 +486,7 @@ pub(crate) async fn complete_keystone_sign(
     // Claim the row for good, then extract, record and broadcast.
     let claimed = leave_awaiting(&key, &session_id, SessionState::Signed, None)
         .await
-        .map_err(err)?;
+        .for_key(&key_id)?;
     if !claimed {
         return Err(not_found(
             "the Keystone session was aborted or completed meanwhile",

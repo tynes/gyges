@@ -38,11 +38,11 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::broadcast::{self, broadcast_route, connected_chain};
 use crate::conn::ConnInfo;
-use crate::errors::tx_error;
+use crate::errors::{ForKey, tx_error};
 use crate::keys::{AUDIT_TARGET, proto_pool};
 use crate::service::{DaemonState, invalid, proto_network, unix_now};
-use crate::tx::{self, Purpose, blocking, obtain_key, proto_proposal, wallet_rpc};
-use crate::with_wallet;
+use crate::tx::{self, Purpose, obtain_key, proto_proposal};
+use crate::{blocking, wallet_rpc, with_wallet};
 
 /// The server-streaming response type for `SignPczt`.
 pub(crate) type SignStream = tonic::codegen::BoxStream<SignPcztEvent>;
@@ -71,8 +71,8 @@ fn parse_and_check(
     bytes: &[u8],
     asserted_key: &str,
 ) -> Result<(Pczt, Tags), Status> {
-    let pczt = pczt_io::parse(bytes).map_err(|e| tx_error(e, "").into_status())?;
-    let tags = pczt_io::tags_of(&pczt).map_err(|e| tx_error(e, "").into_status())?;
+    let pczt = pczt_io::parse(bytes).for_key("")?;
+    let tags = pczt_io::tags_of(&pczt).for_key("")?;
     if tags.network != state.network {
         return Err(GygesError::new(
             ErrorReason::NetworkMismatch,
@@ -151,10 +151,9 @@ pub(crate) async fn create_pczt(
         Purpose::CreatePczt,
     )?;
     let key_id = prepared.key.key_id().to_string();
-    let err = |e: TxError| tx_error(e, &key_id).into_status();
     let params = state.registry.params();
-    let to = core_tx::parse_recipient(&params, &req.to).map_err(err)?;
-    let memo = core_tx::memo_for(&to, &req.memo).map_err(err)?;
+    let to = core_tx::parse_recipient(&params, &req.to).for_key(&key_id)?;
+    let memo = core_tx::memo_for(&to, &req.memo).for_key(&key_id)?;
     let amount = tx::parse_amount(req.amount)?;
     // Sapling notes stay out of a file: proving one needs the proof
     // generation key, which never leaves the `tx send` stream that derives
@@ -230,7 +229,7 @@ pub(crate) async fn create_pczt(
             );
             g.into_status()
         }
-        e => err(e),
+        e => tx_error(e, &key_id).into_status(),
     })?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "session_created");
     tracing::info!(key_id, "pczt created");
@@ -249,8 +248,7 @@ pub(crate) fn inspect_pczt(
     req: InspectPcztRequest,
 ) -> Result<InspectPcztResponse, Status> {
     let (pczt, tags) = parse_and_check(state, &req.pczt, &req.key_id)?;
-    let insp = pczt_io::inspect(&state.registry.params(), &pczt)
-        .map_err(|e| tx_error(e, &tags.key_id).into_status())?;
+    let insp = pczt_io::inspect(&state.registry.params(), &pczt).for_key(&tags.key_id)?;
     Ok(proto_inspection(&tags, &insp))
 }
 
@@ -269,7 +267,7 @@ pub(crate) async fn prove_pczt(
         pczt_io::serialize(pczt)
     })
     .await
-    .map_err(|e| tx_error(e, &key_id).into_status())?;
+    .for_key(&key_id)?;
     tracing::info!(key_id, ms = t0.elapsed().as_millis(), "pczt proven");
     Ok(ProvePcztResponse { pczt: bytes })
 }
@@ -294,16 +292,13 @@ pub(crate) fn sign_pczt(
     let key_id = prepared.key.key_id().to_string();
     // Refused before any passphrase is asked for (THREAT_MODEL.md §6
     // item 1).
-    let pczt = core_tx::refuse_unkeyed_sapling_spends(pczt)
-        .map_err(|e| tx_error(e, &key_id).into_status())?;
-    let insp = pczt_io::inspect(&state.registry.params(), &pczt)
-        .map_err(|e| tx_error(e, &key_id).into_status())?;
+    let pczt = core_tx::refuse_unkeyed_sapling_spends(pczt).for_key(&key_id)?;
+    let insp = pczt_io::inspect(&state.registry.params(), &pczt).for_key(&key_id)?;
     let summary = proto_proposal(&insp.summary);
-    let signer = core_tx::SignerId::of(prepared.key.profile(), &state.registry.params())
-        .map_err(|e| tx_error(e, &key_id).into_status())?;
+    let signer =
+        core_tx::SignerId::of(prepared.key.profile(), &state.registry.params()).for_key(&key_id)?;
     let (tx, rx) = mpsc::channel::<Result<SignPcztEvent, Status>>(4);
     tokio::spawn(async move {
-        let err = |e: TxError| tx_error(e, &key_id).into_status();
         let outcome: Result<(), Status> = async {
             let usk = obtain_key(&state, &prepared, &summary, &tx, 1, |r| SignPcztEvent {
                 event: Some(sign_pczt_event::Event::SignatureRequired(r)),
@@ -316,7 +311,7 @@ pub(crate) fn sign_pczt(
                 pczt_io::serialize(signed)
             })
             .await
-            .map_err(err)?;
+            .for_key(&key_id)?;
             tracing::info!(key_id, "pczt signed");
             let event = Some(sign_pczt_event::Event::Signed(bytes));
             tx::send(&tx, SignPcztEvent { event }).await
@@ -368,7 +363,7 @@ pub(crate) fn combine_pczt(
         .with_key(&key_id)
         .into_status()
     })?;
-    let bytes = pczt_io::serialize(combined).map_err(|e| tx_error(e, &key_id).into_status())?;
+    let bytes = pczt_io::serialize(combined).for_key(&key_id)?;
     Ok(CombinePcztResponse { pczt: bytes })
 }
 
@@ -385,12 +380,11 @@ pub(crate) async fn broadcast_pczt(
     )?;
     let key_id = key.key_id().to_string();
     let typed = |reason, detail: String| GygesError::new(reason, detail).with_key(&key_id);
-    let err = |e: TxError| tx_error(e, &key_id).into_status();
     let chain = connected_chain(&state, &key_id)?;
     let route = broadcast_route(&state, req.via_tor, &key_id)?;
 
     // What the file is missing is named before the Verifier judges it.
-    let insp = pczt_io::inspect(&state.registry.params(), &pczt).map_err(err)?;
+    let insp = pczt_io::inspect(&state.registry.params(), &pczt).for_key(&key_id)?;
     if !insp.is_proven() {
         return Err(typed(
             ErrorReason::InvalidArgument,
@@ -432,12 +426,12 @@ pub(crate) async fn broadcast_pczt(
         .with_session(&session_id)
         .into_status());
     }
-    let expected = Expected::from_json(&row.expected).map_err(err)?;
+    let expected = Expected::from_json(&row.expected).for_key(&key_id)?;
 
     // Verifier (Q-K7), then extract, record and broadcast.
     let pczt = broadcast::verified(&state, &key, pczt, expected)
         .await?
-        .map_err(err)?;
+        .for_key(&key_id)?;
     let provers = state.provers.clone();
     let (txid, raw) =
         wallet_rpc(&key, move |w| core_tx::extract_and_store(w, pczt, &provers)).await?;

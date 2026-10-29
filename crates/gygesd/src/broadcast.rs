@@ -23,7 +23,7 @@ use crate::errors::{broadcast_error, tx_error};
 use crate::keys::AUDIT_TARGET;
 use crate::service::DaemonState;
 use crate::sessions::set_session_state;
-use crate::tx::wallet_rpc;
+use crate::wallet_rpc;
 
 /// The Verifier (Q-K7): `pczt` against the approved proposal, every change
 /// output against what the key owns (THREAT_MODEL.md §6 item 8). Runs under

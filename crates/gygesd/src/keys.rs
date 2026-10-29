@@ -29,7 +29,7 @@ use zeroize::Zeroizing;
 use zip32::fingerprint::SeedFingerprint;
 
 use crate::conn::ConnInfo;
-use crate::errors::{birthday_error, registry_error, vault_error};
+use crate::errors::{ForKey, birthday_error, registry_error};
 use crate::service::{DaemonState, invalid};
 
 /// Security-relevant events, key id and time only (OVERVIEW.md Q-O1). The
@@ -505,7 +505,7 @@ pub(crate) async fn unlock_key(
     let unlocked = tokio::task::spawn_blocking(move || st.vault.unlock(&k, passphrase, scope, ttl))
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e| vault_error(e, &key_id).into_status())?;
+        .for_key(&key_id)?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "unlock", scope = ?unlocked.scope);
     Ok(UnlockKeyResponse {
         session_token: unlocked
@@ -554,7 +554,7 @@ pub(crate) fn export_ufvk(
         None => state
             .vault
             .with_entropy(key.key_id(), Auth::Daemon, |e| key.derive_ufvk(e))
-            .map_err(|e| vault_error(e, key.key_id()).into_status())?
+            .for_key(key.key_id())?
             .map_err(registry_error)?,
     };
     Ok(ExportUfvkResponse {
@@ -591,7 +591,7 @@ pub(crate) async fn export_seed(
     let entropy = tokio::task::spawn_blocking(move || st.vault.verify_passphrase(&k, passphrase))
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e| vault_error(e, &key_id).into_status())?;
+        .for_key(&key_id)?;
     let mnemonic = vault::mnemonic_phrase(&entropy);
     drop(entropy);
     tracing::info!(target: AUDIT_TARGET, key_id, event = "export_seed");

@@ -5,6 +5,24 @@ use gyges_chain::ChainError;
 use gyges_core::vault::{self, VaultError};
 use gyges_core::{BirthdayError, RegistryError, TxError};
 use gyges_proto::v1::{ErrorReason, GygesError};
+use tonic::Status;
+
+/// A `gyges-core` failure as the key's typed status: `.for_key(&key_id)?`.
+pub(crate) trait ForKey<T> {
+    fn for_key(self, key_id: &str) -> Result<T, Status>;
+}
+
+impl<T> ForKey<T> for Result<T, TxError> {
+    fn for_key(self, key_id: &str) -> Result<T, Status> {
+        self.map_err(|e| tx_error(e, key_id).into_status())
+    }
+}
+
+impl<T> ForKey<T> for Result<T, VaultError> {
+    fn for_key(self, key_id: &str) -> Result<T, Status> {
+        self.map_err(|e| vault_error(e, key_id).into_status())
+    }
+}
 
 /// `TxError` → the typed error (API.md §3).
 pub(crate) fn tx_error(e: TxError, key_id: &str) -> GygesError {

@@ -42,29 +42,15 @@ use zcash_protocol::value::Zatoshis;
 
 use crate::broadcast::{self, Route, broadcast_route, connected_chain};
 use crate::conn::ConnInfo;
-use crate::errors::{broadcast_error, tx_error, vault_error};
+use crate::errors::{ForKey, broadcast_error, tx_error, vault_error};
 use crate::keys::{AUDIT_TARGET, proto_pool};
 use crate::service::{DaemonState, invalid, unix_now};
 use crate::sessions::SessionGuard;
 use crate::tex::{self, DriveError, Offered};
-use crate::with_wallet;
+use crate::{blocking, wallet_rpc};
 
 /// The server-streaming response type for `SendTransaction` / `ShieldFunds`.
 pub(crate) type SendStream = tonic::codegen::BoxStream<SendEvent>;
-
-// ---------------------------------------------------------------------------
-// Blocking work
-// ---------------------------------------------------------------------------
-
-/// [`with_wallet`] for an RPC: a failure is the key's typed error.
-pub(crate) async fn wallet_rpc<T: Send + 'static>(
-    key: &Arc<KeyEntry>,
-    f: impl FnOnce(&mut gyges_core::registry::Wallet) -> Result<T, TxError> + Send + 'static,
-) -> Result<T, Status> {
-    with_wallet(key, f)
-        .await
-        .map_err(|e| tx_error(e, key.key_id()).into_status())
-}
 
 // ---------------------------------------------------------------------------
 // Proto conversion
@@ -290,9 +276,8 @@ pub(crate) fn send_transaction(
     )?;
     let key_id = prepared.key.key_id().to_string();
     let params = state.registry.params();
-    let to = core_tx::parse_recipient(&params, &req.to)
-        .map_err(|e| tx_error(e, &key_id).into_status())?;
-    let memo = core_tx::memo_for(&to, &req.memo).map_err(|e| tx_error(e, &key_id).into_status())?;
+    let to = core_tx::parse_recipient(&params, &req.to).for_key(&key_id)?;
+    let memo = core_tx::memo_for(&to, &req.memo).for_key(&key_id)?;
     let amount = parse_amount(req.amount)?;
     let route = broadcast_route(&state, req.via_tor, &key_id)?;
     if matches!(route, Route::Endpoint(_)) && matches!(to, zcash_keys::address::Address::Tex(_)) {
@@ -531,14 +516,6 @@ async fn idle_or_closed<E>(tx: &mpsc::Sender<E>) -> Result<(), Status> {
     }
 }
 
-pub(crate) async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> Result<T, TxError> + Send + 'static,
-) -> Result<T, TxError> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| TxError::Internal(format!("task failed: {e}")))?
-}
-
 /// The pipeline proper (API.md §4.1 event order for `n = 1`).
 async fn pipeline(
     state: &Arc<DaemonState>,
@@ -551,7 +528,6 @@ async fn pipeline(
 ) -> Result<(), Status> {
     let key = &prepared.key;
     let key_id = key.key_id().to_string();
-    let err = |e: TxError| tx_error(e, &key_id).into_status();
 
     // 1–3. Propose (and, unless dry-run, build the PCZT) under the wallet lock.
     let (summary, rest) = wallet_rpc(key, propose).await?;
@@ -618,10 +594,10 @@ async fn pipeline(
             Some(usk) => core_tx::insert_proof_generation_keys(pczt, usk)?,
             None => pczt,
         };
-        Ok((core_tx::prove(pczt, &provers)?, early_key))
+        Ok::<_, TxError>((core_tx::prove(pczt, &provers)?, early_key))
     })
     .await
-    .map_err(err)?;
+    .for_key(&key_id)?;
     emit_proving(tx, &pools, true).await?;
     tracing::info!(
         key_id,
@@ -652,14 +628,15 @@ async fn pipeline(
             Some(usk) => usk,
             None => obtain_key(state, prepared, &proto, tx, 1, signature_required).await?,
         };
-        let signer = core_tx::SignerId::of(key.profile(), &state.registry.params()).map_err(err)?;
+        let signer =
+            core_tx::SignerId::of(key.profile(), &state.registry.params()).for_key(&key_id)?;
         let pczt = wallet_rpc(key, move |w| core_tx::sign(Some(&*w), pczt, &usk, &signer)).await?;
         // `usk` was moved into the signing task and dropped there.
 
         // 6. Verify against the approved proposal (Q-K7).
         let pczt = broadcast::verified(state, key, pczt, expected)
             .await?
-            .map_err(err)?;
+            .for_key(&key_id)?;
 
         // 7. Extract, record in the wallet, and broadcast.
         let provers = state.provers.clone();
@@ -711,7 +688,7 @@ pub(crate) fn key_from_unlock(
     };
     match from_unlock {
         Ok(usk) => {
-            let usk = usk.map_err(|e| tx_error(e, &key_id).into_status())?;
+            let usk = usk.for_key(&key_id)?;
             tracing::info!(target: AUDIT_TARGET, key_id, event = "sign", via = "unlock");
             Ok(Some(usk))
         }
@@ -837,7 +814,6 @@ async fn tex_pipeline(
 
     let key = &prepared.key;
     let key_id = key.key_id().to_string();
-    let err = |e: TxError| tx_error(e, &key_id).into_status();
 
     // One signature prompt per send: the key is obtained once and used for
     // both steps inside the builder.
@@ -899,7 +875,7 @@ async fn tex_pipeline(
     // Both steps go through the queue's broadcast, so a node that already
     // has a step counts as having taken it, as it does for the queue.
     let drive = |e: DriveError| match e {
-        DriveError::Wallet(e) => err(e),
+        DriveError::Wallet(e) => tx_error(e, &key_id).into_status(),
         DriveError::Node(e) => broadcast_error(e, &key_id).into_status(),
     };
     let offer = |raw, step| tex::offer(chain.as_ref(), key, id, raw, step, "transaction broadcast");

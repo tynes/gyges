@@ -45,8 +45,8 @@ use crate::conn::ConnInfo;
 use crate::errors::{broadcast_error, tx_error};
 use crate::keys::AUDIT_TARGET;
 use crate::service::{DaemonState, invalid, unix_now};
-use crate::tx::{self, wallet_rpc};
-use crate::with_wallet;
+use crate::tx;
+use crate::{wallet_rpc, with_wallet};
 
 /// The queue's wake-up and the rows a `tx resume` is rebuilding.
 #[derive(Debug, Default)]

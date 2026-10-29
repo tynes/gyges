@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 use tonic::Status;
 use zcash_keys::keys::UnifiedSpendingKey;
 
-use crate::errors::{tx_error, vault_error};
+use crate::errors::ForKey;
 use crate::keys::AUDIT_TARGET;
 use crate::service::{DaemonState, unix_now};
 use crate::with_wallet;
@@ -259,8 +259,8 @@ pub(crate) async fn satisfy_session(
     })
     .await
     .map_err(|e| Status::internal(e.to_string()))?
-    .map_err(|e| vault_error(e, &key_id).into_status())?
-    .map_err(|e| tx_error(e, &key_id).into_status())?;
+    .for_key(&key_id)?
+    .for_key(&key_id)?;
     if !state.sessions.complete(&session_id, usk) {
         return Err(not_found());
     }
