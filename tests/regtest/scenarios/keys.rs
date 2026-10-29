@@ -416,7 +416,7 @@ fn import_keystone_through_the_binaries() {
         .json();
     assert_eq!(v["key_id"], "ks");
     assert_eq!(v["device_version"], "13.2.0");
-    assert_eq!(v["account_name"], "Keystone");
+    assert_eq!(v["account_name"], "Keystone 0");
     assert_eq!(v["seed_fingerprint"].as_str().unwrap().len(), 64);
 
     // `--ur`, an unknown version allowed: the human summary and warning.
@@ -432,7 +432,7 @@ fn import_keystone_through_the_binaries() {
         &silent,
     ])
     .ok()
-    .stderr_has("key 'ks2' imported from the Keystone: account 0 \"Keystone\"")
+    .stderr_has("key 'ks2' imported from the Keystone: account 0 \"Keystone 0\"")
     .stderr_has("firmware unknown")
     .stderr_has("warning: the Keystone does not report its firmware version");
 

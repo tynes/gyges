@@ -31,17 +31,11 @@ fn device_answer(request: &[String]) -> Vec<String> {
         asm.receive(f).unwrap();
     }
     let (ur_type, cbor) = asm.message().unwrap().expect("the request reassembles");
-    let answer = emulator::answer(&keystone_device(), &ur_type, &cbor);
-    let answer_type = if ur_type == gyges_qr::ur_types::ZCASH_SIGN_BATCH {
-        gyges_qr::ur_types::ZCASH_BATCH_SIG_RESULT
-    } else {
-        gyges_qr::ur_types::ZCASH_PCZT
-    };
-    let mut frames =
-        gyges_qr::Frames::new(answer_type, &answer, gyges_qr::DEFAULT_FRAGMENT_LEN).unwrap();
-    (0..frames.fragment_count())
-        .map(|_| frames.next_frame().unwrap())
-        .collect()
+    let (answer_type, answer) = emulator::answer(&keystone_device(), &ur_type, &cbor);
+    gyges_qr::Frames::new(answer_type, &answer, gyges_qr::DEFAULT_FRAGMENT_LEN)
+        .unwrap()
+        .take_loops(1)
+        .unwrap()
 }
 
 /// The one Keystone session awaiting the device.

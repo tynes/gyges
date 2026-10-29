@@ -102,40 +102,14 @@ pub fn test_key_transparent() -> TransparentAddress {
 /// per line. The UFVK has the device's shape: the seed's Orchard and
 /// transparent items, no Sapling.
 pub fn keystone_export(device_version: Option<&str>) -> String {
-    use zcash_address::unified::{Container as _, Encoding as _, Fvk, Ufvk};
-    let seed = test_seed();
-    let usk = test_usk(&seed);
-    let payload = gyges_qr::Payload::Accounts(gyges_qr::Accounts {
-        seed_fingerprint: zip32::fingerprint::SeedFingerprint::from_seed(&seed)
-            .unwrap()
-            .to_bytes()
-            .to_vec(),
-        accounts: vec![gyges_qr::Account {
-            ufvk: {
-                let full = usk.to_unified_full_viewing_key().encode(&regtest());
-                let (net, ufvk) = Ufvk::decode(&full).unwrap();
-                let items: Vec<Fvk> = ufvk
-                    .items()
-                    .into_iter()
-                    .filter(|i| !matches!(i, Fvk::Sapling(_)))
-                    .collect();
-                Ufvk::try_from_items(items).unwrap().encode(&net)
-            },
-            index: 0,
-            name: Some("Keystone".into()),
-        }],
-        device_version: device_version.map(Into::into),
-    });
+    let payload = gyges_core::keystone::emulator::pairing_export(
+        gyges_core::Network::Regtest,
+        &test_seed(),
+        &[0],
+        device_version,
+    );
     let mut frames = payload.frames(gyges_qr::DEFAULT_FRAGMENT_LEN).unwrap();
-    let n = if frames.is_single() {
-        1
-    } else {
-        2 * frames.fragment_count()
-    };
-    (0..n)
-        .map(|_| frames.next_frame().unwrap())
-        .collect::<Vec<_>>()
-        .join("\n")
+    frames.take_loops(2).unwrap().join("\n")
 }
 
 /// The Keystone that [`keystone_export`] pairs: [`mnemonic`]'s account 0,

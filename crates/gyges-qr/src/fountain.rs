@@ -77,6 +77,18 @@ impl Frames {
             Inner::Multi(e) => e.next_part().map_err(ur_error),
         }
     }
+
+    /// The next `loops` passes through the animation, one frame per entry:
+    /// every fragment once per loop. One loop is enough to reassemble; a
+    /// single frame is returned once however many loops are asked for.
+    pub fn take_loops(&mut self, loops: usize) -> Result<Vec<String>, QrError> {
+        let n = if self.is_single() {
+            1
+        } else {
+            loops * self.fragment_count()
+        };
+        (0..n).map(|_| self.next_frame()).collect()
+    }
 }
 
 /// Collects frames, from a camera, a file or pasted text, until the
