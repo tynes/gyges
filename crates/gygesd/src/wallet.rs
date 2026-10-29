@@ -25,7 +25,7 @@ use zcash_protocol::consensus::{NetworkType, Parameters as _};
 use crate::keys::proto_pool;
 use crate::service::{DaemonState, invalid, proto_network};
 use crate::tex;
-use crate::tx::wallet_rpc;
+use crate::wallet_rpc;
 
 /// `ListTransactions.limit = 0` (docs/interface.md API).
 pub(crate) const DEFAULT_TX_LIMIT: usize = 50;

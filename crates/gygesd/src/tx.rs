@@ -1,6 +1,5 @@
-//! The spending RPCs: `SendTransaction`, `ShieldFunds`, `GetBalance`, the
-//! passphrase signing sessions behind `UnlockKey { session_id }`,
-//! `ListSigningSessions` and `AbortSigningSession` (docs/interface.md API §4.1, §6).
+//! The spending RPCs `SendTransaction`, `ShieldFunds` and `GetBalance`
+//! (docs/interface.md API §4.1).
 //!
 //! A send is one task per stream that walks `gyges_core::tx` step by step
 //! and emits an event after each (`Proposed`, `Proving`,
@@ -15,426 +14,43 @@
 //! without ever being written (docs/security.md §6 item 1). The spending
 //! key is obtained from, in order, the
 //! connection-scoped token the request carries, a daemon-scoped unlock, or
-//! a **signing session**: the stream pauses on `SignatureRequired` and the
-//! client answers with `UnlockKey { session_id, passphrase }`, which
-//! verifies the passphrase (per-key back-off included), derives the
-//! spending key and hands it to the waiting task through a channel. The key
-//! is used for the signing step and dropped. Passphrase sessions live in
-//! memory only (docs/interface.md API §6.1): the stream that created one is gone after a
-//! restart.
+//! a **signing session** (`crate::sessions`): the stream pauses on
+//! `SignatureRequired` and the client answers with
+//! `UnlockKey { session_id, passphrase }`, which verifies the passphrase
+//! (per-key back-off included), derives the spending key and hands it to
+//! the waiting task through a channel. The key is used for the signing
+//! step and dropped.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use age::secrecy::SecretString;
-use gyges_chain::{ChainBackend, ChainError};
-use gyges_core::db::sessions::{self, SessionState};
+use gyges_chain::ChainError;
 use gyges_core::tx::{self as core_tx, AmountSpec, Expected, ProposalSummary, TxError};
 use gyges_core::vault::manager::{Auth, Token};
 use gyges_core::{KeyEntry, SigningMode};
 use gyges_proto::v1::{
-    self, AbortSigningSessionRequest, ErrorReason, GetBalanceRequest, GetBalanceResponse,
-    GygesError, ListSigningSessionsRequest, ListSigningSessionsResponse, SendEvent,
-    SendTransactionRequest, SessionPurpose, SessionStatus, ShieldFundsRequest, SignatureKind,
-    SignatureRequired, SigningSession, UnlockKeyResponse, send_event,
+    self, ErrorReason, GetBalanceRequest, GetBalanceResponse, GygesError, SendEvent,
+    SendTransactionRequest, SessionStatus, ShieldFundsRequest, SignatureKind, SignatureRequired,
+    send_event,
 };
 use pczt::Pczt;
 use prost::Message as _;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tonic::Status;
 use zcash_keys::keys::UnifiedSpendingKey;
-use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
 
+use crate::broadcast::{self, Route, broadcast_route, connected_chain};
 use crate::conn::ConnInfo;
-use crate::keys::{AUDIT_TARGET, proto_pool, vault_error};
+use crate::errors::{ForKey, broadcast_error, tx_error, vault_error};
+use crate::keys::{AUDIT_TARGET, proto_pool};
 use crate::service::{DaemonState, invalid, unix_now};
+use crate::sessions::SessionGuard;
 use crate::tex::{self, DriveError, Offered};
-use crate::with_wallet;
+use crate::{blocking, wallet_rpc};
 
 /// The server-streaming response type for `SendTransaction` / `ShieldFunds`.
 pub(crate) type SendStream = tonic::codegen::BoxStream<SendEvent>;
-
-// ---------------------------------------------------------------------------
-// Signing sessions
-// ---------------------------------------------------------------------------
-
-/// One pending (or finished) passphrase session.
-struct Session {
-    key_id: String,
-    step: u32,
-    created_at: i64,
-    expires_at: i64,
-    summary: v1::Proposal,
-    status: SessionStatus,
-    last_error: String,
-    /// Present while awaiting a signature; the stream task holds the other
-    /// end. Dropped on abort, which the task sees as `CANCELLED`.
-    deliver: Option<oneshot::Sender<UnifiedSpendingKey>>,
-}
-
-impl Session {
-    fn to_proto(&self, session_id: &str) -> SigningSession {
-        SigningSession {
-            session_id: session_id.to_string(),
-            key_id: self.key_id.clone(),
-            kind: SignatureKind::Passphrase as i32,
-            purpose: SessionPurpose::Send as i32,
-            status: self.status as i32,
-            created_at: self.created_at,
-            expires_at: self.expires_at,
-            summary: Some(self.summary.clone()),
-            step: self.step,
-            last_error: self.last_error.clone(),
-            payload: Vec::new(),
-        }
-    }
-}
-
-/// Finished sessions kept for `tx sessions --include-finished`, newest
-/// first, bounded.
-const FINISHED_KEPT: usize = 64;
-
-/// The daemon's in-memory signing sessions (docs/interface.md API §6.1: passphrase kinds
-/// are not persisted).
-#[derive(Default)]
-pub(crate) struct SessionHub {
-    sessions: Mutex<BTreeMap<String, Session>>,
-}
-
-impl std::fmt::Debug for SessionHub {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionHub")
-            .field("sessions", &self.lock().len())
-            .finish()
-    }
-}
-
-impl SessionHub {
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Session>> {
-        crate::lock(&self.sessions)
-    }
-
-    /// Create a session awaiting a passphrase for `key_id`. Returns its id
-    /// and the receiver the stream task waits on.
-    pub(crate) fn create(
-        &self,
-        key_id: &str,
-        step: u32,
-        ttl: Duration,
-        summary: v1::Proposal,
-    ) -> (String, i64, oneshot::Receiver<UnifiedSpendingKey>) {
-        let session_id = gyges_core::pczt_io::new_session_id();
-        let (tx, rx) = oneshot::channel();
-        let now = unix_now();
-        let expires_at = now + i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
-        let mut all = self.lock();
-        all.insert(
-            session_id.clone(),
-            Session {
-                key_id: key_id.to_string(),
-                step,
-                created_at: now,
-                expires_at,
-                summary,
-                status: SessionStatus::AwaitingSignature,
-                last_error: String::new(),
-                deliver: Some(tx),
-            },
-        );
-        prune(&mut all);
-        (session_id, expires_at, rx)
-    }
-
-    /// The key a pending session belongs to.
-    fn key_of(&self, session_id: &str) -> Option<String> {
-        self.lock()
-            .get(session_id)
-            .filter(|s| s.status == SessionStatus::AwaitingSignature)
-            .map(|s| s.key_id.clone())
-    }
-
-    /// Hand the derived key to the waiting stream and mark the session
-    /// completed. `false` when the session is gone or no longer pending.
-    fn complete(&self, session_id: &str, usk: UnifiedSpendingKey) -> bool {
-        let mut all = self.lock();
-        let Some(s) = all.get_mut(session_id) else {
-            return false;
-        };
-        let Some(tx) = s.deliver.take() else {
-            return false;
-        };
-        if tx.send(usk).is_err() {
-            // The stream went away; nothing to sign for.
-            s.status = SessionStatus::Failed;
-            s.last_error = "the client disconnected before signing".into();
-            return false;
-        }
-        s.status = SessionStatus::Completed;
-        true
-    }
-
-    /// A session whose key was delivered but whose work then failed
-    /// (`tx resume` building step 2): `Completed` becomes `Failed` with the
-    /// reason, so `tx sessions --include-finished` shows it.
-    pub(crate) fn fail(&self, session_id: &str, error: &str) {
-        let mut all = self.lock();
-        if let Some(s) = all.get_mut(session_id) {
-            s.status = SessionStatus::Failed;
-            s.last_error = error.to_string();
-            s.deliver = None;
-        }
-    }
-
-    /// Mark a session finished (expired, failed, aborted) without
-    /// delivering a key; dropping the sender wakes the task.
-    pub(crate) fn finish(
-        &self,
-        session_id: &str,
-        status: SessionStatus,
-        error: &str,
-    ) -> Option<SigningSession> {
-        let mut all = self.lock();
-        let s = all.get_mut(session_id)?;
-        if s.status == SessionStatus::AwaitingSignature {
-            s.status = status;
-            s.last_error = error.to_string();
-            s.deliver = None;
-        }
-        Some(s.to_proto(session_id))
-    }
-
-    fn list(&self, key_id: &str, include_finished: bool) -> Vec<SigningSession> {
-        self.lock()
-            .iter()
-            .filter(|(_, s)| key_id.is_empty() || s.key_id == key_id)
-            .filter(|(_, s)| include_finished || s.status == SessionStatus::AwaitingSignature)
-            .map(|(id, s)| s.to_proto(id))
-            .collect()
-    }
-}
-
-/// Drop the oldest finished sessions beyond [`FINISHED_KEPT`].
-fn prune(all: &mut BTreeMap<String, Session>) {
-    let mut finished: Vec<(i64, String)> = all
-        .iter()
-        .filter(|(_, s)| s.status != SessionStatus::AwaitingSignature)
-        .map(|(id, s)| (s.created_at, id.clone()))
-        .collect();
-    if finished.len() > FINISHED_KEPT {
-        finished.sort();
-        for (_, id) in finished.iter().take(finished.len() - FINISHED_KEPT) {
-            all.remove(id);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Error mapping
-// ---------------------------------------------------------------------------
-
-/// `TxError` → the typed error (docs/interface.md API §3).
-pub(crate) fn tx_error(e: TxError, key_id: &str) -> GygesError {
-    let err = match e {
-        TxError::InsufficientFunds {
-            available,
-            required,
-        } => GygesError::new(
-            ErrorReason::InsufficientFunds,
-            format!("insufficient funds: {available} zatoshis spendable, {required} needed"),
-        ),
-        TxError::NotSynced(detail) => GygesError::new(ErrorReason::NotSynced, detail),
-        TxError::InvalidArgument(detail) => GygesError::new(ErrorReason::InvalidArgument, detail),
-        TxError::UnsupportedPool(detail) => GygesError::new(ErrorReason::UnsupportedPool, detail),
-        // A tampered or stale PCZT is the client's problem (exit 6), not a
-        // daemon failure.
-        TxError::Verifier(detail) => GygesError::new(ErrorReason::InvalidArgument, detail),
-        TxError::Internal(detail) => {
-            // Upstream error texts can quote addresses or values, so the
-            // detail goes to the client and to `debug` only (docs/interface.md API §4.5).
-            tracing::error!(key_id, "transaction engine failure");
-            tracing::debug!(key_id, error = %detail, "transaction engine failure detail");
-            GygesError::new(ErrorReason::Internal, detail)
-        }
-    };
-    err.with_key(key_id)
-}
-
-/// [`with_wallet`] for an RPC: a failure is the key's typed error.
-pub(crate) async fn wallet_rpc<T: Send + 'static>(
-    key: &Arc<KeyEntry>,
-    f: impl FnOnce(&mut gyges_core::registry::Wallet) -> Result<T, TxError> + Send + 'static,
-) -> Result<T, Status> {
-    with_wallet(key, f)
-        .await
-        .map_err(|e| tx_error(e, key.key_id()).into_status())
-}
-
-/// [`sessions::set_state`] on the key's wallet.
-pub(crate) async fn set_session_state(
-    key: &Arc<KeyEntry>,
-    session_id: &str,
-    to: SessionState,
-    txid: Option<[u8; 32]>,
-    error: Option<&str>,
-) -> Result<(), TxError> {
-    let sid = session_id.to_string();
-    let error = error.map(str::to_string);
-    with_wallet(key, move |w| {
-        Ok(sessions::set_state(w, &sid, to, txid, error.as_deref())?)
-    })
-    .await
-}
-
-/// [`sessions::leave_awaiting`] on the key's wallet: `true` when the row
-/// was still awaiting a signature.
-pub(crate) async fn leave_awaiting(
-    key: &Arc<KeyEntry>,
-    session_id: &str,
-    to: SessionState,
-    error: Option<&str>,
-) -> Result<bool, TxError> {
-    let sid = session_id.to_string();
-    let error = error.map(str::to_string);
-    with_wallet(key, move |w| {
-        Ok(sessions::leave_awaiting(w, &sid, to, error.as_deref())?)
-    })
-    .await
-}
-
-/// Broadcast a signed session's transaction over `route`. A failure is
-/// recorded on the row (still `Signed`, with the node's text when it gave
-/// one) and returned.
-pub(crate) async fn broadcast_signed(
-    key: &Arc<KeyEntry>,
-    chain: &Arc<dyn ChainBackend>,
-    route: &Route,
-    session_id: &str,
-    raw: Vec<u8>,
-) -> Result<(), GygesError> {
-    let Err(e) = route.send(chain, raw, key.key_id()).await else {
-        return Ok(());
-    };
-    let text = if e.node_error.is_empty() {
-        &e.detail
-    } else {
-        &e.node_error
-    };
-    let _ = set_session_state(key, session_id, SessionState::Signed, None, Some(text)).await;
-    Err(e)
-}
-
-pub(crate) fn broadcast_error(e: ChainError, key_id: &str) -> GygesError {
-    match e {
-        ChainError::Rejected(text) => {
-            let mut err = GygesError::new(
-                ErrorReason::NodeRejected,
-                "the node rejected the transaction; it stays in the wallet as unmined until it expires",
-            )
-            .with_key(key_id);
-            err.node_error = text;
-            err
-        }
-        ChainError::Unreachable(detail) => {
-            GygesError::new(ErrorReason::NodeUnreachable, detail).with_key(key_id)
-        }
-        other => GygesError::new(ErrorReason::Internal, other.to_string()).with_key(key_id),
-    }
-}
-
-/// Where a transaction goes: the node's `sendrawtransaction`, or the
-/// fallback endpoint's `SendTransaction` for `--via-tor` and
-/// `broadcast_via_tor` (docs/security.md §3 row 10).
-#[derive(Clone)]
-pub(crate) enum Route {
-    Node,
-    Endpoint(Arc<dyn gyges_chain::ChainBackend>),
-}
-
-impl Route {
-    /// The `via` field of the `broadcast` audit event.
-    pub(crate) fn name(&self) -> &'static str {
-        match self {
-            Route::Node => "node",
-            Route::Endpoint(_) => "fallback",
-        }
-    }
-
-    /// Broadcast `raw` over this route; `node` is used for [`Route::Node`].
-    pub(crate) async fn send(
-        &self,
-        node: &Arc<dyn gyges_chain::ChainBackend>,
-        raw: Vec<u8>,
-        key_id: &str,
-    ) -> Result<(), GygesError> {
-        match self {
-            Route::Node => node
-                .send_raw_transaction(raw)
-                .await
-                .map_err(|e| broadcast_error(e, key_id)),
-            Route::Endpoint(endpoint) => {
-                endpoint
-                    .send_raw_transaction(raw)
-                    .await
-                    .map_err(|e| match e {
-                        ChainError::Unreachable(detail) => GygesError::new(
-                            ErrorReason::FallbackUnavailable,
-                            format!(
-                                "the fallback endpoint could not be reached for the --via-tor broadcast \
-                                 (it stays in the wallet as unmined until it expires): {detail}"
-                            ),
-                        )
-                        .with_key(key_id),
-                        other => broadcast_error(other, key_id),
-                    })
-            }
-        }
-    }
-}
-
-/// The route for a broadcast, decided before anything is proven or signed.
-/// `requested` is the request's `via_tor`; `broadcast_via_tor` in
-/// `config.toml` turns it on for every broadcast. Asking for Tor never falls
-/// back to the node: without a Tor endpoint the request is refused. A
-/// `use_tor = false` endpoint stands in on regtest only, as it does for
-/// backfill in CI (docs/testing.md §2).
-pub(crate) fn broadcast_route(
-    state: &DaemonState,
-    requested: bool,
-    key_id: &str,
-) -> Result<Route, Status> {
-    if !(requested || state.config.fallback_lightwalletd.broadcast_via_tor) {
-        return Ok(Route::Node);
-    }
-    let refuse = |detail: &str| {
-        GygesError::new(ErrorReason::FallbackUnavailable, detail)
-            .with_key(key_id)
-            .into_status()
-    };
-    let Some(endpoint) = state.fallback.clone() else {
-        return Err(refuse(
-            "--via-tor broadcasts through the fallback endpoint's Tor client, and none is configured \
-             ([fallback_lightwalletd] enabled = true with a grpc_url); nothing was broadcast",
-        ));
-    };
-    match endpoint.transport() {
-        gyges_chain::Transport::Tor { .. } => {}
-        gyges_chain::Transport::Direct if state.network == gyges_core::Network::Regtest => {
-            tracing::warn!(
-                key_id,
-                "--via-tor on regtest with fallback_lightwalletd.use_tor = false: broadcasting to the endpoint directly"
-            );
-        }
-        gyges_chain::Transport::Direct => {
-            return Err(refuse(
-                "--via-tor needs fallback_lightwalletd.use_tor = true; the configured endpoint is reached \
-                 directly, which would show it this host's address; nothing was broadcast",
-            ));
-        }
-    }
-    Ok(Route::Endpoint(endpoint))
-}
 
 // ---------------------------------------------------------------------------
 // Proto conversion
@@ -660,9 +276,8 @@ pub(crate) fn send_transaction(
     )?;
     let key_id = prepared.key.key_id().to_string();
     let params = state.registry.params();
-    let to = core_tx::parse_recipient(&params, &req.to)
-        .map_err(|e| tx_error(e, &key_id).into_status())?;
-    let memo = core_tx::memo_for(&to, &req.memo).map_err(|e| tx_error(e, &key_id).into_status())?;
+    let to = core_tx::parse_recipient(&params, &req.to).for_key(&key_id)?;
+    let memo = core_tx::memo_for(&to, &req.memo).for_key(&key_id)?;
     let amount = parse_amount(req.amount)?;
     let route = broadcast_route(&state, req.via_tor, &key_id)?;
     if matches!(route, Route::Endpoint(_)) && matches!(to, zcash_keys::address::Address::Tex(_)) {
@@ -707,16 +322,16 @@ pub(crate) fn send_transaction(
             memo,
             min_confirmations,
         )?;
-        let mut summary = core_tx::summarize(&params, &proposal, min_confirmations);
-        let expiry = keystone_expiry(keystone, proposal.min_target_height(), &mut summary);
+        let expiry = keystone.then(|| crate::roles::long_expiry(proposal.min_target_height()));
+        let summary = core_tx::summarize(&params, &proposal, min_confirmations, expiry);
         if dry_run {
             return Ok((summary, None));
         }
         if core_tx::is_two_step(&proposal) {
             return Ok((summary, Some(Built::Tex(Box::new(proposal)))));
         }
-        let expected = Expected::from_proposal(&params, &proposal, expiry)?;
-        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal, expiry)?;
+        let (expected, pczt) =
+            core_tx::build_single_step(wallet, &params, account, &proposal, expiry)?;
         Ok((summary, Some(Built::Pczt(expected, Box::new(pczt)))))
     };
     Ok(run(
@@ -732,23 +347,6 @@ pub(crate) fn send_transaction(
 /// Whether the key signs on a Keystone.
 fn is_keystone(prepared: &Prepared) -> bool {
     prepared.key.profile().signing_mode == SigningMode::KeystoneQr
-}
-
-/// A Keystone send waits for a person and a device, possibly across a
-/// restart, for up to `vault.signing_session_ttl`; it gets the expiry a
-/// PCZT file gets (`target + 1152`, about a day) instead of `tx send`'s 40
-/// blocks. Returns the override and updates the summary to match.
-fn keystone_expiry(
-    keystone: bool,
-    min_target: impl Into<BlockHeight>,
-    summary: &mut ProposalSummary,
-) -> Option<BlockHeight> {
-    if !keystone {
-        return None;
-    }
-    let expiry = min_target.into() + crate::roles::PCZT_EXPIRY_BLOCKS;
-    summary.expiry_height = u32::from(expiry);
-    Some(expiry)
 }
 
 /// One Keystone session per key at a time: until it is completed or
@@ -801,13 +399,13 @@ pub(crate) fn shield_funds(
         let account = core_tx::account_of(wallet)?;
         let proposal =
             core_tx::propose_shield(wallet, &params, account, threshold, min_confirmations)?;
-        let mut summary = core_tx::summarize(&params, &proposal, min_confirmations);
-        let expiry = keystone_expiry(keystone, proposal.min_target_height(), &mut summary);
+        let expiry = keystone.then(|| crate::roles::long_expiry(proposal.min_target_height()));
+        let summary = core_tx::summarize(&params, &proposal, min_confirmations, expiry);
         if dry_run {
             return Ok((summary, None));
         }
-        let expected = Expected::from_proposal(&params, &proposal, expiry)?;
-        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal, expiry)?;
+        let (expected, pczt) =
+            core_tx::build_single_step(wallet, &params, account, &proposal, expiry)?;
         Ok((summary, Some(Built::Pczt(expected, Box::new(pczt)))))
     };
     Ok(run(
@@ -918,36 +516,6 @@ async fn idle_or_closed<E>(tx: &mpsc::Sender<E>) -> Result<(), Status> {
     }
 }
 
-/// The node backend for a broadcast, refused when air-gapped or offline.
-pub(crate) fn connected_chain(
-    state: &DaemonState,
-    key_id: &str,
-) -> Result<Arc<dyn ChainBackend>, Status> {
-    let refuse = |reason, detail: &str| GygesError::new(reason, detail).with_key(key_id);
-    let chain = state.chain.clone().ok_or_else(|| {
-        refuse(
-            ErrorReason::Airgapped,
-            "an air-gapped daemon cannot broadcast",
-        )
-    })?;
-    if !chain.status().connected {
-        return Err(refuse(
-            ErrorReason::NodeUnreachable,
-            "the node is not connected; the transaction could not be broadcast",
-        )
-        .into());
-    }
-    Ok(chain)
-}
-
-pub(crate) async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> Result<T, TxError> + Send + 'static,
-) -> Result<T, TxError> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| TxError::Internal(format!("task failed: {e}")))?
-}
-
 /// The pipeline proper (docs/interface.md API §4.1 event order for `n = 1`).
 async fn pipeline(
     state: &Arc<DaemonState>,
@@ -960,7 +528,6 @@ async fn pipeline(
 ) -> Result<(), Status> {
     let key = &prepared.key;
     let key_id = key.key_id().to_string();
-    let err = |e: TxError| tx_error(e, &key_id).into_status();
 
     // 1–3. Propose (and, unless dry-run, build the PCZT) under the wallet lock.
     let (summary, rest) = wallet_rpc(key, propose).await?;
@@ -1027,10 +594,10 @@ async fn pipeline(
             Some(usk) => core_tx::insert_proof_generation_keys(pczt, usk)?,
             None => pczt,
         };
-        Ok((core_tx::prove(pczt, &provers)?, early_key))
+        Ok::<_, TxError>((core_tx::prove(pczt, &provers)?, early_key))
     })
     .await
-    .map_err(err)?;
+    .for_key(&key_id)?;
     emit_proving(tx, &pools, true).await?;
     tracing::info!(
         key_id,
@@ -1061,24 +628,22 @@ async fn pipeline(
             Some(usk) => usk,
             None => obtain_key(state, prepared, &proto, tx, 1, signature_required).await?,
         };
-        let signer = core_tx::SignerId::of(key.profile(), &state.registry.params()).map_err(err)?;
+        let signer =
+            core_tx::SignerId::of(key.profile(), &state.registry.params()).for_key(&key_id)?;
         let pczt = wallet_rpc(key, move |w| core_tx::sign(Some(&*w), pczt, &usk, &signer)).await?;
         // `usk` was moved into the signing task and dropped there.
 
         // 6. Verify against the approved proposal (Q-K7).
-        let owner_params = state.registry.params();
-        let owner = wallet_rpc(key, move |w| core_tx::Owner::of_wallet(&owner_params, w)).await?;
-        let pczt = core_tx::verify(pczt, &expected, &owner).map_err(err)?;
+        let pczt = broadcast::verified(state, key, pczt, expected)
+            .await?
+            .for_key(&key_id)?;
 
         // 7. Extract, record in the wallet, and broadcast.
         let provers = state.provers.clone();
         let (txid, raw) =
             wallet_rpc(key, move |w| core_tx::extract_and_store(w, pczt, &provers)).await?;
         emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
-        route.send(prepared.chain()?, raw, &key_id).await?;
-        tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());
-        tracing::info!(key_id, via = route.name(), "transaction broadcast");
-        state.sync.wake();
+        broadcast::broadcast(state, key, prepared.chain()?, route, raw, txid, None).await?;
         txid
     };
     let txid_hex = txid.to_string();
@@ -1123,7 +688,7 @@ pub(crate) fn key_from_unlock(
     };
     match from_unlock {
         Ok(usk) => {
-            let usk = usk.map_err(|e| tx_error(e, &key_id).into_status())?;
+            let usk = usk.for_key(&key_id)?;
             tracing::info!(target: AUDIT_TARGET, key_id, event = "sign", via = "unlock");
             Ok(Some(usk))
         }
@@ -1186,10 +751,7 @@ pub(crate) async fn obtain_key<E: Send + 'static>(
             summary: Some(summary.clone()),
         };
         send(tx, wrap(required)).await?;
-        let guard = SessionGuard {
-            hub: state.clone(),
-            session_id: session_id.clone(),
-        };
+        let guard = SessionGuard::new(state, &session_id);
         tokio::select! {
             got = tokio::time::timeout(ttl, rx) => match got {
                 Ok(Ok(usk)) => {
@@ -1252,7 +814,6 @@ async fn tex_pipeline(
 
     let key = &prepared.key;
     let key_id = key.key_id().to_string();
-    let err = |e: TxError| tx_error(e, &key_id).into_status();
 
     // One signature prompt per send: the key is obtained once and used for
     // both steps inside the builder.
@@ -1314,7 +875,7 @@ async fn tex_pipeline(
     // Both steps go through the queue's broadcast, so a node that already
     // has a step counts as having taken it, as it does for the queue.
     let drive = |e: DriveError| match e {
-        DriveError::Wallet(e) => err(e),
+        DriveError::Wallet(e) => tx_error(e, &key_id).into_status(),
         DriveError::Node(e) => broadcast_error(e, &key_id).into_status(),
     };
     let offer = |raw, step| tex::offer(chain.as_ref(), key, id, raw, step, "transaction broadcast");
@@ -1416,107 +977,6 @@ async fn tex_pipeline(
     Ok(())
 }
 
-/// Finishes a session as failed when the waiting task goes away (client
-/// disconnect, error) before the key arrived.
-struct SessionGuard {
-    hub: Arc<DaemonState>,
-    session_id: String,
-}
-
-impl SessionGuard {
-    fn disarm(self) {
-        std::mem::forget(self);
-    }
-}
-
-impl Drop for SessionGuard {
-    fn drop(&mut self) {
-        self.hub.sessions.finish(
-            &self.session_id,
-            SessionStatus::Failed,
-            "the send was abandoned before a passphrase arrived",
-        );
-    }
-}
-
-/// `UnlockKey { session_id, passphrase }` (docs/interface.md API §6.2): verify the
-/// passphrase, derive the key, hand it to the stream. No token is returned
-/// and no unlock is created.
-pub(crate) async fn satisfy_session(
-    state: Arc<DaemonState>,
-    session_id: String,
-    passphrase: SecretString,
-) -> Result<UnlockKeyResponse, Status> {
-    let not_found = || {
-        GygesError::new(
-            ErrorReason::SessionNotFound,
-            "no such pending signing session",
-        )
-        .with_session(&session_id)
-        .into_status()
-    };
-    let key_id = state.sessions.key_of(&session_id).ok_or_else(not_found)?;
-    let key = state.resolve_key(&key_id)?;
-    let params = state.registry.params();
-    let account_index = key.profile().account_index;
-    let st = state.clone();
-    let k = key.clone();
-    let usk = tokio::task::spawn_blocking(move || {
-        let entropy = st.vault.verify_passphrase(&k, passphrase)?;
-        Ok::<_, gyges_core::vault::VaultError>(core_tx::spending_key(
-            &params,
-            &entropy,
-            account_index,
-        ))
-    })
-    .await
-    .map_err(|e| Status::internal(e.to_string()))?
-    .map_err(|e| vault_error(e, &key_id).into_status())?
-    .map_err(|e| tx_error(e, &key_id).into_status())?;
-    if !state.sessions.complete(&session_id, usk) {
-        return Err(not_found());
-    }
-    tracing::info!(target: AUDIT_TARGET, key_id, event = "session_completed");
-    Ok(UnlockKeyResponse {
-        session_token: Vec::new(),
-        expires_at: 0,
-        scope: v1::UnlockScope::Unspecified as i32,
-    })
-}
-
-/// `ListSigningSessions` (the ZIP 320 rows are added by the service, from
-/// `crate::tex`).
-pub(crate) fn list_signing_sessions(
-    state: &DaemonState,
-    req: &ListSigningSessionsRequest,
-) -> Result<ListSigningSessionsResponse, Status> {
-    Ok(ListSigningSessionsResponse {
-        sessions: state.sessions.list(&req.key_id, req.include_finished),
-        tex_transfers: Vec::new(),
-    })
-}
-
-/// `AbortSigningSession`: the waiting stream ends with `CANCELLED`.
-pub(crate) fn abort_signing_session(
-    state: &DaemonState,
-    req: AbortSigningSessionRequest,
-) -> Result<SigningSession, Status> {
-    let session = state
-        .sessions
-        .finish(
-            &req.session_id,
-            SessionStatus::Aborted,
-            "aborted by the client",
-        )
-        .ok_or_else(|| {
-            GygesError::new(ErrorReason::SessionNotFound, "no such signing session")
-                .with_session(&req.session_id)
-                .into_status()
-        })?;
-    tracing::info!(target: AUDIT_TARGET, key_id = session.key_id, event = "session_aborted");
-    Ok(session)
-}
-
 /// `GetBalance` (docs/interface.md API): per pool at `min_confirmations`.
 pub(crate) async fn get_balance(
     state: Arc<DaemonState>,
@@ -1585,54 +1045,5 @@ mod tests {
                 ErrorReason::InvalidArgument
             );
         }
-    }
-
-    #[test]
-    fn tx_errors_map_to_the_documented_reasons() {
-        assert_eq!(
-            tx_error(
-                TxError::InsufficientFunds {
-                    available: 1,
-                    required: 2
-                },
-                "k"
-            )
-            .reason(),
-            ErrorReason::InsufficientFunds
-        );
-        assert_eq!(
-            tx_error(TxError::NotSynced("x".into()), "k").reason(),
-            ErrorReason::NotSynced
-        );
-        assert_eq!(
-            tx_error(TxError::UnsupportedPool("x".into()), "k").reason(),
-            ErrorReason::UnsupportedPool
-        );
-        let e = broadcast_error(ChainError::Rejected("tx-expired".into()), "k");
-        assert_eq!(e.reason(), ErrorReason::NodeRejected);
-        assert_eq!(e.node_error, "tx-expired");
-        assert_eq!(
-            broadcast_error(ChainError::Unreachable("down".into()), "k").reason(),
-            ErrorReason::NodeUnreachable
-        );
-    }
-
-    #[test]
-    fn session_hub_lifecycle() {
-        let hub = SessionHub::default();
-        let (id, _, rx) = hub.create("main", 1, Duration::from_secs(60), v1::Proposal::default());
-        assert_eq!(hub.key_of(&id).as_deref(), Some("main"));
-        assert_eq!(hub.list("", false).len(), 1);
-        assert!(hub.list("other", false).is_empty());
-        let s = hub.finish(&id, SessionStatus::Aborted, "aborted").unwrap();
-        assert_eq!(s.status(), SessionStatus::Aborted);
-        assert!(hub.key_of(&id).is_none());
-        assert!(hub.list("", false).is_empty());
-        assert_eq!(hub.list("", true).len(), 1);
-        // The receiver sees the drop.
-        assert!(rx.blocking_recv().is_err());
-        // Finishing twice keeps the first status.
-        let s = hub.finish(&id, SessionStatus::Failed, "x").unwrap();
-        assert_eq!(s.status(), SessionStatus::Aborted);
     }
 }

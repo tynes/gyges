@@ -535,11 +535,13 @@ fn summarize_step<N>(proposal: &Proposal<StandardFeeRule, N>, step: &Step<N>) ->
     }
 }
 
-/// Step 2 of the pipeline: what the user approves.
+/// Step 2 of the pipeline: what the user approves. `expiry` is the one
+/// [`build_single_step`] is given (`None` for the default).
 pub fn summarize<N>(
     params: &ConsensusParams,
     proposal: &Proposal<StandardFeeRule, N>,
     min_confirmations: u32,
+    expiry: Option<BlockHeight>,
 ) -> ProposalSummary {
     let steps: Vec<StepSummary> = proposal
         .steps()
@@ -567,10 +569,26 @@ pub fn summarize<N>(
             .first()
             .anchor_height()
             .map_or(0, u32::from),
-        expiry_height: u32::from(default_expiry(params, target)),
+        expiry_height: u32::from(expiry.unwrap_or_else(|| default_expiry(params, target))),
         min_confirmations,
         upstream,
     }
+}
+
+/// Step 3 for a single-step proposal: its PCZT ([`build_pczt`]) and what
+/// the Verifier will hold it to ([`Expected::from_proposal`]), both with
+/// the same `expiry`, which is the one [`summarize`] was given so that
+/// what the user approves, what is built and what is checked agree.
+pub fn build_single_step<N: fmt::Display>(
+    wallet: &mut Wallet,
+    params: &ConsensusParams,
+    account: AccountUuid,
+    proposal: &Proposal<StandardFeeRule, N>,
+    expiry: Option<BlockHeight>,
+) -> Result<(Expected, Pczt), TxError> {
+    let expected = Expected::from_proposal(params, proposal, expiry)?;
+    let pczt = build_pczt(wallet, params, account, proposal, expiry)?;
+    Ok((expected, pczt))
 }
 
 /// Step 3: Creator, Constructor, IO Finalizer and Updater (anchors and

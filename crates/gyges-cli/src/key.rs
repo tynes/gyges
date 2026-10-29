@@ -444,82 +444,33 @@ async fn import_keystone(ctx: &Ctx, args: ImportKeystoneArgs) -> Result<(), CliE
     })
 }
 
-/// The checks the CLI can make without the daemon: a complete
-/// `ur:zcash-accounts` export and its firmware version. Exit codes follow
-/// the daemon's: 6 for the wrong payload, 9 for firmware below the minimum,
-/// 4 for an unknown version without `--allow-unknown-firmware`.
+/// The checks the CLI can make without the daemon, shared with the daemon's
+/// `ImportKeystone` (`gyges_qr::read_accounts_export`, `firmware::admit`): a
+/// complete `ur:zcash-accounts` export and its firmware version. Exit codes
+/// follow the daemon's: 6 for the wrong payload, 9 for an export that does
+/// not decode or firmware below the minimum, 4 for an unknown version
+/// without `--allow-unknown-firmware`.
 fn precheck_accounts_export(payload: &str, allow_unknown_firmware: bool) -> Result<(), CliError> {
-    use gyges_qr::firmware::{self, FirmwareCheck};
-    let fail = |reason, detail: String| Err(CliError::Daemon(GygesError::new(reason, detail)));
-    let mut asm = gyges_qr::Assembler::new();
-    for frame in payload.split_whitespace() {
-        if frame.to_ascii_lowercase().starts_with("uview") {
-            return fail(
+    use gyges_qr::ExportError;
+    use gyges_qr::firmware::{self, FirmwareRefusal};
+    let fail = |reason, detail: String| CliError::Daemon(GygesError::new(reason, detail));
+    let accounts =
+        gyges_qr::read_accounts_export(payload.split_whitespace()).map_err(|e| match e {
+            ExportError::NoFrames => fail(
                 ErrorReason::InvalidArgument,
-                "a bare UFVK carries no seed fingerprint, so the Keystone could not recognise its \
-                 key in a PCZT; pass the device's ur:zcash-accounts QR"
-                    .into(),
-            );
-        }
-        if let Err(e) = asm.receive(frame) {
-            return fail(
-                ErrorReason::InvalidArgument,
-                format!("not a Keystone accounts export: {e}"),
-            );
-        }
-    }
-    match asm.ur_type() {
-        None => {
-            return fail(
-                ErrorReason::InvalidArgument,
-                "no ur:zcash-accounts frame given (pass --ur, or the frames on stdin)".into(),
-            );
-        }
-        Some(gyges_qr::ur_types::ZCASH_UNIFIED_FULL_VIEWING_KEY) => {
-            return fail(
-                ErrorReason::InvalidArgument,
-                "ur:zcash-unified-full-viewing-key carries no seed fingerprint, so the Keystone \
-                 could not recognise its key in a PCZT; pass the device's ur:zcash-accounts QR \
-                 (Connect Software Wallet)"
-                    .into(),
-            );
-        }
-        Some(t) if t != gyges_qr::ur_types::ZCASH_ACCOUNTS => {
-            return fail(
-                ErrorReason::InvalidArgument,
-                format!("expected ur:zcash-accounts, got ur:{t}"),
-            );
-        }
-        Some(_) => {}
-    }
-    if !asm.is_complete() {
-        let (resolved, total) = asm.progress();
-        return fail(
-            ErrorReason::InvalidArgument,
-            format!(
-                "the accounts export is incomplete ({resolved} of {total} fragments); pass every \
-                 frame"
+                format!("{e} (pass --ur, or the frames on stdin)"),
             ),
-        );
-    }
-    let Ok(Some(gyges_qr::Payload::Accounts(accounts))) = gyges_qr::Payload::from_assembler(&asm)
-    else {
-        // It does not decode: the daemon's HARDWARE_SIGNER refusal says why.
-        return Ok(());
-    };
-    let reported = accounts.device_version.as_deref();
-    match firmware::check(reported) {
-        FirmwareCheck::Supported(_) => Ok(()),
-        FirmwareCheck::TooOld(v) => fail(ErrorReason::HardwareSigner, firmware::too_old_message(v)),
-        FirmwareCheck::Unknown if allow_unknown_firmware => Ok(()),
-        FirmwareCheck::Unknown => fail(
-            ErrorReason::ConfirmationRequired,
-            format!(
-                "{}; update it and export again, or pass --allow-unknown-firmware to import it \
-                 anyway",
-                firmware::unknown_message(reported)
-            ),
-        ),
+            e if e.is_device_fault() => fail(ErrorReason::HardwareSigner, e.to_string()),
+            e => fail(ErrorReason::InvalidArgument, e.to_string()),
+        })?;
+    match firmware::admit(accounts.device_version.as_deref(), allow_unknown_firmware) {
+        Ok(_) => Ok(()),
+        Err(e @ FirmwareRefusal::TooOld(_)) => {
+            Err(fail(ErrorReason::HardwareSigner, e.to_string()))
+        }
+        Err(e @ FirmwareRefusal::Unknown(_)) => {
+            Err(fail(ErrorReason::ConfirmationRequired, e.to_string()))
+        }
     }
 }
 

@@ -31,7 +31,11 @@ use zcash_client_backend::data_api::wallet::{
     SignerView, redact_pczt_for_batch_signer, redact_pczt_for_signer,
 };
 
+use zcash_keys::keys::UnifiedFullViewingKey;
+use zip32::fingerprint::SeedFingerprint;
+
 use crate::db::sessions::Protocol;
+use crate::network::Network;
 use crate::pczt_io::{TAG_KEY_ID, TAG_NETWORK, TAG_SESSION_ID};
 
 /// Why a device's answer was refused. The session stays open: the user can
@@ -209,6 +213,116 @@ fn combine_single(proven: Pczt, answer: Vec<u8>) -> Result<Pczt, DeviceError> {
         .map_err(|e| DeviceError::Mismatch(format!("{e:?}")))
 }
 
+/// The account a Keystone pairing export (`ur:zcash-accounts`) pairs,
+/// checked against what every Keystone account is.
+pub struct PairedAccount {
+    pub ufvk: UnifiedFullViewingKey,
+    pub seed_fingerprint: SeedFingerprint,
+    pub account_index: zip32::AccountId,
+    pub name: Option<String>,
+}
+
+// No viewing key in debug output (Q-O1).
+impl std::fmt::Debug for PairedAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairedAccount")
+            .field("account_index", &u32::from(self.account_index))
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a decoded pairing export cannot be imported.
+#[derive(Debug, thiserror::Error)]
+pub enum PairingError {
+    #[error(
+        "account {wanted} is not in the export, which lists account {}; pass --account",
+        listed(have)
+    )]
+    AccountMissing { wanted: u32, have: Vec<u32> },
+    #[error("the export's seed fingerprint is {0} bytes, not the 32 of ZIP 32")]
+    FingerprintLength(usize),
+    #[error("the export lists an account index twice")]
+    DuplicateIndex,
+    #[error("the export lists no accounts")]
+    NoAccounts,
+    #[error("account index {0} is out of range")]
+    IndexOutOfRange(u32),
+    #[error("account {index}'s UFVK is not a {network} viewing key: {detail}")]
+    WrongUfvk {
+        index: u32,
+        network: &'static str,
+        detail: String,
+    },
+    #[error("account {0}'s UFVK has no Orchard component, which every Keystone account has")]
+    NoOrchard(u32),
+}
+
+impl PairingError {
+    /// Whether the device's content is at fault (`HARDWARE_SIGNER`) rather
+    /// than the account the user asked for (`INVALID_ARGUMENT`).
+    pub fn is_device_fault(&self) -> bool {
+        !matches!(self, Self::AccountMissing { .. })
+    }
+}
+
+fn listed(indices: &[u32]) -> String {
+    indices
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Pick account `account_index` from `export` and check it: a ZIP 32 seed
+/// fingerprint, distinct indices, and a `network` UFVK with an Orchard
+/// component. With one account listed, index 0 means "that one".
+pub fn paired_account(
+    network: Network,
+    export: &gyges_qr::Accounts,
+    account_index: u32,
+) -> Result<PairedAccount, PairingError> {
+    let fp: [u8; 32] = export
+        .seed_fingerprint
+        .as_slice()
+        .try_into()
+        .map_err(|_| PairingError::FingerprintLength(export.seed_fingerprint.len()))?;
+    let mut indices: Vec<u32> = export.accounts.iter().map(|a| a.index).collect();
+    indices.sort_unstable();
+    if indices.windows(2).any(|w| w[0] == w[1]) {
+        return Err(PairingError::DuplicateIndex);
+    }
+    let account =
+        match export.accounts.as_slice() {
+            [] => return Err(PairingError::NoAccounts),
+            [only] if account_index == 0 || only.index == account_index => only,
+            list => list.iter().find(|a| a.index == account_index).ok_or(
+                PairingError::AccountMissing {
+                    wanted: account_index,
+                    have: indices,
+                },
+            )?,
+        };
+    let index = zip32::AccountId::try_from(account.index)
+        .map_err(|_| PairingError::IndexOutOfRange(account.index))?;
+    let ufvk = UnifiedFullViewingKey::decode(&network.consensus_params(), &account.ufvk).map_err(
+        |detail| PairingError::WrongUfvk {
+            index: account.index,
+            network: network.name(),
+            detail,
+        },
+    )?;
+    if ufvk.orchard().is_none() {
+        return Err(PairingError::NoOrchard(account.index));
+    }
+    Ok(PairedAccount {
+        ufvk,
+        seed_fingerprint: SeedFingerprint::from_bytes(fp),
+        account_index: index,
+        name: account.name.clone(),
+    })
+}
+
 /// A Keystone in software, for tests: it answers a request as the device
 /// does, from the payload alone, with upstream's Signer roles only (the
 /// batch side as upstream's own batch test does), never with Gyges' own
@@ -358,14 +472,63 @@ pub mod emulator {
     }
 
     /// What a working device answers to a request of `ur_type`.
-    pub fn answer(device: &Device, ur_type: &str, payload: &[u8]) -> Vec<u8> {
+    pub fn answer(device: &Device, ur_type: &str, payload: &[u8]) -> (&'static str, Vec<u8>) {
+        use gyges_qr::ur_types;
         match ur_type {
-            gyges_qr::ur_types::ZCASH_SIGN_BATCH => {
+            ur_types::ZCASH_SIGN_BATCH => {
                 let (id, sigs) = batch_signatures(device, payload);
-                batch_answer(id, sigs)
+                (ur_types::ZCASH_BATCH_SIG_RESULT, batch_answer(id, sigs))
             }
-            gyges_qr::ur_types::ZCASH_PCZT => pczt_answer(signed_pczt(device, payload)),
+            ur_types::ZCASH_PCZT => (
+                ur_types::ZCASH_PCZT,
+                pczt_answer(signed_pczt(device, payload)),
+            ),
             other => panic!("not a Keystone request: ur:{other}"),
         }
+    }
+
+    /// The pairing export (`ur:zcash-accounts`) a device holding `seed`
+    /// shows for `accounts` on `network`: each UFVK with its Orchard and
+    /// transparent items only (the device's UFVK has no Sapling
+    /// component), the ZIP 32 seed fingerprint, and `device_version`.
+    /// Account `i` is named "Keystone i".
+    pub fn pairing_export(
+        network: crate::network::Network,
+        seed: &[u8],
+        accounts: &[u32],
+        device_version: Option<&str>,
+    ) -> gyges_qr::Payload {
+        use zcash_address::unified::{Container as _, Encoding as _, Fvk, Ufvk};
+        let params = network.consensus_params();
+        let accounts = accounts
+            .iter()
+            .map(|&index| {
+                let account = zip32::AccountId::try_from(index).expect("a ZIP 32 account index");
+                let usk = UnifiedSpendingKey::from_seed(&params, seed, account)
+                    .expect("a spending key for the seed");
+                let full = usk.to_unified_full_viewing_key().encode(&params);
+                let (net, ufvk) = Ufvk::decode(&full).expect("our own UFVK decodes");
+                let items: Vec<Fvk> = ufvk
+                    .items()
+                    .into_iter()
+                    .filter(|i| !matches!(i, Fvk::Sapling(_)))
+                    .collect();
+                gyges_qr::Account {
+                    ufvk: Ufvk::try_from_items(items)
+                        .expect("Orchard and transparent items")
+                        .encode(&net),
+                    index,
+                    name: Some(format!("Keystone {index}")),
+                }
+            })
+            .collect();
+        gyges_qr::Payload::Accounts(gyges_qr::Accounts {
+            seed_fingerprint: SeedFingerprint::from_seed(seed)
+                .expect("a seed of at least 32 bytes")
+                .to_bytes()
+                .to_vec(),
+            accounts,
+            device_version: device_version.map(Into::into),
+        })
     }
 }

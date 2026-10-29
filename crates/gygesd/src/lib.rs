@@ -28,7 +28,9 @@
 // everything they do not need stays crate-private so that rustc's dead-code
 // lint sees the whole daemon.
 mod backfill;
+mod broadcast;
 mod conn;
+mod errors;
 mod keys;
 mod keystone;
 mod lifecycle;
@@ -37,6 +39,7 @@ mod node;
 mod policy;
 mod roles;
 mod service;
+mod sessions;
 mod sync;
 mod tex;
 mod tx;
@@ -97,20 +100,39 @@ impl WalletTaskError for gyges_core::SyncError {
     }
 }
 
-/// Run `f` with the key's wallet on a blocking thread.
+/// Run `f` on a blocking thread, off the async workers (proving, signing,
+/// anything that touches SQLite).
+pub(crate) async fn blocking<T: Send + 'static, E: WalletTaskError>(
+    f: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, E> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| E::wallet_task(format!("blocking task failed: {e}")))?
+}
+
+/// Run `f` with the key's wallet on a blocking thread, holding the key's
+/// wallet lock for the duration.
 pub(crate) async fn with_wallet<T: Send + 'static, E: WalletTaskError>(
     key: &Arc<gyges_core::KeyEntry>,
     f: impl FnOnce(&mut gyges_core::registry::Wallet) -> Result<T, E> + Send + 'static,
 ) -> Result<T, E> {
     let key = key.clone();
-    tokio::task::spawn_blocking(move || {
+    blocking(move || {
         let mut wallet = key
             .wallet()
             .ok_or_else(|| E::wallet_task("this profile has no wallet".into()))?;
         f(&mut wallet)
     })
     .await
-    .map_err(|e| E::wallet_task(format!("wallet task failed: {e}")))?
+}
+
+/// [`with_wallet`] for an RPC: a failure is the key's typed error.
+pub(crate) async fn wallet_rpc<T: Send + 'static>(
+    key: &Arc<gyges_core::KeyEntry>,
+    f: impl FnOnce(&mut gyges_core::registry::Wallet) -> Result<T, gyges_core::TxError> + Send + 'static,
+) -> Result<T, tonic::Status> {
+    use errors::ForKey as _;
+    with_wallet(key, f).await.for_key(key.key_id())
 }
 
 /// What the command line decided (docs/interface.md CLI §2.1 `gyges daemon start`).

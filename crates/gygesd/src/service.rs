@@ -37,9 +37,10 @@ use tonic::{Request, Response, Status};
 use crate::keys;
 use crate::logs::{LogHub, LogStream};
 use crate::roles::{self, SignStream};
+use crate::sessions::{self, SessionHub};
 use crate::sync::{self, ProgressStream, SyncHub};
 use crate::tex::{self, TexHub};
-use crate::tx::{self, SendStream, SessionHub};
+use crate::tx::{self, SendStream};
 use crate::wallet;
 
 /// Everything the RPC handlers share.
@@ -153,7 +154,7 @@ impl DaemonState {
     pub(crate) fn resolve_key(&self, key_id: &str) -> Result<Arc<KeyEntry>, Status> {
         self.registry
             .resolve(key_id)
-            .map_err(|e| keys::registry_error(e).into())
+            .map_err(|e| crate::errors::registry_error(e).into())
     }
 
     /// [`Self::resolve_key`], refusing a profile without a wallet with `why`.
@@ -332,11 +333,9 @@ impl Gyges for GygesService {
         request: Request<ListSigningSessionsRequest>,
     ) -> Result<Response<ListSigningSessionsResponse>, Status> {
         let req = request.into_inner();
-        let mut resp = tx::list_signing_sessions(&self.state, &req)?;
-        resp.sessions
-            .extend(crate::keystone::list(&self.state, &req.key_id, req.include_finished).await);
-        resp.tex_transfers = tex::list(&self.state, &req.key_id, req.include_finished).await;
-        Ok(Response::new(resp))
+        Ok(Response::new(
+            sessions::list_signing_sessions(&self.state, &req).await,
+        ))
     }
 
     async fn resume_tex_transfer(
@@ -362,11 +361,9 @@ impl Gyges for GygesService {
         &self,
         request: Request<AbortSigningSessionRequest>,
     ) -> Result<Response<SigningSession>, Status> {
-        let req = request.into_inner();
-        if let Some(session) = crate::keystone::abort(&self.state, &req.session_id).await? {
-            return Ok(Response::new(session));
-        }
-        tx::abort_signing_session(&self.state, req).map(Response::new)
+        sessions::abort_signing_session(&self.state, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn complete_keystone_sign(

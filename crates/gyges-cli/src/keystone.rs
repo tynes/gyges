@@ -56,9 +56,7 @@ pub(crate) fn frames(kind: SignatureKind, payload: &[u8]) -> Result<Frames, CliE
 /// Every fragment once, which is enough to reassemble: what `--qr-out` and
 /// a non-terminal print, one per line.
 pub(crate) fn frame_lines(mut frames: Frames) -> Result<Vec<String>, CliError> {
-    (0..frames.fragment_count())
-        .map(|_| frames.next_frame().map_err(|e| CliError::Other(e.into())))
-        .collect()
+    frames.take_loops(1).map_err(|e| CliError::Other(e.into()))
 }
 
 /// Loop the frames on stderr until the user presses Enter; Ctrl-C is

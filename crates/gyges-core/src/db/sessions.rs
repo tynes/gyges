@@ -3,7 +3,7 @@
 //! file or for a Keystone, holding the proposal the user approved so that
 //! the Verifier can run against it days later and after restarts
 //! (docs/architecture.md Components §3.5). Passphrase sessions of `tx send` stay in memory
-//! (`gygesd::tx::SessionHub`).
+//! (`gygesd::sessions::SessionHub`).
 //!
 //! A Keystone session carries its device-side
 //! half ([`KeystoneRow`]) in the same row: the proven PCZT the device's

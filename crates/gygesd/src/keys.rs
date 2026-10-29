@@ -1,6 +1,6 @@
 //! The key RPCs (`ListKeys`, `InitKey`, `RestoreKey`, `ImportKeystone`,
-//! `UnlockKey`, `LockKey`, `ExportUfvk`, `ExportSeed`) and the mapping from
-//! `gyges-core` errors to `GygesError` (docs/interface.md API §3, §4).
+//! `UnlockKey`, `LockKey`, `ExportUfvk`, `ExportSeed`, docs/interface.md API §4). Their
+//! errors map to `GygesError` in `crate::errors`.
 //!
 //! Passphrases and mnemonics arrive as plain strings in the request message
 //! (`[debug_redact]` in the proto keeps them out of `Debug` output). They are
@@ -13,10 +13,9 @@ use std::time::Duration;
 use age::secrecy::SecretString;
 use gyges_chain::ChainError;
 use gyges_core::registry::{NewKeystoneKey, NewLocalSeedKey};
-use gyges_core::vault::VaultError;
 use gyges_core::vault::manager::{Auth, Scope, UnlockState};
 use gyges_core::{
-    BirthdayError, KeyEntry, Network, RegistryError, ResolvedBirthday, SigningMode, birthday, vault,
+    BirthdayError, KeyEntry, Network, ResolvedBirthday, SigningMode, birthday, vault,
 };
 use gyges_proto::v1::{
     self, ErrorReason, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest,
@@ -24,13 +23,13 @@ use gyges_proto::v1::{
     InitKeyResponse, KeySummary, LockKeyRequest, LockKeyResponse, RestoreKeyRequest,
     RestoreKeyResponse, UnlockKeyRequest, UnlockKeyResponse, UnlockScope,
 };
-use gyges_qr::{Assembler, Payload};
 use tonic::Status;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zeroize::Zeroizing;
 use zip32::fingerprint::SeedFingerprint;
 
 use crate::conn::ConnInfo;
+use crate::errors::{ForKey, birthday_error, registry_error};
 use crate::service::{DaemonState, invalid};
 
 /// Security-relevant events, key id and time only (docs/decisions.md Q-O1). The
@@ -97,113 +96,6 @@ pub(crate) fn summaries(state: &DaemonState) -> Vec<KeySummary> {
         .iter()
         .map(|e| summary(e, &default, &unlocks))
         .collect()
-}
-
-/// `VaultError` → typed error.
-pub(crate) fn vault_error(e: VaultError, key_id: &str) -> GygesError {
-    let err = match e {
-        VaultError::WrongPassphrase => {
-            GygesError::new(ErrorReason::InvalidPassphrase, "wrong passphrase")
-        }
-        VaultError::RateLimited(wait) => GygesError::new(
-            ErrorReason::RateLimited,
-            format!(
-                "too many failed unlock attempts; retry in {}s",
-                wait.as_secs().max(1)
-            ),
-        ),
-        VaultError::Locked => GygesError::new(
-            ErrorReason::VaultLocked,
-            "the key is locked; run `gyges key unlock` or pass --passphrase-fd",
-        ),
-        VaultError::NoSeed => GygesError::new(
-            ErrorReason::InvalidArgument,
-            "this profile has no seed on disk and cannot be unlocked",
-        ),
-        other => {
-            tracing::error!(error = %other, key_id, "vault failure");
-            GygesError::new(ErrorReason::Internal, other.to_string())
-        }
-    };
-    err.with_key(key_id)
-}
-
-/// `RegistryError` → the typed error the CLI dispatches on.
-pub(crate) fn registry_error(e: RegistryError) -> GygesError {
-    use RegistryError as R;
-    match e {
-        R::InvalidKeyId(id) => GygesError::new(
-            ErrorReason::InvalidArgument,
-            "key id must match ^[a-z0-9][a-z0-9_-]{0,31}$",
-        )
-        .with_key(id),
-        R::Exists(id) => {
-            GygesError::new(ErrorReason::KeyExists, "a key with this id already exists")
-                .with_key(id)
-        }
-        R::NotFound(id) => GygesError::new(ErrorReason::KeyNotFound, "no such key").with_key(id),
-        R::NoDefault => GygesError::new(ErrorReason::KeyNotFound, "no default key; pass --key"),
-        R::Vault {
-            key_id,
-            source: vault::VaultError::WrongPassphrase,
-        } => GygesError::new(ErrorReason::InvalidPassphrase, "wrong passphrase").with_key(key_id),
-        R::Vault {
-            key_id,
-            source: vault::VaultError::Mnemonic(m),
-        } => GygesError::new(
-            ErrorReason::InvalidArgument,
-            format!("invalid mnemonic: {m}"),
-        )
-        .with_key(key_id),
-        R::Invalid(detail) => GygesError::new(ErrorReason::InvalidArgument, detail),
-        other => {
-            // Paths and SQLite messages, never key material.
-            tracing::error!(error = %other, "key registry failure");
-            GygesError::new(ErrorReason::Internal, other.to_string())
-        }
-    }
-}
-
-/// `BirthdayError` → typed error. `BelowRetention` maps to
-/// `FALLBACK_UNAVAILABLE` (no fallback endpoint); callers that can backfill
-/// intercept it first and decide on `allow_backfill` (`below_retention`).
-pub(crate) fn birthday_error(e: BirthdayError) -> GygesError {
-    match e {
-        BirthdayError::NodeRequired(what) => GygesError::new(
-            ErrorReason::NodeUnreachable,
-            format!("a connected node is required to {what}"),
-        ),
-        BirthdayError::AboveTip { height, tip } => GygesError::new(
-            ErrorReason::InvalidArgument,
-            format!("birthday {height} is above the node's tip {tip}"),
-        ),
-        BirthdayError::BelowRetention {
-            height,
-            retained_from,
-        } => GygesError::new(
-            ErrorReason::FallbackUnavailable,
-            format!(
-                "birthday {height} is below the node's retention window (retained from {retained_from}) \
-                 and no fallback endpoint is configured; enable [fallback_lightwalletd] to backfill \
-                 the blocks below the window, or restore with a later birthday"
-            ),
-        ),
-        BirthdayError::Fallback(e) => GygesError::new(
-            ErrorReason::FallbackUnavailable,
-            format!("the fallback endpoint cannot serve the birthday's tree state: {e}"),
-        ),
-        e @ BirthdayError::FallbackMismatch { .. } => {
-            GygesError::new(ErrorReason::FallbackUnavailable, e.to_string())
-        }
-        BirthdayError::Chain(
-            ChainError::Unreachable(detail)
-            | ChainError::Rpc(detail)
-            | ChainError::Rejected(detail),
-        ) => GygesError::new(ErrorReason::NodeUnreachable, detail),
-        BirthdayError::Chain(
-            e @ (ChainError::TreeStateUnavailable { .. } | ChainError::BlockUnavailable { .. }),
-        ) => GygesError::new(ErrorReason::FallbackUnavailable, e.to_string()),
-    }
 }
 
 /// Move the passphrase out of the request into a zeroizing wrapper.
@@ -479,130 +371,43 @@ fn check_accounts_export(
     account_index: u32,
     allow_unknown_firmware: bool,
 ) -> Result<AccountsExport, GygesError> {
-    let bad = |detail: String| GygesError::new(ErrorReason::InvalidArgument, detail);
-    let device = |detail: String| GygesError::new(ErrorReason::HardwareSigner, detail);
-    let not_accounts = |what: &str| {
-        bad(format!(
-            "{what} carries no seed fingerprint, so the Keystone could not recognise its key in a \
-             PCZT; export the accounts from the device (Connect Software Wallet) and pass the \
-             ur:zcash-accounts QR"
-        ))
+    use gyges_qr::firmware::{self, FirmwareCheck, FirmwareRefusal};
+    let refused = |device_fault: bool, detail: String| {
+        let reason = if device_fault {
+            ErrorReason::HardwareSigner
+        } else {
+            ErrorReason::InvalidArgument
+        };
+        GygesError::new(reason, detail)
     };
-
-    let frames: Vec<&str> = payload.split_whitespace().collect();
-    let Some(first) = frames.first() else {
-        return Err(bad("no ur:zcash-accounts frame given".into()));
-    };
-    if first.to_ascii_lowercase().starts_with("uview") {
-        return Err(not_accounts("a bare UFVK"));
-    }
-    let mut asm = Assembler::new();
-    for f in &frames {
-        asm.receive(f)
-            .map_err(|e| bad(format!("not a Keystone accounts export: {e}")))?;
-    }
-    match asm.ur_type() {
-        Some(gyges_qr::ur_types::ZCASH_ACCOUNTS) => {}
-        Some(gyges_qr::ur_types::ZCASH_UNIFIED_FULL_VIEWING_KEY) => {
-            return Err(not_accounts("ur:zcash-unified-full-viewing-key"));
-        }
-        other => {
-            return Err(bad(format!(
-                "expected ur:zcash-accounts, got ur:{}",
-                other.unwrap_or("?")
-            )));
-        }
-    }
-    if !asm.is_complete() {
-        let (resolved, total) = asm.progress();
-        return Err(bad(format!(
-            "the accounts export is incomplete ({resolved} of {total} fragments); pass every frame"
-        )));
-    }
-    let accounts = match Payload::from_assembler(&asm) {
-        Ok(Some(Payload::Accounts(a))) => a,
-        Ok(_) => return Err(bad("the accounts export is incomplete".into())),
-        Err(e) => return Err(device(format!("the accounts export does not decode: {e}"))),
-    };
-
-    let fp: [u8; 32] = accounts
-        .seed_fingerprint
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            device(format!(
-                "the export's seed fingerprint is {} bytes, not the 32 of ZIP 32",
-                accounts.seed_fingerprint.len()
-            ))
-        })?;
-    let seed_fingerprint = SeedFingerprint::from_bytes(fp);
-
-    let mut indices: Vec<u32> = accounts.accounts.iter().map(|a| a.index).collect();
-    indices.sort_unstable();
-    if indices.windows(2).any(|w| w[0] == w[1]) {
-        return Err(device("the export lists an account index twice".into()));
-    }
-    let account = match accounts.accounts.as_slice() {
-        [] => return Err(device("the export lists no accounts".into())),
-        [only] if account_index == 0 || only.index == account_index => only,
-        list => list
-            .iter()
-            .find(|a| a.index == account_index)
-            .ok_or_else(|| {
-                let have: Vec<String> = indices.iter().map(u32::to_string).collect();
-                bad(format!(
-                    "account {account_index} is not in the export, which lists account {}; pass \
-                     --account",
-                    have.join(", ")
-                ))
-            })?,
-    };
-    let index = zip32::AccountId::try_from(account.index)
-        .map_err(|_| device(format!("account index {} is out of range", account.index)))?;
-    let ufvk =
-        UnifiedFullViewingKey::decode(&network.consensus_params(), &account.ufvk).map_err(|e| {
-            device(format!(
-                "account {}'s UFVK is not a {} viewing key: {e}",
-                account.index,
-                network.name()
-            ))
-        })?;
-    if ufvk.orchard().is_none() {
-        return Err(device(format!(
-            "account {}'s UFVK has no Orchard component, which every Keystone account has",
-            account.index
-        )));
-    }
-
-    use gyges_qr::firmware::{self, FirmwareCheck};
+    let accounts = gyges_qr::read_accounts_export(payload.split_whitespace())
+        .map_err(|e| refused(e.is_device_fault(), e.to_string()))?;
+    let paired = gyges_core::keystone::paired_account(network, &accounts, account_index)
+        .map_err(|e| refused(e.is_device_fault(), e.to_string()))?;
     let reported = accounts.device_version.as_deref();
-    let (device_version, warning) = match firmware::check(reported) {
-        FirmwareCheck::Supported(_) => (reported.unwrap_or_default().to_string(), None),
-        FirmwareCheck::TooOld(v) => return Err(device(firmware::too_old_message(v))),
-        FirmwareCheck::Unknown if allow_unknown_firmware => (
+    let (device_version, warning) = match firmware::admit(reported, allow_unknown_firmware) {
+        Ok(FirmwareCheck::Unknown) => (
             reported.unwrap_or("unknown").to_string(),
             Some(format!(
                 "{}; it was imported anyway (--allow-unknown-firmware)",
                 firmware::unknown_message(reported)
             )),
         ),
-        FirmwareCheck::Unknown => {
+        Ok(_) => (reported.unwrap_or_default().to_string(), None),
+        Err(e @ FirmwareRefusal::TooOld(_)) => return Err(refused(true, e.to_string())),
+        Err(e @ FirmwareRefusal::Unknown(_)) => {
             return Err(GygesError::new(
                 ErrorReason::ConfirmationRequired,
-                format!(
-                    "{}; update it and export again, or pass --allow-unknown-firmware to import \
-                     it anyway",
-                    firmware::unknown_message(reported)
-                ),
+                e.to_string(),
             ));
         }
     };
     Ok(AccountsExport {
-        ufvk,
-        seed_fingerprint,
-        account_index: index,
+        ufvk: paired.ufvk,
+        seed_fingerprint: paired.seed_fingerprint,
+        account_index: paired.account_index,
         device_version,
-        name: account.name.clone(),
+        name: paired.name,
         warning,
     })
 }
@@ -683,7 +488,7 @@ pub(crate) async fn unlock_key(
 ) -> Result<UnlockKeyResponse, Status> {
     let passphrase = take_passphrase(&mut req.passphrase)?;
     if !req.session_id.is_empty() {
-        return crate::tx::satisfy_session(state, req.session_id, passphrase).await;
+        return crate::sessions::satisfy_session(state, req.session_id, passphrase).await;
     }
     let key = state.resolve_key(&req.key_id)?;
     let scope = match req.scope() {
@@ -700,7 +505,7 @@ pub(crate) async fn unlock_key(
     let unlocked = tokio::task::spawn_blocking(move || st.vault.unlock(&k, passphrase, scope, ttl))
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e| vault_error(e, &key_id).into_status())?;
+        .for_key(&key_id)?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "unlock", scope = ?unlocked.scope);
     Ok(UnlockKeyResponse {
         session_token: unlocked
@@ -749,7 +554,7 @@ pub(crate) fn export_ufvk(
         None => state
             .vault
             .with_entropy(key.key_id(), Auth::Daemon, |e| key.derive_ufvk(e))
-            .map_err(|e| vault_error(e, key.key_id()).into_status())?
+            .for_key(key.key_id())?
             .map_err(registry_error)?,
     };
     Ok(ExportUfvkResponse {
@@ -786,7 +591,7 @@ pub(crate) async fn export_seed(
     let entropy = tokio::task::spawn_blocking(move || st.vault.verify_passphrase(&k, passphrase))
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .map_err(|e| vault_error(e, &key_id).into_status())?;
+        .for_key(&key_id)?;
     let mnemonic = vault::mnemonic_phrase(&entropy);
     drop(entropy);
     tracing::info!(target: AUDIT_TARGET, key_id, event = "export_seed");
@@ -794,49 +599,4 @@ pub(crate) async fn export_seed(
         mnemonic: mnemonic.to_string(),
         birthday_height: key.profile().birthday_height.unwrap_or(0),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn registry_errors_map_to_the_documented_reasons() {
-        assert_eq!(
-            registry_error(RegistryError::Exists("a".into())).reason(),
-            ErrorReason::KeyExists
-        );
-        assert_eq!(
-            registry_error(RegistryError::NotFound("a".into())).key_id,
-            "a"
-        );
-        assert_eq!(
-            registry_error(RegistryError::NoDefault).detail,
-            "no default key; pass --key"
-        );
-        assert_eq!(
-            registry_error(RegistryError::InvalidKeyId("A".into())).reason(),
-            ErrorReason::InvalidArgument
-        );
-        assert_eq!(
-            registry_error(RegistryError::Vault {
-                key_id: "a".into(),
-                source: vault::VaultError::WrongPassphrase
-            })
-            .reason(),
-            ErrorReason::InvalidPassphrase
-        );
-        assert_eq!(
-            birthday_error(BirthdayError::NodeRequired("x")).reason(),
-            ErrorReason::NodeUnreachable
-        );
-        assert_eq!(
-            birthday_error(BirthdayError::BelowRetention {
-                height: 1,
-                retained_from: 2
-            })
-            .reason(),
-            ErrorReason::FallbackUnavailable
-        );
-    }
 }
