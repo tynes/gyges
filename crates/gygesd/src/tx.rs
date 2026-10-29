@@ -372,13 +372,11 @@ impl Route {
             Route::Node => node
                 .send_raw_transaction(raw)
                 .await
-                .map(drop)
                 .map_err(|e| broadcast_error(e, key_id)),
             Route::Endpoint(endpoint) => {
                 endpoint
                     .send_raw_transaction(raw)
                     .await
-                    .map(drop)
                     .map_err(|e| match e {
                         ChainError::Unreachable(detail) => GygesError::new(
                             ErrorReason::FallbackUnavailable,

@@ -124,9 +124,7 @@ service CompactTxStreamer {
   rpc GetTransaction(TxFilter) returns (RawTransaction) {}
   rpc SendTransaction(RawTransaction) returns (SendResponse) {}
   rpc GetTreeState(BlockID) returns (TreeState) {}
-  rpc GetLatestTreeState(Empty) returns (TreeState) {}
   rpc GetSubtreeRoots(GetSubtreeRootsArg) returns (stream SubtreeRoot) {}
   rpc GetAddressUtxos(GetAddressUtxosArg) returns (GetAddressUtxosReplyList) {}
-  rpc GetAddressUtxosStream(GetAddressUtxosArg) returns (stream GetAddressUtxosReply) {}
   rpc GetLightdInfo(Empty) returns (LightdInfo) {}
 }

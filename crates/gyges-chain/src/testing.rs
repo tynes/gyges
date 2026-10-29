@@ -3,7 +3,8 @@
 //! `zakurad` JSON-RPC server speaking the subset of methods
 //! [`crate::ZakuraRpcBackend`] uses, with the response shapes recorded in
 //! OVERVIEW.md §4.2. Used by this crate's tests, by `gygesd`'s, and by the
-//! regtest harness until a pinned `zakurad` is wired in (TESTING.md §2).
+//! regtest harness's fake-node scenarios, alongside the ones that run a
+//! pinned `zakurad` (TESTING.md §2).
 //!
 //! Blocks the fake mines itself are transparent-only, but `sendrawtransaction`
 //! puts any transaction (shielded bundles included) into a mempool that the

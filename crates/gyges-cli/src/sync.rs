@@ -62,10 +62,10 @@ pub struct RunArgs {
     /// Rescan from this height, rewinding the wallet to HEIGHT - 1 first.
     #[arg(long, value_name = "HEIGHT")]
     pub from: Option<u32>,
-    /// Stop at this height (not supported in this milestone).
+    /// Stop at this height (not implemented yet).
     #[arg(long, value_name = "HEIGHT")]
     pub to: Option<u32>,
-    /// Use the Tor fallback even inside the node's window (not supported in this milestone).
+    /// Use the Tor fallback even inside the node's window (not implemented yet).
     #[arg(long)]
     pub force_tor_lwd: bool,
     /// Confirm a rewind without prompting.
@@ -93,11 +93,12 @@ async fn mempool(ctx: &Ctx) -> Result<(), CliError> {
         })
         .await?
         .into_inner();
-    ctx.report(&resp, || {
-        println!(
-            "{}",
+    // The scan summary is the command's result, so `-q` keeps it.
+    ctx.print(&resp, || {
+        format!(
+            "{}\n",
             render_mempool(resp.transactions_scanned, resp.notes_found)
-        );
+        )
     })
 }
 
@@ -223,6 +224,13 @@ async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<(), CliError> {
 }
 
 async fn run_sync(ctx: &Ctx, args: RunArgs) -> Result<(), CliError> {
+    // The daemon refuses both; fail like every other unimplemented feature.
+    if args.to.is_some() {
+        return Err(CliError::NotImplemented("sync run --to"));
+    }
+    if args.force_tor_lwd {
+        return Err(CliError::NotImplemented("sync run --force-tor-lwd"));
+    }
     let mut conn = ctx.connect().await?;
     let mut confirm_rewind = false;
     if let Some(from) = args.from {

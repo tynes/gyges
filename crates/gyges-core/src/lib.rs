@@ -8,9 +8,10 @@
 //! * [`sync`] – the per-key state machine's types and the scan, transparent
 //!   indexing and rewind steps over `gyges_chain` (SYNC.md); the scheduler
 //!   that drives them lives in `gygesd`;
-//! * [`tx`] – the `TxEngine`: proposal → PCZT roles → raw transaction
-//!   (Q-K3, Q-K4, Q-K7); the daemon streams the steps and broadcasts;
-//! * `TexQueue` – durable two-step ZIP 320 broadcaster (Q-T1…T3);
+//! * [`tx`] – proposal → PCZT roles → raw transaction (Q-K3, Q-K4, Q-K7);
+//!   the daemon streams the steps and broadcasts;
+//! * [`db::tex`] – the durable ZIP 320 queue's rows (Q-T1…T3); the
+//!   broadcaster that drives them lives in `gygesd`;
 //! * [`log::Sensitive`] – the redaction wrapper every address, amount, memo,
 //!   txid and secret goes through before it can reach a log line (Q-O1).
 

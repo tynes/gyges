@@ -457,8 +457,7 @@ fn precheck_accounts_export(payload: &str, allow_unknown_firmware: bool) -> Resu
             return fail(
                 ErrorReason::InvalidArgument,
                 "a bare UFVK carries no seed fingerprint, so the Keystone could not recognise its \
-                 key in a PCZT; pass the device's ur:zcash-accounts QR, or use `key import-ufvk` \
-                 for a watch-only key"
+                 key in a PCZT; pass the device's ur:zcash-accounts QR"
                     .into(),
             );
         }
@@ -481,7 +480,7 @@ fn precheck_accounts_export(payload: &str, allow_unknown_firmware: bool) -> Resu
                 ErrorReason::InvalidArgument,
                 "ur:zcash-unified-full-viewing-key carries no seed fingerprint, so the Keystone \
                  could not recognise its key in a PCZT; pass the device's ur:zcash-accounts QR \
-                 (Connect Software Wallet), or use `key import-ufvk` for a watch-only key"
+                 (Connect Software Wallet)"
                     .into(),
             );
         }

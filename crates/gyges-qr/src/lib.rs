@@ -49,21 +49,9 @@ pub enum QrError {
     Io(#[from] std::io::Error),
 }
 
-/// CBOR tags of the Keystone Zcash UR registry types, as documented in
-/// `keystone-sdk-rust/registry_types.rs`. Kept as literals so that a change in
-/// the `ur-registry` crate is caught by `tests::registry_tags_are_stable`.
-pub mod tags {
-    pub const ZCASH_ACCOUNTS: u64 = 49201;
-    /// Reserved upstream, no implementation. Not accepted by Gyges.
-    pub const ZCASH_FULL_VIEWING_KEY: u64 = 49202;
-    pub const ZCASH_UNIFIED_FULL_VIEWING_KEY: u64 = 49203;
-    pub const ZCASH_PCZT: u64 = 49204;
-    pub const ZCASH_SIGN_BATCH: u64 = 49205;
-    pub const ZCASH_SIGN_RESULT: u64 = 49206;
-    pub const ZCASH_BATCH_SIG_RESULT: u64 = 49207;
-}
-
-/// UR type strings paired with the tags above.
+/// UR type strings of the Keystone Zcash registry types Gyges accepts
+/// (CBOR tags 49201, 49203, 49204, 49205 and 49207; `tests` pins them
+/// against the `ur-registry` crate).
 pub mod ur_types {
     pub const ZCASH_ACCOUNTS: &str = "zcash-accounts";
     pub const ZCASH_UNIFIED_FULL_VIEWING_KEY: &str = "zcash-unified-full-viewing-key";
@@ -74,55 +62,34 @@ pub mod ur_types {
 
 #[cfg(test)]
 mod tests {
-    use super::{tags, ur_types};
+    use super::ur_types;
     use ur_registry::registry_types as reg;
 
-    /// Q-K6: a registry change must fail CI, not silently mis-tag a payload.
-    #[test]
-    fn registry_tags_are_stable() {
-        assert_eq!(tags::ZCASH_ACCOUNTS, 49201);
-        assert_eq!(tags::ZCASH_FULL_VIEWING_KEY, 49202);
-        assert_eq!(tags::ZCASH_UNIFIED_FULL_VIEWING_KEY, 49203);
-        assert_eq!(tags::ZCASH_PCZT, 49204);
-        assert_eq!(tags::ZCASH_SIGN_BATCH, 49205);
-        assert_eq!(tags::ZCASH_SIGN_RESULT, 49206);
-        assert_eq!(tags::ZCASH_BATCH_SIG_RESULT, 49207);
-    }
-
-    /// The literals above agree with the `ur-registry` crate the codecs
-    /// come from (TESTING.md §4 `registry_tags`).
+    /// Q-K6: a change in the `ur-registry` crate must fail CI, not silently
+    /// mis-tag a payload (TESTING.md §4 `registry_tags`). The tags are the
+    /// literals from `keystone-sdk-rust/registry_types.rs`; 49202 (reserved
+    /// upstream, no implementation) and 49206 have no UR type in Gyges and
+    /// are refused.
     #[test]
     fn registry_tags_match_ur_registry() {
         for (registry, tag, ur_type) in [
-            (
-                reg::ZCASH_ACCOUNTS,
-                tags::ZCASH_ACCOUNTS,
-                Some(ur_types::ZCASH_ACCOUNTS),
-            ),
-            (
-                reg::ZCASH_FULL_VIEWING_KEY,
-                tags::ZCASH_FULL_VIEWING_KEY,
-                None,
-            ),
+            (reg::ZCASH_ACCOUNTS, 49201, Some(ur_types::ZCASH_ACCOUNTS)),
+            (reg::ZCASH_FULL_VIEWING_KEY, 49202, None),
             (
                 reg::ZCASH_UNIFIED_FULL_VIEWING_KEY,
-                tags::ZCASH_UNIFIED_FULL_VIEWING_KEY,
+                49203,
                 Some(ur_types::ZCASH_UNIFIED_FULL_VIEWING_KEY),
             ),
-            (
-                reg::ZCASH_PCZT,
-                tags::ZCASH_PCZT,
-                Some(ur_types::ZCASH_PCZT),
-            ),
+            (reg::ZCASH_PCZT, 49204, Some(ur_types::ZCASH_PCZT)),
             (
                 reg::ZCASH_SIGN_BATCH,
-                tags::ZCASH_SIGN_BATCH,
+                49205,
                 Some(ur_types::ZCASH_SIGN_BATCH),
             ),
-            (reg::ZCASH_SIGN_RESULT, tags::ZCASH_SIGN_RESULT, None),
+            (reg::ZCASH_SIGN_RESULT, 49206, None),
             (
                 reg::ZCASH_BATCH_SIG_RESULT,
-                tags::ZCASH_BATCH_SIG_RESULT,
+                49207,
                 Some(ur_types::ZCASH_BATCH_SIG_RESULT),
             ),
         ] {

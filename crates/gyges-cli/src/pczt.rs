@@ -7,7 +7,8 @@
 //! an assertion the daemon checks (`KEY_MISMATCH`, exit 6). `qr-export
 //! --session` shows a Keystone signing session's request, and `qr-scan
 //! --session` (camera) and `qr-import --session` (frames) complete it
-//! (`crate::keystone`); the same for PCZT files waits for a later M5 item.
+//! (`crate::keystone`); the same for PCZT files is not implemented
+//! (`sign --qr-out`).
 //!
 //! With `--json` every command prints its RPC response (the PCZT bytes as
 //! base64 inside it) on stdout and writes the file only when `-o` is given.
@@ -129,7 +130,7 @@ pub struct InOutArgs {
 pub struct SignArgs {
     #[command(flatten)]
     pub io: InOutArgs,
-    /// Write Keystone UR frames here instead of animating them (ROADMAP.md M5).
+    /// Write Keystone UR frames here instead of animating them (not implemented yet).
     #[arg(long, value_name = "FILE")]
     pub qr_out: Option<PathBuf>,
 }

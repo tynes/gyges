@@ -379,7 +379,7 @@ fn import_keystone_through_the_binaries() {
     // 6: not an accounts export.
     import(&["--birthday", "1", "--ur", "uview1qqqq"])
         .code(6)
-        .stderr_has("import-ufvk");
+        .stderr_has("seed fingerprint");
     // 9: firmware below v3.0.2, in both numberings.
     import(&["--birthday", "1", "--ur", &old])
         .code(9)
@@ -400,7 +400,9 @@ fn import_keystone_through_the_binaries() {
     .unwrap()
     .next_frame()
     .unwrap();
-    import(&["--ur", &lone]).code(6).stderr_has("import-ufvk");
+    import(&["--ur", &lone])
+        .code(6)
+        .stderr_has("seed fingerprint");
     assert!(good.lines().count() > 1, "the export should span frames");
     import(&["--ur", good.lines().next().unwrap()])
         .code(6)

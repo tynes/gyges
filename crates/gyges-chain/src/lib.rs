@@ -139,9 +139,6 @@ pub struct SubtreeRoot {
     pub root: [u8; 32],
     /// Height of the block whose commitment completed the subtree.
     pub end_height: BlockHeight,
-    /// Hash of that block, internal byte order; lightwalletd reports it,
-    /// `z_getsubtreesbyindex` does not.
-    pub end_hash: Option<[u8; 32]>,
 }
 
 impl SubtreeRoot {
@@ -259,11 +256,11 @@ pub trait ChainBackend: Send + Sync + fmt::Debug {
     ) -> BoxFuture<'_, Result<Vec<CompactBlock>, ChainError>>;
 
     /// `sendrawtransaction(hex)`: hand a signed transaction to the node's
-    /// mempool. Returns the txid in internal byte order. A node that
+    /// mempool. A node that
     /// accepts the connection but refuses the transaction answers
     /// [`ChainError::Rejected`] with its own text, which `tx send` shows
     /// verbatim as `NODE_REJECTED`.
-    fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<[u8; 32], ChainError>>;
+    fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<(), ChainError>>;
 
     /// `getrawtransaction(txid, 1)`: whether the node has the transaction in
     /// its mempool or its main chain. `txid` is in internal byte order.
@@ -335,9 +332,9 @@ pub(crate) fn bytes32(bytes: &[u8], what: impl fmt::Display) -> Result<[u8; 32],
 }
 
 /// Refuse a source that serves another chain than `params`' and return
-/// this daemon's network name. A node or lightwalletd reports `"main"` or
-/// `"test"` (`"test"` for regtest as well); zaino on regtest reports
-/// `"regtest"`. `who` starts the error text.
+/// this daemon's network name. A node, lightwalletd or zaino 0.10.2 reports
+/// `"main"` or `"test"` (`"test"` for regtest as well, OVERVIEW.md §4.5);
+/// `"regtest"` is accepted too. `who` starts the error text.
 pub(crate) fn check_chain_name(
     params: &impl Parameters,
     reported: &str,
@@ -396,7 +393,6 @@ mod tests {
             index: 0,
             root: bytes,
             end_height: BlockHeight::from_u32(10),
-            end_hash: None,
         };
         // Zero is a valid field element in both curves; all-ones is not.
         assert!(root(ShieldedPool::Sapling, [0; 32]).sapling().is_some());

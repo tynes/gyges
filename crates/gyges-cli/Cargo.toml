@@ -26,7 +26,7 @@ zeroize = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
-nix = { workspace = true }  # uid for the launchd domain
+nix = { workspace = true }  # uids for the launchd domain and the hardened install's user and group lookups
 
 [features]
 # `pczt qr-scan` and the camera step of `tx send` (ROADMAP.md M5, fourth
