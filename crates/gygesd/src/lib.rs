@@ -120,6 +120,13 @@ pub struct Options {
     pub fallback_lwd: Option<String>,
     /// `--no-tor`.
     pub no_tor: bool,
+    /// `--socket PATH`: `daemon.socket_path`.
+    pub socket: Option<String>,
+    /// `--socket-group GROUP`: `daemon.socket_group`.
+    pub socket_group: Option<String>,
+    /// `--allow-uid UID`, repeatable: replaces `daemon.allowed_uids` when
+    /// given at least once.
+    pub allowed_uids: Vec<u32>,
     /// The node backend. `None` means "build a `ZakuraRpcBackend` from the
     /// configuration" (or nothing, when air-gapped); tests inject a fake.
     pub chain: Option<Arc<dyn ChainBackend>>,
@@ -139,6 +146,9 @@ impl Options {
             zakura_cookie: None,
             fallback_lwd: None,
             no_tor: false,
+            socket: None,
+            socket_group: None,
+            allowed_uids: Vec::new(),
             chain: None,
             log_hub: None,
         }
@@ -162,6 +172,15 @@ impl Options {
         }
         if self.no_tor {
             config.fallback_lightwalletd.use_tor = false;
+        }
+        if let Some(p) = &self.socket {
+            config.daemon.socket_path = p.clone();
+        }
+        if let Some(g) = &self.socket_group {
+            config.daemon.socket_group = g.clone();
+        }
+        if !self.allowed_uids.is_empty() {
+            config.daemon.allowed_uids = self.allowed_uids.clone();
         }
     }
 }
@@ -206,6 +225,14 @@ impl Daemon {
         config
             .validate(network)
             .with_context(|| format!("invalid configuration in {}", config_path.display()))?;
+        // A socket outside the network directory is not covered by
+        // `check_tree`, so its directory gets its own check.
+        if let Some(socket) = config.socket_path()
+            && let Some(parent) = socket.parent()
+        {
+            perms::check_socket_dir(parent, nix::unistd::getuid().as_raw())
+                .context("refusing to start: unsafe socket directory")?;
+        }
 
         let pid = PidLock::acquire(&home.pid_path(network))?;
         // First start: leave a commented config.toml naming every knob and
@@ -304,8 +331,12 @@ impl Daemon {
         &self.state.config
     }
 
+    /// `daemon.socket_path`, else `<network dir>/gygesd.sock`.
     pub fn socket_path(&self) -> PathBuf {
-        self.home.socket_path(self.network)
+        self.state
+            .config
+            .socket_path()
+            .unwrap_or_else(|| self.home.socket_path(self.network))
     }
 
     /// Step 6: bind the socket and serve until `shutdown` resolves or the
@@ -512,7 +543,13 @@ mod tests {
         opts.zakura_rpc = Some("http://127.0.0.1:18232".into());
         opts.fallback_lwd = Some("http://127.0.0.1:9067".into());
         opts.no_tor = true;
+        opts.socket = Some("/run/gyges/regtest/gygesd.sock".into());
+        opts.socket_group = Some("gyges".into());
+        opts.allowed_uids = vec![1000, 1001];
         opts.apply_to(&mut cfg);
+        assert_eq!(cfg.daemon.socket_path, "/run/gyges/regtest/gygesd.sock");
+        assert_eq!(cfg.daemon.socket_group, "gyges");
+        assert_eq!(cfg.daemon.allowed_uids, [1000, 1001]);
         assert!(cfg.airgapped);
         assert_eq!(cfg.zakura_rpc.url, "http://127.0.0.1:18232");
         assert!(cfg.fallback_lightwalletd.enabled);

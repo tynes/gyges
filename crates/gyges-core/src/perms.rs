@@ -68,6 +68,54 @@ pub fn check_tree(root: &Path) -> Result<(), PermissionError> {
     }
 }
 
+/// A socket directory that other users could write to or enter.
+#[derive(Debug, thiserror::Error)]
+pub enum SocketDirError {
+    #[error("{path} is owned by uid {owner}, not by the daemon (uid {uid}); fix: chown {uid} {path}", path = .path.display())]
+    NotOwned { path: PathBuf, owner: u32, uid: u32 },
+    #[error("{path} is mode {mode:04o}; the socket's directory may grant its group search only and others nothing; fix: chmod 750 {path}", path = .path.display())]
+    TooWide { path: PathBuf, mode: u32 },
+    #[error("cannot inspect the socket directory {path}: {source}", path = .path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// The directory of a socket placed outside `GYGES_HOME`
+/// (`daemon.socket_path`) must exist, belong to `uid`, and grant nothing
+/// beyond group read and search (`0750`, as systemd's
+/// `RuntimeDirectoryMode` sets it). A writable or shared directory would let
+/// another user replace the socket with their own.
+pub fn check_socket_dir(dir: &Path, uid: u32) -> Result<(), SocketDirError> {
+    let meta = fs::symlink_metadata(dir).map_err(|source| SocketDirError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    if !meta.is_dir() {
+        return Err(SocketDirError::Io {
+            path: dir.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::NotADirectory, "not a directory"),
+        });
+    }
+    if meta.uid() != uid {
+        return Err(SocketDirError::NotOwned {
+            path: dir.to_path_buf(),
+            owner: meta.uid(),
+            uid,
+        });
+    }
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o7027 != 0 {
+        return Err(SocketDirError::TooWide {
+            path: dir.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
 /// Create `dir` (and its parents) with mode `0700`, or verify an existing
 /// one is no wider.
 pub fn ensure_private_dir(dir: &Path) -> Result<(), PermissionError> {
@@ -161,5 +209,26 @@ mod tests {
         create_private_file(&f).unwrap();
         set_mode(&f, 0o400).unwrap();
         check_tree(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn socket_dir_allows_group_search_only() {
+        let dir = tmp();
+        let d = dir.path().join("run");
+        ensure_private_dir(&d).unwrap();
+        let uid = fs::metadata(&d).unwrap().uid();
+        for ok in [0o700, 0o710, 0o750] {
+            set_mode(&d, ok).unwrap();
+            check_socket_dir(&d, uid).unwrap();
+        }
+        for bad in [0o770, 0o751, 0o755, 0o1750] {
+            set_mode(&d, bad).unwrap();
+            let msg = check_socket_dir(&d, uid).unwrap_err().to_string();
+            assert!(msg.contains(&format!("chmod 750 {}", d.display())), "{msg}");
+        }
+        set_mode(&d, 0o750).unwrap();
+        let msg = check_socket_dir(&d, uid + 1).unwrap_err().to_string();
+        assert!(msg.contains("not by the daemon"), "{msg}");
+        assert!(check_socket_dir(&d.join("missing"), uid).is_err());
     }
 }

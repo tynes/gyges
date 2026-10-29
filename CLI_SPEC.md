@@ -74,6 +74,8 @@ Flags:
 ```
 The CLI locates `gygesd` through `GYGES_DAEMON_BIN`, then next to its own executable, then on `PATH`. Without `--foreground` the daemon detaches itself after validating its configuration, so configuration and permission errors are reported by `daemon start` (exit 1). Running `daemon start` against an already running daemon is a no-op (exit 0). The CLI does not start the daemon implicitly (exit 3 when the socket is absent) unless `GYGES_AUTOSTART=1` is set for development.
 
+`gygesd` itself also takes `--socket <PATH>`, `--socket-group <GROUP>` and `--allow-uid <UID>` (repeatable), which override `daemon.socket_path`, `daemon.socket_group` and `daemon.allowed_uids` for that process. The hardened unit passes them; `daemon start` does not forward them.
+
 #### `gyges daemon install` / `gyges daemon uninstall`
 Writes or removes a per-user service that runs `gygesd --foreground` for `--network`: a `launchd` agent `~/Library/LaunchAgents/org.gyges.gygesd.<network>.plist` (macOS) or a `systemd --user` unit `$XDG_CONFIG_HOME/systemd/user/gygesd-<network>.service` (Linux). One service per network.
 
@@ -82,6 +84,14 @@ Writes or removes a per-user service that runs `gygesd --foreground` for `--netw
 - **`uninstall`** stops the daemon, removes the unit and exits 0 when there is nothing to remove.
 - **Linux.** A user unit stops when the user's last session ends unless lingering is on (`loginctl enable-linger $USER`); `install` says so.
 - **`--json`** prints `{manager, unit_path, network, running}`.
+- **`install --hardened [--user NAME]`** (Linux with systemd, as root) sets up the hardened deployment (`THREAT_MODEL.md` §6 item 4):
+  - creates the `gyges` system group and user (no login shell) if missing, and adds the admitted user (`--user`, default `$SUDO_USER`, never root) to the group; they must log in again for that to apply;
+  - writes `/etc/systemd/system/gygesd-<network>.service`, running `gygesd --network <network> --foreground --socket /run/gyges/<network>/gygesd.sock --socket-group gyges --allow-uid <uid>` as `gyges`, with `GYGES_HOME=/var/lib/gyges` (systemd `StateDirectory`, 0700), the socket directory from `RuntimeDirectory` (0750) and sandboxing (`ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `LimitCORE=0`, and others);
+  - enables and starts it, and waits for the socket to accept (root is not an admitted peer, so there is no handshake).
+  - `gygesd` must not live under `/home` or `/root`, which `ProtectHome=yes` hides; `install` refuses such a path. The node's cookie must be readable by `gyges` and named in `/var/lib/gyges/<network>/config.toml` (`zakura_rpc.cookie_path`).
+  - The admitted user reaches the daemon with `GYGES_SOCKET=/run/gyges/<network>/gygesd.sock`.
+  - macOS is refused.
+- **`uninstall --hardened`** (as root) stops the unit and removes it. The `gyges` account and `/var/lib/gyges`, keys included, stay.
 
 #### `gyges daemon stop`
 Finishes the current scan batch, checkpoints SQLite WAL, aborts in-progress proving, leaves pending ZIP 320 and signing-session rows to resume on next start, and zeroizes all unlocked keys before exit.

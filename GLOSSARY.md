@@ -32,7 +32,7 @@ Terms used across `ARCHITECTURE.md`, `CLI_SPEC.md`, `THREAT_MODEL.md` and `OVERV
 
 **Full-disk encryption (FDE).** FileVault, LUKS or equivalent. Gyges v1 relies on it for the confidentiality of `wallet.sqlite` at rest (Q-S6, `THREAT_MODEL.md` §3 row 4).
 
-**Hardened deployment.** The documented configuration in which `gygesd` runs as a dedicated OS user with a 0660 socket and a `gyges` group, so the interactive user's processes cannot read `seed.age` or `wallet.sqlite` (Q-S1).
+**Hardened deployment.** The configuration, set up by `sudo gyges daemon install --hardened` on Linux, in which `gygesd` runs as the dedicated `gyges` user from `/var/lib/gyges`, with a 0660 socket for the `gyges` group at `/run/gyges/<network>/gygesd.sock`, so the interactive user's processes cannot read `seed.age` or `wallet.sqlite` (Q-S1, `THREAT_MODEL.md` §6 item 4).
 
 **Ironwood.** A third shielded pool, using the Orchard protocol with its own note commitment tree, exposed by the Zakura node (`z_gettreestate`, `z_getsubtreesbyindex` accept `"ironwood"`), the Zakura wallet libraries (`ironwood_action_count` on a proposal `Step`, a separate v6 transaction bundle) and Keystone firmware (signs Ironwood spends). After NU6.3 every shielded output the wallet libraries build is Ironwood and the ZIP 318 turnstile keeps value out of Orchard, so Gyges spends Orchard and Ironwood and receives Ironwood (Q-D7, `OVERVIEW.md` §4.3).
 

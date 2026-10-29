@@ -368,6 +368,62 @@ fn closed_port_url() -> String {
     url
 }
 
+/// `daemon.socket_path` (`--socket`) puts the socket outside the 0700
+/// network directory, which the hardened deployment needs: a group member
+/// cannot search a 0700 directory. Its directory must be the daemon's and
+/// grant at most group search; the socket file goes when the daemon stops.
+#[tokio::test]
+async fn socket_path_outside_the_home_needs_a_closed_directory() {
+    // Under $TMPDIR, not tempdir()'s long path, to stay inside SUN_LEN.
+    let run = tempfile::Builder::new()
+        .prefix("gy")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let sock_dir = run.path().join("regtest");
+    std::fs::create_dir(&sock_dir).unwrap();
+    perms::set_mode(&sock_dir, 0o755).unwrap();
+    let sock = sock_dir.join("gygesd.sock");
+
+    let (dir, home) = fresh_home_with(TEST_CONFIG);
+    let mut opts = Options::new(home.clone(), Network::Regtest);
+    opts.zakura_rpc = Some(closed_port_url());
+    opts.socket = Some(sock.display().to_string());
+    let err = format!("{:#}", Daemon::prepare(opts.clone()).unwrap_err());
+    assert!(
+        err.contains("unsafe socket directory") && err.contains("chmod 750"),
+        "{err}"
+    );
+
+    perms::set_mode(&sock_dir, 0o750).unwrap();
+    let url = closed_port_url();
+    let running = start_in(dir, |o| {
+        o.zakura_rpc = Some(url);
+        o.socket = Some(sock.display().to_string());
+    })
+    .await;
+    assert_eq!(running.socket, sock);
+    assert!(!home.socket_path(Network::Regtest).exists());
+    let mode = std::fs::metadata(&sock).unwrap().mode() & 0o777;
+    assert_eq!(mode, 0o600, "socket mode {mode:o}");
+    let mut c = client(&sock).await;
+    c.get_info(GetInfoRequest {}).await.unwrap();
+    c.shutdown(ShutdownRequest { graceful: true })
+        .await
+        .unwrap();
+    running.task.await.unwrap().unwrap();
+    assert!(!sock.exists());
+
+    // A relative path is a configuration error.
+    let (_dir, home) = fresh_home_with(TEST_CONFIG);
+    let mut opts = Options::new(home, Network::Regtest);
+    opts.socket = Some("run/gygesd.sock".into());
+    let err = format!("{:#}", Daemon::prepare(opts).unwrap_err());
+    assert!(
+        err.contains("socket_path must be an absolute path"),
+        "{err}"
+    );
+}
+
 #[tokio::test]
 async fn get_info_over_uds_and_socket_is_owner_only() {
     let running = start(|_| {}).await;

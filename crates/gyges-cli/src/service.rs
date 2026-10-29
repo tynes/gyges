@@ -8,6 +8,14 @@
 //! restarts a running daemon when its binary is replaced, so running
 //! `daemon install` again is the upgrade step: it stops the service, rewrites
 //! the unit and starts it.
+//!
+//! `--hardened` (Linux only, as root) is the deployment of THREAT_MODEL.md
+//! §6 item 4: a system unit that runs the daemon as the `gyges` user with
+//! its home in `/var/lib/gyges` and its socket at
+//! `/run/gyges/<network>/gygesd.sock` (0660, group `gyges`). The socket
+//! cannot stay in the 0700 network directory, where no group member could
+//! reach it. One named user is admitted (`--allow-uid`) and added to the
+//! group.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,6 +35,8 @@ use crate::exit::CliError;
 pub enum Manager {
     Launchd,
     SystemdUser,
+    /// A system unit for the hardened deployment.
+    SystemdSystem,
 }
 
 impl Manager {
@@ -51,7 +61,31 @@ impl Manager {
                 Some(d) if Path::new(&d).is_absolute() => PathBuf::from(d).join("systemd/user"),
                 _ => home()?.join(".config/systemd/user"),
             },
+            Self::SystemdSystem => PathBuf::from("/etc/systemd/system"),
         })
+    }
+
+    /// `systemctl` arguments that select this manager's instance.
+    fn systemctl(self, args: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        if self == Self::SystemdUser {
+            v.push("--user".into());
+        }
+        v.extend(args.iter().map(|a| a.to_string()));
+        v
+    }
+}
+
+/// The hardened deployment's fixed names.
+pub mod hardened {
+    /// The daemon's user and group; the socket's group.
+    pub const ACCOUNT: &str = "gyges";
+    /// The daemon's `GYGES_HOME` (systemd `StateDirectory`).
+    pub const HOME: &str = "/var/lib/gyges";
+
+    /// `/run/gyges/<network>/gygesd.sock` (systemd `RuntimeDirectory`).
+    pub fn socket(network: &str) -> String {
+        format!("/run/gyges/{network}/gygesd.sock")
     }
 }
 
@@ -64,6 +98,8 @@ pub struct Spec {
     /// Absolute `GYGES_HOME`, written into the unit when the installing
     /// shell had one set.
     pub gyges_home: Option<PathBuf>,
+    /// The admitted uid of a hardened unit.
+    pub allow_uid: Option<u32>,
 }
 
 impl Spec {
@@ -80,23 +116,43 @@ impl Spec {
     pub fn file_name(&self, manager: Manager) -> String {
         match manager {
             Manager::Launchd => format!("{}.plist", self.label()),
-            Manager::SystemdUser => self.unit_name(),
+            Manager::SystemdUser | Manager::SystemdSystem => self.unit_name(),
         }
     }
 
-    fn args(&self) -> [String; 4] {
-        [
+    /// The socket the unit's daemon listens on.
+    pub fn socket(&self, manager: Manager, default: &Path) -> PathBuf {
+        match manager {
+            Manager::SystemdSystem => hardened::socket(self.network.name()).into(),
+            _ => default.to_path_buf(),
+        }
+    }
+
+    fn args(&self, manager: Manager) -> Vec<String> {
+        let mut v = vec![
             self.binary.display().to_string(),
             "--network".into(),
             self.network.name().into(),
             "--foreground".into(),
-        ]
+        ];
+        if manager == Manager::SystemdSystem {
+            v.extend([
+                "--socket".into(),
+                hardened::socket(self.network.name()),
+                "--socket-group".into(),
+                hardened::ACCOUNT.into(),
+            ]);
+            if let Some(uid) = self.allow_uid {
+                v.extend(["--allow-uid".into(), uid.to_string()]);
+            }
+        }
+        v
     }
 
     pub fn render(&self, manager: Manager) -> String {
         match manager {
             Manager::Launchd => self.render_launchd(),
-            Manager::SystemdUser => self.render_systemd(),
+            Manager::SystemdUser | Manager::SystemdSystem => self.render_systemd(manager),
         }
     }
 
@@ -117,7 +173,7 @@ impl Spec {
             xml(&self.label())
         );
         s += "  <key>ProgramArguments</key>\n  <array>\n";
-        for a in self.args() {
+        for a in self.args(Manager::Launchd) {
             s += &format!("    <string>{}</string>\n", xml(&a));
         }
         s += "  </array>\n";
@@ -137,28 +193,66 @@ impl Spec {
         s
     }
 
-    /// A `systemd --user` unit. A daemon that keeps failing (bad config)
-    /// gives up after five tries instead of looping forever.
-    /// `TimeoutStopSec` covers `daemon.shutdown_grace` (30 s by default).
-    fn render_systemd(&self) -> String {
+    /// A `systemd` unit. A daemon that keeps failing (bad config) gives up
+    /// after five tries instead of looping forever. `TimeoutStopSec` covers
+    /// `daemon.shutdown_grace` (30 s by default).
+    ///
+    /// The hardened unit runs as `gyges`. systemd creates `/var/lib/gyges`
+    /// (0700) and `/run/gyges/<network>` (0750, group `gyges`, removed when
+    /// the daemon stops), and the sandboxing lines take away what a wallet
+    /// daemon does not need. `ProtectHome=yes` hides `/home`, so neither
+    /// `gygesd` nor the node's cookie may live there.
+    fn render_systemd(&self, manager: Manager) -> String {
+        let hard = manager == Manager::SystemdSystem;
         let exec = self
-            .args()
+            .args(manager)
             .iter()
             .map(|a| systemd_quote(a))
             .collect::<Vec<_>>()
             .join(" ");
         let mut s = format!(
-            "[Unit]\n\
-             Description=Gyges wallet daemon ({})\n\
-             StartLimitIntervalSec=300\n\
+            "[Unit]\nDescription=Gyges wallet daemon ({}{})\n",
+            self.network.name(),
+            if hard { ", hardened" } else { "" }
+        );
+        if hard {
+            s += "After=network-online.target\nWants=network-online.target\n";
+        }
+        s += &format!(
+            "StartLimitIntervalSec=300\n\
              StartLimitBurst=5\n\
              \n\
              [Service]\n\
              Type=simple\n\
-             ExecStart={exec}\n",
-            self.network.name()
+             ExecStart={exec}\n"
         );
-        if let Some(home) = &self.gyges_home {
+        if hard {
+            let net = self.network.name();
+            let a = hardened::ACCOUNT;
+            s += &format!(
+                "User={a}\n\
+                 Group={a}\n\
+                 Environment=\"GYGES_HOME={home}\"\n\
+                 StateDirectory={a}\n\
+                 StateDirectoryMode=0700\n\
+                 RuntimeDirectory={a}/{net}\n\
+                 RuntimeDirectoryMode=0750\n\
+                 UMask=0077\n\
+                 LimitCORE=0\n\
+                 NoNewPrivileges=yes\n\
+                 ProtectSystem=strict\n\
+                 ProtectHome=yes\n\
+                 PrivateTmp=yes\n\
+                 PrivateDevices=yes\n\
+                 ProtectKernelTunables=yes\n\
+                 ProtectKernelModules=yes\n\
+                 ProtectControlGroups=yes\n\
+                 RestrictSUIDSGID=yes\n\
+                 LockPersonality=yes\n\
+                 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n",
+                home = hardened::HOME
+            );
+        } else if let Some(home) = &self.gyges_home {
             s += &format!(
                 "Environment={}\n",
                 systemd_quote(&format!("GYGES_HOME={}", home.display()))
@@ -168,8 +262,12 @@ impl Spec {
               RestartSec=10\n\
               TimeoutStopSec=90\n\
               \n\
-              [Install]\n\
-              WantedBy=default.target\n";
+              [Install]\n";
+        s += if hard {
+            "WantedBy=multi-user.target\n"
+        } else {
+            "WantedBy=default.target\n"
+        };
         s
     }
 }
@@ -240,31 +338,25 @@ impl Commands {
 
     /// Stop and unload the unit; `true` if it was loaded.
     fn stop(&self, r: &mut dyn Runner, spec: &Spec) -> anyhow::Result<bool> {
-        Ok(match self.manager {
-            Manager::Launchd => r
-                .run(
-                    "launchctl",
-                    &[
-                        "bootout".into(),
-                        format!("{}/{}", self.domain, spec.label()),
-                    ],
-                )?
-                .is_ok(),
-            Manager::SystemdUser => r
-                .run(
-                    "systemctl",
-                    &[
-                        "--user".into(),
-                        "disable".into(),
-                        "--now".into(),
-                        spec.unit_name(),
-                    ],
-                )?
-                .is_ok(),
-        })
+        let (program, args) = match self.manager {
+            Manager::Launchd => (
+                "launchctl",
+                vec![
+                    "bootout".into(),
+                    format!("{}/{}", self.domain, spec.label()),
+                ],
+            ),
+            Manager::SystemdUser | Manager::SystemdSystem => (
+                "systemctl",
+                self.manager
+                    .systemctl(&["disable", "--now", &spec.unit_name()]),
+            ),
+        };
+        Ok(r.run(program, &args)?.is_ok())
     }
 
-    /// Load the unit from `path` and start it now and at every login.
+    /// Load the unit from `path` and start it now and at every login (or
+    /// boot, for a system unit).
     fn start(&self, r: &mut dyn Runner, spec: &Spec, path: &Path) -> anyhow::Result<()> {
         let (program, steps): (&str, Vec<Vec<String>>) = match self.manager {
             Manager::Launchd => (
@@ -275,16 +367,12 @@ impl Commands {
                     path.display().to_string(),
                 ]],
             ),
-            Manager::SystemdUser => (
+            Manager::SystemdUser | Manager::SystemdSystem => (
                 "systemctl",
                 vec![
-                    vec!["--user".into(), "daemon-reload".into()],
-                    vec![
-                        "--user".into(),
-                        "enable".into(),
-                        "--now".into(),
-                        spec.unit_name(),
-                    ],
+                    self.manager.systemctl(&["daemon-reload"]),
+                    self.manager
+                        .systemctl(&["enable", "--now", &spec.unit_name()]),
                 ],
             ),
         };
@@ -298,9 +386,9 @@ impl Commands {
 
     /// Forget a removed unit file (systemd only).
     fn reload(&self, r: &mut dyn Runner) -> anyhow::Result<()> {
-        if self.manager == Manager::SystemdUser {
+        if self.manager != Manager::Launchd {
             // Best effort: the file is already gone.
-            let _ = r.run("systemctl", &["--user".into(), "daemon-reload".into()])?;
+            let _ = r.run("systemctl", &self.manager.systemctl(&["daemon-reload"]))?;
         }
         Ok(())
     }
@@ -310,6 +398,7 @@ impl Commands {
         match self.manager {
             Manager::Launchd => format!("launchctl print {}/{}", self.domain, spec.label()),
             Manager::SystemdUser => format!("journalctl --user -u {}", spec.unit_name()),
+            Manager::SystemdSystem => format!("journalctl -u {}", spec.unit_name()),
         }
     }
 }
@@ -362,10 +451,178 @@ pub fn spec_from_env(network: Network) -> Result<Spec, CliError> {
         network,
         binary: absolute_daemon_binary()?,
         gyges_home,
+        allow_uid: None,
     })
 }
 
-pub async fn install(ctx: &Ctx) -> Result<(), CliError> {
+/// `gyges daemon install` flags.
+#[derive(Debug, Clone, clap::Args)]
+pub struct InstallArgs {
+    /// Linux, as root: a system unit running gygesd as the `gyges` user,
+    /// socket /run/gyges/<network>/gygesd.sock for the `gyges` group.
+    #[arg(long)]
+    pub hardened: bool,
+    /// With --hardened: the user admitted to the socket and added to the
+    /// `gyges` group [default: $SUDO_USER].
+    #[arg(long, requires = "hardened", value_name = "NAME")]
+    pub user: Option<String>,
+}
+
+/// The admitted user of a hardened install.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Admitted {
+    pub name: String,
+    pub uid: u32,
+}
+
+/// What exists already; the steps create the rest.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Accounts {
+    pub group_exists: bool,
+    pub user_exists: bool,
+    /// The admitted user is in the `gyges` group already.
+    pub member: bool,
+}
+
+impl Accounts {
+    fn lookup(admitted: &str) -> anyhow::Result<Self> {
+        use nix::unistd::{Group, User};
+        let group = Group::from_name(hardened::ACCOUNT)?;
+        Ok(Self {
+            member: group
+                .as_ref()
+                .is_some_and(|g| g.mem.iter().any(|m| m == admitted)),
+            group_exists: group.is_some(),
+            user_exists: User::from_name(hardened::ACCOUNT)?.is_some(),
+        })
+    }
+
+    /// `groupadd`, `useradd` and `usermod` for whatever is missing. The
+    /// daemon's account is a system account with no login shell, and its
+    /// home is created by systemd (`StateDirectory`), not by `useradd`.
+    pub fn steps(self, admitted: &str) -> Vec<(&'static str, Vec<String>)> {
+        let a = hardened::ACCOUNT;
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut steps = Vec::new();
+        if !self.group_exists {
+            steps.push(("groupadd", v(&["--system", a])));
+        }
+        if !self.user_exists {
+            steps.push((
+                "useradd",
+                v(&[
+                    "--system",
+                    "--gid",
+                    a,
+                    "--home-dir",
+                    hardened::HOME,
+                    "--no-create-home",
+                    "--shell",
+                    "/usr/sbin/nologin",
+                    a,
+                ]),
+            ));
+        }
+        if !self.member {
+            steps.push(("usermod", v(&["--append", "--groups", a, admitted])));
+        }
+        steps
+    }
+}
+
+/// Root, systemd and Linux, or a clear refusal.
+fn require_hardened_platform() -> Result<(), CliError> {
+    if Manager::native()? != Manager::SystemdUser {
+        return Err(anyhow!("--hardened needs Linux with systemd").into());
+    }
+    if !nix::unistd::geteuid().is_root() {
+        return Err(anyhow!("--hardened creates a system account and unit; run it as root").into());
+    }
+    Ok(())
+}
+
+/// `--user`, else `$SUDO_USER`; never root.
+fn admitted_user(user: Option<String>) -> Result<Admitted, CliError> {
+    let name = user
+        .or_else(|| std::env::var("SUDO_USER").ok().filter(|u| !u.is_empty()))
+        .ok_or_else(|| {
+            anyhow!("--hardened needs the user to admit: pass --user NAME or run through sudo")
+        })?;
+    let user = nix::unistd::User::from_name(&name)
+        .map_err(|e| anyhow!("cannot look up user {name}: {e}"))?
+        .ok_or_else(|| anyhow!("no user named {name}"))?;
+    if user.uid.is_root() || name == hardened::ACCOUNT {
+        return Err(anyhow!("admit the interactive user, not {name}").into());
+    }
+    Ok(Admitted {
+        name,
+        uid: user.uid.as_raw(),
+    })
+}
+
+async fn install_hardened(ctx: &Ctx, user: Option<String>) -> Result<(), CliError> {
+    require_hardened_platform()?;
+    let admitted = admitted_user(user)?;
+    let mut spec = spec_from_env(ctx.network.unwrap_or(Network::Mainnet))?;
+    // `ProtectHome=yes` hides these from the service.
+    if spec.binary.starts_with("/home") || spec.binary.starts_with("/root") {
+        return Err(anyhow!(
+            "{} is under a home directory, which the hardened unit cannot see;              install gygesd under /usr/local/bin (or set {DAEMON_BIN_ENV})",
+            spec.binary.display()
+        )
+        .into());
+    }
+    spec.gyges_home = None;
+    spec.allow_uid = Some(admitted.uid);
+
+    let accounts = Accounts::lookup(&admitted.name)?;
+    let mut system = System;
+    for (program, args) in accounts.steps(&admitted.name) {
+        if let Err(stderr) = system.run(program, &args)? {
+            return Err(anyhow!("{program} {} failed: {stderr}", args.join(" ")).into());
+        }
+    }
+    let manager = Manager::SystemdSystem;
+    let report = install_with(ctx, &mut system, manager, &manager.unit_dir()?, &spec, WAIT).await?;
+    let socket = hardened::socket(spec.network.name());
+    ctx.report(&report, || {
+        eprintln!(
+            "installed {} and started gygesd for {} as user {}, home {}",
+            report.unit_path,
+            report.network,
+            hardened::ACCOUNT,
+            hardened::HOME
+        );
+        eprintln!(
+            "admitted {} (uid {}){}",
+            admitted.name,
+            admitted.uid,
+            if accounts.member {
+                String::new()
+            } else {
+                format!(
+                    " and added them to the {} group; they must log in again to use it",
+                    hardened::ACCOUNT
+                )
+            }
+        );
+        eprintln!(
+            "{} reaches the daemon with: export GYGES_SOCKET={socket}",
+            admitted.name
+        );
+        eprintln!(
+            "set zakura_rpc.cookie_path in {}/{}/config.toml to a cookie the {} user can read",
+            hardened::HOME,
+            report.network,
+            hardened::ACCOUNT
+        );
+    })
+}
+
+pub async fn install(ctx: &Ctx, args: InstallArgs) -> Result<(), CliError> {
+    if args.hardened {
+        return install_hardened(ctx, args.user).await;
+    }
     let manager = Manager::native()?;
     let spec = spec_from_env(ctx.network.unwrap_or(Network::Mainnet))?;
     let report = install_with(ctx, &mut System, manager, &manager.unit_dir()?, &spec, WAIT).await?;
@@ -381,8 +638,13 @@ pub async fn install(ctx: &Ctx) -> Result<(), CliError> {
     })
 }
 
-pub async fn uninstall(ctx: &Ctx) -> Result<(), CliError> {
-    let manager = Manager::native()?;
+pub async fn uninstall(ctx: &Ctx, hardened: bool) -> Result<(), CliError> {
+    let manager = if hardened {
+        require_hardened_platform()?;
+        Manager::SystemdSystem
+    } else {
+        Manager::native()?
+    };
     let spec = spec_from_env(ctx.network.unwrap_or(Network::Mainnet))
         // Uninstalling must work when gygesd is gone already.
         .or_else(|_| {
@@ -390,6 +652,7 @@ pub async fn uninstall(ctx: &Ctx) -> Result<(), CliError> {
                 network: ctx.network.unwrap_or(Network::Mainnet),
                 binary: PathBuf::new(),
                 gyges_home: None,
+                allow_uid: None,
             })
         })?;
     let report = uninstall_with(&mut System, manager, &manager.unit_dir()?, &spec)?;
@@ -401,6 +664,13 @@ pub async fn uninstall(ctx: &Ctx) -> Result<(), CliError> {
             );
         } else {
             eprintln!("no gygesd service is installed for {}", report.network);
+        }
+        if hardened {
+            eprintln!(
+                "the {} user and group and {} (keys included) are left in place",
+                hardened::ACCOUNT,
+                hardened::HOME
+            );
         }
     })
 }
@@ -420,21 +690,22 @@ pub async fn install_with(
 ) -> Result<ServiceReport, CliError> {
     let cmds = Commands::new(manager);
     let path = unit_dir.join(spec.file_name(manager));
+    let socket = spec.socket(manager, &ctx.socket);
 
     // Reinstalling restarts: stop the old service and wait for its socket.
     if cmds.stop(runner, spec)? {
         let deadline = Instant::now() + wait;
-        while uds::probe(&ctx.socket).await.is_ok() && Instant::now() < deadline {
+        while uds::probe(&socket).await.is_ok() && Instant::now() < deadline {
             tokio::time::sleep(POLL).await;
         }
     }
     // A daemon still answering was started by hand; a unit would fail on
     // its pid lock and restart forever.
-    if uds::probe(&ctx.socket).await.is_ok() {
+    if uds::probe(&socket).await.is_ok() {
         return Err(anyhow!(
             "a gygesd not started by a service is running on {}; stop it with \
              `gyges daemon stop` first",
-            ctx.socket.display()
+            socket.display()
         )
         .into());
     }
@@ -447,9 +718,16 @@ pub async fn install_with(
 
     let deadline = Instant::now() + wait;
     let up = loop {
-        match ctx.connect().await {
-            Ok(_) => break Ok(()),
-            Err(e) if Instant::now() >= deadline => break Err(e.message()),
+        // Root is not an admitted peer of the hardened daemon, so there the
+        // socket accepting is the signal; elsewhere the handshake is.
+        let r = if manager == Manager::SystemdSystem {
+            uds::probe(&socket).await.map_err(|e| e.to_string())
+        } else {
+            ctx.connect().await.map(drop).map_err(|e| e.message())
+        };
+        match r {
+            Ok(()) => break Ok(()),
+            Err(e) if Instant::now() >= deadline => break Err(e),
             Err(_) => tokio::time::sleep(POLL).await,
         }
     };
@@ -458,7 +736,7 @@ pub async fn install_with(
             "{} is installed but gygesd did not answer on {} within {}s ({last}); see `{}` \
              and the logs under the network directory",
             path.display(),
-            ctx.socket.display(),
+            socket.display(),
             wait.as_secs(),
             cmds.log_hint(spec)
         )
@@ -506,6 +784,7 @@ mod tests {
             network: Network::Testnet,
             binary: "/opt/gyges bin/gygesd".into(),
             gyges_home: home.map(PathBuf::from),
+            allow_uid: None,
         }
     }
 
@@ -701,5 +980,84 @@ mod tests {
         );
         assert!(!units.exists());
         assert_eq!(r.calls.len(), 1);
+    }
+
+    #[test]
+    fn hardened_unit_runs_as_gyges_with_its_socket_outside_the_home() {
+        let mut s = spec(Some("/ignored"));
+        s.gyges_home = None;
+        s.allow_uid = Some(1000);
+        let u = s.render(Manager::SystemdSystem);
+        assert!(
+            u.contains(
+                "ExecStart=\"/opt/gyges bin/gygesd\" \"--network\" \"testnet\" \"--foreground\" \
+                 \"--socket\" \"/run/gyges/testnet/gygesd.sock\" \"--socket-group\" \"gyges\" \
+                 \"--allow-uid\" \"1000\"\n"
+            ),
+            "{u}"
+        );
+        for line in [
+            "User=gyges\n",
+            "Group=gyges\n",
+            "Environment=\"GYGES_HOME=/var/lib/gyges\"\n",
+            "StateDirectoryMode=0700\n",
+            "RuntimeDirectory=gyges/testnet\n",
+            "RuntimeDirectoryMode=0750\n",
+            "ProtectHome=yes\n",
+            "LimitCORE=0\n",
+            "WantedBy=multi-user.target\n",
+        ] {
+            assert!(u.contains(line), "{line}{u}");
+        }
+        assert_eq!(
+            s.socket(Manager::SystemdSystem, Path::new("/x")),
+            Path::new("/run/gyges/testnet/gygesd.sock")
+        );
+        assert_eq!(
+            s.socket(Manager::SystemdUser, Path::new("/x")),
+            Path::new("/x")
+        );
+        assert_eq!(
+            Manager::SystemdSystem.unit_dir().unwrap(),
+            Path::new("/etc/systemd/system")
+        );
+    }
+
+    #[test]
+    fn hardened_accounts_are_created_only_when_missing() {
+        let all = Accounts::default().steps("alice");
+        let progs: Vec<_> = all.iter().map(|(p, _)| *p).collect();
+        assert_eq!(progs, ["groupadd", "useradd", "usermod"]);
+        assert_eq!(all[0].1, ["--system", "gyges"]);
+        assert!(
+            all[1]
+                .1
+                .ends_with(&["/usr/sbin/nologin".to_string(), "gyges".into()])
+        );
+        assert!(all[1].1.contains(&"--no-create-home".to_string()));
+        assert_eq!(all[2].1, ["--append", "--groups", "gyges", "alice"]);
+        let none = Accounts {
+            group_exists: true,
+            user_exists: true,
+            member: true,
+        };
+        assert!(none.steps("alice").is_empty());
+    }
+
+    /// Hardened install and uninstall use the system instance (no `--user`).
+    #[test]
+    fn hardened_uninstall_uses_the_system_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = spec(None);
+        std::fs::write(dir.path().join(s.unit_name()), "x").unwrap();
+        let mut r = Recorder::default();
+        uninstall_with(&mut r, Manager::SystemdSystem, dir.path(), &s).unwrap();
+        assert_eq!(
+            r.calls,
+            [
+                "systemctl disable --now gygesd-testnet.service",
+                "systemctl daemon-reload"
+            ]
+        );
     }
 }
