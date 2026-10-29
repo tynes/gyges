@@ -1,6 +1,6 @@
 //! The key RPCs (`ListKeys`, `InitKey`, `RestoreKey`, `ImportKeystone`,
-//! `UnlockKey`, `LockKey`, `ExportUfvk`, `ExportSeed`) and the mapping from
-//! `gyges-core` errors to `GygesError` (API.md §3, §4).
+//! `UnlockKey`, `LockKey`, `ExportUfvk`, `ExportSeed`, API.md §4). Their
+//! errors map to `GygesError` in `crate::errors`.
 //!
 //! Passphrases and mnemonics arrive as plain strings in the request message
 //! (`[debug_redact]` in the proto keeps them out of `Debug` output). They are
