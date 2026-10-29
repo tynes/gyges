@@ -68,11 +68,11 @@ impl Network {
 /// `zcash_protocol::consensus::Parameters` for the three networks.
 ///
 /// Mainnet and testnet are the upstream constants. Regtest activates every
-/// network upgrade at height 1, which is what the Zebra-derived `zakurad`
-/// does by default; the activation heights a regtest node actually reports
-/// (`getblockchaininfo.upgrades`) are checked against this table when the
-/// node backend connects (ROADMAP.md M1, **needs verification** against a
-/// running `zakurad`).
+/// network upgrade at height 1; a regtest `zakurad` does so only when its
+/// `[network.testnet_parameters.activation_heights]` says so (OVERVIEW.md
+/// §4.3). The heights a node reports (`getblockchaininfo.upgrades`) are
+/// checked against this table when the node backend connects
+/// (`ZakuraRpcBackend::check_upgrades`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsensusParams {
     Main,

@@ -296,7 +296,6 @@ mod tests {
             index,
             root: [byte; 32],
             end_height: BlockHeight::from_u32(end),
-            end_hash: None,
         }
     }
 

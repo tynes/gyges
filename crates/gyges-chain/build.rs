@@ -22,9 +22,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = tonic_prost_build::configure()
         .build_server(true)
         .build_client(false)
-        // The fake implements the methods the tests drive; the rest answer
-        // UNIMPLEMENTED.
-        .generate_default_stubs(true)
         .out_dir(PathBuf::from(std::env::var("OUT_DIR")?));
     for name in [
         "ChainMetadata",

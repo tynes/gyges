@@ -142,19 +142,18 @@ One directory per network so mainnet, testnet and regtest daemons coexist (full 
 ```
 
 ### Example `config.toml`
-Valid TOML; `~` is expanded by the daemon in every path value.
+Valid TOML, checked by a `gyges-core` config test; `~` is expanded by the daemon in every path value. DATA_MODEL.md §2 lists every key.
 
 ```toml
 network = "mainnet"
 default_key = "main"
 airgapped = false
-min_retention_blocks = 10000
 
 [zakura_rpc]
 url = "http://127.0.0.1:8232"
 cookie_path = "~/.cache/zakura/.cookie"
 poll_interval_secs = 15
-# indexer_grpc_url = "http://127.0.0.1:8233"   # optional zakurad indexer gRPC
+min_retention_blocks = 10000
 
 [fallback_lightwalletd]
 enabled = false

@@ -43,13 +43,12 @@ use zcash_client_backend::proto::service::{
     ShieldedProtocol, TxFilter,
 };
 use zcash_client_backend::tor;
-use zcash_primitives::transaction::Transaction;
 use zcash_protocol::ShieldedPool;
-use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
+use zcash_protocol::consensus::{BlockHeight, Parameters};
 
 use crate::{
     BoxFuture, ChainBackend, ChainError, NodeBounds, NodeStatus, Source, StatusCell, SubtreeRoot,
-    TxStatus, bytes32, check_chain_name, display_hash, innermost_error, parse_display_hash,
+    TxStatus, bytes32, check_chain_name, display_hash, innermost_error,
 };
 
 /// One `GetAddressUtxos` entry: an output the endpoint says is unspent at
@@ -565,15 +564,11 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                     break;
                 };
                 let index = start_index + roots.len() as u32;
-                let end_hash = (!root.completing_block_hash.is_empty())
-                    .then(|| bytes32(&root.completing_block_hash, "GetSubtreeRoots: hash"))
-                    .transpose()?;
                 roots.push(SubtreeRoot {
                     pool,
                     index,
                     root: bytes32(&root.root_hash, "GetSubtreeRoots: hash")?,
                     end_height: height_of(root.completing_block_height, "GetSubtreeRoots")?,
-                    end_hash,
                 });
             }
             Ok(roots)
@@ -658,12 +653,13 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
 
     /// `SendTransaction`: broadcast through the endpoint (`tx send
     /// --via-tor`, `broadcast_via_tor`). lightwalletd answers the node's
-    /// `sendrawtransaction` result: `error_code` 0 with the txid in
-    /// `error_message`, or the node's rejection code and text, which is
+    /// `sendrawtransaction` result: `error_code` 0 (with the txid in
+    /// `error_message`, which Gyges does not need), or the node's rejection
+    /// code and text, which is
     /// passed through as [`ChainError::Rejected`]. zaino answers a refusal
     /// as `Internal` instead; [`zaino_rejection`] picks the node's text out
     /// of it.
-    async fn send_transaction(&self, raw: Vec<u8>) -> Result<[u8; 32], ChainError> {
+    async fn send_transaction(&self, raw: Vec<u8>) -> Result<(), ChainError> {
         self.call(|mut client| async move {
             let resp = client
                 .send_transaction(RawTransaction {
@@ -685,24 +681,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                     resp.error_message, resp.error_code
                 )));
             }
-            if let Ok(txid) = parse_display_hash(&resp.error_message) {
-                return Ok(txid);
-            }
-            // No txid in the reply: compute it from the transaction itself,
-            // parsed under the branch id of the next block.
-            let tip = self
-                .status()
-                .bounds
-                .map_or(BlockHeight::from_u32(0), |b| b.tip_height);
-            let branch = BranchId::for_height(&self.params, tip + 1);
-            Transaction::read(&raw[..], branch)
-                .map(|tx| *tx.txid().as_ref())
-                .map_err(|e| {
-                    ChainError::Rpc(format!(
-                        "SendTransaction at {} accepted a transaction Gyges cannot parse: {e}",
-                        self.endpoint
-                    ))
-                })
+            Ok(())
         })
         .await
     }
@@ -828,7 +807,7 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ArtiTorLwdBackend<P
         Box::pin(self.block_range(range))
     }
 
-    fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<[u8; 32], ChainError>> {
+    fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<(), ChainError>> {
         Box::pin(self.send_transaction(raw))
     }
 
@@ -863,6 +842,8 @@ mod tests {
     use transparent::address::TransparentAddress;
     use zcash_client_backend::data_api::chain::BlockCache as _;
     use zcash_client_backend::data_api::scanning::{ScanPriority, ScanRange};
+    use zcash_primitives::transaction::Transaction;
+    use zcash_protocol::consensus::BranchId;
     use zcash_protocol::local_consensus::LocalNetwork;
 
     use super::*;
@@ -1103,7 +1084,6 @@ mod tests {
         assert_eq!(sapling[2].index, 2);
         assert_eq!(sapling[2].root, [3; 32]);
         assert_eq!(sapling[2].end_height, h(3000));
-        assert_eq!(sapling[2].end_hash, Some(node.block(1).unwrap().hash));
         assert_eq!(sapling[2].pool, ShieldedPool::Sapling);
         let upstream = sapling[0].sapling().expect("a valid Sapling node");
         assert_eq!(upstream.subtree_end_height(), h(1000));

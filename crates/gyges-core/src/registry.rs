@@ -77,8 +77,8 @@ pub enum RegistryError {
     #[error("key \"{key_id}\": wallet.sqlite: {detail}")]
     Wallet { key_id: String, detail: String },
     #[error(
-        "key \"{0}\": a wallet migration needs the seed; this release cannot unlock at startup, \
-         see ROADMAP.md"
+        "key \"{0}\": a wallet migration needs the seed, which this release cannot unlock at \
+         startup"
     )]
     SeedRequiredForMigration(String),
     #[error("{context} {path}: {source}", path = .path.display())]
@@ -127,10 +127,6 @@ impl KeyEntry {
 
     pub fn seed_path(&self) -> PathBuf {
         self.dir.join(SEED_FILE)
-    }
-
-    pub fn wallet_path(&self) -> PathBuf {
-        self.dir.join(WALLET_FILE)
     }
 
     /// The wallet database, `None` for `signer-only` profiles. A poisoned

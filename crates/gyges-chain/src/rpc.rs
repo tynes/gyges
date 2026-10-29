@@ -634,11 +634,12 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
         })
     }
 
-    /// `sendrawtransaction(hex)`; the node answers the txid as display hex.
+    /// `sendrawtransaction(hex)`; the node answers the txid as display hex,
+    /// which is only checked for shape.
     /// A JSON-RPC error is the node's rejection and is passed through
     /// verbatim as [`ChainError::Rejected`]; transport failures stay
     /// [`ChainError::Unreachable`].
-    fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<[u8; 32], ChainError>> {
+    fn send_raw_transaction(&self, raw: Vec<u8>) -> BoxFuture<'_, Result<(), ChainError>> {
         Box::pin(async move {
             let txid: String = self
                 .call("sendrawtransaction", vec![json!(hex::encode(raw))])
@@ -649,7 +650,7 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
                     }
                     other => self.chain_error("sendrawtransaction", other),
                 })?;
-            parse_display_hash(&txid)
+            parse_display_hash(&txid).map(drop)
         })
     }
 
@@ -770,7 +771,6 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
                         index: start_index + i as u32,
                         root,
                         end_height: BlockHeight::from_u32(st.end_height),
-                        end_hash: None,
                     })
                 })
                 .collect()
@@ -947,7 +947,6 @@ mod tests {
         assert_eq!(all[1].index, 1);
         assert_eq!(all[1].root, [2; 32]);
         assert_eq!(all[1].end_height, h(200));
-        assert_eq!(all[1].end_hash, None, "the node reports no completing hash");
         assert!(all[1].sapling().is_some());
 
         let some = be.subtree_roots(ShieldedPool::Sapling, 1, 1).await.unwrap();

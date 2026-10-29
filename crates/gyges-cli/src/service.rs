@@ -567,7 +567,8 @@ async fn install_hardened(ctx: &Ctx, user: Option<String>) -> Result<(), CliErro
     // `ProtectHome=yes` hides these from the service.
     if spec.binary.starts_with("/home") || spec.binary.starts_with("/root") {
         return Err(anyhow!(
-            "{} is under a home directory, which the hardened unit cannot see;              install gygesd under /usr/local/bin (or set {DAEMON_BIN_ENV})",
+            "{} is under a home directory, which the hardened unit cannot see; \
+             install gygesd under /usr/local/bin (or set {DAEMON_BIN_ENV})",
             spec.binary.display()
         )
         .into());

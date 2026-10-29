@@ -1119,7 +1119,7 @@ async fn keystone_import_refusals_and_account_choice() {
             "bare ufvk",
             keystone_req("k", &bare, 450),
             ErrorReason::InvalidArgument,
-            "import-ufvk",
+            "a bare UFVK",
         ),
         (
             "ufvk ur",

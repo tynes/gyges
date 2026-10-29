@@ -51,7 +51,7 @@ pub struct DaemonConfig {
     pub allowed_uids: Vec<u32>,
     /// `tracing` filter; overridden by `RUST_LOG`.
     pub log_level: String,
-    /// Node unreachable longer than this -> `Stalled(NodeUnreachable)`.
+    /// Node unreachable longer than this -> `Stalled(Offline)`.
     #[serde(with = "humantime_serde")]
     pub offline_grace: Duration,
     /// Bound on how long `Shutdown { graceful: true }` waits for in-flight
@@ -443,16 +443,26 @@ fn fallback_url_allowed(url: &str, network: Network) -> bool {
 mod tests {
     use super::*;
 
+    /// The first toml block of a spec document.
+    fn toml_example(doc: &str) -> String {
+        let start = doc.find("```toml\n").expect("a toml block") + "```toml\n".len();
+        let end = doc[start..].find("```").expect("toml block closed") + start;
+        doc[start..end].to_string()
+    }
+
     /// The example in DATA_MODEL.md §2 is the schema's documentation; it must
     /// parse with `deny_unknown_fields` so the two cannot drift apart.
     fn data_model_example() -> String {
-        let doc = include_str!("../../../DATA_MODEL.md");
-        let start = doc
-            .find("```toml\n")
-            .expect("DATA_MODEL.md has a toml block")
-            + "```toml\n".len();
-        let end = doc[start..].find("```").expect("toml block closed") + start;
-        doc[start..end].to_string()
+        toml_example(include_str!("../../../DATA_MODEL.md"))
+    }
+
+    /// ARCHITECTURE.md's example says it is valid; hold it to that.
+    #[test]
+    fn architecture_example_parses() {
+        let text = toml_example(include_str!("../../../ARCHITECTURE.md"));
+        let cfg = Config::parse(&text).unwrap();
+        cfg.validate(Network::Mainnet).unwrap();
+        assert_eq!(cfg.zakura_rpc.min_retention_blocks, 10_000);
     }
 
     #[test]

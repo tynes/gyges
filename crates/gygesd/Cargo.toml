@@ -32,7 +32,6 @@ zcash_keys = { workspace = true }
 zip32 = { workspace = true }
 pczt = { workspace = true }
 age = { workspace = true }
-hex = { workspace = true }
 zeroize = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }  # BroadcastStream for StreamLogs followers
@@ -51,13 +50,12 @@ tracing-appender = { workspace = true }
 
 [dev-dependencies]
 orchard = { workspace = true }
-pczt = { workspace = true }
+hex = { workspace = true }
 proptest = { workspace = true }
 gyges-chain = { workspace = true, features = ["test-util"] }
 gyges-core = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }  # service_fn in the policy-layer tests
 tempfile = { workspace = true }
-serde_json = { workspace = true }
 transparent = { workspace = true }
 zcash_primitives = { workspace = true }  # decoding the mined ZIP 320 transactions in the tests
 zcash_address = { workspace = true }  # a Keystone-shaped UFVK (no Sapling item) in the import tests

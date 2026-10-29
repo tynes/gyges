@@ -1,6 +1,6 @@
 [package]
 name = "gyges-core"
-description = "KeyRegistry, VaultManager, SyncScheduler, TxEngine and TexQueue for gygesd"
+description = "Daemon-side wallet logic for gygesd: config, KeyRegistry, VaultManager, sync steps, transaction engine and the ZIP 320 queue"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -56,7 +56,6 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 humantime = { workspace = true }
 humantime-serde = { workspace = true }
-time = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 hex = { workspace = true }

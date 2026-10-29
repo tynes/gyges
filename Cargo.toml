@@ -59,7 +59,7 @@ pczt = { package = "zakura-pczt", version = "=0.1.0-rc7", features = [
     "zcp-builder", "io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor",
     "orchard", "sapling", "transparent",
 ] }
-zakura-pir-status = { version = "=0.0.1-rc1" }   # experimental; only `gyges tx status --pir`
+zakura-pir-status = { version = "=0.0.1-rc1" }   # experimental; no member uses it yet: reserved for `gyges tx status --pir` (ROADMAP.md M6)
 
 # --- Zakura common crates (zakura-core/common) ---
 zcash_keys        = { package = "zakura-keys",           version = "=4.0.0-rc2", features = ["orchard", "sapling", "transparent-inputs"] }
@@ -85,7 +85,6 @@ bip32      = { version = "0.6", default-features = false }  # ChildNumber, for t
 schemerz   = "0.2"                                   # MigratorError, to match zcash_client_sqlite's SeedRequired
 schemerz-rusqlite = "0.370"                          # external wallet migrations (the `ext_gyges_*` tables)
 uuid       = "1"                                     # migration ids
-time       = "0.3"
 
 # --- Async runtime & IPC (gRPC over Unix Domain Socket) ---
 tokio        = { version = "1.42", features = ["full"] }

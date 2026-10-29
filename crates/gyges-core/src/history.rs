@@ -21,8 +21,8 @@
 //! Compact blocks carry no memos, so a received note shows its memo when
 //! the wallet holds the full transaction: always for the wallet's own sends
 //! (their `sent_notes` row is the fallback), for incoming payments once
-//! transaction enhancement fetches them (not yet: `TransactionDataRequest`
-//! handling is open, ROADMAP.md M1 SyncScheduler item).
+//! transaction enhancement fetches them (not yet: ROADMAP.md, the "Not done"
+//! list of the M1 follow-up item).
 
 use zcash_client_backend::data_api::WalletRead as _;
 use zcash_protocol::memo::{Memo, MemoBytes};

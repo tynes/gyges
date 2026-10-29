@@ -164,9 +164,9 @@ pub fn registry_error(e: RegistryError) -> GygesError {
     }
 }
 
-/// `BirthdayError` → typed error. `BelowRetention` is not mapped here: the
-/// callers decide between `CONFIRMATION_REQUIRED` and `FALLBACK_UNAVAILABLE`
-/// depending on `allow_backfill`.
+/// `BirthdayError` → typed error. `BelowRetention` maps to
+/// `FALLBACK_UNAVAILABLE` (no fallback endpoint); callers that can backfill
+/// intercept it first and decide on `allow_backfill` (`below_retention`).
 pub fn birthday_error(e: BirthdayError) -> GygesError {
     match e {
         BirthdayError::NodeRequired(what) => GygesError::new(
@@ -485,7 +485,7 @@ fn check_accounts_export(
         bad(format!(
             "{what} carries no seed fingerprint, so the Keystone could not recognise its key in a \
              PCZT; export the accounts from the device (Connect Software Wallet) and pass the \
-             ur:zcash-accounts QR, or use `key import-ufvk` for a watch-only key"
+             ur:zcash-accounts QR"
         ))
     };
 

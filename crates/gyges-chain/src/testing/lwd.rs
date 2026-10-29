@@ -342,6 +342,9 @@ fn height_arg(id: Option<BlockId>) -> Result<u32, Status> {
 
 #[tonic::async_trait]
 impl CompactTxStreamer for Service {
+    type GetBlockRangeStream = BoxStream<CompactBlock>;
+    type GetSubtreeRootsStream = BoxStream<SubtreeRoot>;
+
     async fn get_lightd_info(&self, _: Request<Empty>) -> Result<Response<LightdInfo>, Status> {
         let st = self.lock("GetLightdInfo");
         let tip = st.blocks.keys().next_back().copied().unwrap_or(0);
@@ -383,7 +386,7 @@ impl CompactTxStreamer for Service {
     async fn get_block_range(
         &self,
         req: Request<BlockRange>,
-    ) -> Result<Response<BoxStream<CompactBlock>>, Status> {
+    ) -> Result<Response<Self::GetBlockRangeStream>, Status> {
         let range = req.into_inner();
         let start = height_arg(range.start)?;
         let end = height_arg(range.end)?;
@@ -425,7 +428,7 @@ impl CompactTxStreamer for Service {
     async fn get_subtree_roots(
         &self,
         req: Request<GetSubtreeRootsArg>,
-    ) -> Result<Response<BoxStream<SubtreeRoot>>, Status> {
+    ) -> Result<Response<Self::GetSubtreeRootsStream>, Status> {
         let arg = req.into_inner();
         let pool = match arg.shielded_protocol() {
             ShieldedProtocol::Sapling => ShieldedPool::Sapling,

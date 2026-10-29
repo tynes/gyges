@@ -162,7 +162,7 @@ Live progress, blocks/sec, active route (`zakura-rpc` or `tor-lwd-fallback`), sy
 Blocks until the key is *spendable* (default: `scanned_tip` at the node tip and no open scan ranges above priority `Ignored`) or merely *scanned* (`--until scanned`). With `--txid`, waits until that transaction has `N` confirmations instead. Exits 7 if the key is `stalled`.
 
 #### `gyges sync run [--key <KEY_ID>] [--from <HEIGHT>] [--to <HEIGHT>] [--force-tor-lwd]`
-Triggers an immediate foreground scan. `--from` **rewinds**: it truncates notes, nullifiers and ShardTree checkpoints above `HEIGHT - 1` before rescanning; unmined transactions are kept and re-evaluated against their expiry. Requires confirmation unless `--yes`.
+Triggers an immediate foreground scan. `--from` **rewinds**: it truncates notes, nullifiers and ShardTree checkpoints above `HEIGHT - 1` before rescanning; unmined transactions are kept and re-evaluated against their expiry. Requires confirmation unless `--yes`. `--to` and `--force-tor-lwd` are not implemented yet (exit 1).
 
 #### `gyges sync mempool [--key <KEY_ID>]`
 Forces an immediate mempool pass for every key, even with `mempool.scan = false`. It covers every transaction in the node's mempool, up to 500. Mempool scanning otherwise runs continuously in the daemon (`mempool.scan = true`), fed by `getrawmempool` diffs (the node's `mempool_change` stream once an indexer exists). Prints `scanned N transactions, found M notes`, where the notes are those paying `--key` (every key without it). Notes found show as pending in `balance` until mined. `--json` prints `ScanMempoolResponse`.
