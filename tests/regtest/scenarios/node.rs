@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use gyges_chain::{ChainBackend as _, ChainError, ZakuraRpcBackend};
 use gyges_regtest::{
     BURN_MINER_ADDRESS, Fixture, NODE_CONFIG, Node, NodeOpts, PASSPHRASE, Run, balance,
     funded_wallet, parse_tex_txids, poll_until, regtest, send, shield, spendable, start_daemon,
@@ -127,6 +128,28 @@ fn daemon_status_and_key_init_against_the_real_node() {
     let run = fx.gyges(&["sync", "status", "--json"]).run();
     assert_eq!(run.json()["keys"][0]["scanned_tip"], 3, "{}", run.stdout);
     drop(fx);
+
+    // A wrong or missing cookie: zakurad closes the connection without an
+    // answer, which must still read as a credentials problem, not as a
+    // node that is down.
+    let dir = tempfile::tempdir().unwrap();
+    let wrong = dir.path().join(".cookie");
+    std::fs::write(&wrong, "__cookie__:wrong").unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (cookie, hint) in [
+        (Some(wrong), "presented but rejected"),
+        (None, "no cookie configured"),
+    ] {
+        let be = ZakuraRpcBackend::new(node.url(), cookie, regtest()).unwrap();
+        let err = rt.block_on(be.node_bounds()).unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Unreachable(m) if m.contains("credentials") && m.contains(hint)),
+            "{err}"
+        );
+    }
 
     // A testnet daemon pointed at this regtest node: same chain name
     // ("test"), different activation heights.

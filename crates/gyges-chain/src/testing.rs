@@ -684,7 +684,7 @@ impl FakeNode {
 async fn handle(
     state: Arc<Mutex<State>>,
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<Full<Bytes>>, Box<dyn std::error::Error + Send + Sync>> {
     let auth = req
         .headers()
         .get(hyper::header::AUTHORIZATION)
@@ -733,8 +733,10 @@ async fn handle(
             .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
             .and_then(|bytes| String::from_utf8(bytes).ok());
         if presented.as_deref() != Some(expected.as_str()) {
-            // Zakura answers an empty 401.
-            return Ok(plain(StatusCode::UNAUTHORIZED, ""));
+            // Zakura's auth middleware fails the request instead of
+            // answering it (the TODO in its `http_request_compatibility.rs`),
+            // and hyper then closes the connection without a response.
+            return Err("unauthenticated method".into());
         }
     }
 

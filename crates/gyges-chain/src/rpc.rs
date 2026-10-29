@@ -81,10 +81,19 @@ impl<P> fmt::Debug for ZakuraRpcBackend<P> {
 /// [`ChainError`] with the method name.
 #[derive(Debug)]
 enum RpcFailure {
-    /// Could not connect, timed out, or the node closed the connection.
+    /// Could not connect, timed out, or the connection failed mid-request.
     Transport(String),
-    /// HTTP 401/403: the cookie is wrong, missing or stale.
+    /// HTTP 401/403: the cookie is wrong, missing or stale. zakurad itself
+    /// never answers this way (see `ClosedUnanswered`); a proxy in front
+    /// of it may.
     Auth,
+    /// The node accepted the request and closed the connection without
+    /// answering. That is how zakurad refuses credentials: its auth
+    /// middleware fails the request (the TODO in its
+    /// `http_request_compatibility.rs`) and hyper drops the connection.
+    /// Carries the transport error, since a node going down mid-request
+    /// looks the same.
+    ClosedUnanswered(String),
     /// The node answered with a JSON-RPC error object.
     Json { code: i64, message: String },
     /// The response was not the JSON we expected.
@@ -336,6 +345,8 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
         let resp = req.send().await.map_err(|e| {
             if e.is_connect() || e.is_timeout() {
                 RpcFailure::Transport(connect_error_text(&e))
+            } else if closed_unanswered(&e) {
+                RpcFailure::ClosedUnanswered(innermost_error(&e))
             } else {
                 RpcFailure::Transport(e.to_string())
             }
@@ -349,14 +360,9 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
             .await
             .map_err(|e| RpcFailure::Transport(e.to_string()))?;
         if bytes.is_empty() {
-            // Zakura answers a bad cookie with an empty body (see the TODO in
-            // its `http_request_compatibility.rs`), so an empty reply is
-            // most likely an auth failure.
-            return Err(if credentials.is_err() || self.cookie_path.is_some() {
-                RpcFailure::Auth
-            } else {
-                RpcFailure::Decode(format!("empty response (HTTP {status})"))
-            });
+            return Err(RpcFailure::Decode(format!(
+                "empty response (HTTP {status})"
+            )));
         }
         let parsed: RpcResponse = serde_json::from_slice(&bytes)
             .map_err(|e| RpcFailure::Decode(format!("{e} (HTTP {status})")))?;
@@ -372,22 +378,32 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
         serde_json::from_value(result).map_err(|e| RpcFailure::Decode(e.to_string()))
     }
 
+    /// What to check about the cookie after the node refused a request.
+    /// `if_none` finishes the sentence when no cookie is configured.
+    fn credentials_hint(&self, if_none: &str) -> String {
+        match self.credentials() {
+            Ok(Some(_)) => "the cookie was presented but rejected; is zakura_rpc.cookie_path the running node's cookie?".to_string(),
+            Ok(None) => format!("no cookie configured (zakura_rpc.cookie_path is empty) {if_none}"),
+            Err(reason) => reason,
+        }
+    }
+
     /// Fold a failure into a [`ChainError`], naming the method.
     fn chain_error(&self, method: &str, failure: RpcFailure) -> ChainError {
         match failure {
             RpcFailure::Transport(detail) => {
                 ChainError::Unreachable(format!("{method} at {}: {detail}", self.url))
             }
-            RpcFailure::Auth => {
-                let hint = match self.credentials() {
-                    Ok(Some(_)) => "the cookie was presented but rejected; is zakura_rpc.cookie_path the running node's cookie?".to_string(),
-                    Ok(None) => "no cookie configured (zakura_rpc.cookie_path is empty) but the node requires one".to_string(),
-                    Err(reason) => reason,
-                };
-                ChainError::Unreachable(format!(
-                    "{method}: the node rejected the credentials; {hint}"
-                ))
-            }
+            RpcFailure::Auth => ChainError::Unreachable(format!(
+                "{method}: the node rejected the credentials; {}",
+                self.credentials_hint("but the node requires one")
+            )),
+            RpcFailure::ClosedUnanswered(detail) => ChainError::Unreachable(format!(
+                "{method} at {}: the node closed the connection without answering ({detail}); \
+                 it most likely rejected the credentials; {}",
+                self.url,
+                self.credentials_hint("and the node may require one")
+            )),
             RpcFailure::Json { code, message } => {
                 ChainError::Rpc(format!("{method}: {message} (code {code})"))
             }
@@ -588,6 +604,20 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
 
 /// `reqwest`'s connect errors wrap the OS error several layers deep; the
 /// innermost message ("Connection refused") is the useful one.
+/// Whether the node took the request and closed the connection before
+/// sending any response (hyper's "connection closed before message
+/// completed").
+fn closed_unanswered(e: &reqwest::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(h) = err.downcast_ref::<hyper::Error>() {
+            return h.is_incomplete_message();
+        }
+        cur = err.source();
+    }
+    false
+}
+
 fn connect_error_text(e: &reqwest::Error) -> String {
     let last = innermost_error(e);
     if e.is_timeout() {
