@@ -56,6 +56,14 @@ pub(crate) type SignStream = tonic::codegen::BoxStream<SignPcztEvent>;
 /// passphrase session.
 pub const PCZT_EXPIRY_BLOCKS: u32 = 1152;
 
+/// The expiry of a transaction that waits for a person: a `pczt create`
+/// file, or a Keystone send, which may wait across a restart for up to
+/// `vault.signing_session_ttl`. [`PCZT_EXPIRY_BLOCKS`] past the proposal's
+/// target height instead of `tx send`'s 40.
+pub(crate) fn long_expiry(min_target: impl Into<BlockHeight>) -> BlockHeight {
+    min_target.into() + PCZT_EXPIRY_BLOCKS
+}
+
 /// Parse the bytes, read the tags, and apply the two checks every PCZT RPC
 /// makes: the file is for this daemon's network, and the caller's `--key`
 /// (if any) is the key the file names.
@@ -181,12 +189,10 @@ pub(crate) async fn create_pczt(
                     .into(),
             ));
         }
-        let mut summary = core_tx::summarize(&params, &proposal, min_confirmations);
-        let target = BlockHeight::from(proposal.min_target_height());
-        let expiry = target + PCZT_EXPIRY_BLOCKS;
-        summary.expiry_height = u32::from(expiry);
-        let expected = Expected::from_proposal(&params, &proposal, Some(expiry))?;
-        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal, Some(expiry))?;
+        let expiry = Some(long_expiry(proposal.min_target_height()));
+        let summary = core_tx::summarize(&params, &proposal, min_confirmations, expiry);
+        let (expected, pczt) =
+            core_tx::build_single_step(wallet, &params, account, &proposal, expiry)?;
         let session_id = pczt_io::new_session_id();
         let pczt = pczt_io::tag(
             pczt,

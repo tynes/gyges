@@ -38,7 +38,6 @@ use prost::Message as _;
 use tokio::sync::mpsc;
 use tonic::Status;
 use zcash_keys::keys::UnifiedSpendingKey;
-use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
 
 use crate::broadcast::{Route, broadcast_route, connected_chain};
@@ -338,16 +337,16 @@ pub(crate) fn send_transaction(
             memo,
             min_confirmations,
         )?;
-        let mut summary = core_tx::summarize(&params, &proposal, min_confirmations);
-        let expiry = keystone_expiry(keystone, proposal.min_target_height(), &mut summary);
+        let expiry = keystone.then(|| crate::roles::long_expiry(proposal.min_target_height()));
+        let summary = core_tx::summarize(&params, &proposal, min_confirmations, expiry);
         if dry_run {
             return Ok((summary, None));
         }
         if core_tx::is_two_step(&proposal) {
             return Ok((summary, Some(Built::Tex(Box::new(proposal)))));
         }
-        let expected = Expected::from_proposal(&params, &proposal, expiry)?;
-        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal, expiry)?;
+        let (expected, pczt) =
+            core_tx::build_single_step(wallet, &params, account, &proposal, expiry)?;
         Ok((summary, Some(Built::Pczt(expected, Box::new(pczt)))))
     };
     Ok(run(
@@ -363,23 +362,6 @@ pub(crate) fn send_transaction(
 /// Whether the key signs on a Keystone.
 fn is_keystone(prepared: &Prepared) -> bool {
     prepared.key.profile().signing_mode == SigningMode::KeystoneQr
-}
-
-/// A Keystone send waits for a person and a device, possibly across a
-/// restart, for up to `vault.signing_session_ttl`; it gets the expiry a
-/// PCZT file gets (`target + 1152`, about a day) instead of `tx send`'s 40
-/// blocks. Returns the override and updates the summary to match.
-fn keystone_expiry(
-    keystone: bool,
-    min_target: impl Into<BlockHeight>,
-    summary: &mut ProposalSummary,
-) -> Option<BlockHeight> {
-    if !keystone {
-        return None;
-    }
-    let expiry = min_target.into() + crate::roles::PCZT_EXPIRY_BLOCKS;
-    summary.expiry_height = u32::from(expiry);
-    Some(expiry)
 }
 
 /// One Keystone session per key at a time: until it is completed or
@@ -432,13 +414,13 @@ pub(crate) fn shield_funds(
         let account = core_tx::account_of(wallet)?;
         let proposal =
             core_tx::propose_shield(wallet, &params, account, threshold, min_confirmations)?;
-        let mut summary = core_tx::summarize(&params, &proposal, min_confirmations);
-        let expiry = keystone_expiry(keystone, proposal.min_target_height(), &mut summary);
+        let expiry = keystone.then(|| crate::roles::long_expiry(proposal.min_target_height()));
+        let summary = core_tx::summarize(&params, &proposal, min_confirmations, expiry);
         if dry_run {
             return Ok((summary, None));
         }
-        let expected = Expected::from_proposal(&params, &proposal, expiry)?;
-        let pczt = core_tx::build_pczt(wallet, &params, account, &proposal, expiry)?;
+        let (expected, pczt) =
+            core_tx::build_single_step(wallet, &params, account, &proposal, expiry)?;
         Ok((summary, Some(Built::Pczt(expected, Box::new(pczt)))))
     };
     Ok(run(

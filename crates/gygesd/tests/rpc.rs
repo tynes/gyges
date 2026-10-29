@@ -1344,6 +1344,11 @@ fn assert_device_view(req: &gyges_proto::v1::SignatureRequired) {
         "{:?}",
         view.global().proprietary().keys().collect::<Vec<_>>()
     );
+    assert_eq!(
+        *view.global().expiry_height(),
+        req.summary.as_ref().unwrap().expiry_height,
+        "the device is shown the expiry the user approved"
+    );
     for bundle in [view.orchard(), view.ironwood()] {
         for a in bundle.actions() {
             assert!(
