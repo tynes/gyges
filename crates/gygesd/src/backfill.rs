@@ -202,11 +202,12 @@ pub(crate) fn load_session(key: &KeyEntry) -> Option<Session> {
     }
 }
 
-/// Write `value` as pretty JSON to a new owner-only file at `path`.
+/// Replace the owner-only file at `path` with `value` as pretty JSON. The
+/// write is atomic, so a crash mid-save leaves the previous session or
+/// report readable instead of a truncated file that loads as nothing.
 fn write_private_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
-    use std::io::Write as _;
     let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
-    gyges_core::perms::create_private_file(path)?.write_all(&bytes)
+    gyges_core::perms::write_private_atomic(path, &bytes)
 }
 
 fn report_path(key: &KeyEntry) -> PathBuf {
