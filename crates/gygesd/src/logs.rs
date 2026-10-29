@@ -14,14 +14,14 @@
 //!   migration, DATA_MODEL.md §7) and carries only what the events do: a
 //!   timestamp, the level, the event name, the key id and, where applicable,
 //!   the unlock scope or the signing path;
-//! * the **capture** layer keeps the last [`RING_CAPACITY`] entries of each
+//! * the **capture** layer keeps the last `RING_CAPACITY` entries of each
 //!   log in memory and fans new ones out to `StreamLogs` followers, so the
 //!   CLI never tails a file.
 //!
 //! Redaction happens upstream of all three: values are wrapped in
 //! [`gyges_core::Sensitive`] at the call site, so every writer below sees
 //! `[redacted]`. Tests install the same stack over in-memory writers
-//! ([`layers`]) and assert the rendered lines.
+//! (`layers`) and assert the rendered lines.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -47,11 +47,11 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use crate::keys::AUDIT_TARGET;
 
 /// How many entries of each log `StreamLogs` can replay.
-pub const RING_CAPACITY: usize = 1000;
+pub(crate) const RING_CAPACITY: usize = 1000;
 /// How far a slow follower may fall behind before it skips entries.
 const FOLLOW_CAPACITY: usize = 256;
 /// The file beside the rotated main log (DATA_MODEL.md §1).
-pub const AUDIT_FILE: &str = "audit.log";
+pub(crate) const AUDIT_FILE: &str = "audit.log";
 
 /// What the generated service returns for `StreamLogs`.
 pub type LogStream = tonic::codegen::BoxStream<LogEntry>;
@@ -130,7 +130,7 @@ pub struct LogHub {
 
 impl LogHub {
     /// Store one entry, routed by target.
-    pub fn record(&self, entry: LogEntry) {
+    pub(crate) fn record(&self, entry: LogEntry) {
         if entry.target == AUDIT_TARGET {
             self.audit.push(entry);
         } else {
@@ -285,7 +285,7 @@ const QUIET_UPSTREAM: &[&str] = &[
 
 /// The effective filter: `RUST_LOG` when set and non-empty (the operator's
 /// own choice, taken as given), else `daemon.log_level` with
-/// [`QUIET_UPSTREAM`] appended.
+/// `QUIET_UPSTREAM` appended.
 pub fn filter_spec(configured: &str) -> String {
     std::env::var("RUST_LOG")
         .ok()
@@ -307,7 +307,7 @@ fn audit_only() -> FilterFn {
 /// into `hub`. `filter` is a `tracing` directive string such as `info` or
 /// `gygesd=debug,info`; it governs the main log and the main ring, never the
 /// audit log.
-pub fn layers<S, M, A>(
+pub(crate) fn layers<S, M, A>(
     hub: &Arc<LogHub>,
     filter: &str,
     main_writer: M,
@@ -351,7 +351,7 @@ impl fmt::Debug for Guards {
     }
 }
 
-/// Install the global subscriber for a daemon: the stack from [`layers`]
+/// Install the global subscriber for a daemon: the stack from `layers`
 /// over `logs_dir/gygesd.<date>.log` (daily, seven kept) and
 /// `logs_dir/audit.log` (never rotated), plus stderr when `to_stderr`.
 /// Files are created 0600 under the daemon's umask.

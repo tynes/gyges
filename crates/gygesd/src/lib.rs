@@ -24,20 +24,23 @@
 
 #![forbid(unsafe_code)]
 
-pub mod backfill;
-pub mod conn;
-pub mod keys;
-pub mod keystone;
-pub mod lifecycle;
+// The library exists for `main.rs` and the in-process integration tests;
+// everything they do not need stays crate-private so that rustc's dead-code
+// lint sees the whole daemon.
+mod backfill;
+mod conn;
+mod keys;
+mod keystone;
+mod lifecycle;
 pub mod logs;
-pub mod node;
-pub mod policy;
-pub mod roles;
-pub mod service;
-pub mod sync;
-pub mod tex;
-pub mod tx;
-pub mod wallet;
+mod node;
+mod policy;
+mod roles;
+mod service;
+mod sync;
+mod tex;
+mod tx;
+mod wallet;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -52,11 +55,16 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
-pub use conn::{Conn, ConnInfo};
-pub use lifecycle::{PidLock, PidLockError};
+pub use keys::AUDIT_TARGET;
 pub use logs::LogHub;
-pub use policy::{PeerPolicy, PolicyLayer};
-pub use service::{DaemonState, GygesService};
+pub use roles::PCZT_EXPIRY_BLOCKS;
+pub use service::DaemonState;
+pub use sync::SyncHub;
+
+use conn::Conn;
+use lifecycle::PidLock;
+use policy::{PeerPolicy, PolicyLayer};
+use service::GygesService;
 
 /// Poison-tolerant locking: a holder that panicked leaves the data usable.
 pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {

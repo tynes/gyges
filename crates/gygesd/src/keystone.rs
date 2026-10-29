@@ -46,7 +46,7 @@ type Outcome = Result<TxId, GygesError>;
 
 /// Streams waiting on their session, and the sessions being completed.
 #[derive(Default)]
-pub struct KeystoneHub {
+pub(crate) struct KeystoneHub {
     waiters: Mutex<BTreeMap<String, oneshot::Sender<Outcome>>>,
     completing: Mutex<BTreeSet<String>>,
 }
@@ -184,7 +184,7 @@ fn keystone_keys(state: &DaemonState, key_id: &str) -> Vec<Arc<KeyEntry>> {
 }
 
 /// `ListSigningSessions`' persisted half.
-pub async fn list(
+pub(crate) async fn list(
     state: &DaemonState,
     key_id: &str,
     include_finished: bool,
@@ -233,7 +233,7 @@ async fn find(
 
 /// `AbortSigningSession` for a persisted Keystone session; `None` when no
 /// key holds it. The waiting stream, if any, ends with `CANCELLED`.
-pub async fn abort(
+pub(crate) async fn abort(
     state: &DaemonState,
     session_id: &str,
 ) -> Result<Option<SigningSession>, Status> {
@@ -365,7 +365,7 @@ pub(crate) async fn await_device(
 }
 
 /// `CompleteKeystoneSign` (API.md §6.2).
-pub async fn complete_keystone_sign(
+pub(crate) async fn complete_keystone_sign(
     state: Arc<DaemonState>,
     req: CompleteKeystoneSignRequest,
 ) -> Result<CompleteKeystoneSignResponse, Status> {

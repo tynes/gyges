@@ -17,12 +17,12 @@ use crate::service::DaemonState;
 /// Bound on the first poll, which runs before the socket is bound so that a
 /// `daemon status` right after `daemon start` is accurate. A refused
 /// connection returns at once; this only bites on a black-holed address.
-pub const FIRST_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const FIRST_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What the previous poll saw, so that only transitions are logged and a
 /// node that stays down produces one warning rather than one per tick.
 #[derive(Debug, Default)]
-pub struct Link(AtomicU8);
+pub(crate) struct Link(AtomicU8);
 
 // 0 (the default) means "never polled"; both transitions below log.
 const UP: u8 = 1;
@@ -32,7 +32,7 @@ const DOWN: u8 = 2;
 /// Anything else is a remote node, which THREAT_MODEL.md §3 row 6 says
 /// moves the node operator into the trusted base; the first successful poll
 /// warns once.
-pub fn is_local_host(url: &str) -> bool {
+pub(crate) fn is_local_host(url: &str) -> bool {
     let Ok(uri) = url.parse::<http::Uri>() else {
         return false;
     };
@@ -47,7 +47,7 @@ pub fn is_local_host(url: &str) -> bool {
 }
 
 /// One poll. Returns whether the node answered.
-pub async fn poll_once(state: &DaemonState, chain: &dyn ChainBackend, link: &Link) -> bool {
+pub(crate) async fn poll_once(state: &DaemonState, chain: &dyn ChainBackend, link: &Link) -> bool {
     let before = link.0.load(Ordering::Relaxed);
     let url = &state.config.zakura_rpc.url;
     match chain.node_bounds().await {

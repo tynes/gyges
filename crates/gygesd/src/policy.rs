@@ -26,14 +26,14 @@ use crate::conn::ConnInfo;
 
 /// Who may connect to the socket.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PeerPolicy {
+pub(crate) struct PeerPolicy {
     daemon_uid: u32,
     allowed_uids: Vec<u32>,
 }
 
 /// Why a connection was dropped at accept time.
 #[derive(Debug, thiserror::Error)]
-pub enum PeerRejected {
+pub(crate) enum PeerRejected {
     #[error("peer uid {0} is not the daemon's uid and not in daemon.allowed_uids")]
     Uid(u32),
     #[error("peer credentials unavailable: {0}")]
@@ -42,21 +42,21 @@ pub enum PeerRejected {
 
 impl PeerPolicy {
     /// `daemon_uid` is always allowed; `allowed_uids` is `daemon.allowed_uids`.
-    pub fn new(daemon_uid: u32, allowed_uids: impl IntoIterator<Item = u32>) -> Self {
+    pub(crate) fn new(daemon_uid: u32, allowed_uids: impl IntoIterator<Item = u32>) -> Self {
         Self {
             daemon_uid,
             allowed_uids: allowed_uids.into_iter().collect(),
         }
     }
 
-    pub fn allows(&self, uid: u32) -> bool {
+    pub(crate) fn allows(&self, uid: u32) -> bool {
         uid == self.daemon_uid || self.allowed_uids.contains(&uid)
     }
 
     /// Read the peer's credentials (`SO_PEERCRED` on Linux, `LOCAL_PEERCRED`
     /// on macOS, via tokio) and decide. Returns the admitted uid, which
     /// [`crate::conn::Conn`] carries into every request.
-    pub fn admit(&self, stream: &UnixStream) -> Result<u32, PeerRejected> {
+    pub(crate) fn admit(&self, stream: &UnixStream) -> Result<u32, PeerRejected> {
         let cred = stream.peer_cred().map_err(PeerRejected::Unavailable)?;
         let uid = cred.uid();
         if self.allows(uid) {
@@ -70,7 +70,7 @@ impl PeerPolicy {
 /// Method names (without the `/gyges.v1.Gyges/` prefix) served when the
 /// daemon runs `--airgapped` (API.md §8). `Shutdown` is included so that an
 /// air-gapped daemon can be stopped over the socket; it touches no network.
-pub const AIRGAPPED_METHODS: &[&str] = &[
+pub(crate) const AIRGAPPED_METHODS: &[&str] = &[
     "GetInfo",
     "Shutdown",
     "StreamLogs",
@@ -99,7 +99,7 @@ fn service_prefix() -> String {
 
 /// Whether an HTTP/2 request path may be served while air-gapped. Paths that
 /// do not belong to the Gyges service are left to tonic (`UNIMPLEMENTED`).
-pub fn allowed_when_airgapped(path: &str) -> bool {
+pub(crate) fn allowed_when_airgapped(path: &str) -> bool {
     match path.strip_prefix(service_prefix().as_str()) {
         Some(method) => AIRGAPPED_METHODS.contains(&method),
         None => true,
@@ -108,13 +108,13 @@ pub fn allowed_when_airgapped(path: &str) -> bool {
 
 /// Tower layer applying [`PeerPolicy`] and the air-gapped allow-list.
 #[derive(Clone, Debug)]
-pub struct PolicyLayer {
+pub(crate) struct PolicyLayer {
     peer: PeerPolicy,
     airgapped: bool,
 }
 
 impl PolicyLayer {
-    pub fn new(peer: PeerPolicy, airgapped: bool) -> Self {
+    pub(crate) fn new(peer: PeerPolicy, airgapped: bool) -> Self {
         Self { peer, airgapped }
     }
 }
@@ -133,7 +133,7 @@ impl<S> Layer<S> for PolicyLayer {
 
 /// The service produced by [`PolicyLayer`].
 #[derive(Clone, Debug)]
-pub struct Policy<S> {
+pub(crate) struct Policy<S> {
     inner: S,
     peer: PeerPolicy,
     airgapped: bool,

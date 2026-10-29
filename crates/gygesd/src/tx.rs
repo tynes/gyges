@@ -54,7 +54,7 @@ use crate::tex::{self, DriveError, Offered};
 use crate::with_wallet;
 
 /// The server-streaming response type for `SendTransaction` / `ShieldFunds`.
-pub type SendStream = tonic::codegen::BoxStream<SendEvent>;
+pub(crate) type SendStream = tonic::codegen::BoxStream<SendEvent>;
 
 // ---------------------------------------------------------------------------
 // Signing sessions
@@ -99,7 +99,7 @@ const FINISHED_KEPT: usize = 64;
 /// The daemon's in-memory signing sessions (API.md §6.1: passphrase kinds
 /// are not persisted).
 #[derive(Default)]
-pub struct SessionHub {
+pub(crate) struct SessionHub {
     sessions: Mutex<BTreeMap<String, Session>>,
 }
 
@@ -235,7 +235,7 @@ fn prune(all: &mut BTreeMap<String, Session>) {
 // ---------------------------------------------------------------------------
 
 /// `TxError` → the typed error (API.md §3).
-pub fn tx_error(e: TxError, key_id: &str) -> GygesError {
+pub(crate) fn tx_error(e: TxError, key_id: &str) -> GygesError {
     let err = match e {
         TxError::InsufficientFunds {
             available,
@@ -440,7 +440,7 @@ pub(crate) fn broadcast_route(
 // Proto conversion
 // ---------------------------------------------------------------------------
 
-pub fn proto_proposal(s: &ProposalSummary) -> v1::Proposal {
+pub(crate) fn proto_proposal(s: &ProposalSummary) -> v1::Proposal {
     v1::Proposal {
         steps: s
             .steps
@@ -645,7 +645,7 @@ enum Built {
 type Proposed = (ProposalSummary, Option<Built>);
 
 /// `SendTransaction` (API.md §4.1).
-pub fn send_transaction(
+pub(crate) fn send_transaction(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
     req: SendTransactionRequest,
@@ -773,7 +773,7 @@ fn refuse_if_pending(prepared: &Prepared) -> Result<(), Status> {
 
 /// `ShieldFunds` (API.md §4.1): the same stream for a transparent → Orchard
 /// proposal.
-pub fn shield_funds(
+pub(crate) fn shield_funds(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
     req: ShieldFundsRequest,
@@ -1442,7 +1442,7 @@ impl Drop for SessionGuard {
 /// `UnlockKey { session_id, passphrase }` (API.md §6.2): verify the
 /// passphrase, derive the key, hand it to the stream. No token is returned
 /// and no unlock is created.
-pub async fn satisfy_session(
+pub(crate) async fn satisfy_session(
     state: Arc<DaemonState>,
     session_id: String,
     passphrase: SecretString,
@@ -1486,7 +1486,7 @@ pub async fn satisfy_session(
 
 /// `ListSigningSessions` (the ZIP 320 rows are added by the service, from
 /// `crate::tex`).
-pub fn list_signing_sessions(
+pub(crate) fn list_signing_sessions(
     state: &DaemonState,
     req: &ListSigningSessionsRequest,
 ) -> Result<ListSigningSessionsResponse, Status> {
@@ -1497,7 +1497,7 @@ pub fn list_signing_sessions(
 }
 
 /// `AbortSigningSession`: the waiting stream ends with `CANCELLED`.
-pub fn abort_signing_session(
+pub(crate) fn abort_signing_session(
     state: &DaemonState,
     req: AbortSigningSessionRequest,
 ) -> Result<SigningSession, Status> {
@@ -1518,7 +1518,7 @@ pub fn abort_signing_session(
 }
 
 /// `GetBalance` (API.md): per pool at `min_confirmations`.
-pub async fn get_balance(
+pub(crate) async fn get_balance(
     state: Arc<DaemonState>,
     req: GetBalanceRequest,
 ) -> Result<GetBalanceResponse, Status> {

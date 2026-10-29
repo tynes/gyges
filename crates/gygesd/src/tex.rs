@@ -49,14 +49,14 @@ use crate::with_wallet;
 
 /// The queue's wake-up and the rows a `tx resume` is rebuilding.
 #[derive(Debug, Default)]
-pub struct TexHub {
+pub(crate) struct TexHub {
     wake: Notify,
     rebuilding: Mutex<BTreeSet<[u8; 32]>>,
 }
 
 impl TexHub {
     /// Run a pass now rather than at the next interval.
-    pub fn wake(&self) {
+    pub(crate) fn wake(&self) {
         self.wake.notify_one();
     }
 
@@ -75,7 +75,10 @@ const ACTIVE: [TexState; 4] = [
 ];
 
 /// Start the queue task.
-pub fn spawn(state: Arc<DaemonState>, chain: Arc<dyn ChainBackend>) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn(
+    state: Arc<DaemonState>,
+    chain: Arc<dyn ChainBackend>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = state
             .config
@@ -93,7 +96,7 @@ pub fn spawn(state: Arc<DaemonState>, chain: Arc<dyn ChainBackend>) -> tokio::ta
 }
 
 /// One pass over every key's active rows.
-pub async fn tick(state: &Arc<DaemonState>, chain: &dyn ChainBackend) {
+pub(crate) async fn tick(state: &Arc<DaemonState>, chain: &dyn ChainBackend) {
     if !chain.status().connected {
         return;
     }
@@ -337,7 +340,7 @@ async fn drive(
 // Proto conversion and listing
 // ---------------------------------------------------------------------------
 
-pub fn proto_state(s: TexState) -> v1::TexState {
+pub(crate) fn proto_state(s: TexState) -> v1::TexState {
     match s {
         TexState::Built => v1::TexState::Built,
         TexState::Step1Broadcast => v1::TexState::Step1Broadcast,
@@ -351,7 +354,7 @@ pub fn proto_state(s: TexState) -> v1::TexState {
     }
 }
 
-pub fn to_proto(key_id: &str, row: &TexRow) -> TexQueueEntry {
+pub(crate) fn to_proto(key_id: &str, row: &TexRow) -> TexQueueEntry {
     TexQueueEntry {
         step1_txid: display_hash(&row.step1_txid),
         step2_txid: display_hash(&row.step2_txid),
@@ -368,7 +371,11 @@ pub fn to_proto(key_id: &str, row: &TexRow) -> TexQueueEntry {
 }
 
 /// Every transfer of `key_id` (all keys when empty), for `tx sessions`.
-pub async fn list(state: &DaemonState, key_id: &str, include_finished: bool) -> Vec<TexQueueEntry> {
+pub(crate) async fn list(
+    state: &DaemonState,
+    key_id: &str,
+    include_finished: bool,
+) -> Vec<TexQueueEntry> {
     let mut out = Vec::new();
     for key in state.wallet_keys() {
         if !key_id.is_empty() && key.key_id() != key_id {
@@ -410,7 +417,7 @@ async fn load_row(key: &Arc<KeyEntry>, id: [u8; 32]) -> Result<TexRow, Status> {
 
 /// `AbortTexTransfer` (API.md §4.3): allowed while the row is still
 /// `built`, i.e. before either transaction reached the node.
-pub async fn abort_tex_transfer(
+pub(crate) async fn abort_tex_transfer(
     state: Arc<DaemonState>,
     req: AbortTexTransferRequest,
 ) -> Result<TexQueueEntry, Status> {
@@ -449,7 +456,7 @@ pub async fn abort_tex_transfer(
 /// The row is read before the spending checks, so that a finished or
 /// in-flight transfer gets its answer whatever the key's sync state; only a
 /// rebuild needs a synced, spendable key.
-pub async fn resume_tex_transfer(
+pub(crate) async fn resume_tex_transfer(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
     req: ResumeTexTransferRequest,

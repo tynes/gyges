@@ -42,7 +42,7 @@ use crate::with_wallet;
 
 /// What the daemon knows about the fallback endpoint (`GetInfo.fallback`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum Trust {
+pub(crate) enum Trust {
     /// No backfill has been validated against the node yet.
     #[default]
     Untested,
@@ -69,14 +69,14 @@ struct TrustInner {
 
 /// The endpoint's trust state, shared by the scheduler and `GetInfo`.
 #[derive(Debug, Default)]
-pub struct TrustHub {
+pub(crate) struct TrustHub {
     inner: Mutex<TrustInner>,
 }
 
 impl TrustHub {
     /// Read the persisted mark at `path`. A mark for another endpoint is a
     /// config change, which clears it.
-    pub fn load(&self, path: PathBuf, endpoint: &str) {
+    pub(crate) fn load(&self, path: PathBuf, endpoint: &str) {
         let mut inner = self.lock();
         inner.endpoint = endpoint.to_string();
         inner.trust = Trust::Untested;
@@ -114,7 +114,7 @@ impl TrustHub {
         crate::lock(&self.inner)
     }
 
-    pub fn get(&self) -> Trust {
+    pub(crate) fn get(&self) -> Trust {
         self.lock().trust.clone()
     }
 
@@ -142,7 +142,7 @@ impl TrustHub {
 }
 
 /// `GetInfo.fallback.trust`.
-pub fn proto_trust(state: &DaemonState) -> v1::FallbackTrust {
+pub(crate) fn proto_trust(state: &DaemonState) -> v1::FallbackTrust {
     if state.fallback.is_none() {
         return v1::FallbackTrust::Unspecified;
     }
@@ -154,7 +154,7 @@ pub fn proto_trust(state: &DaemonState) -> v1::FallbackTrust {
 }
 
 /// `GetInfo.tor`: the embedded Tor client behind the fallback endpoint.
-pub fn tor_status(state: &DaemonState) -> v1::TorStatus {
+pub(crate) fn tor_status(state: &DaemonState) -> v1::TorStatus {
     let Some(fallback) = &state.fallback else {
         return v1::TorStatus {
             state: v1::TorState::Disabled as i32,
@@ -178,11 +178,11 @@ pub fn tor_status(state: &DaemonState) -> v1::TorStatus {
 
 /// A key's open backfill (`keys/<id>/backfill.json`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Session {
+pub(crate) struct Session {
     /// First height scanned from the endpoint; a failed handoff truncates
     /// the key to `from - 1`.
-    pub from: u32,
-    pub endpoint: String,
+    pub(crate) from: u32,
+    pub(crate) endpoint: String,
 }
 
 fn session_path(key: &KeyEntry) -> PathBuf {
@@ -190,7 +190,7 @@ fn session_path(key: &KeyEntry) -> PathBuf {
 }
 
 /// The persisted session of `key`, if one is open.
-pub fn load_session(key: &KeyEntry) -> Option<Session> {
+pub(crate) fn load_session(key: &KeyEntry) -> Option<Session> {
     let path = session_path(key);
     let bytes = std::fs::read(&path).ok()?;
     match serde_json::from_slice(&bytes) {
@@ -215,7 +215,7 @@ fn report_path(key: &KeyEntry) -> PathBuf {
 
 /// The key's last transparent recovery (`keys/<id>/transparent_recovery.json`),
 /// if it was ever backfilled below the node's window.
-pub fn load_report(key: &KeyEntry) -> Option<Report> {
+pub(crate) fn load_report(key: &KeyEntry) -> Option<Report> {
     serde_json::from_slice(&std::fs::read(report_path(key)).ok()?).ok()
 }
 
@@ -235,7 +235,7 @@ fn clear_session(key: &KeyEntry) {
 }
 
 /// Where the untrusted mark lives.
-pub fn trust_path(network_dir: &Path) -> PathBuf {
+pub(crate) fn trust_path(network_dir: &Path) -> PathBuf {
     network_dir.join("fallback_trust.json")
 }
 
@@ -872,7 +872,7 @@ impl Scheduler {
 }
 
 /// `KeySyncStatus.backend` for a key's state.
-pub fn proto_backend(state: &SyncState) -> v1::SyncBackend {
+pub(crate) fn proto_backend(state: &SyncState) -> v1::SyncBackend {
     match state {
         SyncState::Backfilling { via_tor: true, .. } => v1::SyncBackend::TorLwdFallback,
         SyncState::Backfilling { via_tor: false, .. } => v1::SyncBackend::DirectLwdFallback,

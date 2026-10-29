@@ -38,10 +38,10 @@ use crate::service::{DaemonState, invalid};
 pub const AUDIT_TARGET: &str = "gyges::audit";
 
 /// The literal `ExportSeed.confirmation` must equal (CLI_SPEC.md §2.2).
-pub const REVEAL_SEED: &str = "reveal seed";
+pub(crate) const REVEAL_SEED: &str = "reveal seed";
 
 /// `gyges_core::SigningMode` → wire enum.
-pub fn proto_signing_mode(mode: SigningMode) -> v1::SigningMode {
+pub(crate) fn proto_signing_mode(mode: SigningMode) -> v1::SigningMode {
     match mode {
         SigningMode::LocalSeed => v1::SigningMode::LocalSeed,
         SigningMode::KeystoneQr => v1::SigningMode::KeystoneQr,
@@ -51,7 +51,7 @@ pub fn proto_signing_mode(mode: SigningMode) -> v1::SigningMode {
 }
 
 /// `gyges_core::Pool` → wire enum.
-pub fn proto_pool(pool: gyges_core::Pool) -> v1::Pool {
+pub(crate) fn proto_pool(pool: gyges_core::Pool) -> v1::Pool {
     match pool {
         gyges_core::Pool::Transparent => v1::Pool::Transparent,
         gyges_core::Pool::Sapling => v1::Pool::Sapling,
@@ -67,7 +67,7 @@ fn proto_pools(pools: &[gyges_core::Pool]) -> Vec<i32> {
 /// One `KeySummary` row. `locked` is false only for a daemon-scoped unlock:
 /// connection-scoped ones are usable by nobody else and are not shown
 /// (API.md §6.3).
-pub fn summary(entry: &KeyEntry, default_key: &str, unlocks: &[UnlockState]) -> KeySummary {
+pub(crate) fn summary(entry: &KeyEntry, default_key: &str, unlocks: &[UnlockState]) -> KeySummary {
     let p = entry.profile();
     let unlock = unlocks.iter().find(|u| u.key_id == p.key_id);
     KeySummary {
@@ -88,7 +88,7 @@ pub fn summary(entry: &KeyEntry, default_key: &str, unlocks: &[UnlockState]) -> 
 }
 
 /// Every key, sorted by id (`ListKeys`, `GetInfo.keys`).
-pub fn summaries(state: &DaemonState) -> Vec<KeySummary> {
+pub(crate) fn summaries(state: &DaemonState) -> Vec<KeySummary> {
     let default = state.registry.default_key();
     let unlocks = state.vault.daemon_unlocks();
     state
@@ -100,7 +100,7 @@ pub fn summaries(state: &DaemonState) -> Vec<KeySummary> {
 }
 
 /// `VaultError` → typed error.
-pub fn vault_error(e: VaultError, key_id: &str) -> GygesError {
+pub(crate) fn vault_error(e: VaultError, key_id: &str) -> GygesError {
     let err = match e {
         VaultError::WrongPassphrase => {
             GygesError::new(ErrorReason::InvalidPassphrase, "wrong passphrase")
@@ -129,7 +129,7 @@ pub fn vault_error(e: VaultError, key_id: &str) -> GygesError {
 }
 
 /// `RegistryError` → the typed error the CLI dispatches on.
-pub fn registry_error(e: RegistryError) -> GygesError {
+pub(crate) fn registry_error(e: RegistryError) -> GygesError {
     use RegistryError as R;
     match e {
         R::InvalidKeyId(id) => GygesError::new(
@@ -167,7 +167,7 @@ pub fn registry_error(e: RegistryError) -> GygesError {
 /// `BirthdayError` → typed error. `BelowRetention` maps to
 /// `FALLBACK_UNAVAILABLE` (no fallback endpoint); callers that can backfill
 /// intercept it first and decide on `allow_backfill` (`below_retention`).
-pub fn birthday_error(e: BirthdayError) -> GygesError {
+pub(crate) fn birthday_error(e: BirthdayError) -> GygesError {
     match e {
         BirthdayError::NodeRequired(what) => GygesError::new(
             ErrorReason::NodeUnreachable,
@@ -266,7 +266,7 @@ fn maybe_set_default(state: &DaemonState, key_id: &str, set_default: bool) {
 /// `InitKey`: fresh 24-word entropy, `seed.age`, and either a `local-seed`
 /// wallet born at the node's tip or, on an air-gapped daemon, a
 /// `signer-only` profile with no wallet and no birthday.
-pub async fn init_key(
+pub(crate) async fn init_key(
     state: Arc<DaemonState>,
     mut req: InitKeyRequest,
 ) -> Result<InitKeyResponse, Status> {
@@ -330,7 +330,7 @@ pub async fn init_key(
 /// no endpoint is configured or it is marked untrusted; otherwise the tree
 /// state comes from the endpoint (its block hash checked against the node)
 /// and the scheduler backfills and validates at the handoff.
-pub async fn restore_key(
+pub(crate) async fn restore_key(
     state: Arc<DaemonState>,
     mut req: RestoreKeyRequest,
 ) -> Result<RestoreKeyResponse, Status> {
@@ -393,7 +393,7 @@ async fn resolve_import_birthday(
 /// device's `ur:zcash-accounts` export. Every check of the export runs
 /// before the birthday is resolved and before anything is written, so a
 /// refused export touches neither the node nor the disk.
-pub async fn import_keystone(
+pub(crate) async fn import_keystone(
     state: Arc<DaemonState>,
     req: ImportKeystoneRequest,
 ) -> Result<ImportKeystoneResponse, Status> {
@@ -676,7 +676,7 @@ async fn below_retention(
 /// the requested scope. With one: single-use, satisfies the signing session
 /// a paused `SendTransaction` stream is waiting on (API.md §6.2) and
 /// returns no token.
-pub async fn unlock_key(
+pub(crate) async fn unlock_key(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
     mut req: UnlockKeyRequest,
@@ -717,7 +717,10 @@ pub async fn unlock_key(
 }
 
 /// `LockKey`: one key (every scope) or all of them.
-pub fn lock_key(state: &DaemonState, req: LockKeyRequest) -> Result<LockKeyResponse, Status> {
+pub(crate) fn lock_key(
+    state: &DaemonState,
+    req: LockKeyRequest,
+) -> Result<LockKeyResponse, Status> {
     let locked_key_ids = if req.all {
         state.vault.lock_all()
     } else {
@@ -736,7 +739,7 @@ pub fn lock_key(state: &DaemonState, req: LockKeyRequest) -> Result<LockKeyRespo
 
 /// `ExportUfvk`. A `signer-only` profile keeps no viewing key on disk, so
 /// it needs a live daemon-scoped unlock (`VAULT_LOCKED` otherwise).
-pub fn export_ufvk(
+pub(crate) fn export_ufvk(
     state: &DaemonState,
     req: ExportUfvkRequest,
 ) -> Result<ExportUfvkResponse, Status> {
@@ -757,7 +760,7 @@ pub fn export_ufvk(
 
 /// `ExportSeed` (OVERVIEW.md Q-S4): disabled by config, a fresh passphrase
 /// (never a session), the literal confirmation, audit-logged.
-pub async fn export_seed(
+pub(crate) async fn export_seed(
     state: Arc<DaemonState>,
     mut req: ExportSeedRequest,
 ) -> Result<ExportSeedResponse, Status> {
