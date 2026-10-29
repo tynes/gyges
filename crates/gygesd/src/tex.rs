@@ -1,5 +1,5 @@
-//! The `TexQueue` driver (ARCHITECTURE.md §2.1, §3.3; API.md §6.5;
-//! OVERVIEW.md Q-T1…T3) and the `ResumeTexTransfer` / `AbortTexTransfer`
+//! The `TexQueue` driver (docs/architecture.md Components §2.1, §3.3; docs/interface.md API §6.5;
+//! docs/decisions.md Q-T1…T3) and the `ResumeTexTransfer` / `AbortTexTransfer`
 //! RPCs.
 //!
 //! One task per daemon. Every `tex.rebroadcast_interval`, and whenever a
@@ -20,7 +20,7 @@
 //! `sync::Scheduler::check_status` pass, which records the node's answer for
 //! a fully transparent step 2 the scanner cannot see. Nothing here signs:
 //! both transactions were signed in the send's session, and a restart
-//! replays bytes, never keys (TESTING.md §3 row 12).
+//! replays bytes, never keys (docs/testing.md §3 row 12).
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -415,7 +415,7 @@ async fn load_row(key: &Arc<KeyEntry>, id: [u8; 32]) -> Result<TexRow, Status> {
         })
 }
 
-/// `AbortTexTransfer` (API.md §4.3): allowed while the row is still
+/// `AbortTexTransfer` (docs/interface.md API §4.3): allowed while the row is still
 /// `built`, i.e. before either transaction reached the node.
 pub(crate) async fn abort_tex_transfer(
     state: Arc<DaemonState>,
@@ -446,7 +446,7 @@ pub(crate) async fn abort_tex_transfer(
     Ok(to_proto(&key_id, &row))
 }
 
-/// `ResumeTexTransfer` (API.md §6.5): on a `step2_failed` row, build a new
+/// `ResumeTexTransfer` (docs/interface.md API §6.5): on a `step2_failed` row, build a new
 /// step 2 with the key (from the request's token, a daemon unlock, or a
 /// signing session the client satisfies; the RPC is unary, so with a
 /// session it answers `SIGNATURE_REQUIRED` and the rebuild finishes in the

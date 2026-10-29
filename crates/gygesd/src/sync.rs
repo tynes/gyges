@@ -1,5 +1,5 @@
-//! The `SyncScheduler` (SYNC.md §2.2, §3, §4, §6) and the sync RPCs
-//! (`GetSyncStatus`, `WaitSync`, `RunSync`; API.md §4.4). Case B, the
+//! The `SyncScheduler` (docs/architecture.md Sync §2.2, §3, §4, §6) and the sync RPCs
+//! (`GetSyncStatus`, `WaitSync`, `RunSync`; docs/interface.md API §4.4). Case B, the
 //! backfill below the node's window, is in [`crate::backfill`].
 //!
 //! One task per daemon. Each tick: poll the node, reconcile the shared block
@@ -59,7 +59,7 @@ pub struct SyncHub {
     /// after it woke the scheduler (see [`SyncHub::ticks`]).
     ticks: Mutex<(u64, u64)>,
     /// Set once at shutdown: the scheduler finishes the batch in hand and
-    /// returns (SYNC.md §8 step 1).
+    /// returns (docs/architecture.md Sync §8 step 1).
     stop: watch::Sender<bool>,
     /// `ScanMempool` requests waiting for the scheduler's next tick.
     mempool_requests: Mutex<Vec<MempoolRequest>>,
@@ -225,7 +225,7 @@ pub(crate) struct Scheduler {
     /// When each key's transaction status work last went to the node
     /// ([`Self::check_status`]).
     status_checked: BTreeMap<String, Instant>,
-    /// The node's mempool as of the last pass (SYNC.md §7): only txids not
+    /// The node's mempool as of the last pass (docs/architecture.md Sync §7): only txids not
     /// in it are fetched.
     mempool_seen: HashSet<[u8; 32]>,
     mempool_scanned_at: Option<Instant>,
@@ -362,7 +362,7 @@ impl Scheduler {
         did_work
     }
 
-    /// SYNC.md §7. `ScanMempool` requests get a full pass over the whole
+    /// docs/architecture.md Sync §7. `ScanMempool` requests get a full pass over the whole
     /// mempool now. Otherwise, with `mempool.scan` on, a pass over what is
     /// new runs once per poll interval on a tick that scanned no batch, so
     /// catching up is not slowed down.
@@ -512,7 +512,7 @@ impl Scheduler {
         let retained_from = bounds.retained_from;
         // The node pruned under a batch (its bounds are from this tick's
         // poll): with an endpoint the next tick re-polls, finds the key
-        // below the window and backfills (SYNC.md §4.2).
+        // below the window and backfills (docs/architecture.md Sync §4.2).
         let pruned_under_us = match &e {
             SyncError::Chain(ChainError::BlockUnavailable { height }) => {
                 (*height < retained_from || self.state.fallback.is_some()).then_some(*height)
@@ -543,7 +543,7 @@ impl Scheduler {
         }
     }
 
-    /// SYNC.md §4.2: the Case A invariant is broken and no fallback
+    /// docs/architecture.md Sync §4.2: the Case A invariant is broken and no fallback
     /// endpoint is configured.
     pub(crate) fn stall_pruned(&self, key_id: &str, needed: u32, bounds: &NodeBounds) {
         let retained_from = u32::from(bounds.retained_from);
@@ -574,7 +574,7 @@ impl Scheduler {
         }
     }
 
-    /// Per-tick reorg detector on the shared cache (SYNC.md §4.3 step 1,
+    /// Per-tick reorg detector on the shared cache (docs/architecture.md Sync §4.3 step 1,
     /// applied to the cache so that every key benefits from one
     /// `getblockhash` per tick): drop cached blocks the node no longer has.
     async fn reconcile_cache(&self, bounds: &NodeBounds) -> Result<(), SyncError> {
@@ -622,7 +622,7 @@ impl Scheduler {
         }
     }
 
-    /// SYNC.md §2.2 step 4: keep `cache.retain_blocks` behind the slowest key.
+    /// docs/architecture.md Sync §2.2 step 4: keep `cache.retain_blocks` behind the slowest key.
     fn evict(&self, slowest: Option<BlockHeight>) -> Result<(), CacheError> {
         let Some(slowest) = slowest else {
             return Ok(());
@@ -689,7 +689,7 @@ impl Scheduler {
         let view = with_wallet(key, move |w| WalletView::read(w, Some(tip))).await?;
         let scanned_tip = view.scanned_tip();
 
-        // SYNC.md §4.3 detector 1: does the node still have the block the
+        // docs/architecture.md Sync §4.3 detector 1: does the node still have the block the
         // wallet considers fully scanned?
         if let Some((h, wallet_hash)) = view.fully_scanned
             && self.trusted_hash(h).await? != Some(wallet_hash)
@@ -699,11 +699,11 @@ impl Scheduler {
         }
 
         // An open backfill session runs to its handoff before anything is
-        // scanned from the node (SYNC.md §5).
+        // scanned from the node (docs/architecture.md Sync §5).
         if self.in_backfill(key) {
             return self.step_backfill(key, bounds, scanned_tip).await;
         }
-        // SYNC.md §3: a key whose scanned tip is below the window backfills
+        // docs/architecture.md Sync §3: a key whose scanned tip is below the window backfills
         // first, from its scanned tip up, before upstream's queue sends it
         // to the chain tip: the wallet's trees are then built in order and
         // the root check at the handoff sees every leaf (§5.2).
@@ -716,7 +716,7 @@ impl Scheduler {
             return self.enter_backfill(key, bounds, scanned_tip).await;
         }
 
-        // SYNC.md §4.2 invariant: the next batch starts at a height whose
+        // docs/architecture.md Sync §4.2 invariant: the next batch starts at a height whose
         // body the node has, and its prior tree state is still served.
         let Some(range) = view.next_range(self.state.config.cache.scan_batch as usize) else {
             self.publish_synced(&key_id, &view, bounds);
@@ -834,7 +834,7 @@ impl Scheduler {
         }
     }
 
-    /// SYNC.md §4.3: find the fork point by walking back from `at_height - 1`
+    /// docs/architecture.md Sync §4.3: find the fork point by walking back from `at_height - 1`
     /// over the wallet's stored hashes, truncate the wallet to it, and let
     /// the next tick rescan from there.
     async fn handle_reorg(
@@ -1072,7 +1072,7 @@ pub(crate) fn get_sync_status(
 ) -> Result<GetSyncStatusResponse, Status> {
     let keys = if req.key_id.is_empty() {
         // An empty key_id means "all keys" for status even with a default
-        // configured (CLI_SPEC.md §2.3 `--all`), unlike the other RPCs.
+        // configured (docs/interface.md CLI §2.3 `--all`), unlike the other RPCs.
         state
             .wallet_keys()
             .iter()
@@ -1085,7 +1085,7 @@ pub(crate) fn get_sync_status(
     Ok(GetSyncStatusResponse { keys })
 }
 
-/// `ScanMempool`: one full mempool pass now (CLI_SPEC.md `sync mempool`),
+/// `ScanMempool`: one full mempool pass now (docs/interface.md CLI `sync mempool`),
 /// whether or not `mempool.scan` runs them continuously. An empty `key_id`
 /// counts the notes of every key; every key is scanned either way.
 pub(crate) async fn scan_mempool(
@@ -1141,7 +1141,7 @@ fn stalled_status(p: &KeyProgress) -> Status {
         .into_status()
 }
 
-/// `WaitSync` (API.md §4.4): stream progress until the target holds; a
+/// `WaitSync` (docs/interface.md API §4.4): stream progress until the target holds; a
 /// stalled key fails the stream at once with `NOT_SYNCED`.
 pub(crate) fn wait_sync(
     state: Arc<DaemonState>,
@@ -1164,7 +1164,7 @@ pub(crate) fn wait_sync(
     Ok(progress_stream(state, key, until, false))
 }
 
-/// `RunSync` (API.md §4.4): wake the scheduler, optionally after queueing a
+/// `RunSync` (docs/interface.md API §4.4): wake the scheduler, optionally after queueing a
 /// rewind, and stream until the key is spendable at the tip.
 pub(crate) fn run_sync(
     state: Arc<DaemonState>,

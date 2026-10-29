@@ -1,4 +1,4 @@
-//! Startup permission enforcement (DATA_MODEL.md §1, THREAT_MODEL.md Q-S7).
+//! Startup permission enforcement (docs/architecture.md Data model §1, docs/security.md Q-S7).
 //!
 //! Every directory under `GYGES_HOME` must be `0700` and every file `0600`
 //! (more precisely: no group or other bits). The daemon refuses to start on

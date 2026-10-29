@@ -1,6 +1,6 @@
-# Gyges Glossary (`GLOSSARY.md`)
+# Gyges Glossary
 
-Terms used across `ARCHITECTURE.md`, `CLI_SPEC.md`, `THREAT_MODEL.md` and `OVERVIEW.md`, in alphabetical order. Where a term is defined by a ZIP or an upstream crate, the reference is given; where it is a Gyges-specific name, that is said.
+Terms used across `architecture.md` Components, `interface.md` CLI, `security.md` and `decisions.md`, in alphabetical order. Where a term is defined by a ZIP or an upstream crate, the reference is given; where it is a Gyges-specific name, that is said.
 
 ---
 
@@ -16,7 +16,7 @@ Terms used across `ARCHITECTURE.md`, `CLI_SPEC.md`, `THREAT_MODEL.md` and `OVERV
 
 **Block cache.** The shared SQLite store `~/.gyges/<network>/cache/blocks.sqlite` of `CompactBlock`s implementing the upstream `BlockCache` trait, filled once per block by a single fetcher and read by every key profile's scanner (Q-Y3). Gyges-specific.
 
-**Case A / Case B.** Gyges names for the two sync routes in `ARCHITECTURE.md` §3.1. **Case A**: the key's `scanned_tip + 1 >= retained_from`, so blocks are fetched from the local Zakura node (`getblock(h, 0)`) and turned into compact blocks locally. **Case B**: the key needs blocks below `retained_from`, so compact blocks are streamed from the archival endpoint over Tor and validated against the node (Q-Y5) before the scanner hands off to Case A.
+**Case A / Case B.** Gyges names for the two sync routes in `architecture.md` Components §3.1. **Case A**: the key's `scanned_tip + 1 >= retained_from`, so blocks are fetched from the local Zakura node (`getblock(h, 0)`) and turned into compact blocks locally. **Case B**: the key needs blocks below `retained_from`, so compact blocks are streamed from the archival endpoint over Tor and validated against the node (Q-Y5) before the scanner hands off to Case A.
 
 **Combiner.** PCZT role (ZIP 374) that merges several PCZTs for the same transaction into one, e.g. a proven copy and a signed copy. Gyges runs it in the daemon when a Keystone returns a full signed PCZT in the single-PCZT flow (Q-K4). The upstream Combiner rejects structurally different inputs, which doubles as the correlation check.
 
@@ -30,17 +30,17 @@ Terms used across `ARCHITECTURE.md`, `CLI_SPEC.md`, `THREAT_MODEL.md` and `OVERV
 
 **Fountain code.** An erasure code (Luby transform) that lets a multi-part UR be reconstructed from *any* sufficient subset of frames, so an animated QR loop can be scanned starting at any frame and tolerating missed ones. Used by BC-UR for payloads larger than one QR code.
 
-**Full-disk encryption (FDE).** FileVault, LUKS or equivalent. Gyges v1 relies on it for the confidentiality of `wallet.sqlite` at rest (Q-S6, `THREAT_MODEL.md` §3 row 4).
+**Full-disk encryption (FDE).** FileVault, LUKS or equivalent. Gyges v1 relies on it for the confidentiality of `wallet.sqlite` at rest (Q-S6, `security.md` §3 row 4).
 
-**Hardened deployment.** The configuration, set up by `sudo gyges daemon install --hardened` on Linux, in which `gygesd` runs as the dedicated `gyges` user from `/var/lib/gyges`, with a 0660 socket for the `gyges` group at `/run/gyges/<network>/gygesd.sock`, so the interactive user's processes cannot read `seed.age` or `wallet.sqlite` (Q-S1, `THREAT_MODEL.md` §6 item 4).
+**Hardened deployment.** The configuration, set up by `sudo gyges daemon install --hardened` on Linux, in which `gygesd` runs as the dedicated `gyges` user from `/var/lib/gyges`, with a 0660 socket for the `gyges` group at `/run/gyges/<network>/gygesd.sock`, so the interactive user's processes cannot read `seed.age` or `wallet.sqlite` (Q-S1, `security.md` §6 item 4).
 
-**Ironwood.** A third shielded pool, using the Orchard protocol with its own note commitment tree, exposed by the Zakura node (`z_gettreestate`, `z_getsubtreesbyindex` accept `"ironwood"`), the Zakura wallet libraries (`ironwood_action_count` on a proposal `Step`, a separate v6 transaction bundle) and Keystone firmware (signs Ironwood spends). After NU6.3 every shielded output the wallet libraries build is Ironwood and the ZIP 318 turnstile keeps value out of Orchard, so Gyges spends Orchard and Ironwood and receives Ironwood (Q-D7, `OVERVIEW.md` §4.3).
+**Ironwood.** A third shielded pool, using the Orchard protocol with its own note commitment tree, exposed by the Zakura node (`z_gettreestate`, `z_getsubtreesbyindex` accept `"ironwood"`), the Zakura wallet libraries (`ironwood_action_count` on a proposal `Step`, a separate v6 transaction bundle) and Keystone firmware (signs Ironwood spends). After NU6.3 every shielded output the wallet libraries build is Ironwood and the ZIP 318 turnstile keeps value out of Orchard, so Gyges spends Orchard and Ironwood and receives Ironwood (Q-D7, `decisions.md` §2.3).
 
 **Keystone 3 Pro.** An air-gapped hardware wallet that communicates only by QR code. With the Cypherpunk firmware edition it signs Zcash Orchard and Ironwood spends and checks transparent inputs; it does not sign Sapling spends (Q-K1). Pairs by exporting `ur:zcash-accounts`.
 
 **lightwalletd / zaino.** Servers that index a Zcash chain and serve `CompactBlock`s, subtree roots and transparent address data to light clients over the `CompactTxStreamer` gRPC service. `lightwalletd` is the original Go implementation; `zaino` is the Rust successor. Gyges uses one only as the archival endpoint for Case B.
 
-**NU5 / NU6.3.** Zcash network upgrades. NU5 (mainnet block 1,687,104, ZIP 252) activated Orchard and Unified Addresses. NU6.3 introduces the Ironwood pool and the ZIP 318 turnstile (mainnet 3,428,143, regtest height 1; `ARCHITECTURE.md` §1); its activation heights are set by the node. NU7 is a later upgrade; the regtest harness activates only through NU6.3 (`OVERVIEW.md` §4.5).
+**NU5 / NU6.3.** Zcash network upgrades. NU5 (mainnet block 1,687,104, ZIP 252) activated Orchard and Unified Addresses. NU6.3 introduces the Ironwood pool and the ZIP 318 turnstile (mainnet 3,428,143, regtest height 1; `architecture.md` Components §1); its activation heights are set by the node. NU7 is a later upgrade; the regtest harness activates only through NU6.3 (`decisions.md` §2.5).
 
 **Orchard.** The shielded pool introduced by NU5, using the Pallas curve and Halo 2 proofs with no trusted setup. Its proving key can be derived from the full viewing key, so Orchard spends can be *proven* while the vault is locked; only the spend authorising signature needs the spending key (Q-K3). See ZIP 224.
 
@@ -52,13 +52,13 @@ Terms used across `ARCHITECTURE.md`, `CLI_SPEC.md`, `THREAT_MODEL.md` and `OVERV
 
 **Proof generation key (PGK).** The Sapling key pair `(ak, nsk)` required to create a Sapling spend proof. `nsk` is not part of any viewing key, so Sapling spends cannot be proven from a UFVK alone; the vault must be unlocked first and the PGK inserted into the PCZT by the Updater (Q-K3). Orchard has no equivalent restriction.
 
-**profile.json.** Per-key metadata file: key id, signing mode (`LocalEncryptedSeed`, `KeystoneQr`, `WatchOnly`, `SignerOnly`), birthday height, `spend_pools`, `receive_pools`, `seed_format`, Keystone `device_version`. Schema to be defined in `DATA_MODEL.md`. Gyges-specific.
+**profile.json.** Per-key metadata file: key id, signing mode (`LocalEncryptedSeed`, `KeystoneQr`, `WatchOnly`, `SignerOnly`), birthday height, `spend_pools`, `receive_pools`, `seed_format`, Keystone `device_version`. Schema to be defined in `architecture.md` Data model. Gyges-specific.
 
 **Proprietary map.** The free-form `proprietary` key-value area in a PCZT's global section (ZIP 374). Gyges writes `gyges.key_id`, `gyges.network` and `gyges.session_id` there so `pczt` subcommands know which profile a stream belongs to; the Redactor strips it before anything leaves the host (Q-C6).
 
 **Prover.** PCZT role (ZIP 374) that creates the zero-knowledge proofs for each shielded spend and output. Gyges runs it in the daemon (or on the air-gapped box) with the `pczt` crate's `prover` feature and `zcash_proofs`' bundled Sapling parameters.
 
-**pruneheight / retention height / `retained_from`.** Three names for one number. `pruneheight` is the `getblockchaininfo` field on a pruned Zakura node: "the lowest height whose block body this node still stores" (Q-D1). `ARCHITECTURE.md` calls it the retention height, $H_{\text{retain}}$. `retained_from` is the field name in Gyges' `NodeBounds` struct (`pruneheight` when `pruned`, else `0`). Configured on the node as `state.storage_mode.pruned.tx_retention`, default and minimum 10,000 blocks. Headers, txids and consensus state are kept below it; only transaction bodies are pruned.
+**pruneheight / retention height / `retained_from`.** Three names for one number. `pruneheight` is the `getblockchaininfo` field on a pruned Zakura node: "the lowest height whose block body this node still stores" (Q-D1). `architecture.md` Components calls it the retention height, $H_{\text{retain}}$. `retained_from` is the field name in Gyges' `NodeBounds` struct (`pruneheight` when `pruned`, else `0`). Configured on the node as `state.storage_mode.pruned.tx_retention`, default and minimum 10,000 blocks. Headers, txids and consensus state are kept below it; only transaction bodies are pruned.
 
 **Redactor.** PCZT role (ZIP 374) that removes data a given party does not need, so a smaller PCZT can cross a QR boundary. Gyges' Redactor removes proofs, Merkle witnesses and the proprietary map, and never the amounts, recipients or memos a Keystone displays (Q-K7).
 
@@ -82,7 +82,7 @@ Terms used across `ARCHITECTURE.md`, `CLI_SPEC.md`, `THREAT_MODEL.md` and `OVERV
 
 **tex1 / ZIP 320.** A Transparent-Source-Only Address (`tex1…` mainnet, `textest1…` testnet) defined by ZIP 320. Funds sent to it must come from a transparent input, so a shielded wallet pays it in two transactions: Step 1 deshields to an ephemeral transparent address, Step 2 spends that output to the `tex1` recipient. Gyges supports `tex1` on the send side only (Q-T5).
 
-**TexQueue.** Gyges component that persists both ZIP 320 transactions as raw bytes in the `tex_queue` table and rebroadcasts whichever is missing from the node until both are mined or expired (Q-T1, Q-T2). Named in `ARCHITECTURE.md` §2, defined in `OVERVIEW.md` Q-T1.
+**TexQueue.** Gyges component that persists both ZIP 320 transactions as raw bytes in the `tex_queue` table and rebroadcasts whichever is missing from the node until both are mined or expired (Q-T1, Q-T2). Named in `architecture.md` Components §2, defined in `decisions.md` Q-T1.
 
 **Trial decryption.** Attempting to decrypt every shielded output in a block with the wallet's incoming viewing keys to find the ones addressed to it. The dominant cost of scanning; dominated by scalar multiplication and ChaCha20-Poly1305, hence the `*-asm` features on the curve crates (Q-D6).
 
@@ -102,7 +102,7 @@ Terms used across `ARCHITECTURE.md`, `CLI_SPEC.md`, `THREAT_MODEL.md` and `OVERV
 
 **wallet.sqlite.** The per-profile `zcash_client_sqlite` `WalletDb`: accounts, UFVK, notes, nullifiers, transactions, ShardTree, plus Gyges' own tables (`tex_queue`, `signing_sessions`, labels). Plaintext at rest (Q-S6).
 
-**WatchOnly.** See *Signing mode*. Created by `key import-ufvk`. Can scan and, for Orchard, prove; `CLI_SPEC.md`'s "proving-only" should read "Orchard proving-only" (Q-K3).
+**WatchOnly.** See *Signing mode*. Created by `key import-ufvk`. Can scan and, for Orchard, prove; `interface.md` CLI's "proving-only" should read "Orchard proving-only" (Q-K3).
 
 **Zakura.** The organisation (`zakura-core` on GitHub) and the stack: a Zebra-derived node with pruning, and forks of the `librustzcash` wallet crates published as `zakura-*` on crates.io but exposing their *upstream* library target names (`zcash_client_backend`, `pczt`, `orchard`, …). Pre-release (`-rc`) throughout.
 

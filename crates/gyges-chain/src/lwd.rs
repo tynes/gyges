@@ -1,7 +1,7 @@
 //! `ArtiTorLwdBackend`: [`ChainBackend`] over a lightwalletd / zaino
 //! `CompactTxStreamer` endpoint, for the historical backfill below the
-//! node's retention window (ARCHITECTURE.md §3.1 step 2, SYNC.md §5,
-//! THREAT_MODEL.md §3 rows 7 and 10, OVERVIEW.md Q-D5 / Q-Y5).
+//! node's retention window (docs/architecture.md Components §3.1 step 2, docs/architecture.md Sync §5,
+//! docs/security.md §3 rows 7 and 10, docs/decisions.md Q-D5 / Q-Y5).
 //!
 //! Two transports, chosen by `fallback_lightwalletd.use_tor`:
 //!
@@ -9,13 +9,13 @@
 //!   `zcash_client_backend::tor` (its persistent state under
 //!   `tor_cache/`), bootstrapped lazily on the first request, `.onion`
 //!   endpoints reached as onion services; `https://` endpoints get TLS from
-//!   rustls with the webpki roots and the URI host as SNI (OVERVIEW.md §4.4);
+//!   rustls with the webpki roots and the URI host as SNI (docs/decisions.md §2.4);
 //! * [`Transport::Direct`]: plain tonic over TCP, for regtest and CI
 //!   (`use_tor = false`), with the same TLS rule for `https://`.
 //!
-//! The endpoint is untrusted (THREAT_MODEL.md B3): every block batch must
+//! The endpoint is untrusted (docs/security.md B3): every block batch must
 //! carry the heights asked for and link by `prev_hash`, and the handoff
-//! validation of SYNC.md §5.2 (`gyges_core::handoff`, run by
+//! validation of docs/architecture.md Sync §5.2 (`gyges_core::handoff`, run by
 //! `gygesd::backfill`) checks the result against the local node before the
 //! wallet relies on it. What this module guarantees is only that a batch is
 //! internally consistent and that a stalled or short stream is reported
@@ -52,7 +52,7 @@ use crate::{
 };
 
 /// One `GetAddressUtxos` entry: an output the endpoint says is unspent at
-/// one of the requested addresses. Untrusted until checked (SYNC.md §5.3).
+/// one of the requested addresses. Untrusted until checked (docs/architecture.md Sync §5.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddressUtxo {
     /// As requested (`t1…`, `tm…`).
@@ -101,7 +101,7 @@ impl Default for LwdTimeouts {
     }
 }
 
-/// The embedded Tor client's state, for `GetInfo.tor` (API.md).
+/// The embedded Tor client's state, for `GetInfo.tor` (docs/interface.md API).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TorState {
     /// `use_tor = false`.
@@ -142,7 +142,7 @@ impl<P> fmt::Debug for ArtiTorLwdBackend<P> {
 impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
     /// A backend for `endpoint` (`fallback_lightwalletd.grpc_url`: an
     /// `http://` or `https://` URL with a host; `Config::validate` has
-    /// already applied the scheme rules of DATA_MODEL.md §2). Nothing is
+    /// already applied the scheme rules of docs/architecture.md Data model §2). Nothing is
     /// contacted here.
     pub fn new(endpoint: &str, transport: Transport, params: P) -> Result<Self, ChainError> {
         let uri: Uri = endpoint.trim().parse().map_err(|e| {
@@ -250,7 +250,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
             .keep_alive_timeout(Duration::from_secs(20))
             .keep_alive_while_idle(false);
         if self.endpoint.scheme_str() == Some("https") {
-            // The same policy as the Tor path (OVERVIEW.md §4.4): webpki
+            // The same policy as the Tor path (docs/decisions.md §2.4): webpki
             // roots, SNI and hostname verification from the URI host.
             endpoint = endpoint
                 .tls_config(ClientTlsConfig::new().with_webpki_roots())
@@ -278,7 +278,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
             .with_connect(self.timeouts.connect)
             .with_request(self.timeouts.request);
         // `|_| {}` keeps arti's own permission checks (the directory must
-        // not be group or world writable), which is what DATA_MODEL.md §1
+        // not be group or world writable), which is what docs/architecture.md Data model §1
         // demands anyway.
         match tor::Client::create_with_timeouts(tor_dir, |_| {}, timeouts).await {
             Ok(client) => {
@@ -296,7 +296,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
 
     /// `GetLightdInfo`: refuse an endpoint for another chain. lightwalletd
     /// reports `"main"` or `"test"`, and zaino 0.10.2 reports `"test"` on
-    /// regtest too (OVERVIEW.md §4.5); `"regtest"` is accepted as well.
+    /// regtest too (docs/decisions.md §2.5); `"regtest"` is accepted as well.
     async fn check_endpoint(
         &self,
         client: &mut CompactTxStreamerClient<Channel>,
@@ -416,7 +416,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
 
     /// `GetTreeState(height)` as the `ChainState` an account born at
     /// `height + 1` starts from. Untrusted until the handoff validation of
-    /// SYNC.md §5.2 has covered it (SYNC.md §9).
+    /// docs/architecture.md Sync §5.2 has covered it (docs/architecture.md Sync §9).
     async fn tree_state(&self, height: BlockHeight) -> Result<ChainState, ChainError> {
         self.call(|mut client| async move {
             let state = client
@@ -463,7 +463,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                 end: Some(block_id(end - 1)),
                 // Legacy behaviour: shielded data only. Transparent outputs
                 // below `retained_from` come from `GetAddressUtxos`
-                // (SYNC.md §5.3).
+                // (docs/architecture.md Sync §5.3).
                 pool_types: vec![],
             };
             let mut stream = client
@@ -688,7 +688,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
 }
 
 /// Whether a zaino `Internal` answer to `GetTransaction` is the node's
-/// "no such transaction" (OVERVIEW.md §4.5, deviation 1). zaino 0.10.2
+/// "no such transaction" (docs/decisions.md §2.5, deviation 1). zaino 0.10.2
 /// passes the node's JSON-RPC error through as
 /// `RPC error: LegacyRpcError { code: -5, message: "No such mempool or main chain transaction" }`
 /// where lightwalletd answers NOT_FOUND. Both the code and the text must
@@ -704,7 +704,7 @@ fn zaino_tx_not_found(message: &str) -> bool {
 }
 
 /// The node's own text when a zaino `Internal` answer to `SendTransaction`
-/// is the node refusing the transaction (OVERVIEW.md §4.5, deviation 2);
+/// is the node refusing the transaction (docs/decisions.md §2.5, deviation 2);
 /// `None` when zaino could not reach or authenticate to the node.
 ///
 /// zaino 0.10.2 drops the node's JSON-RPC code and keeps one of two shapes
@@ -813,7 +813,7 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ArtiTorLwdBackend<P
 
     /// `GetTransaction(txid)`: lightwalletd reports `height` 0 for the
     /// mempool, `u64::MAX` for a transaction mined only on a fork, else the
-    /// main-chain height (OVERVIEW.md §4.4); NOT_FOUND (zaino: `Internal`
+    /// main-chain height (docs/decisions.md §2.4); NOT_FOUND (zaino: `Internal`
     /// with the node's -5) is [`TxStatus::Unknown`].
     fn transaction_status(&self, txid: [u8; 32]) -> BoxFuture<'_, Result<TxStatus, ChainError>> {
         Box::pin(async move {
@@ -1204,7 +1204,7 @@ mod tests {
         );
     }
 
-    /// zaino 0.10.2's answers, verbatim from the runs in OVERVIEW.md §4.5.
+    /// zaino 0.10.2's answers, verbatim from the runs in docs/decisions.md §2.5.
     const ZAINO_UNKNOWN_TXID: &str = r#"RPC error: LegacyRpcError { code: -5, message: "No such mempool or main chain transaction" }"#;
     const ZAINO_DUPLICATE: &str = "InternalServerError: error receiving data from backing node: critical error in backing block source: validator unreachable: any transaction with the same effects will be rejected from the mempool until a chain reset: transaction was committed to the best chain";
     const ZAINO_MALFORMED: &str = "InternalServerError: error receiving data from backing node: critical error in backing block source: validator rejected the query: malformed transaction: parse error: bad tx header";
@@ -1301,7 +1301,7 @@ mod tests {
     #[tokio::test]
     async fn tor_transport_needs_a_bootstrap_before_any_request() {
         // No network here: a bootstrap attempt cannot be exercised in unit
-        // tests (TESTING.md §1, nightly tier). What can be checked is that
+        // tests (docs/testing.md §1, nightly tier). What can be checked is that
         // the backend creates its directory and reports the failure through
         // `TorState` rather than hanging: an unreachable directory makes the
         // bootstrap fail before Tor is touched.

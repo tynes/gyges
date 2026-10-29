@@ -1,5 +1,5 @@
 //! Turning a birthday height into the `AccountBirthday` the wallet database
-//! needs (SYNC.md §"New or restored key", DATA_MODEL.md §3 defaults).
+//! needs (docs/architecture.md Sync §"New or restored key", docs/architecture.md Data model §3 defaults).
 //!
 //! An account born at height `h` needs the note commitment tree state as of
 //! the end of block `h - 1`. Below Sapling activation both trees are empty,
@@ -7,7 +7,7 @@
 //! primary source, and a pruned node can answer only for
 //! `h - 1 >= retained_from`. Below that, [`resolve_from_fallback`] takes the
 //! tree state from the fallback endpoint instead, and the Case B backfill
-//! validates it at the handoff (SYNC.md §5).
+//! validates it at the handoff (docs/architecture.md Sync §5).
 
 use gyges_chain::{ChainBackend, ChainError};
 use zcash_client_backend::data_api::AccountBirthday;
@@ -140,13 +140,13 @@ pub async fn resolve(
     })
 }
 
-/// A birthday below the node's retention window (SYNC.md §9, "New or
+/// A birthday below the node's retention window (docs/architecture.md Sync §9, "New or
 /// restored key"): the tree state at `height - 1` comes from the fallback
 /// endpoint's `GetTreeState`, and its block hash must equal the node's
 /// `getblockhash(height - 1)` (the node keeps headers at every height). The
 /// frontier itself cannot be checked against a pruned node here; the root
 /// check at the handoff height covers it, since the root there commits to
-/// every leaf before the birthday too (SYNC.md §5.2).
+/// every leaf before the birthday too (docs/architecture.md Sync §5.2).
 pub async fn resolve_from_fallback(
     chain: &dyn ChainBackend,
     fallback: &dyn ChainBackend,

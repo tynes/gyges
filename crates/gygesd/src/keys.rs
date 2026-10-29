@@ -1,6 +1,6 @@
 //! The key RPCs (`ListKeys`, `InitKey`, `RestoreKey`, `ImportKeystone`,
 //! `UnlockKey`, `LockKey`, `ExportUfvk`, `ExportSeed`) and the mapping from
-//! `gyges-core` errors to `GygesError` (API.md §3, §4).
+//! `gyges-core` errors to `GygesError` (docs/interface.md API §3, §4).
 //!
 //! Passphrases and mnemonics arrive as plain strings in the request message
 //! (`[debug_redact]` in the proto keeps them out of `Debug` output). They are
@@ -33,11 +33,11 @@ use zip32::fingerprint::SeedFingerprint;
 use crate::conn::ConnInfo;
 use crate::service::{DaemonState, invalid};
 
-/// Security-relevant events, key id and time only (OVERVIEW.md Q-O1). The
+/// Security-relevant events, key id and time only (docs/decisions.md Q-O1). The
 /// target is how `logs` routes them to `audit.log`.
 pub const AUDIT_TARGET: &str = "gyges::audit";
 
-/// The literal `ExportSeed.confirmation` must equal (CLI_SPEC.md §2.2).
+/// The literal `ExportSeed.confirmation` must equal (docs/interface.md CLI §2.2).
 pub(crate) const REVEAL_SEED: &str = "reveal seed";
 
 /// `gyges_core::SigningMode` → wire enum.
@@ -66,7 +66,7 @@ fn proto_pools(pools: &[gyges_core::Pool]) -> Vec<i32> {
 
 /// One `KeySummary` row. `locked` is false only for a daemon-scoped unlock:
 /// connection-scoped ones are usable by nobody else and are not shown
-/// (API.md §6.3).
+/// (docs/interface.md API §6.3).
 pub(crate) fn summary(entry: &KeyEntry, default_key: &str, unlocks: &[UnlockState]) -> KeySummary {
     let p = entry.profile();
     let unlock = unlocks.iter().find(|u| u.key_id == p.key_id);
@@ -249,7 +249,7 @@ async fn create_local_seed(
 }
 
 /// Apply `set_default`, which lasts for this daemon's lifetime (the daemon
-/// never rewrites `config.toml`, DATA_MODEL.md §7).
+/// never rewrites `config.toml`, docs/architecture.md Data model §7).
 fn maybe_set_default(state: &DaemonState, key_id: &str, set_default: bool) {
     if set_default {
         if let Err(e) = state.registry.set_default_key(key_id) {
@@ -325,7 +325,7 @@ pub(crate) async fn init_key(
 /// `RestoreKey`: a known mnemonic and a birthday. Inside the node's
 /// retention window the node serves the birthday's tree state. Below it the
 /// blocks up to the window must come from the fallback endpoint (Case B,
-/// SYNC.md §5): refused with `CONFIRMATION_REQUIRED` until the client has
+/// docs/architecture.md Sync §5): refused with `CONFIRMATION_REQUIRED` until the client has
 /// asked the user (`allow_backfill`), then with `FALLBACK_UNAVAILABLE` when
 /// no endpoint is configured or it is marked untrusted; otherwise the tree
 /// state comes from the endpoint (its block hash checked against the node)
@@ -381,7 +381,7 @@ async fn resolve_import_birthday(
             let warning = format!(
                 "transparent history below height {retained_from} comes from the fallback \
                  endpoint and is best-effort: an output it leaves out cannot be detected \
-                 (SYNC.md §5.3)"
+                 (docs/architecture.md Sync §5.3)"
             );
             Ok((b, n, vec![warning]))
         }
@@ -389,7 +389,7 @@ async fn resolve_import_birthday(
     }
 }
 
-/// `ImportKeystone` (ARCHITECTURE.md §3.4): a `keystone-qr` profile from the
+/// `ImportKeystone` (docs/architecture.md Components §3.4): a `keystone-qr` profile from the
 /// device's `ur:zcash-accounts` export. Every check of the export runs
 /// before the birthday is resolved and before anything is written, so a
 /// refused export touches neither the node nor the disk.
@@ -610,7 +610,7 @@ fn check_accounts_export(
 /// A restore below the node's window: consent, an endpoint that is not
 /// marked untrusted, and the birthday's tree state from it. Returns the
 /// birthday and how many blocks the backfill fetches from the endpoint
-/// (up to the handoff height, SYNC.md §5.1).
+/// (up to the handoff height, docs/architecture.md Sync §5.1).
 async fn below_retention(
     state: &DaemonState,
     height: u32,
@@ -672,9 +672,9 @@ async fn below_retention(
     Ok((resolved, (handoff + 1).saturating_sub(height)))
 }
 
-/// `UnlockKey` (API.md §6.3). Without `session_id`: a reusable unlock in
+/// `UnlockKey` (docs/interface.md API §6.3). Without `session_id`: a reusable unlock in
 /// the requested scope. With one: single-use, satisfies the signing session
-/// a paused `SendTransaction` stream is waiting on (API.md §6.2) and
+/// a paused `SendTransaction` stream is waiting on (docs/interface.md API §6.2) and
 /// returns no token.
 pub(crate) async fn unlock_key(
     state: Arc<DaemonState>,
@@ -758,7 +758,7 @@ pub(crate) fn export_ufvk(
     })
 }
 
-/// `ExportSeed` (OVERVIEW.md Q-S4): disabled by config, a fresh passphrase
+/// `ExportSeed` (docs/decisions.md Q-S4): disabled by config, a fresh passphrase
 /// (never a session), the literal confirmation, audit-logged.
 pub(crate) async fn export_seed(
     state: Arc<DaemonState>,

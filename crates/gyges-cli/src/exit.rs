@@ -1,5 +1,5 @@
-//! Process exit codes and the one function that chooses them (API.md §3.1,
-//! CLI_SPEC.md §1.3).
+//! Process exit codes and the one function that chooses them (docs/interface.md API §3.1,
+//! docs/interface.md CLI §1.3).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,7 +31,7 @@ impl From<Exit> for ExitCode {
 
 /// The only place a `GygesError.reason` becomes an exit code. The match is
 /// exhaustive on purpose: a new `ErrorReason` variant fails to compile until
-/// it has a row here (TESTING.md §6).
+/// it has a row here (docs/testing.md §6).
 pub fn exit_for_reason(reason: ErrorReason) -> Exit {
     use ErrorReason as R;
     match reason {
@@ -142,13 +142,13 @@ impl CliError {
             }
             CliError::Cancelled => "cancelled".to_string(),
             CliError::NotImplemented(what) => {
-                format!("`gyges {what}` is not implemented yet; see ROADMAP.md")
+                format!("`gyges {what}` is not implemented yet; see docs/decisions.md §3")
             }
             CliError::Other(e) => format!("{e:#}"),
         }
     }
 
-    /// The `error` object for `--json` output (API.md §3.1): the daemon's
+    /// The `error` object for `--json` output (docs/interface.md API §3.1): the daemon's
     /// `GygesError` verbatim, or a synthesised one for client-side failures.
     pub fn as_gyges_error(&self) -> GygesError {
         match self {
@@ -196,7 +196,7 @@ impl From<std::io::Error> for CliError {
 mod tests {
     use super::*;
 
-    /// Table from API.md §3.1; the exhaustive `match` in `exit_for_reason`
+    /// Table from docs/interface.md API §3.1; the exhaustive `match` in `exit_for_reason`
     /// is what catches a new variant, this test catches a wrong row.
     #[test]
     fn exit_codes_match_api_md() {

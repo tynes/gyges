@@ -1,4 +1,4 @@
-//! `gyges daemon …` (CLI_SPEC.md §2.1, API.md §7).
+//! `gyges daemon …` (docs/interface.md CLI §2.1, docs/interface.md API §7).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -238,7 +238,7 @@ async fn status(ctx: &Ctx) -> Result<(), CliError> {
     ctx.print(&conn.info, || render_status(&conn.info))
 }
 
-/// Human-readable `daemon status` (CLI_SPEC.md §2.1).
+/// Human-readable `daemon status` (docs/interface.md CLI §2.1).
 pub fn render_status(info: &GetInfoResponse) -> String {
     let api = info.api_version.unwrap_or_default();
     let mut s = String::new();

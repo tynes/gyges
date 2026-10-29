@@ -1,4 +1,4 @@
-# Pinned node for the end-to-end scenarios (TESTING.md §2.1, ROADMAP.md M1).
+# Pinned node for the end-to-end scenarios (docs/testing.md §2.1).
 #
 # The harness downloads the release asset for the running platform into
 # `target/regtest-bin/` on first use and checks it against the sha256 below
@@ -8,7 +8,7 @@
 # --tag <tag> --locked zakura` builds one in a few minutes) or the node
 # scenarios skip themselves.
 #
-# Bumping the tag is one PR per Zakura release (OVERVIEW.md Q-D3); update
+# Bumping the tag is one PR per Zakura release (docs/decisions.md Q-D3); update
 # the hashes from the new release's SHA256SUMS.txt in the same change.
 
 [zakurad]
@@ -18,8 +18,8 @@ tag = "v1.6.0"
 linux-x86_64 = "12842638072feb3b2fab500b60da979738d884b484194c4d2aef5220f7a3f372"
 linux-aarch64 = "ffc346c2279f8b9a580e7b35dee468c036d31bcd9d1dc530460583bdb049c9d5"
 
-# The archival endpoint for the backfill scenarios (ROADMAP.md M2, sixth
-# item; OVERVIEW.md §4.5). zaino publishes no binaries, so the harness pins
+# The archival endpoint for the backfill scenarios
+# (docs/decisions.md §2.5). zaino publishes no binaries, so the harness pins
 # the crates.io `.crate` by its sha256, unpacks it and runs `cargo install
 # --locked --path` into `target/regtest-bin/zainod-<version>/` (Linux, with
 # `GYGES_BUILD_ZAINOD=1` as the CI `regtest` job sets it; a few minutes).

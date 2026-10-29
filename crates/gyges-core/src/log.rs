@@ -1,4 +1,4 @@
-//! Redaction by type (OVERVIEW.md Q-O1, THREAT_MODEL.md A10).
+//! Redaction by type (docs/decisions.md Q-O1, docs/security.md A10).
 //!
 //! Anything that identifies a payment or a key (addresses, amounts, memos,
 //! txids, passphrases, key material) is wrapped in [`Sensitive`] before it
@@ -7,7 +7,7 @@
 //! [`REDACTED`]. The value is reachable only through [`Sensitive::expose`],
 //! which makes every deliberate use greppable.
 //!
-//! The level policy this backs (API.md §4.5): `info` carries heights, counts,
+//! The level policy this backs (docs/interface.md API §4.5): `info` carries heights, counts,
 //! key ids and durations only; `debug` may carry txids; nothing at any level
 //! carries memos, passphrases or key material.
 

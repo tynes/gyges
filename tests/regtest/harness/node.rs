@@ -1,4 +1,4 @@
-//! The real `zakurad` for the end-to-end scenarios (TESTING.md §2.1).
+//! The real `zakurad` for the end-to-end scenarios (docs/testing.md §2.1).
 //!
 //! [`zakurad_binary`] finds the node: `ZAKURAD_BIN`, else the release pinned
 //! in `versions.toml` downloaded into `target/regtest-bin/` and verified
@@ -9,7 +9,7 @@
 //! configurable coinbase recipient, and drives it over JSON-RPC.
 //!
 //! Facts this module relies on, verified against v1.6.0 on 2026-10-21 and
-//! recorded in `OVERVIEW.md` §4.3: `generate` mines instantly once
+//! recorded in `docs/decisions.md` §2.3: `generate` mines instantly once
 //! `mining.miner_address` is set; a regtest node activates only Canopy
 //! unless `[network.testnet_parameters.activation_heights]` says otherwise;
 //! `state.storage_mode.pruned.tx_retention` must be at least 1001 on
@@ -46,7 +46,7 @@ pub const MIN_TX_RETENTION: u32 = 1001;
 /// `tx_retention` from its finalized tip, not from the chain tip, so its
 /// `pruneheight` is `tip - FINALITY_DEPTH - (tx_retention - 1)` once that
 /// is positive, and 0 before: with the smallest window, block 1 is pruned
-/// at tip 2,002 (measured on v1.6.0, `OVERVIEW.md` §4.5).
+/// at tip 2,002 (measured on v1.6.0, `docs/decisions.md` §2.5).
 pub const FINALITY_DEPTH: u32 = 1000;
 
 #[derive(Debug, Deserialize)]

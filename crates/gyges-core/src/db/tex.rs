@@ -1,5 +1,5 @@
-//! The persisted side of the `TexQueue` (ARCHITECTURE.md §3.3, DATA_MODEL.md
-//! §5.1, OVERVIEW.md Q-T1): one row per ZIP 320 transfer in
+//! The persisted side of the `TexQueue` (docs/architecture.md Components §3.3, docs/architecture.md Data model
+//! §5.1, docs/decisions.md Q-T1): one row per ZIP 320 transfer in
 //! `ext_gyges_tex_queue`, holding both signed transactions so that the
 //! daemon can finish a transfer after a restart without signing again.
 //!

@@ -1,4 +1,4 @@
-//! Connection and RPC admission (API.md §1.2 peer credentials, §8 air-gapped
+//! Connection and RPC admission (docs/interface.md API §1.2 peer credentials, §8 air-gapped
 //! allow-list).
 //!
 //! Two gates, in order:
@@ -68,7 +68,7 @@ impl PeerPolicy {
 }
 
 /// Method names (without the `/gyges.v1.Gyges/` prefix) served when the
-/// daemon runs `--airgapped` (API.md §8). `Shutdown` is included so that an
+/// daemon runs `--airgapped` (docs/interface.md API §8). `Shutdown` is included so that an
 /// air-gapped daemon can be stopped over the socket; it touches no network.
 pub(crate) const AIRGAPPED_METHODS: &[&str] = &[
     "GetInfo",
@@ -255,7 +255,7 @@ mod tests {
         assert!(allowed_when_airgapped("/grpc.health.v1.Health/Check"));
     }
 
-    /// THREAT_MODEL.md §5, first row: the tower layer refuses a request
+    /// docs/security.md §5, first row: the tower layer refuses a request
     /// whose connection carries a foreign uid, or none, before it reaches a
     /// handler, and applies the air-gapped allow-list to the rest. Stands in
     /// for the accept-loop check that CI cannot run as a second user.

@@ -1,4 +1,4 @@
-//! `seed.age` and the mnemonic (DATA_MODEL.md §4, OVERVIEW.md Q-S5).
+//! `seed.age` and the mnemonic (docs/architecture.md Data model §4, docs/decisions.md Q-S5).
 //!
 //! What is on disk is an ordinary armored age file with a single scrypt
 //! passphrase recipient, holding the 32-byte BIP 39 **entropy** of the

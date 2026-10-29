@@ -1,4 +1,4 @@
-//! `gyges notes` (CLI_SPEC.md §2.4): decrypted notes and UTXOs from
+//! `gyges notes` (docs/interface.md CLI §2.4): decrypted notes and UTXOs from
 //! `ListNotes`, with heights, values, memo previews and witness readiness.
 
 use std::fmt::Write as _;

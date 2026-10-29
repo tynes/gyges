@@ -17,7 +17,7 @@ rqrr = { workspace = true }
 nokhwa = { workspace = true, optional = true }
 
 [features]
-# The camera path of `qr-scan` (ROADMAP.md M5, fourth item): native capture
+# The camera path of `qr-scan`: native capture
 # (AVFoundation, V4L2, Media Foundation). Off by default; the Linux backend
 # needs libclang (`v4l2-sys-mit` runs bindgen for its V4L2 bindings).
 camera = ["dep:nokhwa"]

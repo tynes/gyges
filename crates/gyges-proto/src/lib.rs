@@ -1,14 +1,14 @@
 //! gRPC contract between `gyges` (CLI) and `gygesd` (daemon).
 //!
-//! The source of truth is `proto/gyges.proto`; `API.md` is its human-readable
+//! The source of truth is `proto/gyges.proto`; `docs/interface.md` API is its human-readable
 //! companion. The generated code lives in [`v1`]. Hand-written here, because
 //! both sides need them identically:
 //!
-//! * the API version constants (API.md §2);
+//! * the API version constants (docs/interface.md API §2);
 //! * [`v1::GygesError`] ⇄ [`tonic::Status`] conversion through
-//!   `grpc-status-details-bin` (API.md §3);
+//!   `grpc-status-details-bin` (docs/interface.md API §3);
 //! * the `google.rpc.Status` envelope those details travel in;
-//! * [`uds::connect`], the Unix-domain-socket connector (API.md §1.1);
+//! * [`uds::connect`], the Unix-domain-socket connector (docs/interface.md API §1.1);
 //! * [`v1::Network`] name conversions shared by the CLI flags and the daemon.
 
 #![forbid(unsafe_code)]
@@ -42,7 +42,7 @@ pub mod google {
     }
 }
 
-/// API major version. The CLI requires an equal major (OVERVIEW.md Q-O3).
+/// API major version. The CLI requires an equal major (docs/decisions.md Q-O3).
 pub const API_MAJOR: u32 = 0;
 /// API minor version. A newer daemon minor produces a warning, never an error.
 pub const API_MINOR: u32 = 1;
@@ -53,12 +53,12 @@ pub const fn schema_version() -> &'static str {
     "0.1"
 }
 
-/// Type URL of the one detail every failed Gyges RPC carries (API.md §3).
+/// Type URL of the one detail every failed Gyges RPC carries (docs/interface.md API §3).
 pub const GYGES_ERROR_TYPE_URL: &str = "type.googleapis.com/gyges.v1.GygesError";
 
 impl v1::ErrorReason {
     /// The gRPC status code sent alongside this reason, chosen to make sense
-    /// to generic gRPC clients. The CLI never dispatches on it (API.md §3).
+    /// to generic gRPC clients. The CLI never dispatches on it (docs/interface.md API §3).
     pub fn grpc_code(self) -> tonic::Code {
         use tonic::Code;
         use v1::ErrorReason as R;
@@ -171,7 +171,7 @@ impl v1::Network {
     }
 }
 
-/// gRPC over a Unix domain socket (API.md §1.1).
+/// gRPC over a Unix domain socket (docs/interface.md API §1.1).
 pub mod uds {
     use std::path::{Path, PathBuf};
 

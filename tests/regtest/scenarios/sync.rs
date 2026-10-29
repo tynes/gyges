@@ -1,5 +1,5 @@
 //! `gyges sync status / wait / run` through the binaries against an
-//! in-process fake `zakurad` (TESTING.md §2; the real-node runs are in
+//! in-process fake `zakurad` (docs/testing.md §2; the real-node runs are in
 //! `scenarios/node.rs`). Covers the daemon reaching the tip for a new key, the
 //! node bounds in `daemon status`, the exit-7 stall on a prune race and the
 //! `--from` rewind confirmation.
@@ -117,8 +117,8 @@ fn sync_wait_times_out_with_exit_7_when_the_node_is_down() {
         .stdout_has("initializing");
 }
 
-/// `key restore` below the node's window through the binaries (ROADMAP.md
-/// M2, fifth item): without a terminal the consent is exit 4 and asks for
+/// `key restore` below the node's window through the binaries:
+/// without a terminal the consent is exit 4 and asks for
 /// `--yes`; with it, the notes on what the endpoint learns, the best-effort
 /// warning, the backfill, and `daemon status` repeating the warning. A
 /// first start also leaves a commented `config.toml`.

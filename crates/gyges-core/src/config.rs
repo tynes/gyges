@@ -1,9 +1,9 @@
-//! `config.toml` (DATA_MODEL.md §2).
+//! `config.toml` (docs/architecture.md Data model §2).
 //!
-//! Every key is optional and defaults to the value shown in the DATA_MODEL.md
+//! Every key is optional and defaults to the value shown in the docs/architecture.md Data model
 //! example; unknown keys are an error so a typo cannot silently fall back to a
 //! default. Durations are `humantime` strings (`60s`, `5m`, `24h`). The CLI
-//! never reads this file (OVERVIEW.md Q-C1).
+//! never reads this file (docs/decisions.md Q-C1).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -23,7 +23,7 @@ pub struct Config {
     /// means "no default, pass --key".
     pub default_key: String,
     /// Disables every network interface (Tor, RPC, indexer); PCZT proving and
-    /// signing only (API.md §8).
+    /// signing only (docs/interface.md API §8).
     pub airgapped: bool,
     pub daemon: DaemonConfig,
     pub zakura_rpc: ZakuraRpcConfig,
@@ -47,7 +47,7 @@ pub struct DaemonConfig {
     pub socket_path: String,
     /// Non-empty: socket mode 0660 owned by this group (name or numeric gid).
     pub socket_group: String,
-    /// Peer uids other than the daemon's own that may connect (API.md §1.2).
+    /// Peer uids other than the daemon's own that may connect (docs/interface.md API §1.2).
     pub allowed_uids: Vec<u32>,
     /// `tracing` filter; overridden by `RUST_LOG`.
     pub log_level: String,
@@ -105,13 +105,13 @@ impl Default for ZakuraRpcConfig {
 pub struct FallbackConfig {
     pub enabled: bool,
     /// Required when enabled. No default: the operator is chosen deliberately
-    /// (OVERVIEW.md Q-D5).
+    /// (docs/decisions.md Q-D5).
     pub grpc_url: String,
     /// `false` only for regtest / CI.
     pub use_tor: bool,
     /// `tx send --via-tor` default.
     pub broadcast_via_tor: bool,
-    /// `k` in SYNC.md §5.
+    /// `k` in docs/architecture.md Sync §5.
     pub overlap_blocks: u32,
 }
 
@@ -253,7 +253,7 @@ pub enum ConfigError {
         directory: Network,
     },
     #[error(
-        "[fallback_lightwalletd] enabled = true requires grpc_url (no default endpoint; see DATA_MODEL.md §2)"
+        "[fallback_lightwalletd] enabled = true requires grpc_url (no default endpoint; see docs/architecture.md Data model §2)"
     )]
     FallbackUrlMissing,
     #[error(
@@ -271,7 +271,7 @@ pub enum ConfigError {
 }
 
 /// The commented `config.toml` the daemon writes on first start when none
-/// exists (DATA_MODEL.md §2, OVERVIEW.md Q-D5). Every line is a comment, so
+/// exists (docs/architecture.md Data model §2, docs/decisions.md Q-D5). Every line is a comment, so
 /// it parses to [`Config::default`]: the file names the knobs and the
 /// public archival endpoints without choosing any of them for the user.
 pub fn template(network: Network) -> String {
@@ -296,7 +296,7 @@ pub fn template(network: Network) -> String {
     };
     format!(
         "# Gyges daemon configuration for {network}. Every key is optional; the\n\
-         # values shown are the defaults. See DATA_MODEL.md §2 for each one.\n\
+         # values shown are the defaults. See docs/architecture.md Data model §2 for each one.\n\
          #\n\
          # default_key = \"main\"\n\
          # airgapped = false\n\
@@ -316,7 +316,7 @@ pub fn template(network: Network) -> String {
          # min_retention_blocks = 10000\n\
          \n\
          # The archival endpoint for history below the node's retention window\n\
-         # (SYNC.md §5). It learns the block ranges you fetch (about a restored\n\
+         # (docs/architecture.md Sync §5). It learns the block ranges you fetch (about a restored\n\
          # key's birthday) and, for transparent recovery, the key's transparent\n\
          # addresses. There is no default endpoint.\n\
          [fallback_lightwalletd]\n\
@@ -370,7 +370,7 @@ impl Config {
         }
     }
 
-    /// Cross-field rules from DATA_MODEL.md §2 and THREAT_MODEL.md (Q-D5).
+    /// Cross-field rules from docs/architecture.md Data model §2 and docs/security.md (Q-D5).
     pub fn validate(&self, directory: Network) -> Result<(), ConfigError> {
         if let Some(configured) = self.network
             && configured != directory
@@ -443,23 +443,28 @@ fn fallback_url_allowed(url: &str, network: Network) -> bool {
 mod tests {
     use super::*;
 
-    /// The first toml block of a spec document.
-    fn toml_example(doc: &str) -> String {
-        let start = doc.find("```toml\n").expect("a toml block") + "```toml\n".len();
+    const ARCHITECTURE: &str = include_str!("../../../docs/architecture.md");
+
+    /// The first toml block after `heading` in docs/architecture.md.
+    fn toml_example(heading: &str) -> String {
+        let doc = ARCHITECTURE;
+        let section = doc.find(heading).expect("heading");
+        let start =
+            doc[section..].find("```toml\n").expect("a toml block") + section + "```toml\n".len();
         let end = doc[start..].find("```").expect("toml block closed") + start;
         doc[start..end].to_string()
     }
 
-    /// The example in DATA_MODEL.md §2 is the schema's documentation; it must
+    /// The example in docs/architecture.md Data model §2 is the schema's documentation; it must
     /// parse with `deny_unknown_fields` so the two cannot drift apart.
     fn data_model_example() -> String {
-        toml_example(include_str!("../../../DATA_MODEL.md"))
+        toml_example("\n## Data model\n")
     }
 
-    /// ARCHITECTURE.md's example says it is valid; hold it to that.
+    /// The Components part's example says it is valid; hold it to that.
     #[test]
     fn architecture_example_parses() {
-        let text = toml_example(include_str!("../../../ARCHITECTURE.md"));
+        let text = toml_example("\n## Components\n");
         let cfg = Config::parse(&text).unwrap();
         cfg.validate(Network::Mainnet).unwrap();
         assert_eq!(cfg.zakura_rpc.min_retention_blocks, 10_000);

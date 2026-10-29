@@ -1,5 +1,5 @@
-//! What a `.pczt` file carries beyond the transaction (ARCHITECTURE.md §3.5,
-//! API.md §7.1, CLI_SPEC.md §2.6): the ZIP 374 global `proprietary` tags
+//! What a `.pczt` file carries beyond the transaction (docs/architecture.md Components §3.5,
+//! docs/interface.md API §7.1, docs/interface.md CLI §2.6): the ZIP 374 global `proprietary` tags
 //! `gyges.key_id`, `gyges.network` and `gyges.session_id`, the bytes on the
 //! wire, and the two views `pczt inspect` renders: the proposal as the file
 //! itself implies it (inputs, outputs, fee, expiry), and which roles have

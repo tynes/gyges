@@ -1,4 +1,4 @@
-//! Reading a Keystone's answer from a camera (ROADMAP.md M5, fourth item):
+//! Reading a Keystone's answer from a camera:
 //! decode the QR codes in each greyscale frame and feed the `ur:` ones to an
 //! [`Assembler`] until the answer reassembles.
 //!

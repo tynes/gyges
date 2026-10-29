@@ -1,4 +1,4 @@
-//! `gyges daemon install` / `uninstall` (CLI_SPEC.md §2.1, OVERVIEW.md
+//! `gyges daemon install` / `uninstall` (docs/interface.md CLI §2.1, docs/decisions.md
 //! Q-C5): a per-user service that runs `gygesd --foreground` for one
 //! network. macOS gets a `launchd` agent in `~/Library/LaunchAgents`, Linux a
 //! `systemd --user` unit in `$XDG_CONFIG_HOME/systemd/user`.
@@ -9,7 +9,7 @@
 //! `daemon install` again is the upgrade step: it stops the service, rewrites
 //! the unit and starts it.
 //!
-//! `--hardened` (Linux only, as root) is the deployment of THREAT_MODEL.md
+//! `--hardened` (Linux only, as root) is the deployment of docs/security.md
 //! §6 item 4: a system unit that runs the daemon as the `gyges` user with
 //! its home in `/var/lib/gyges` and its socket at
 //! `/run/gyges/<network>/gygesd.sock` (0660, group `gyges`). The socket

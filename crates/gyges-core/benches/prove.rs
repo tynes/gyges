@@ -1,4 +1,4 @@
-//! Proving and trial-decryption timings for `docs/BENCHMARKS.md`.
+//! Proving and trial-decryption timings for `docs/testing.md` §9.
 //!
 //! ```console
 //! cargo bench -p gyges-core --bench prove
@@ -40,7 +40,7 @@ use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
 use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::BlockHeight;
 
-/// Ironwood actions in the scanned range, as `OVERVIEW.md` Q-D6 asks.
+/// Ironwood actions in the scanned range, as `docs/decisions.md` Q-D6 asks.
 const SCAN_ACTIONS: usize = 1_000;
 const BLOCKS: u32 = 10;
 /// Two-action transactions per block: 10 × 50 × 2 = 1,000 actions.

@@ -1,5 +1,5 @@
 //! Terminal input: passphrases, confirmations and the non-interactive rules
-//! of CLI_SPEC.md §1.2.
+//! of docs/interface.md CLI §1.2.
 //!
 //! Nothing here blocks when stdin is not a TTY or `--non-interactive` is
 //! set; the caller gets `CliError::Daemon(CONFIRMATION_REQUIRED)` /

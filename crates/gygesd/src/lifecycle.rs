@@ -1,4 +1,4 @@
-//! Single-instance enforcement through `gygesd.pid` (DATA_MODEL.md §1: "PID
+//! Single-instance enforcement through `gygesd.pid` (docs/architecture.md Data model §1: "PID
 //! of the running daemon, advisory-locked").
 
 use std::fs::{self, File, TryLockError};

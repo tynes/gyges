@@ -1,5 +1,5 @@
 //! One accepted socket connection: a unique id, the peer's uid, and a hook
-//! that drops the connection's unlocks when it closes (API.md §6.3).
+//! that drops the connection's unlocks when it closes (docs/interface.md API §6.3).
 //!
 //! tonic attaches [`Connected::connect_info`] to every request's extensions,
 //! which is how the handlers learn which connection they serve and how the

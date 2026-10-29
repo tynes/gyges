@@ -1,4 +1,4 @@
-//! `gyges balance` (CLI_SPEC.md §2.4): spendable and pending value per
+//! `gyges balance` (docs/interface.md CLI §2.4): spendable and pending value per
 //! pool from `GetBalance`.
 
 use std::fmt::Write as _;

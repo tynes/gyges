@@ -1,4 +1,4 @@
-//! Keystone signing sessions (API.md §6, ROADMAP.md M5 third item).
+//! Keystone signing sessions (docs/interface.md API §6).
 //!
 //! A `tx send` or `tx shield` from a `keystone-qr` key proves the PCZT,
 //! persists a session (`gyges_core::db::sessions::insert`) holding the
@@ -364,7 +364,7 @@ pub(crate) async fn await_device(
     }
 }
 
-/// `CompleteKeystoneSign` (API.md §6.2).
+/// `CompleteKeystoneSign` (docs/interface.md API §6.2).
 pub(crate) async fn complete_keystone_sign(
     state: Arc<DaemonState>,
     req: CompleteKeystoneSignRequest,

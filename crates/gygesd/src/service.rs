@@ -1,6 +1,6 @@
 //! The `gyges.v1.Gyges` service implementation.
 //!
-//! Only what ROADMAP.md has reached is implemented; every other RPC answers
+//! Only what has been built is implemented; every other RPC answers
 //! `UNIMPLEMENTED` through the stubs `tonic-prost-build` generates.
 
 use std::sync::Arc;
@@ -54,23 +54,23 @@ pub struct DaemonState {
     pub chain: Option<Arc<dyn ChainBackend>>,
     /// The archival endpoint for Case B (`fallback_lightwalletd`), `None`
     /// when disabled or air-gapped. Built at start, connected (and Tor
-    /// bootstrapped) by the first backfill that needs it (SYNC.md §5).
+    /// bootstrapped) by the first backfill that needs it (docs/architecture.md Sync §5).
     pub fallback: Option<Arc<ArtiTorLwdBackend<ConsensusParams>>>,
     /// Whether the fallback endpoint has passed (or failed) the handoff
-    /// validation (SYNC.md §5.2); loaded from `fallback_trust.json` at start.
+    /// validation (docs/architecture.md Sync §5.2); loaded from `fallback_trust.json` at start.
     pub(crate) fallback_trust: crate::backfill::TrustHub,
     /// The shared compact block cache (`cache/blocks.sqlite`); `None` only
     /// when air-gapped.
     pub block_cache: Option<Arc<BlockDb>>,
-    /// Per-key sync progress and the scheduler's wake-up (SYNC.md §3, §6).
+    /// Per-key sync progress and the scheduler's wake-up (docs/architecture.md Sync §3, §6).
     pub sync: SyncHub,
     /// Passphrase signing sessions awaiting `UnlockKey { session_id }`
-    /// (API.md §6).
+    /// (docs/interface.md API §6).
     pub(crate) sessions: SessionHub,
     /// Keystone sessions: the streams waiting on them and the ones being
     /// completed (the sessions themselves are in each key's wallet).
     pub(crate) keystone: Arc<crate::keystone::KeystoneHub>,
-    /// The ZIP 320 queue's wake-up (ARCHITECTURE.md §3.3).
+    /// The ZIP 320 queue's wake-up (docs/architecture.md Components §3.3).
     pub(crate) tex: TexHub,
     /// Proving and verifying keys, built on first use.
     pub provers: Arc<Provers>,
@@ -183,7 +183,7 @@ impl DaemonState {
         }
     }
 
-    /// `GetInfo.node` from the backend's last poll (API.md `NodeStatus`).
+    /// `GetInfo.node` from the backend's last poll (docs/interface.md API `NodeStatus`).
     /// Air-gapped: not connected, with the reason.
     pub(crate) fn node_status(&self) -> NodeStatus {
         let Some(chain) = &self.chain else {

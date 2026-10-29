@@ -1,4 +1,4 @@
-//! The Keystone Zcash UR registry types Gyges speaks (OVERVIEW.md §4.1,
+//! The Keystone Zcash UR registry types Gyges speaks (docs/decisions.md §2.1,
 //! Q-K6), as plain Rust values over `ur-registry`'s CBOR codecs, so callers
 //! never depend on `ur-registry` themselves.
 //!

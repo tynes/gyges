@@ -200,7 +200,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// TESTING.md §4: a 12 KiB PCZT at several fragment sizes, the frames
+    /// docs/testing.md §4: a 12 KiB PCZT at several fragment sizes, the frames
     /// shuffled and a fifth of them dropped, still reassembles exactly.
     #[test]
     fn fountain_round_trip_survives_shuffling_and_loss() {

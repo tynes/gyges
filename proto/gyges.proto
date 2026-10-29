@@ -2,7 +2,7 @@
 //
 // Transport: gRPC over a Unix domain socket at ~/.gyges/<network>/gygesd.sock.
 // One daemon per network. Every RPC is callable by `gyges` and by any other
-// same-uid client; see API.md for authentication, versioning and the error
+// same-uid client; see docs/interface.md API for authentication, versioning and the error
 // model. Field numbers are never removed or renumbered; every enum has an
 // `_UNSPECIFIED = 0` value; new fields and new stream events must be
 // ignorable by older clients.
@@ -129,7 +129,7 @@ service Gyges {
 
 // Attached to every failed RPC as a `grpc-status-details-bin` detail
 // (`google.rpc.Status.details[0]`, type URL `type.googleapis.com/gyges.v1.GygesError`).
-// The CLI maps `reason` to its exit code; see API.md §3.
+// The CLI maps `reason` to its exit code; see docs/interface.md API §3.
 message GygesError {
   ErrorReason reason = 1;
   // Key the error concerns, when any.
@@ -258,7 +258,7 @@ message KeySummary {
   string seed_fingerprint = 11;
   // Non-zero when the key was backfilled below the node's window: its
   // transparent history below this height came from the fallback endpoint
-  // and is best-effort (SYNC.md §5.3).
+  // and is best-effort (docs/architecture.md Sync §5.3).
   uint32 transparent_best_effort_below = 12;
 }
 
@@ -420,7 +420,7 @@ message RestoreKeyResponse {
   // Number of blocks that will be fetched over the fallback endpoint.
   uint32 backfill_blocks = 4;
   // Human-readable warnings the CLI prints: set for every restore below the
-  // node's window (transparent history there is best-effort, SYNC.md §5.3).
+  // node's window (transparent history there is best-effort, docs/architecture.md Sync §5.3).
   repeated string warnings = 5;
 }
 
@@ -495,7 +495,7 @@ enum UnlockScope {
   // The key stays decrypted in gygesd RAM with an idle TTL and no token;
   // any same-uid client may then spend until it expires or `LockKey` is
   // called. Used by `gyges key unlock --timeout` for batch scripts. This is
-  // the weaker mode; see API.md §6.3.
+  // the weaker mode; see docs/interface.md API §6.3.
   UNLOCK_SCOPE_DAEMON = 2;
 }
 
@@ -920,7 +920,7 @@ message SendTransactionRequest {
   // UTF-8 text or raw bytes decoded by the CLI from hex; at most 512 bytes.
   bytes memo = 4;
   // Broadcast through the fallback endpoint over Tor, never the node; refused
-  // with FALLBACK_UNAVAILABLE when no such endpoint is configured (API.md §4.1).
+  // with FALLBACK_UNAVAILABLE when no such endpoint is configured (docs/interface.md API §4.1).
   bool via_tor = 5;
   bool dry_run = 6;
   // From a prior CONNECTION-scoped UnlockKey; optional. Without it the stream
@@ -1162,13 +1162,13 @@ message CreatePcztResponse {
   repeated bytes pczts = 1;
   Proposal proposal = 2;
   // The `gyges.session_id` written into the PCZT: the stored proposal
-  // BroadcastPczt verifies against (API.md §7.1).
+  // BroadcastPczt verifies against (docs/interface.md API §7.1).
   string session_id = 3;
 }
 
 message InspectPcztRequest {
   bytes pczt = 1;
-  // Assertion only (API.md §7.1): KEY_MISMATCH when it differs from the
+  // Assertion only (docs/interface.md API §7.1): KEY_MISMATCH when it differs from the
   // PCZT's `gyges.key_id`; empty asserts nothing.
   string key_id = 2;
 }
@@ -1198,7 +1198,7 @@ message ProvePcztRequest {
   // Required for Sapling spends in a LOCAL_SEED or SIGNER_ONLY profile (the
   // proof generation key is inserted before proving); ignored otherwise.
   bytes session_token = 2 [debug_redact = true];
-  // Assertion only (API.md §7.1).
+  // Assertion only (docs/interface.md API §7.1).
   string key_id = 3;
 }
 
@@ -1210,7 +1210,7 @@ message SignPcztRequest {
   bytes pczt = 1;
   // Optional; without it a locked LOCAL_SEED key pauses on SignatureRequired.
   bytes session_token = 2 [debug_redact = true];
-  // Assertion only (API.md §7.1).
+  // Assertion only (docs/interface.md API §7.1).
   string key_id = 3;
 }
 
@@ -1225,7 +1225,7 @@ message SignPcztEvent {
 message CombinePcztRequest {
   // Two or more PCZTs for the same transaction and key id.
   repeated bytes pczts = 1;
-  // Assertion only (API.md §7.1).
+  // Assertion only (docs/interface.md API §7.1).
   string key_id = 2;
 }
 
@@ -1237,7 +1237,7 @@ message BroadcastPcztRequest {
   bytes pczt = 1;
   // As SendTransactionRequest.via_tor.
   bool via_tor = 2;
-  // Assertion only (API.md §7.1).
+  // Assertion only (docs/interface.md API §7.1).
   string key_id = 3;
 }
 

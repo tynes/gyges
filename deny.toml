@@ -1,4 +1,4 @@
-# cargo-deny configuration (OVERVIEW.md Q-O5). Run: cargo deny check
+# cargo-deny configuration (docs/decisions.md Q-O5). Run: cargo deny check
 
 [graph]
 all-features = false

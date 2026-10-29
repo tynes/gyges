@@ -1,4 +1,4 @@
-//! `KeyRegistry` (ARCHITECTURE.md §2.1): enumerates `keys/<id>/profile.json`,
+//! `KeyRegistry` (docs/architecture.md Components §2.1): enumerates `keys/<id>/profile.json`,
 //! opens one `WalletDb` per key, enforces the 0700/0600 rule on every key
 //! directory, resolves `default_key`, and creates new `local-seed` and
 //! `signer-only` profiles for `key init` / `key restore` and `keystone-qr`
@@ -167,7 +167,7 @@ impl KeyEntry {
 }
 
 /// What `key import-keystone` hands to [`KeyRegistry::create_keystone`],
-/// after the daemon has checked the export (ARCHITECTURE.md §3.4).
+/// after the daemon has checked the export (docs/architecture.md Components §3.4).
 #[derive(Debug)]
 pub struct NewKeystoneKey<'a> {
     pub key_id: &'a str,
@@ -334,7 +334,7 @@ impl KeyRegistry {
         )
         .map_err(|e| wallet_error(key_id, e))?
         // Per-handle, not persisted: transparent discovery in Case A reads the
-        // local node's raw blocks (SYNC.md §2.1), which upstream classes as
+        // local node's raw blocks (docs/architecture.md Sync §2.1), which upstream classes as
         // the "public" ledger source; Zakura's transparent APIs fail closed
         // until a mode is chosen.
         .with_transparent_ledger_mode(TransparentLedgerMode::Public)
@@ -353,7 +353,7 @@ impl KeyRegistry {
             source,
         })?;
         // Upstream's schema plus Gyges' own `ext_gyges_*` tables, migrated
-        // together (DATA_MODEL.md §5).
+        // together (docs/architecture.md Data model §5).
         let migrator =
             WalletMigrator::new().with_external_migrations(vec![Box::new(crate::db::MIGRATION)]);
         match migrator.init_or_migrate(&mut wallet) {
@@ -388,7 +388,7 @@ impl KeyRegistry {
     }
 
     /// Change the default for this daemon's lifetime. `config.toml` is never
-    /// rewritten by the daemon (DATA_MODEL.md §7), so the caller tells the
+    /// rewritten by the daemon (docs/architecture.md Data model §7), so the caller tells the
     /// user to set `default_key` there to make it stick.
     pub fn set_default_key(&self, key_id: &str) -> Result<(), RegistryError> {
         if !self.keys().contains_key(key_id) {
@@ -412,7 +412,7 @@ impl KeyRegistry {
         self.keys().values().cloned().collect()
     }
 
-    /// Resolve a request's `key_id` (API.md §1.4): empty means the default.
+    /// Resolve a request's `key_id` (docs/interface.md API §1.4): empty means the default.
     pub fn resolve(&self, key_id: &str) -> Result<Arc<KeyEntry>, RegistryError> {
         let id = if key_id.is_empty() {
             let d = self.default_key();
@@ -465,7 +465,7 @@ impl KeyRegistry {
     }
 
     /// `key init` on an air-gapped daemon: seed and profile only, no wallet
-    /// and no birthday (DATA_MODEL.md §3, Q-K5).
+    /// and no birthday (docs/architecture.md Data model §3, Q-K5).
     pub fn create_signer_only(
         &self,
         key_id: &str,
@@ -512,7 +512,7 @@ impl KeyRegistry {
                 )
                 .map_err(|e| wallet_error(key_id, e))?;
             // The device signs Orchard and Ironwood spends and transparent
-            // inputs, never Sapling (OVERVIEW.md §4.1), and its UFVK has no
+            // inputs, never Sapling (docs/decisions.md §2.1), and its UFVK has no
             // Sapling component, so it cannot receive there either.
             let pools = vec![Pool::Orchard, Pool::Ironwood, Pool::Transparent];
             let profile = KeyProfile {
@@ -604,10 +604,10 @@ impl KeyRegistry {
             birthday_height: Some(req.birthday.height),
             // Every pool is spent from (Sapling since M6: the proof
             // generation key is inserted inside the sending stream,
-            // THREAT_MODEL.md §6 item 1). After NU6.3 every shielded output
+            // docs/security.md §6 item 1). After NU6.3 every shielded output
             // the wallet libraries build is Ironwood and the ZIP 318
             // turnstile keeps value out of Orchard, so Ironwood is both
-            // spent from and received to (OVERVIEW.md §4.3).
+            // spent from and received to (docs/decisions.md §2.3).
             spend_pools: Pool::ALL.to_vec(),
             receive_pools: Pool::ALL.to_vec(),
             account_index: req.account_index,

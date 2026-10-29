@@ -1,5 +1,5 @@
-//! The PCZT role RPCs behind `gyges pczt …` (ARCHITECTURE.md §3.5, API.md
-//! §4.2, §7.1, CLI_SPEC.md §2.6): `CreatePczt`, `InspectPczt`, `ProvePczt`,
+//! The PCZT role RPCs behind `gyges pczt …` (docs/architecture.md Components §3.5, docs/interface.md API
+//! §4.2, §7.1, docs/interface.md CLI §2.6): `CreatePczt`, `InspectPczt`, `ProvePczt`,
 //! `SignPczt`, `CombinePczt` and `BroadcastPczt`.
 //!
 //! The six are the single-step send pipeline of [`crate::tx`] cut at the
@@ -14,7 +14,7 @@
 //! says: a file tampered with on the way is refused with `INVALID_ARGUMENT`.
 //!
 //! `InspectPczt`, `ProvePczt`, `SignPczt` and `CombinePczt` need no node
-//! and are on the air-gapped allow-list (API.md §8); `SignPczt` accepts a
+//! and are on the air-gapped allow-list (docs/interface.md API §8); `SignPczt` accepts a
 //! `signer-only` profile, which signs transparent inputs from the BIP 44
 //! derivations in the file (`gyges_core::tx::sign`).
 
@@ -47,7 +47,7 @@ pub(crate) type SignStream = tonic::codegen::BoxStream<SignPcztEvent>;
 
 /// How far past the proposal's target height a `pczt create` transaction
 /// may still be mined. A file travels on removable media and waits for a
-/// person (ARCHITECTURE.md §3.5), so the default `target + 40` of `tx send`
+/// person (docs/architecture.md Components §3.5), so the default `target + 40` of `tx send`
 /// (fifty minutes on mainnet) would expire most of them; this is about a
 /// day of 75-second blocks, the window `vault.signing_session_ttl` gives a
 /// passphrase session.
@@ -125,7 +125,7 @@ fn proto_inspection(tags: &Tags, insp: &Inspection) -> InspectPcztResponse {
 
 /// `CreatePczt`: propose, build the PCZT (Creator → Updater), tag it, and
 /// store the approved proposal under the session id. One PCZT, because a
-/// ZIP 320 recipient is refused here (API.md §9: upstream builds PCZTs from
+/// ZIP 320 recipient is refused here (docs/interface.md API §9: upstream builds PCZTs from
 /// single-step proposals only).
 pub(crate) async fn create_pczt(
     state: Arc<DaemonState>,
@@ -148,7 +148,7 @@ pub(crate) async fn create_pczt(
     let amount = tx::parse_amount(req.amount)?;
     // Sapling notes stay out of a file: proving one needs the proof
     // generation key, which never leaves the `tx send` stream that derives
-    // it (THREAT_MODEL.md §6 item 1).
+    // it (docs/security.md §6 item 1).
     let profile_pools = &prepared.key.profile().spend_pools;
     let sapling_left_out = profile_pools.contains(&gyges_core::Pool::Sapling);
     let spend_pools: Vec<_> = profile_pools
@@ -266,7 +266,7 @@ pub(crate) async fn prove_pczt(
     Ok(ProvePcztResponse { pczt: bytes })
 }
 
-/// `SignPczt` (API.md §4.2): the Signer role with the key from the
+/// `SignPczt` (docs/interface.md API §4.2): the Signer role with the key from the
 /// request's token, a daemon-scoped unlock, or a passphrase session the
 /// client satisfies with `UnlockKey { session_id }`, exactly as `tx send`.
 pub(crate) fn sign_pczt(
@@ -284,7 +284,7 @@ pub(crate) fn sign_pczt(
         Purpose::SignPczt,
     )?;
     let key_id = prepared.key.key_id().to_string();
-    // Refused before any passphrase is asked for (THREAT_MODEL.md §6
+    // Refused before any passphrase is asked for (docs/security.md §6
     // item 1).
     let pczt = core_tx::refuse_unkeyed_sapling_spends(pczt)
         .map_err(|e| tx_error(e, &key_id).into_status())?;
@@ -323,7 +323,7 @@ pub(crate) fn sign_pczt(
 }
 
 /// `CombinePczt`: the Combiner role over two or more files for the same
-/// key (API.md §7.1 refuses mixed key ids before upstream sees them).
+/// key (docs/interface.md API §7.1 refuses mixed key ids before upstream sees them).
 pub(crate) fn combine_pczt(
     state: &DaemonState,
     req: CombinePcztRequest,

@@ -1,4 +1,4 @@
-//! `gyges key …` (CLI_SPEC.md §2.2, API.md §7).
+//! `gyges key …` (docs/interface.md CLI §2.2, docs/interface.md API §7).
 //!
 //! Implemented: `list`, `init`, `restore`, `import-keystone`, `unlock`,
 //! `lock`, `export-ufvk` and `export-seed`. The rest of the group is declared
@@ -112,7 +112,7 @@ pub struct ImportKeystoneArgs {
 }
 
 /// `--id`, falling back to the global `--key`; empty means the daemon's
-/// default key (API.md §1.4).
+/// default key (docs/interface.md API §1.4).
 #[derive(Debug, Clone, Args)]
 pub struct KeyIdArg {
     /// Key id [default: --key, then the daemon's default_key].
@@ -222,7 +222,7 @@ pub fn mode_name(mode: SigningMode) -> &'static str {
 }
 
 /// `key init`: passphrase twice, `InitKey`, mnemonic shown once, three words
-/// typed back (OVERVIEW.md Q-S4).
+/// typed back (docs/decisions.md Q-S4).
 ///
 /// Scripted form: with `--json` and a passphrase source
 /// (`--passphrase-fd` / `GYGES_PASSPHRASE_FILE`) no terminal is needed; the
@@ -311,7 +311,7 @@ fn pick_three(n: usize) -> [usize; 3] {
 }
 
 /// `key restore`: mnemonic from `--stdin` or a hidden prompt, passphrase
-/// twice, backfill consent computed from `GetInfo` (API.md §4,
+/// twice, backfill consent computed from `GetInfo` (docs/interface.md API §4,
 /// `RestoreKey.allow_backfill`).
 async fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<(), CliError> {
     let mut conn = ctx.connect().await?;
@@ -374,7 +374,7 @@ async fn restore(ctx: &Ctx, args: RestoreArgs) -> Result<(), CliError> {
     })
 }
 
-/// `key import-keystone` (CLI_SPEC.md §2.2): the frames from `--ur` or
+/// `key import-keystone` (docs/interface.md CLI §2.2): the frames from `--ur` or
 /// stdin, checked locally first so that a wrong payload or old firmware is
 /// refused before any question is asked (the daemon checks again), then the
 /// birthday (asked when not given) and the backfill consent.
@@ -560,7 +560,7 @@ fn backfill_consent(
 }
 
 /// What the user should know about the endpoint before consenting
-/// (OVERVIEW.md Q-D5): what it learns, and the `.onion` preference.
+/// (docs/decisions.md Q-D5): what it learns, and the `.onion` preference.
 pub(crate) fn endpoint_notes(url: &str, use_tor: bool) -> Vec<String> {
     let mut notes = vec![
         "the endpoint learns the block range fetched (about the key's birthday) and the key's \
@@ -591,7 +591,7 @@ pub(crate) fn endpoint_notes(url: &str, use_tor: bool) -> Vec<String> {
     notes
 }
 
-/// `key unlock`: a daemon-scoped unlock with an idle timeout (API.md §6.3,
+/// `key unlock`: a daemon-scoped unlock with an idle timeout (docs/interface.md API §6.3,
 /// the weaker mode; the inline `tx send` flow uses connection scope).
 async fn unlock(ctx: &Ctx, args: UnlockArgs) -> Result<(), CliError> {
     let mut conn = ctx.connect().await?;
@@ -658,7 +658,7 @@ async fn export_ufvk(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
     ctx.print(&resp, || format!("{}\n", resp.ufvk))
 }
 
-/// `key export-seed` (OVERVIEW.md Q-S4): terminal only, never `--json`, the
+/// `key export-seed` (docs/decisions.md Q-S4): terminal only, never `--json`, the
 /// passphrase is always asked, `reveal seed` typed back.
 async fn export_seed(ctx: &Ctx, args: KeyIdArg) -> Result<(), CliError> {
     if ctx.json {
@@ -728,7 +728,7 @@ fn note_created(key_id: &str, warnings: &[String], set_default: bool) {
     }
 }
 
-/// Default restore birthday per network (DATA_MODEL.md §3). Duplicated
+/// Default restore birthday per network (docs/architecture.md Data model §3). Duplicated
 /// from `gyges-core` on purpose: the CLI does not link the wallet stack.
 pub fn sapling_activation(network: Network) -> u32 {
     match network {

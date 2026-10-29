@@ -1,4 +1,4 @@
-//! Chain access for `gygesd` (ARCHITECTURE.md §3.1, SYNC.md).
+//! Chain access for `gygesd` (docs/architecture.md Components §3.1, docs/architecture.md Sync).
 //!
 //! * [`ChainBackend`] – the node-facing operations the wallet core and the
 //!   sync scheduler need: node bounds, tree states, block hashes and
@@ -51,7 +51,7 @@ pub use fetch::{FillError, fill_cache};
 pub use lwd::{AddressUtxo, ArtiTorLwdBackend, LwdTimeouts, TorState, Transport};
 pub use rpc::ZakuraRpcBackend;
 
-/// What `getblockchaininfo` tells us about the node (OVERVIEW.md Q-D1).
+/// What `getblockchaininfo` tells us about the node (docs/decisions.md Q-D1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeBounds {
     pub tip_height: BlockHeight,
@@ -71,7 +71,7 @@ impl NodeBounds {
     }
 }
 
-/// The last thing the node told us, for `GetInfo.node` (API.md) and the
+/// The last thing the node told us, for `GetInfo.node` (docs/interface.md API) and the
 /// scheduler's `Stalled(Offline)` decision. Refreshed by every successful or
 /// failed [`ChainBackend::node_bounds`] call.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -124,7 +124,7 @@ impl StatusCell {
 
 /// One completed 2^16-leaf subtree of a note commitment tree, as
 /// `z_getsubtreesbyindex` (node) and `GetSubtreeRoots` (lightwalletd) report
-/// it. The handoff validation of SYNC.md §5.2 compares the two sources index
+/// it. The handoff validation of docs/architecture.md Sync §5.2 compares the two sources index
 /// by index; the scheduler hands the roots to `put_sapling_subtree_roots` /
 /// `put_orchard_subtree_roots` through [`SubtreeRoot::sapling`] and
 /// [`SubtreeRoot::orchard`].
@@ -189,20 +189,20 @@ pub enum ChainError {
         retained_from: BlockHeight,
     },
     /// `getblock(h, 0)` for a height whose body the node no longer stores
-    /// (or does not have yet). The caller re-polls the bounds (SYNC.md §1).
+    /// (or does not have yet). The caller re-polls the bounds (docs/architecture.md Sync §1).
     #[error("block {height} is not available from the node (pruned or above the tip)")]
     BlockUnavailable { height: BlockHeight },
     /// The node returned an error or an unparseable response.
     #[error("node error: {0}")]
     Rpc(String),
     /// `sendrawtransaction` refused the transaction; the text is the node's
-    /// verbatim rejection (`GygesError.node_error`, API.md §3).
+    /// verbatim rejection (`GygesError.node_error`, docs/interface.md API §3).
     #[error("node rejected the transaction: {0}")]
     Rejected(String),
 }
 
 /// What the node knows about a transaction (`getrawtransaction(txid, 1)`),
-/// for the ZIP 320 queue (ARCHITECTURE.md §3.3) and `tx status`.
+/// for the ZIP 320 queue (docs/architecture.md Components §3.3) and `tx status`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxStatus {
     /// Neither in the mempool nor in the main chain (never seen, evicted,
@@ -243,7 +243,7 @@ pub trait ChainBackend: Send + Sync + fmt::Debug {
     fn chain_state(&self, height: BlockHeight) -> BoxFuture<'_, Result<ChainState, ChainError>>;
 
     /// `getblockhash(height)`, in internal byte order. Works at every height
-    /// a node has headers for, pruned or not (SYNC.md §1).
+    /// a node has headers for, pruned or not (docs/architecture.md Sync §1).
     fn block_hash(&self, height: BlockHeight) -> BoxFuture<'_, Result<[u8; 32], ChainError>>;
 
     /// Synthetic compact blocks for `range` (ascending, contiguous, linked by
@@ -267,7 +267,7 @@ pub trait ChainBackend: Send + Sync + fmt::Debug {
     fn transaction_status(&self, txid: [u8; 32]) -> BoxFuture<'_, Result<TxStatus, ChainError>>;
 
     /// `getrawmempool`: the txids in the node's mempool, in internal byte
-    /// order (SYNC.md §7). Only the local node is asked; a backend without
+    /// order (docs/architecture.md Sync §7). Only the local node is asked; a backend without
     /// a mempool listing (the fallback endpoint, which must not learn what
     /// the wallet looks at) refuses.
     fn mempool_txids(&self) -> BoxFuture<'_, Result<Vec<[u8; 32]>, ChainError>> {
@@ -333,7 +333,7 @@ pub(crate) fn bytes32(bytes: &[u8], what: impl fmt::Display) -> Result<[u8; 32],
 
 /// Refuse a source that serves another chain than `params`' and return
 /// this daemon's network name. A node, lightwalletd or zaino 0.10.2 reports
-/// `"main"` or `"test"` (`"test"` for regtest as well, OVERVIEW.md §4.5);
+/// `"main"` or `"test"` (`"test"` for regtest as well, docs/decisions.md §2.5);
 /// `"regtest"` is accepted too. `who` starts the error text.
 pub(crate) fn check_chain_name(
     params: &impl Parameters,

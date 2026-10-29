@@ -1,4 +1,4 @@
-//! Synthetic `CompactBlock`s from raw blocks (SYNC.md §2.1).
+//! Synthetic `CompactBlock`s from raw blocks (docs/architecture.md Sync §2.1).
 //!
 //! Zakura has no CompactBlock API, so Case A parses `getblock(h, 0)` with
 //! `zcash_primitives` and keeps, per transaction: the txid, Sapling spends'
@@ -9,7 +9,7 @@
 //! (`zcash_client_backend::proto::compact_formats`), so `scan_cached_blocks`
 //! sees no difference from a lightwalletd-served block. The scanner ignores
 //! `vin`/`vout`; the sync scheduler reads them from the cache to credit
-//! transparent receivers (DATA_MODEL.md §5.4).
+//! transparent receivers (docs/architecture.md Data model §5.4).
 
 use std::io::{self, Cursor};
 
