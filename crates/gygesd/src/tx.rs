@@ -40,7 +40,7 @@ use tonic::Status;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::value::Zatoshis;
 
-use crate::broadcast::{Route, broadcast_route, connected_chain};
+use crate::broadcast::{self, Route, broadcast_route, connected_chain};
 use crate::conn::ConnInfo;
 use crate::errors::{broadcast_error, tx_error, vault_error};
 use crate::keys::{AUDIT_TARGET, proto_pool};
@@ -657,19 +657,16 @@ async fn pipeline(
         // `usk` was moved into the signing task and dropped there.
 
         // 6. Verify against the approved proposal (Q-K7).
-        let owner_params = state.registry.params();
-        let owner = wallet_rpc(key, move |w| core_tx::Owner::of_wallet(&owner_params, w)).await?;
-        let pczt = core_tx::verify(pczt, &expected, &owner).map_err(err)?;
+        let pczt = broadcast::verified(state, key, pczt, expected)
+            .await?
+            .map_err(err)?;
 
         // 7. Extract, record in the wallet, and broadcast.
         let provers = state.provers.clone();
         let (txid, raw) =
             wallet_rpc(key, move |w| core_tx::extract_and_store(w, pczt, &provers)).await?;
         emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
-        route.send(prepared.chain()?, raw, &key_id).await?;
-        tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());
-        tracing::info!(key_id, via = route.name(), "transaction broadcast");
-        state.sync.wake();
+        broadcast::broadcast(state, key, prepared.chain()?, route, raw, txid, None).await?;
         txid
     };
     let txid_hex = txid.to_string();

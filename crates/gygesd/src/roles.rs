@@ -41,7 +41,6 @@ use crate::conn::ConnInfo;
 use crate::errors::tx_error;
 use crate::keys::{AUDIT_TARGET, proto_pool};
 use crate::service::{DaemonState, invalid, proto_network, unix_now};
-use crate::sessions::set_session_state;
 use crate::tx::{self, Purpose, blocking, obtain_key, proto_proposal, wallet_rpc};
 use crate::with_wallet;
 
@@ -435,26 +434,14 @@ pub(crate) async fn broadcast_pczt(
     }
     let expected = Expected::from_json(&row.expected).map_err(err)?;
 
-    // Verifier (Q-K7), then extract and record.
-    let owner_params = state.registry.params();
-    let owner = wallet_rpc(&key, move |w| core_tx::Owner::of_wallet(&owner_params, w)).await?;
-    let pczt = core_tx::verify(pczt, &expected, &owner).map_err(err)?;
+    // Verifier (Q-K7), then extract, record and broadcast.
+    let pczt = broadcast::verified(&state, &key, pczt, expected)
+        .await?
+        .map_err(err)?;
     let provers = state.provers.clone();
     let (txid, raw) =
         wallet_rpc(&key, move |w| core_tx::extract_and_store(w, pczt, &provers)).await?;
-    broadcast::broadcast_signed(&key, &chain, &route, &session_id, raw).await?;
-    set_session_state(
-        &key,
-        &session_id,
-        SessionState::Broadcast,
-        Some(*txid.as_ref()),
-        None,
-    )
-    .await
-    .map_err(err)?;
-    tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());
-    tracing::info!(key_id, via = route.name(), "transaction broadcast");
-    state.sync.wake();
+    broadcast::broadcast(&state, &key, &chain, &route, raw, txid, Some(&session_id)).await?;
     Ok(BroadcastPcztResponse {
         txid: txid.to_string(),
     })

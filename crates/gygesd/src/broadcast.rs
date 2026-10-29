@@ -1,18 +1,98 @@
-//! Where a signed transaction goes and how it gets there: the node's
+//! The end of every send: the Verifier against what the user approved,
+//! then the broadcast. Where a signed transaction goes is the node's
 //! `sendrawtransaction`, or the fallback endpoint over Tor for `--via-tor`
 //! (THREAT_MODEL.md §3 row 10).
+//!
+//! `SendTransaction`, `BroadcastPczt` and `CompleteKeystoneSign` all end
+//! here: [`verified`], then the wallet's own record of the transaction
+//! (`extract_and_store`, which each caller runs itself because a Keystone
+//! completion claims its session row first), then [`broadcast`].
 
 use std::sync::Arc;
 
 use gyges_chain::{ChainBackend, ChainError};
 use gyges_core::KeyEntry;
 use gyges_core::db::sessions::SessionState;
+use gyges_core::tx::{self as core_tx, Expected, TxError};
 use gyges_proto::v1::{ErrorReason, GygesError};
+use pczt::Pczt;
 use tonic::Status;
+use zcash_protocol::TxId;
 
-use crate::errors::broadcast_error;
+use crate::errors::{broadcast_error, tx_error};
+use crate::keys::AUDIT_TARGET;
 use crate::service::DaemonState;
 use crate::sessions::set_session_state;
+use crate::tx::wallet_rpc;
+
+/// The Verifier (Q-K7): `pczt` against the approved proposal, every change
+/// output against what the key owns (THREAT_MODEL.md §6 item 8). Runs under
+/// the key's wallet lock, which reading the owner needs. The outer error is
+/// the wallet's (the key's typed error); the inner one is the Verifier's
+/// refusal, which each caller maps itself (`INVALID_ARGUMENT` for a file or
+/// a send, `HARDWARE_SIGNER` for a Keystone's answer).
+pub(crate) async fn verified(
+    state: &DaemonState,
+    key: &Arc<KeyEntry>,
+    pczt: Pczt,
+    expected: Expected,
+) -> Result<Result<Pczt, TxError>, Status> {
+    let params = state.registry.params();
+    wallet_rpc(key, move |w| {
+        let owner = core_tx::Owner::of_wallet(&params, w)?;
+        Ok(core_tx::verify(pczt, &expected, &owner))
+    })
+    .await
+}
+
+/// Broadcast `raw` (the transaction `txid`) over `route`, record it on the
+/// session row when there is one (a `pczt create` file or a Keystone
+/// session), write the audit event and wake the sync scheduler. A failed
+/// broadcast leaves the row `Signed` with the node's text (or the error's,
+/// when the node gave none) and is returned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn broadcast(
+    state: &DaemonState,
+    key: &Arc<KeyEntry>,
+    chain: &Arc<dyn ChainBackend>,
+    route: &Route,
+    raw: Vec<u8>,
+    txid: TxId,
+    session_id: Option<&str>,
+) -> Result<(), GygesError> {
+    let key_id = key.key_id();
+    if let Err(e) = route.send(chain, raw, key_id).await {
+        if let Some(sid) = session_id {
+            let text = if e.node_error.is_empty() {
+                &e.detail
+            } else {
+                &e.node_error
+            };
+            let _ = set_session_state(key, sid, SessionState::Signed, None, Some(text)).await;
+        }
+        return Err(e);
+    }
+    if let Some(sid) = session_id {
+        set_session_state(
+            key,
+            sid,
+            SessionState::Broadcast,
+            Some(*txid.as_ref()),
+            None,
+        )
+        .await
+        .map_err(|e| tx_error(e, key_id))?;
+    }
+    tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());
+    tracing::info!(
+        key_id,
+        session_id,
+        via = route.name(),
+        "transaction broadcast"
+    );
+    state.sync.wake();
+    Ok(())
+}
 
 /// The node backend for a broadcast, refused when air-gapped or offline.
 pub(crate) fn connected_chain(
@@ -127,26 +207,4 @@ pub(crate) fn broadcast_route(
         }
     }
     Ok(Route::Endpoint(endpoint))
-}
-
-/// Broadcast a signed session's transaction over `route`. A failure is
-/// recorded on the row (still `Signed`, with the node's text when it gave
-/// one) and returned.
-pub(crate) async fn broadcast_signed(
-    key: &Arc<KeyEntry>,
-    chain: &Arc<dyn ChainBackend>,
-    route: &Route,
-    session_id: &str,
-    raw: Vec<u8>,
-) -> Result<(), GygesError> {
-    let Err(e) = route.send(chain, raw, key.key_id()).await else {
-        return Ok(());
-    };
-    let text = if e.node_error.is_empty() {
-        &e.detail
-    } else {
-        &e.node_error
-    };
-    let _ = set_session_state(key, session_id, SessionState::Signed, None, Some(text)).await;
-    Err(e)
 }

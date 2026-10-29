@@ -476,9 +476,7 @@ pub(crate) async fn complete_keystone_sign(
         .await);
     }
     let expected = Expected::from_json(&row.expected).map_err(err)?;
-    let owner_params = state.registry.params();
-    let owner = wallet_rpc(&key, move |w| core_tx::Owner::of_wallet(&owner_params, w)).await?;
-    let verified = match core_tx::verify(signed, &expected, &owner) {
+    let verified = match broadcast::verified(&state, &key, signed, expected).await? {
         Ok(p) => p,
         Err(e) => {
             return Err(refuse(format!(
@@ -521,28 +519,11 @@ pub(crate) async fn complete_keystone_sign(
         }
     };
     tracing::info!(target: AUDIT_TARGET, key_id, event = "sign", via = "keystone");
-    let raw_txid = *txid.as_ref();
-    if let Err(e) = broadcast::broadcast_signed(&key, &chain, &route, &session_id, raw).await {
+    let sent = broadcast::broadcast(&state, &key, &chain, &route, raw, txid, Some(&session_id));
+    if let Err(e) = sent.await {
         state.keystone.notify(&session_id, Err(e.clone()));
         return Err(e.into_status());
     }
-    set_session_state(
-        &key,
-        &session_id,
-        SessionState::Broadcast,
-        Some(raw_txid),
-        None,
-    )
-    .await
-    .map_err(err)?;
-    tracing::info!(target: AUDIT_TARGET, key_id, event = "broadcast", via = route.name());
-    tracing::info!(
-        key_id,
-        session_id,
-        via = route.name(),
-        "Keystone transaction broadcast"
-    );
-    state.sync.wake();
     state.keystone.notify(&session_id, Ok(txid));
     let mut done = row;
     done.state = SessionState::Broadcast;
