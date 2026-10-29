@@ -13,10 +13,9 @@ use std::time::Duration;
 use age::secrecy::SecretString;
 use gyges_chain::ChainError;
 use gyges_core::registry::{NewKeystoneKey, NewLocalSeedKey};
-use gyges_core::vault::VaultError;
 use gyges_core::vault::manager::{Auth, Scope, UnlockState};
 use gyges_core::{
-    BirthdayError, KeyEntry, Network, RegistryError, ResolvedBirthday, SigningMode, birthday, vault,
+    BirthdayError, KeyEntry, Network, ResolvedBirthday, SigningMode, birthday, vault,
 };
 use gyges_proto::v1::{
     self, ErrorReason, ExportSeedRequest, ExportSeedResponse, ExportUfvkRequest,
@@ -30,6 +29,7 @@ use zeroize::Zeroizing;
 use zip32::fingerprint::SeedFingerprint;
 
 use crate::conn::ConnInfo;
+use crate::errors::{birthday_error, registry_error, vault_error};
 use crate::service::{DaemonState, invalid};
 
 /// Security-relevant events, key id and time only (OVERVIEW.md Q-O1). The
@@ -96,113 +96,6 @@ pub(crate) fn summaries(state: &DaemonState) -> Vec<KeySummary> {
         .iter()
         .map(|e| summary(e, &default, &unlocks))
         .collect()
-}
-
-/// `VaultError` → typed error.
-pub(crate) fn vault_error(e: VaultError, key_id: &str) -> GygesError {
-    let err = match e {
-        VaultError::WrongPassphrase => {
-            GygesError::new(ErrorReason::InvalidPassphrase, "wrong passphrase")
-        }
-        VaultError::RateLimited(wait) => GygesError::new(
-            ErrorReason::RateLimited,
-            format!(
-                "too many failed unlock attempts; retry in {}s",
-                wait.as_secs().max(1)
-            ),
-        ),
-        VaultError::Locked => GygesError::new(
-            ErrorReason::VaultLocked,
-            "the key is locked; run `gyges key unlock` or pass --passphrase-fd",
-        ),
-        VaultError::NoSeed => GygesError::new(
-            ErrorReason::InvalidArgument,
-            "this profile has no seed on disk and cannot be unlocked",
-        ),
-        other => {
-            tracing::error!(error = %other, key_id, "vault failure");
-            GygesError::new(ErrorReason::Internal, other.to_string())
-        }
-    };
-    err.with_key(key_id)
-}
-
-/// `RegistryError` → the typed error the CLI dispatches on.
-pub(crate) fn registry_error(e: RegistryError) -> GygesError {
-    use RegistryError as R;
-    match e {
-        R::InvalidKeyId(id) => GygesError::new(
-            ErrorReason::InvalidArgument,
-            "key id must match ^[a-z0-9][a-z0-9_-]{0,31}$",
-        )
-        .with_key(id),
-        R::Exists(id) => {
-            GygesError::new(ErrorReason::KeyExists, "a key with this id already exists")
-                .with_key(id)
-        }
-        R::NotFound(id) => GygesError::new(ErrorReason::KeyNotFound, "no such key").with_key(id),
-        R::NoDefault => GygesError::new(ErrorReason::KeyNotFound, "no default key; pass --key"),
-        R::Vault {
-            key_id,
-            source: vault::VaultError::WrongPassphrase,
-        } => GygesError::new(ErrorReason::InvalidPassphrase, "wrong passphrase").with_key(key_id),
-        R::Vault {
-            key_id,
-            source: vault::VaultError::Mnemonic(m),
-        } => GygesError::new(
-            ErrorReason::InvalidArgument,
-            format!("invalid mnemonic: {m}"),
-        )
-        .with_key(key_id),
-        R::Invalid(detail) => GygesError::new(ErrorReason::InvalidArgument, detail),
-        other => {
-            // Paths and SQLite messages, never key material.
-            tracing::error!(error = %other, "key registry failure");
-            GygesError::new(ErrorReason::Internal, other.to_string())
-        }
-    }
-}
-
-/// `BirthdayError` → typed error. `BelowRetention` maps to
-/// `FALLBACK_UNAVAILABLE` (no fallback endpoint); callers that can backfill
-/// intercept it first and decide on `allow_backfill` (`below_retention`).
-pub(crate) fn birthday_error(e: BirthdayError) -> GygesError {
-    match e {
-        BirthdayError::NodeRequired(what) => GygesError::new(
-            ErrorReason::NodeUnreachable,
-            format!("a connected node is required to {what}"),
-        ),
-        BirthdayError::AboveTip { height, tip } => GygesError::new(
-            ErrorReason::InvalidArgument,
-            format!("birthday {height} is above the node's tip {tip}"),
-        ),
-        BirthdayError::BelowRetention {
-            height,
-            retained_from,
-        } => GygesError::new(
-            ErrorReason::FallbackUnavailable,
-            format!(
-                "birthday {height} is below the node's retention window (retained from {retained_from}) \
-                 and no fallback endpoint is configured; enable [fallback_lightwalletd] to backfill \
-                 the blocks below the window, or restore with a later birthday"
-            ),
-        ),
-        BirthdayError::Fallback(e) => GygesError::new(
-            ErrorReason::FallbackUnavailable,
-            format!("the fallback endpoint cannot serve the birthday's tree state: {e}"),
-        ),
-        e @ BirthdayError::FallbackMismatch { .. } => {
-            GygesError::new(ErrorReason::FallbackUnavailable, e.to_string())
-        }
-        BirthdayError::Chain(
-            ChainError::Unreachable(detail)
-            | ChainError::Rpc(detail)
-            | ChainError::Rejected(detail),
-        ) => GygesError::new(ErrorReason::NodeUnreachable, detail),
-        BirthdayError::Chain(
-            e @ (ChainError::TreeStateUnavailable { .. } | ChainError::BlockUnavailable { .. }),
-        ) => GygesError::new(ErrorReason::FallbackUnavailable, e.to_string()),
-    }
 }
 
 /// Move the passphrase out of the request into a zeroizing wrapper.
@@ -595,7 +488,7 @@ pub(crate) async fn unlock_key(
 ) -> Result<UnlockKeyResponse, Status> {
     let passphrase = take_passphrase(&mut req.passphrase)?;
     if !req.session_id.is_empty() {
-        return crate::tx::satisfy_session(state, req.session_id, passphrase).await;
+        return crate::sessions::satisfy_session(state, req.session_id, passphrase).await;
     }
     let key = state.resolve_key(&req.key_id)?;
     let scope = match req.scope() {
@@ -706,49 +599,4 @@ pub(crate) async fn export_seed(
         mnemonic: mnemonic.to_string(),
         birthday_height: key.profile().birthday_height.unwrap_or(0),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn registry_errors_map_to_the_documented_reasons() {
-        assert_eq!(
-            registry_error(RegistryError::Exists("a".into())).reason(),
-            ErrorReason::KeyExists
-        );
-        assert_eq!(
-            registry_error(RegistryError::NotFound("a".into())).key_id,
-            "a"
-        );
-        assert_eq!(
-            registry_error(RegistryError::NoDefault).detail,
-            "no default key; pass --key"
-        );
-        assert_eq!(
-            registry_error(RegistryError::InvalidKeyId("A".into())).reason(),
-            ErrorReason::InvalidArgument
-        );
-        assert_eq!(
-            registry_error(RegistryError::Vault {
-                key_id: "a".into(),
-                source: vault::VaultError::WrongPassphrase
-            })
-            .reason(),
-            ErrorReason::InvalidPassphrase
-        );
-        assert_eq!(
-            birthday_error(BirthdayError::NodeRequired("x")).reason(),
-            ErrorReason::NodeUnreachable
-        );
-        assert_eq!(
-            birthday_error(BirthdayError::BelowRetention {
-                height: 1,
-                retained_from: 2
-            })
-            .reason(),
-            ErrorReason::FallbackUnavailable
-        );
-    }
 }

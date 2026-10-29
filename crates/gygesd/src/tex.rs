@@ -42,9 +42,10 @@ use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::conn::ConnInfo;
+use crate::errors::{broadcast_error, tx_error};
 use crate::keys::AUDIT_TARGET;
 use crate::service::{DaemonState, invalid, unix_now};
-use crate::tx::{self, tx_error, wallet_rpc};
+use crate::tx::{self, wallet_rpc};
 use crate::with_wallet;
 
 /// The queue's wake-up and the rows a `tx resume` is rebuilding.
@@ -573,7 +574,7 @@ async fn rebuild(
     let s2 = chain
         .transaction_status(row.step2_txid)
         .await
-        .map_err(|e| tx::broadcast_error(e, &key_id).into_status())?;
+        .map_err(|e| broadcast_error(e, &key_id).into_status())?;
     if s2 != TxStatus::Unknown || u32::from(tip) < row.expiry_height {
         return Err(GygesError::new(
             ErrorReason::InvalidArgument,

@@ -28,7 +28,9 @@
 // everything they do not need stays crate-private so that rustc's dead-code
 // lint sees the whole daemon.
 mod backfill;
+mod broadcast;
 mod conn;
+mod errors;
 mod keys;
 mod keystone;
 mod lifecycle;
@@ -37,6 +39,7 @@ mod node;
 mod policy;
 mod roles;
 mod service;
+mod sessions;
 mod sync;
 mod tex;
 mod tx;

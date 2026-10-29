@@ -36,9 +36,12 @@ use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 use zcash_protocol::TxId;
 
+use crate::broadcast::{self, broadcast_route, connected_chain};
+use crate::errors::tx_error;
 use crate::keys::AUDIT_TARGET;
 use crate::service::DaemonState;
-use crate::tx::{self, Prepared, tx_error, wallet_rpc};
+use crate::sessions::{leave_awaiting, set_session_state};
+use crate::tx::{self, Prepared, wallet_rpc};
 use crate::with_wallet;
 
 /// What a waiting stream is told when its session ends.
@@ -241,7 +244,7 @@ pub(crate) async fn abort(
         return Ok(None);
     };
     let kid = key.key_id().to_string();
-    let left = tx::leave_awaiting(
+    let left = leave_awaiting(
         &key,
         session_id,
         SessionState::Aborted,
@@ -341,7 +344,7 @@ pub(crate) async fn await_device(
             Ok(Err(_)) => Err(tx::cancelled()),
             Err(_elapsed) => {
                 state.keystone.forget(&session_id);
-                let _ = tx::leave_awaiting(
+                let _ = leave_awaiting(
                     key,
                     &session_id,
                     SessionState::Expired,
@@ -412,7 +415,7 @@ pub(crate) async fn complete_keystone_sign(
 
     // Past the transaction's expiry nothing can be mined: refuse before
     // anything is recorded.
-    let chain = tx::connected_chain(&state, &key_id)?;
+    let chain = connected_chain(&state, &key_id)?;
     let tip = chain.status().bounds.map_or(0, |b| u32::from(b.tip_height));
     if ks.expiry_height > 0 && tip >= ks.expiry_height {
         let detail = format!(
@@ -420,14 +423,14 @@ pub(crate) async fn complete_keystone_sign(
              mined, start over",
             ks.expiry_height
         );
-        let _ = tx::leave_awaiting(&key, &session_id, SessionState::Expired, Some(&detail)).await;
+        let _ = leave_awaiting(&key, &session_id, SessionState::Expired, Some(&detail)).await;
         state.keystone.notify(
             &session_id,
             Err(typed(ErrorReason::NotSynced, detail.clone())),
         );
         return Err(typed(ErrorReason::NotSynced, detail).into_status());
     }
-    let route = tx::broadcast_route(&state, ks.via_tor, &key_id)?;
+    let route = broadcast_route(&state, ks.via_tor, &key_id)?;
 
     // The device's answer, then every signature, then the Verifier. A
     // refusal here leaves the session awaiting another scan.
@@ -486,7 +489,7 @@ pub(crate) async fn complete_keystone_sign(
     };
 
     // Claim the row for good, then extract, record and broadcast.
-    let claimed = tx::leave_awaiting(&key, &session_id, SessionState::Signed, None)
+    let claimed = leave_awaiting(&key, &session_id, SessionState::Signed, None)
         .await
         .map_err(err)?;
     if !claimed {
@@ -505,7 +508,7 @@ pub(crate) async fn complete_keystone_sign(
             // Claimed but not recorded: say so on the row and to the stream,
             // which would otherwise wait for an answer that already came.
             let error = tx_error(e, &key_id).with_session(&session_id);
-            let _ = tx::set_session_state(
+            let _ = set_session_state(
                 &key,
                 &session_id,
                 SessionState::Signed,
@@ -519,11 +522,11 @@ pub(crate) async fn complete_keystone_sign(
     };
     tracing::info!(target: AUDIT_TARGET, key_id, event = "sign", via = "keystone");
     let raw_txid = *txid.as_ref();
-    if let Err(e) = tx::broadcast_signed(&key, &chain, &route, &session_id, raw).await {
+    if let Err(e) = broadcast::broadcast_signed(&key, &chain, &route, &session_id, raw).await {
         state.keystone.notify(&session_id, Err(e.clone()));
         return Err(e.into_status());
     }
-    tx::set_session_state(
+    set_session_state(
         &key,
         &session_id,
         SessionState::Broadcast,

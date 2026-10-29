@@ -36,10 +36,13 @@ use tokio::sync::mpsc;
 use tonic::Status;
 use zcash_protocol::consensus::BlockHeight;
 
+use crate::broadcast::{self, broadcast_route, connected_chain};
 use crate::conn::ConnInfo;
+use crate::errors::tx_error;
 use crate::keys::{AUDIT_TARGET, proto_pool};
 use crate::service::{DaemonState, invalid, proto_network, unix_now};
-use crate::tx::{self, Purpose, blocking, obtain_key, proto_proposal, tx_error, wallet_rpc};
+use crate::sessions::set_session_state;
+use crate::tx::{self, Purpose, blocking, obtain_key, proto_proposal, wallet_rpc};
 use crate::with_wallet;
 
 /// The server-streaming response type for `SignPczt`.
@@ -378,8 +381,8 @@ pub(crate) async fn broadcast_pczt(
     let key_id = key.key_id().to_string();
     let typed = |reason, detail: String| GygesError::new(reason, detail).with_key(&key_id);
     let err = |e: TxError| tx_error(e, &key_id).into_status();
-    let chain = tx::connected_chain(&state, &key_id)?;
-    let route = tx::broadcast_route(&state, req.via_tor, &key_id)?;
+    let chain = connected_chain(&state, &key_id)?;
+    let route = broadcast_route(&state, req.via_tor, &key_id)?;
 
     // What the file is missing is named before the Verifier judges it.
     let insp = pczt_io::inspect(&state.registry.params(), &pczt).map_err(err)?;
@@ -433,8 +436,8 @@ pub(crate) async fn broadcast_pczt(
     let provers = state.provers.clone();
     let (txid, raw) =
         wallet_rpc(&key, move |w| core_tx::extract_and_store(w, pczt, &provers)).await?;
-    tx::broadcast_signed(&key, &chain, &route, &session_id, raw).await?;
-    tx::set_session_state(
+    broadcast::broadcast_signed(&key, &chain, &route, &session_id, raw).await?;
+    set_session_state(
         &key,
         &session_id,
         SessionState::Broadcast,
