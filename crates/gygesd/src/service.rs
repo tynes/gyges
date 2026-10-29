@@ -45,10 +45,10 @@ use crate::wallet;
 /// Everything the RPC handlers share.
 #[derive(Debug)]
 pub struct DaemonState {
-    pub config: Config,
-    pub network: Network,
+    pub(crate) config: Config,
+    pub(crate) network: Network,
     pub registry: KeyRegistry,
-    /// Shared with every [`crate::Conn`], which drops its unlocks on close.
+    /// Shared with every connection (`Conn`), which drops its unlocks on close.
     pub vault: Arc<VaultManager>,
     /// `None` only when air-gapped.
     pub chain: Option<Arc<dyn ChainBackend>>,
@@ -58,7 +58,7 @@ pub struct DaemonState {
     pub fallback: Option<Arc<ArtiTorLwdBackend<ConsensusParams>>>,
     /// Whether the fallback endpoint has passed (or failed) the handoff
     /// validation (SYNC.md §5.2); loaded from `fallback_trust.json` at start.
-    pub fallback_trust: crate::backfill::TrustHub,
+    pub(crate) fallback_trust: crate::backfill::TrustHub,
     /// The shared compact block cache (`cache/blocks.sqlite`); `None` only
     /// when air-gapped.
     pub block_cache: Option<Arc<BlockDb>>,
@@ -66,12 +66,12 @@ pub struct DaemonState {
     pub sync: SyncHub,
     /// Passphrase signing sessions awaiting `UnlockKey { session_id }`
     /// (API.md §6).
-    pub sessions: SessionHub,
+    pub(crate) sessions: SessionHub,
     /// Keystone sessions: the streams waiting on them and the ones being
     /// completed (the sessions themselves are in each key's wallet).
-    pub keystone: Arc<crate::keystone::KeystoneHub>,
+    pub(crate) keystone: Arc<crate::keystone::KeystoneHub>,
     /// The ZIP 320 queue's wake-up (ARCHITECTURE.md §3.3).
-    pub tex: TexHub,
+    pub(crate) tex: TexHub,
     /// Proving and verifying keys, built on first use.
     pub provers: Arc<Provers>,
     /// The in-memory tail of the main and audit logs (`StreamLogs`).
@@ -79,14 +79,14 @@ pub struct DaemonState {
     /// Unix seconds the daemon started.
     pub started_at: i64,
     /// Signalled by `Shutdown` (and by the signal handlers in `main`).
-    pub shutdown: Notify,
+    pub(crate) shutdown: Notify,
 }
 
 impl DaemonState {
     /// One argument per optional interface; a builder would only hide that
     /// the two backends and the cache are decided together at start.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         config: Config,
         network: Network,
         registry: KeyRegistry,
@@ -117,7 +117,7 @@ impl DaemonState {
     }
 
     /// Build the `GetInfo` response from the current state.
-    pub fn info(&self) -> GetInfoResponse {
+    pub(crate) fn info(&self) -> GetInfoResponse {
         let fb = &self.config.fallback_lightwalletd;
         GetInfoResponse {
             network: proto_network(self.network) as i32,
@@ -185,7 +185,7 @@ impl DaemonState {
 
     /// `GetInfo.node` from the backend's last poll (API.md `NodeStatus`).
     /// Air-gapped: not connected, with the reason.
-    pub fn node_status(&self) -> NodeStatus {
+    pub(crate) fn node_status(&self) -> NodeStatus {
         let Some(chain) = &self.chain else {
             return NodeStatus {
                 connected: false,
@@ -223,7 +223,7 @@ pub(crate) fn invalid(detail: impl Into<String>) -> Status {
 }
 
 /// `gyges_core::Network` → wire enum.
-pub fn proto_network(network: Network) -> v1::Network {
+pub(crate) fn proto_network(network: Network) -> v1::Network {
     match network {
         Network::Mainnet => v1::Network::Mainnet,
         Network::Testnet => v1::Network::Testnet,
@@ -235,12 +235,12 @@ pub(crate) use gyges_core::profile::unix_now;
 
 /// The tonic service; cheap to clone.
 #[derive(Clone, Debug)]
-pub struct GygesService {
+pub(crate) struct GygesService {
     state: Arc<DaemonState>,
 }
 
 impl GygesService {
-    pub fn new(state: Arc<DaemonState>) -> Self {
+    pub(crate) fn new(state: Arc<DaemonState>) -> Self {
         Self { state }
     }
 }

@@ -28,9 +28,9 @@ use crate::tex;
 use crate::tx::wallet_rpc;
 
 /// `ListTransactions.limit = 0` (API.md).
-pub const DEFAULT_TX_LIMIT: usize = 50;
+pub(crate) const DEFAULT_TX_LIMIT: usize = 50;
 /// The most one page returns.
-pub const MAX_TX_LIMIT: usize = 1000;
+pub(crate) const MAX_TX_LIMIT: usize = 1000;
 
 /// Resolve `key_id` to a profile with a wallet.
 fn wallet_key(state: &DaemonState, key_id: &str) -> Result<Arc<KeyEntry>, Status> {
@@ -82,7 +82,7 @@ fn proto_address(a: addresses::AddressInfo) -> AddressInfo {
 
 /// `GetCurrentAddress`: the address most recently handed out, or the
 /// default shielded address on a fresh key (stored, so it stays current).
-pub async fn get_current_address(
+pub(crate) async fn get_current_address(
     state: Arc<DaemonState>,
     req: GetCurrentAddressRequest,
 ) -> Result<AddressInfo, Status> {
@@ -95,7 +95,7 @@ pub async fn get_current_address(
 /// The receivers `address new` uses without `--receivers` (CLI_SPEC.md
 /// §2.4): shielded only, except that a Keystone account has no Sapling key
 /// for the wallet to use and pairs Orchard with transparent.
-pub fn default_receivers(mode: SigningMode) -> Vec<Pool> {
+pub(crate) fn default_receivers(mode: SigningMode) -> Vec<Pool> {
     match mode {
         SigningMode::KeystoneQr => vec![Pool::Orchard, Pool::Transparent],
         _ => addresses::DEFAULT_RECEIVERS.to_vec(),
@@ -105,7 +105,7 @@ pub fn default_receivers(mode: SigningMode) -> Vec<Pool> {
 /// `NewAddress`: a fresh diversified address with exactly the requested
 /// receivers (Ironwood names the Orchard receiver), each of which the
 /// profile must be able to receive to.
-pub async fn new_address(
+pub(crate) async fn new_address(
     state: Arc<DaemonState>,
     req: NewAddressRequest,
 ) -> Result<AddressInfo, Status> {
@@ -156,7 +156,10 @@ fn proto_kind(k: AddressKind) -> v1::AddressKind {
 /// another network than the daemon's, is `valid = false` with `error` set
 /// (the RPC itself succeeds); `network` is reported whenever the encoding
 /// names one.
-pub fn inspect_address(state: &DaemonState, req: InspectAddressRequest) -> InspectAddressResponse {
+pub(crate) fn inspect_address(
+    state: &DaemonState,
+    req: InspectAddressRequest,
+) -> InspectAddressResponse {
     let daemon_net = state.network.consensus_params().network_type();
     match addresses::inspect(&req.address) {
         Err(error) => InspectAddressResponse {
@@ -213,7 +216,7 @@ fn proto_note(n: &NoteRow) -> v1::Note {
 
 /// `ListNotes`: received notes and UTXOs, by pool (UNSPECIFIED = all) and
 /// spent state (UNSPECIFIED = unspent), oldest first.
-pub async fn list_notes(
+pub(crate) async fn list_notes(
     state: Arc<DaemonState>,
     req: ListNotesRequest,
 ) -> Result<ListNotesResponse, Status> {
@@ -252,7 +255,7 @@ fn tex_row_of<'a>(rows: &'a [TexRow], txid: &[u8; 32]) -> Option<&'a TexRow> {
 /// The wallet's view of a transaction's state. A ZIP 320 transfer is
 /// `TEX_PENDING` until its row finishes, a mined step included: the
 /// transfer is one payment.
-pub fn status_of(row: &TxRow, tex: Option<&TexRow>) -> TransactionStatus {
+pub(crate) fn status_of(row: &TxRow, tex: Option<&TexRow>) -> TransactionStatus {
     use gyges_core::TexState as T;
     match tex.map(|t| t.state) {
         Some(T::Failed | T::Aborted) if row.mined_height.is_none() => TransactionStatus::Failed,
@@ -300,7 +303,7 @@ fn parse_txid(s: &str, field: &str) -> Result<[u8; 32], Status> {
 
 /// `ListTransactions`: newest first, `limit` (0 = 50) per page, paged by
 /// `before_txid`; each ZIP 320 step carries its queue row.
-pub async fn list_transactions(
+pub(crate) async fn list_transactions(
     state: Arc<DaemonState>,
     req: ListTransactionsRequest,
 ) -> Result<ListTransactionsResponse, Status> {
@@ -334,7 +337,7 @@ pub async fn list_transactions(
 /// holds: expired, failed, or (when the node has dropped a mined
 /// transaction from its index) the height the wallet scanned it at, with
 /// `source` left unspecified.
-pub async fn get_transaction_status(
+pub(crate) async fn get_transaction_status(
     state: Arc<DaemonState>,
     req: GetTransactionStatusRequest,
 ) -> Result<GetTransactionStatusResponse, Status> {

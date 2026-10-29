@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 /// Holds the advisory lock on the pid file for the life of the daemon and
 /// removes the file on drop.
 #[derive(Debug)]
-pub struct PidLock {
+pub(crate) struct PidLock {
     file: File,
     path: PathBuf,
 }
 
 /// Why the lock could not be taken.
 #[derive(Debug, thiserror::Error)]
-pub enum PidLockError {
+pub(crate) enum PidLockError {
     #[error("gygesd is already running (pid {pid}); stop it with `gyges daemon stop`")]
     AlreadyRunning { pid: String },
     #[error("cannot lock {path}: {source}", path = .path.display())]
@@ -30,7 +30,7 @@ pub enum PidLockError {
 impl PidLock {
     /// Take the lock, writing our pid. Fails with [`PidLockError::AlreadyRunning`]
     /// when another process holds it.
-    pub fn acquire(path: &Path) -> Result<Self, PidLockError> {
+    pub(crate) fn acquire(path: &Path) -> Result<Self, PidLockError> {
         let io = |source| PidLockError::Io {
             path: path.to_path_buf(),
             source,

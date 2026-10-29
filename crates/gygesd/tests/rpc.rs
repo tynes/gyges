@@ -96,10 +96,8 @@ fn test_hub() -> Arc<LogHub> {
             )
             .with(
                 hub.layer().with_filter(
-                    tracing_subscriber::filter::filter_fn(|m| {
-                        m.target() == gygesd::keys::AUDIT_TARGET
-                    })
-                    .or(tracing_subscriber::filter::LevelFilter::INFO),
+                    tracing_subscriber::filter::filter_fn(|m| m.target() == gygesd::AUDIT_TARGET)
+                        .or(tracing_subscriber::filter::LevelFilter::INFO),
                 ),
             )
             .try_init();
@@ -1543,7 +1541,7 @@ async fn keystone_shield_and_send_through_both_protocols() {
     assert_eq!(req.key_id, "ks");
     let summary = req.summary.clone().unwrap();
     assert!(
-        summary.expiry_height >= summary.anchor_height + gygesd::roles::PCZT_EXPIRY_BLOCKS,
+        summary.expiry_height >= summary.anchor_height + gygesd::PCZT_EXPIRY_BLOCKS,
         "a Keystone send gets a day to be signed: {summary:?}"
     );
     assert_device_view(&req);
@@ -2076,7 +2074,7 @@ async fn stream_logs_replays_the_audit_trail_and_follows() {
         .into_inner();
     let mut mine = Vec::new();
     while let Some(e) = s.message().await.unwrap() {
-        assert_eq!(e.target, gygesd::keys::AUDIT_TARGET);
+        assert_eq!(e.target, gygesd::AUDIT_TARGET);
         assert_eq!(e.level(), gyges_proto::v1::LogLevel::Info);
         if e.fields.get("key_id") == Some(&key_id) {
             mine.push(e);
@@ -3999,9 +3997,8 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
     // The target height is a few blocks above the anchor; the file's
     // expiry is the long one, not `target + 40`.
     assert!(
-        proposal.expiry_height >= proposal.anchor_height + gygesd::roles::PCZT_EXPIRY_BLOCKS
-            && proposal.expiry_height
-                < proposal.anchor_height + gygesd::roles::PCZT_EXPIRY_BLOCKS + 20,
+        proposal.expiry_height >= proposal.anchor_height + gygesd::PCZT_EXPIRY_BLOCKS
+            && proposal.expiry_height < proposal.anchor_height + gygesd::PCZT_EXPIRY_BLOCKS + 20,
         "{proposal:?}"
     );
     let unsigned = created.pczts[0].clone();

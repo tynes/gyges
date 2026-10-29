@@ -18,15 +18,15 @@ use tonic::transport::server::Connected;
 
 /// What every request can see about its connection.
 #[derive(Clone, Copy, Debug)]
-pub struct ConnInfo {
-    pub id: ConnId,
+pub(crate) struct ConnInfo {
+    pub(crate) id: ConnId,
     /// `None` when the platform did not report peer credentials.
-    pub uid: Option<u32>,
+    pub(crate) uid: Option<u32>,
 }
 
 /// A `UnixStream` that knows its id and tells the vault when it is gone.
 #[derive(Debug)]
-pub struct Conn {
+pub(crate) struct Conn {
     stream: UnixStream,
     info: ConnInfo,
     vault: Arc<VaultManager>,
@@ -35,7 +35,7 @@ pub struct Conn {
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 impl Conn {
-    pub fn new(stream: UnixStream, uid: Option<u32>, vault: Arc<VaultManager>) -> Self {
+    pub(crate) fn new(stream: UnixStream, uid: Option<u32>, vault: Arc<VaultManager>) -> Self {
         Self {
             stream,
             info: ConnInfo {
@@ -46,7 +46,7 @@ impl Conn {
         }
     }
 
-    pub fn info(&self) -> ConnInfo {
+    pub(crate) fn info(&self) -> ConnInfo {
         self.info
     }
 }
@@ -106,6 +106,6 @@ impl AsyncWrite for Conn {
 }
 
 /// The connection a request arrived on, from its extensions.
-pub fn of_request<T>(request: &tonic::Request<T>) -> Option<ConnInfo> {
+pub(crate) fn of_request<T>(request: &tonic::Request<T>) -> Option<ConnInfo> {
     request.extensions().get::<ConnInfo>().copied()
 }

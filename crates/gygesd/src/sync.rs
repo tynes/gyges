@@ -77,25 +77,25 @@ struct MempoolRequest {
 const MEMPOOL_MAX_NEW: usize = 500;
 
 impl SyncHub {
-    pub fn get(&self, key_id: &str) -> Option<KeyProgress> {
+    pub(crate) fn get(&self, key_id: &str) -> Option<KeyProgress> {
         read(&self.progress).get(key_id).cloned()
     }
 
     /// A key's progress, `Initializing` before the scheduler reached it.
-    pub fn progress(&self, key_id: &str) -> KeyProgress {
+    pub(crate) fn progress(&self, key_id: &str) -> KeyProgress {
         self.get(key_id)
             .unwrap_or_else(|| KeyProgress::initializing(key_id))
     }
 
     /// Replace a key's progress and notify waiters.
-    pub fn publish(&self, mut progress: KeyProgress) {
+    pub(crate) fn publish(&self, mut progress: KeyProgress) {
         progress.updated_at = SystemTime::now();
         write(&self.progress).insert(progress.key_id.clone(), progress);
         self.generation.send_modify(|g| *g += 1);
     }
 
     /// Edit a key's progress in place (creating it as `Initializing`).
-    pub fn update(&self, key_id: &str, f: impl FnOnce(&mut KeyProgress)) {
+    pub(crate) fn update(&self, key_id: &str, f: impl FnOnce(&mut KeyProgress)) {
         let mut p = self.progress(key_id);
         f(&mut p);
         self.publish(p);
@@ -103,7 +103,7 @@ impl SyncHub {
 
     /// Mark `key_id` stalled for `reason`: it scans nothing until the cause
     /// is gone.
-    pub fn stall(&self, key_id: &str, reason: StallReason, detail: String) {
+    pub(crate) fn stall(&self, key_id: &str, reason: StallReason, detail: String) {
         self.update(key_id, |p| {
             p.state = SyncState::Stalled(reason);
             p.detail = detail;
@@ -112,23 +112,23 @@ impl SyncHub {
     }
 
     /// A receiver that wakes whenever any progress changes.
-    pub fn subscribe(&self) -> watch::Receiver<u64> {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
         self.generation.subscribe()
     }
 
     /// Run a tick now rather than at the next poll interval.
-    pub fn wake(&self) {
+    pub(crate) fn wake(&self) {
         self.wake.notify_one();
     }
 
     /// `RunSync.from_height`: rescan from `from` (truncating to `from - 1`)
     /// at the next tick.
-    pub fn request_rewind(&self, key_id: &str, from: BlockHeight) {
+    pub(crate) fn request_rewind(&self, key_id: &str, from: BlockHeight) {
         lock(&self.rewinds).insert(key_id.to_string(), from);
         self.wake();
     }
 
-    pub fn rewind_pending(&self, key_id: &str) -> bool {
+    pub(crate) fn rewind_pending(&self, key_id: &str) -> bool {
         lock(&self.rewinds).contains_key(key_id)
     }
 
@@ -152,11 +152,11 @@ impl SyncHub {
     }
 
     /// Ask the scheduler to stop at the next batch boundary.
-    pub fn request_stop(&self) {
+    pub(crate) fn request_stop(&self) {
         self.stop.send_replace(true);
     }
 
-    pub fn stopping(&self) -> bool {
+    pub(crate) fn stopping(&self) -> bool {
         *self.stop.borrow()
     }
 
@@ -207,7 +207,7 @@ impl Rate {
 }
 
 /// The scheduler task's state.
-pub struct Scheduler {
+pub(crate) struct Scheduler {
     pub(crate) state: Arc<DaemonState>,
     pub(crate) chain: Arc<dyn ChainBackend>,
     pub(crate) cache: Arc<BlockDb>,
@@ -237,7 +237,7 @@ impl std::fmt::Debug for Scheduler {
 
 /// Start the scheduler. The first node poll has already happened in
 /// `Daemon::serve`; the first tick follows at once.
-pub fn spawn(
+pub(crate) fn spawn(
     state: Arc<DaemonState>,
     chain: Arc<dyn ChainBackend>,
     cache: Arc<BlockDb>,
@@ -1015,7 +1015,7 @@ pub(crate) async fn mined_height(key: &Arc<KeyEntry>, txid: [u8; 32]) -> Option<
 // ---------------------------------------------------------------------------
 
 /// `gyges_core` state → wire enums.
-pub fn proto_state(state: &SyncState) -> (v1::SyncState, v1::StallReason) {
+pub(crate) fn proto_state(state: &SyncState) -> (v1::SyncState, v1::StallReason) {
     match state {
         SyncState::Initializing | SyncState::Synced { .. } => {
             (v1::SyncState::Idle, v1::StallReason::Unspecified)
@@ -1042,7 +1042,7 @@ pub fn proto_state(state: &SyncState) -> (v1::SyncState, v1::StallReason) {
 }
 
 /// One `KeySyncStatus` row.
-pub fn to_proto(p: &KeyProgress) -> KeySyncStatus {
+pub(crate) fn to_proto(p: &KeyProgress) -> KeySyncStatus {
     let (state, stall_reason) = proto_state(&p.state);
     KeySyncStatus {
         key_id: p.key_id.clone(),
@@ -1072,7 +1072,7 @@ fn resolve_synced_key(state: &DaemonState, key_id: &str) -> Result<Arc<KeyEntry>
 }
 
 /// `GetSyncStatus`: every wallet-bearing key, or one.
-pub fn get_sync_status(
+pub(crate) fn get_sync_status(
     state: &DaemonState,
     req: GetSyncStatusRequest,
 ) -> Result<GetSyncStatusResponse, Status> {
@@ -1094,7 +1094,7 @@ pub fn get_sync_status(
 /// `ScanMempool`: one full mempool pass now (CLI_SPEC.md `sync mempool`),
 /// whether or not `mempool.scan` runs them continuously. An empty `key_id`
 /// counts the notes of every key; every key is scanned either way.
-pub async fn scan_mempool(
+pub(crate) async fn scan_mempool(
     state: &DaemonState,
     req: ScanMempoolRequest,
 ) -> Result<ScanMempoolResponse, Status> {
@@ -1127,7 +1127,7 @@ pub async fn scan_mempool(
 
 /// The server-streaming response type for `WaitSync` and `RunSync` (what
 /// `tonic`'s default stubs use).
-pub type ProgressStream = tonic::codegen::BoxStream<SyncProgress>;
+pub(crate) type ProgressStream = tonic::codegen::BoxStream<SyncProgress>;
 
 /// When a progress stream ends.
 #[derive(Clone, Debug)]
@@ -1149,7 +1149,10 @@ fn stalled_status(p: &KeyProgress) -> Status {
 
 /// `WaitSync` (API.md §4.4): stream progress until the target holds; a
 /// stalled key fails the stream at once with `NOT_SYNCED`.
-pub fn wait_sync(state: Arc<DaemonState>, req: WaitSyncRequest) -> Result<ProgressStream, Status> {
+pub(crate) fn wait_sync(
+    state: Arc<DaemonState>,
+    req: WaitSyncRequest,
+) -> Result<ProgressStream, Status> {
     let key = resolve_synced_key(&state, &req.key_id)?;
     let until = if req.txid.is_empty() {
         match req.until() {
@@ -1169,7 +1172,10 @@ pub fn wait_sync(state: Arc<DaemonState>, req: WaitSyncRequest) -> Result<Progre
 
 /// `RunSync` (API.md §4.4): wake the scheduler, optionally after queueing a
 /// rewind, and stream until the key is spendable at the tip.
-pub fn run_sync(state: Arc<DaemonState>, req: RunSyncRequest) -> Result<ProgressStream, Status> {
+pub(crate) fn run_sync(
+    state: Arc<DaemonState>,
+    req: RunSyncRequest,
+) -> Result<ProgressStream, Status> {
     let key = resolve_synced_key(&state, &req.key_id)?;
     if req.to_height != 0 || req.force_tor_lwd {
         return Err(invalid("--to and --force-tor-lwd are not supported yet"));

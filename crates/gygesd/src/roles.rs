@@ -43,7 +43,7 @@ use crate::tx::{self, Purpose, blocking, obtain_key, proto_proposal, tx_error, w
 use crate::with_wallet;
 
 /// The server-streaming response type for `SignPczt`.
-pub type SignStream = tonic::codegen::BoxStream<SignPcztEvent>;
+pub(crate) type SignStream = tonic::codegen::BoxStream<SignPcztEvent>;
 
 /// How far past the proposal's target height a `pczt create` transaction
 /// may still be mined. A file travels on removable media and waits for a
@@ -127,7 +127,7 @@ fn proto_inspection(tags: &Tags, insp: &Inspection) -> InspectPcztResponse {
 /// store the approved proposal under the session id. One PCZT, because a
 /// ZIP 320 recipient is refused here (API.md §9: upstream builds PCZTs from
 /// single-step proposals only).
-pub async fn create_pczt(
+pub(crate) async fn create_pczt(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
     req: CreatePcztRequest,
@@ -236,7 +236,7 @@ pub async fn create_pczt(
 /// `InspectPczt`: the tags, the proposal the file implies, the roles that
 /// have run and the per-pool proof and signature state. Needs nothing but
 /// the bytes.
-pub fn inspect_pczt(
+pub(crate) fn inspect_pczt(
     state: &DaemonState,
     req: InspectPcztRequest,
 ) -> Result<InspectPcztResponse, Status> {
@@ -248,7 +248,7 @@ pub fn inspect_pczt(
 
 /// `ProvePczt`: the Prover role (Orchard, Ironwood and Sapling outputs;
 /// no key needed, Q-K3).
-pub async fn prove_pczt(
+pub(crate) async fn prove_pczt(
     state: Arc<DaemonState>,
     req: ProvePcztRequest,
 ) -> Result<ProvePcztResponse, Status> {
@@ -269,7 +269,7 @@ pub async fn prove_pczt(
 /// `SignPczt` (API.md §4.2): the Signer role with the key from the
 /// request's token, a daemon-scoped unlock, or a passphrase session the
 /// client satisfies with `UnlockKey { session_id }`, exactly as `tx send`.
-pub fn sign_pczt(
+pub(crate) fn sign_pczt(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
     req: SignPcztRequest,
@@ -324,7 +324,7 @@ pub fn sign_pczt(
 
 /// `CombinePczt`: the Combiner role over two or more files for the same
 /// key (API.md §7.1 refuses mixed key ids before upstream sees them).
-pub fn combine_pczt(
+pub(crate) fn combine_pczt(
     state: &DaemonState,
     req: CombinePcztRequest,
 ) -> Result<CombinePcztResponse, Status> {
@@ -366,7 +366,7 @@ pub fn combine_pczt(
 
 /// `BroadcastPczt`: Verifier against the stored proposal, Spend Finalizer,
 /// Transaction Extractor, the wallet's own record, `sendrawtransaction`.
-pub async fn broadcast_pczt(
+pub(crate) async fn broadcast_pczt(
     state: Arc<DaemonState>,
     req: BroadcastPcztRequest,
 ) -> Result<BroadcastPcztResponse, Status> {
