@@ -66,11 +66,11 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Validate proto
         run: protoc --proto_path=proto --descriptor_set_out=/dev/null proto/gyges.proto
-      - name: Validate config example in DATA_MODEL.md parses as TOML
+      - name: Validate config examples in docs/architecture.md parse as TOML
         run: |
           python3 - <<'PY'
           import re, tomllib, sys
-          text = open("DATA_MODEL.md").read()
+          text = open("docs/architecture.md").read()
           blocks = re.findall(r"```toml\n(.*?)```", text, re.S)
           assert blocks, "no toml blocks found"
           for b in blocks:
@@ -79,7 +79,7 @@ jobs:
           PY
 
   # End-to-end scenarios against the pinned real zakurad and zainod
-  # (TESTING.md §2, tests/regtest/versions.toml). The harness downloads the
+  # (docs/testing.md §2, tests/regtest/versions.toml). The harness downloads the
   # zakurad release asset and the zainod `.crate` into target/regtest-bin/,
   # verifies both sha256s and builds zainod there (`cargo install --locked`,
   # in its own target directory, deleted afterwards; only where

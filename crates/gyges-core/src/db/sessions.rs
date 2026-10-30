@@ -1,11 +1,11 @@
-//! The persisted signing sessions (DATA_MODEL.md §5.2, API.md §6.1): one
+//! The persisted signing sessions (docs/architecture.md Data model §5.2, docs/interface.md API §6.1): one
 //! row in `ext_gyges_signing_sessions` per PCZT that left the daemon as a
 //! file or for a Keystone, holding the proposal the user approved so that
 //! the Verifier can run against it days later and after restarts
-//! (ARCHITECTURE.md §3.5). Passphrase sessions of `tx send` stay in memory
+//! (docs/architecture.md Components §3.5). Passphrase sessions of `tx send` stay in memory
 //! (`gygesd::sessions::SessionHub`).
 //!
-//! A Keystone session (ROADMAP.md M5, third item) carries its device-side
+//! A Keystone session carries its device-side
 //! half ([`KeystoneRow`]) in the same row: the proven PCZT the device's
 //! answer is applied to, the request it was shown, and how to broadcast it,
 //! so it can be completed after a restart.

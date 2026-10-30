@@ -1,5 +1,5 @@
-//! Keystone signing through the binaries against the fake node (ROADMAP.md
-//! M5, third item; API.md §4.3). Without a terminal `tx shield` and
+//! Keystone signing through the binaries against the fake node
+//! (docs/interface.md API §4.3). Without a terminal `tx shield` and
 //! `tx send` print the request's frames (or write them with `--qr-out`) and
 //! exit 4 with the session left open; `pczt qr-export --session` shows the
 //! same frames again; the emulated device answers from the frames alone;

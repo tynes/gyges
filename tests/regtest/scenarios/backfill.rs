@@ -1,5 +1,5 @@
 //! The backfill scenarios against a real pruned `zakurad`, an archive node
-//! and `zaino` (TESTING.md §3 rows 5–7, ROADMAP.md M2 sixth item). Each
+//! and `zaino` (docs/testing.md §3 rows 5–7). Each
 //! skips itself without both `ZAKURAD_BIN` and `ZAINOD_BIN` off Linux.
 
 use std::time::Duration;
@@ -68,7 +68,7 @@ fn first_coinbase(fb: &Fallback) -> String {
     block["tx"][0].as_str().unwrap().to_string()
 }
 
-/// TESTING.md §3 rows 6, 5 and 7 on one chain.
+/// docs/testing.md §3 rows 6, 5 and 7 on one chain.
 ///
 /// A funded key pays a second key; the daemon stops before that payment is
 /// mined. Then the chain grows past the pruned node's window, so the

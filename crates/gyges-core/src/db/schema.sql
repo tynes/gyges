@@ -1,4 +1,4 @@
--- Gyges' tables in a key's wallet.sqlite (DATA_MODEL.md §5). Run once by
+-- Gyges' tables in a key's wallet.sqlite (docs/architecture.md Data model §5). Run once by
 -- the external migration in db/mod.rs. The CHECK lists must match the
 -- enums' as_str() spellings; db tests insert every variant to keep them in
 -- step.

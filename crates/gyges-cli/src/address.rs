@@ -1,4 +1,4 @@
-//! `gyges address …` (CLI_SPEC.md §2.4): `current` (`GetCurrentAddress`),
+//! `gyges address …` (docs/interface.md CLI §2.4): `current` (`GetCurrentAddress`),
 //! `new` (`NewAddress`) and `inspect` (`InspectAddress`). The address goes
 //! to stdout alone, so `$(gyges address current)` works; its receivers,
 //! diversifier index and label go to stderr (quiet with `-q`).
@@ -116,7 +116,7 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
                 .await?
                 .into_inner();
             if !resp.valid {
-                // Exit 6 either way (CLI_SPEC.md §2.4); the terminal also
+                // Exit 6 either way (docs/interface.md CLI §2.4); the terminal also
                 // gets whatever did parse.
                 if !ctx.json && resp.kind != AddressKind::Unspecified as i32 {
                     print!("{}", render_inspection(&resp));

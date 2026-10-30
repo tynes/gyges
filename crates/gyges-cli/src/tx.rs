@@ -1,4 +1,4 @@
-//! `gyges tx …` (CLI_SPEC.md §2.5, API.md §4.1, §4.3, §6).
+//! `gyges tx …` (docs/interface.md CLI §2.5, docs/interface.md API §4.1, §4.3, §6).
 //!
 //! Implemented: `send` (including ZIP 320 `tex1` recipients), `shield`,
 //! `sessions` (signing sessions and ZIP 320 transfers), `abort SESSION_ID`,
@@ -11,7 +11,7 @@
 //! `UnlockKey { session_id }` on the same connection, so the key is held
 //! only for the signing step. Without a terminal and without a passphrase
 //! source the session is aborted and the command exits 4 naming the fix
-//! (CLI_SPEC.md §1.2).
+//! (docs/interface.md CLI §1.2).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -217,7 +217,7 @@ fn confirm(ctx: &Ctx, proposal: &Proposal, verb: &str) -> Result<(), CliError> {
     )
 }
 
-/// Consume the stream, answering `SignatureRequired` (API.md §4.1, §4.3).
+/// Consume the stream, answering `SignatureRequired` (docs/interface.md API §4.1, §4.3).
 async fn follow(
     ctx: &Ctx,
     conn: &mut Conn,
@@ -320,7 +320,7 @@ pub(crate) async fn satisfy(
         ) {
             Ok(p) => p,
             Err(e) => {
-                // No terminal and no source (CLI_SPEC.md §1.2): nothing to
+                // No terminal and no source (docs/interface.md CLI §1.2): nothing to
                 // resume, so the session is aborted.
                 abort_session(conn, &session_id).await;
                 return Err(match e {
@@ -378,7 +378,7 @@ async fn abort_session(conn: &mut Conn, session_id: &str) {
         .await;
 }
 
-/// CLI_SPEC.md §2.5: inputs per pool, outputs, the ZIP 317 fee per step,
+/// docs/interface.md CLI §2.5: inputs per pool, outputs, the ZIP 317 fee per step,
 /// the total debit, then the anchor, expiry and confirmations line.
 pub fn render_proposal(p: &Proposal) -> String {
     let mut s = render_steps(p);
@@ -473,7 +473,7 @@ pub fn tex_state_name(s: TexState) -> &'static str {
     }
 }
 
-/// CLI_SPEC.md §2.5: the ZIP 320 rows under the sessions.
+/// docs/interface.md CLI §2.5: the ZIP 320 rows under the sessions.
 pub fn render_tex(rows: &[TexQueueEntry]) -> String {
     if rows.is_empty() {
         return String::new();
@@ -529,7 +529,7 @@ fn parse_txid_arg(id: &str) -> Result<(), CliError> {
 /// passphrase was accepted.
 const RESUME_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// `tx resume TXID` (API.md §6.5): unary; when the daemon needs a passphrase
+/// `tx resume TXID` (docs/interface.md API §6.5): unary; when the daemon needs a passphrase
 /// it answers `SIGNATURE_REQUIRED` with a session, the CLI satisfies it and
 /// then polls until the row has its new step 2 (or the session failed).
 async fn resume(ctx: &Ctx, txid: String) -> Result<(), CliError> {
@@ -660,7 +660,7 @@ async fn abort(ctx: &Ctx, id: String) -> Result<(), CliError> {
     }
     let mut conn = ctx.connect().await?;
     if id.len() == 64 {
-        // A ZIP 320 transfer still `built` (API.md §4.3).
+        // A ZIP 320 transfer still `built` (docs/interface.md API §4.3).
         let entry = conn
             .client
             .abort_tex_transfer(AbortTexTransferRequest {

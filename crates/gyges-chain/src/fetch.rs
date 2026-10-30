@@ -1,4 +1,4 @@
-//! Filling the shared cache from a [`ChainBackend`] (SYNC.md §2.2).
+//! Filling the shared cache from a [`ChainBackend`] (docs/architecture.md Sync §2.2).
 //!
 //! Both routes go through the same loop: the range is fetched in
 //! `cache.fetch_batch`-sized chunks, each chunk is checked to link to the

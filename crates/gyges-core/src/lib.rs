@@ -1,4 +1,4 @@
-//! Daemon-side wallet logic (ARCHITECTURE.md §2, DATA_MODEL.md).
+//! Daemon-side wallet logic (docs/architecture.md Components §2, docs/architecture.md Data model).
 //!
 //! Components, each with its own module:
 //! * [`registry::KeyRegistry`] – enumerates `keys/<id>/profile.json`, owns one
@@ -6,7 +6,7 @@
 //! * [`vault::manager::VaultManager`] – `seed.age` encryption, connection- and
 //!   daemon-scoped unlocks with idle TTL, per-key back-off (Q-S1…S3, Q-S5);
 //! * [`sync`] – the per-key state machine's types and the scan, transparent
-//!   indexing and rewind steps over `gyges_chain` (SYNC.md); the scheduler
+//!   indexing and rewind steps over `gyges_chain` (docs/architecture.md Sync); the scheduler
 //!   that drives them lives in `gygesd`;
 //! * [`tx`] – proposal → PCZT roles → raw transaction (Q-K3, Q-K4, Q-K7);
 //!   the daemon streams the steps and broadcasts;
@@ -48,7 +48,7 @@ pub use sync::{KeyProgress, StallReason, SyncError, SyncState};
 pub use tx::{Provers, TxError};
 pub use vault::manager::VaultManager;
 
-/// How a key profile signs (DATA_MODEL.md `profile.json`).
+/// How a key profile signs (docs/architecture.md Data model `profile.json`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SigningMode {
@@ -95,7 +95,7 @@ impl Pool {
     ];
 }
 
-/// States of a `tex_queue` row (Q-T1, Q-T2; DATA_MODEL.md §5.1).
+/// States of a `tex_queue` row (Q-T1, Q-T2; docs/architecture.md Data model §5.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TexState {

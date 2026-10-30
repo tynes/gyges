@@ -1,5 +1,5 @@
-//! `gyges key list / init / restore` through the binaries (CLI_SPEC.md
-//! §2.2, THREAT_MODEL.md §5 rows for `seed.age` and the permission sweep).
+//! `gyges key list / init / restore` through the binaries (docs/interface.md CLI
+//! §2.2, docs/security.md §5 rows for `seed.age` and the permission sweep).
 //! No node is involved: `key init` therefore needs `--airgapped`
 //! (signer-only) and `key restore` works only with the default birthday.
 //! `key import-keystone` runs against the fake node, which resolves the
@@ -358,7 +358,7 @@ fn unlock_lock_and_export_through_the_cli() {
     );
 }
 
-/// `key import-keystone` (ROADMAP.md M5, second item): the exit codes of
+/// `key import-keystone`: the exit codes of
 /// its refusals, each leaving no key behind, then an import from stdin and
 /// one from `--ur` with an unknown firmware version allowed, `key list`, and
 /// the new key syncing.

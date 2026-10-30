@@ -1,5 +1,5 @@
 //! `gyges tx list` (`ListTransactions`) and `gyges tx status`
-//! (`GetTransactionStatus`), CLI_SPEC.md §2.5. `tx status --pir` exits 1
+//! (`GetTransactionStatus`), docs/interface.md CLI §2.5. `tx status --pir` exits 1
 //! as not implemented, before any RPC is sent.
 
 use std::fmt::Write as _;
@@ -66,7 +66,7 @@ pub async fn status(ctx: &Ctx, args: StatusArgs) -> Result<(), CliError> {
     ctx.print(&resp, || format!("{}\n", render_status(&resp)))
 }
 
-/// The CLI spelling of a status (CLI_SPEC.md §2.5).
+/// The CLI spelling of a status (docs/interface.md CLI §2.5).
 pub fn status_name(s: TransactionStatus) -> &'static str {
     match s {
         TransactionStatus::Unspecified => "unknown",

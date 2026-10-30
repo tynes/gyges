@@ -1,6 +1,6 @@
 [package]
 name = "gyges-regtest"
-description = "End-to-end harness and scenarios that drive gygesd through the gyges binary (TESTING.md §2-3)"
+description = "End-to-end harness and scenarios that drive gygesd through the gyges binary (docs/testing.md §2-3)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -36,13 +36,13 @@ path = "scenarios/pczt.rs"
 name = "keystone"
 path = "scenarios/keystone.rs"
 
-# Against the pinned real zakurad (TESTING.md §3 rows 1–4); skips itself
+# Against the pinned real zakurad (docs/testing.md §3 rows 1–4); skips itself
 # where no node binary is available.
 [[test]]
 name = "node"
 path = "scenarios/node.rs"
 
-# Against a pruned zakurad, an archive zakurad and zainod (TESTING.md §3
+# Against a pruned zakurad, an archive zakurad and zainod (docs/testing.md §3
 # rows 5–7); skips itself where either binary is unavailable.
 [[test]]
 name = "backfill"

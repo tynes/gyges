@@ -1,5 +1,5 @@
-//! The core loop against the pinned real `zakurad` (TESTING.md §3 rows 1–4;
-//! ROADMAP.md M1 exit criterion): restore a key, mine to it, shield, pay a
+//! The core loop against the pinned real `zakurad` (docs/testing.md §3 rows 1–4;
+//!): restore a key, mine to it, shield, pay a
 //! second key's unified address and a transparent address, then survive a
 //! three-block reorg that unmines every one of those transactions.
 //!
@@ -19,7 +19,7 @@ use transparent::address::TransparentAddress;
 
 /// The ZIP 320 (`texregtest1…`) form of the same pubkey hash: a TEX payment
 /// to it comes back to the wallet as transparent balance, which is how the
-/// recipient side of TESTING.md §3 row 9 is observed without a second node.
+/// recipient side of docs/testing.md §3 row 9 is observed without a second node.
 fn test_key_tex_address() -> String {
     let TransparentAddress::PublicKeyHash(hash) = test_key_transparent() else {
         panic!("the default address is P2PKH");
@@ -93,7 +93,7 @@ fn node_with_mature_coinbases(archive: bool) -> Option<Node> {
     Some(node)
 }
 
-/// TESTING.md §3 row 15 in spirit, plus the status surface: the daemon sees
+/// docs/testing.md §3 row 15 in spirit, plus the status surface: the daemon sees
 /// the node's bounds, `key init` takes its birthday from the live tip, and
 /// a daemon for the wrong network is refused by the activation heights.
 #[test]
@@ -115,7 +115,7 @@ fn daemon_status_and_key_init_against_the_real_node() {
     assert_eq!(node_status["tip_height"], 3);
     assert_eq!(node_status["tip_hash"], node.block_hash(3));
     assert_eq!(node_status["pruned"], true, "{node_status}");
-    // Zero is omitted from the JSON (API.md §5).
+    // Zero is omitted from the JSON (docs/interface.md API §5).
     assert_eq!(node_status["retained_from"].as_u64().unwrap_or(0), 0);
 
     let pw = fx.passphrase_file(PASSPHRASE);
@@ -199,7 +199,7 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
     let run = fx.gyges(&["address", "inspect", &bob_ua, "--json"]).ok();
     assert_eq!(run.json()["kind"], "ADDRESS_KIND_UNIFIED");
     let pay_bob_txid = send(&fx, &pw, &log, &bob_ua, "1").stdout.trim().to_string();
-    // SYNC.md §7: while the payment is in the node's mempool, bob sees it
+    // docs/architecture.md Sync §7: while the payment is in the node's mempool, bob sees it
     // as pending (the loop finds it on its own; `sync mempool` forces it).
     fx.gyges(&["-k", "bob", "sync", "mempool"])
         .ok()
@@ -340,7 +340,7 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
         assert_eq!(to, fork - 1, "{rewound}");
     }
 
-    // Nothing identifying in either log (TESTING.md §5 row 18 for rows 1–4).
+    // Nothing identifying in either log (docs/testing.md §5 row 18 for rows 1–4).
     sweep_logs(
         &fx.network_dir().join("logs"),
         &[
@@ -358,7 +358,7 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
     );
 }
 
-/// TESTING.md §3 rows 9, 10 and 12 against `zakurad`: a `texregtest1`
+/// docs/testing.md §3 rows 9, 10 and 12 against `zakurad`: a `texregtest1`
 /// payment chains both steps in the node's mempool and mines them in one
 /// block; the recipient (the wallet's own pubkey hash) sees exactly the
 /// amount as transparent balance; a second payment survives a node restart
@@ -480,7 +480,7 @@ fn zip320_against_the_real_node() {
 /// period, and a Sapling spend always pads its bundle with two outputs.
 const ZIP212_ON: u32 = 1 + 32_256;
 
-/// ROADMAP.md M6, first item (THREAT_MODEL.md §6 item 1), on the real node:
+/// Sapling spends (docs/security.md §6 item 1), on the real node:
 /// past ZIP 212, a second key paid at a Sapling-only address spends that
 /// note with `tx send` (the key is asked for before proving, the proof
 /// generation key inserted, the PCZT proven and signed in the stream), and

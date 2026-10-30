@@ -1,5 +1,5 @@
 //! Every SQL statement Gyges runs against a key's `wallet.sqlite`
-//! (DATA_MODEL.md §5).
+//! (docs/architecture.md Data model §5).
 //!
 //! Gyges' own tables sit next to the upstream schema under the `ext_`
 //! prefix `zcash_client_sqlite` reserves for applications. One external

@@ -1,4 +1,4 @@
-//! Transparent history below the node's window (SYNC.md §5.3, ROADMAP.md M2).
+//! Transparent history below the node's window (docs/architecture.md Sync §5.3).
 //!
 //! Compact blocks from the fallback endpoint carry no transparent outputs,
 //! so a key backfilled below `retained_from` learns its transparent funds
@@ -19,7 +19,7 @@
 //!
 //! An omitted UTXO cannot be detected at all, which is why every restore
 //! below the window warns that transparent history there is best-effort
-//! (THREAT_MODEL.md §6 item 9). The daemon side (fetching, the node checks)
+//! (docs/security.md §6 item 9). The daemon side (fetching, the node checks)
 //! is `gygesd::backfill`.
 
 use std::collections::HashSet;

@@ -1,4 +1,4 @@
-//! The two Keystone signing protocols (ARCHITECTURE.md §3.4, OVERVIEW.md
+//! The two Keystone signing protocols (docs/architecture.md Components §3.4, docs/decisions.md
 //! Q-K2): what the device is shown, and how its answer is applied to the
 //! daemon's own proven copy of the PCZT.
 //!
@@ -18,7 +18,7 @@
 //!
 //! The device is shown the PCZT before it is proven, as Zodl does: proofs
 //! are not signed over, and leaving them out keeps the QR loop short.
-//! Gyges' own `gyges.*` tags are stripped first (THREAT_MODEL.md §5 row 9);
+//! Gyges' own `gyges.*` tags are stripped first (docs/security.md §5 row 9);
 //! nothing the device displays (amounts, recipients, memos) is.
 
 use pczt::Pczt;

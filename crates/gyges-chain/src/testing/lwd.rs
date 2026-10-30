@@ -292,7 +292,7 @@ impl FakeLightwalletd {
         self.lock().reject_broadcasts = message;
     }
 
-    /// Answer as zaino 0.10.2 does (OVERVIEW.md §4.5): an unknown txid is
+    /// Answer as zaino 0.10.2 does (docs/decisions.md §2.5): an unknown txid is
     /// `Internal` carrying the node's -5 error instead of NOT_FOUND, and a
     /// [`FakeLightwalletd::set_reject_broadcasts`] refusal is `Internal`
     /// with the message wrapped as zaino wraps a node's -1, instead of a

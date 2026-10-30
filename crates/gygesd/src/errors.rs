@@ -1,5 +1,5 @@
 //! `gyges-core` and `gyges-chain` errors → the typed `GygesError` the CLI
-//! dispatches on (API.md §3).
+//! dispatches on (docs/interface.md API §3).
 
 use gyges_chain::ChainError;
 use gyges_core::vault::{self, VaultError};
@@ -24,7 +24,7 @@ impl<T> ForKey<T> for Result<T, VaultError> {
     }
 }
 
-/// `TxError` → the typed error (API.md §3).
+/// `TxError` → the typed error (docs/interface.md API §3).
 pub(crate) fn tx_error(e: TxError, key_id: &str) -> GygesError {
     let err = match e {
         TxError::InsufficientFunds {
@@ -42,7 +42,7 @@ pub(crate) fn tx_error(e: TxError, key_id: &str) -> GygesError {
         TxError::Verifier(detail) => GygesError::new(ErrorReason::InvalidArgument, detail),
         TxError::Internal(detail) => {
             // Upstream error texts can quote addresses or values, so the
-            // detail goes to the client and to `debug` only (API.md §4.5).
+            // detail goes to the client and to `debug` only (docs/interface.md API §4.5).
             tracing::error!(key_id, "transaction engine failure");
             tracing::debug!(key_id, error = %detail, "transaction engine failure detail");
             GygesError::new(ErrorReason::Internal, detail)

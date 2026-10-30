@@ -1,6 +1,6 @@
 //! Signing sessions. The passphrase sessions behind `UnlockKey { session_id }`,
-//! `ListSigningSessions` and `AbortSigningSession` (API.md §6) live in
-//! memory only (API.md §6.1): the stream that created one is gone after a
+//! `ListSigningSessions` and `AbortSigningSession` (docs/interface.md API §6) live in
+//! memory only (docs/interface.md API §6.1): the stream that created one is gone after a
 //! restart. The rows of `pczt create` and Keystone sessions live in the
 //! key's `ext_gyges_signing_sessions` table; the helpers at the end move
 //! them between states.
@@ -63,7 +63,7 @@ impl Session {
 /// first, bounded.
 const FINISHED_KEPT: usize = 64;
 
-/// The daemon's in-memory signing sessions (API.md §6.1: passphrase kinds
+/// The daemon's in-memory signing sessions (docs/interface.md API §6.1: passphrase kinds
 /// are not persisted).
 #[derive(Default)]
 pub(crate) struct SessionHub {
@@ -227,7 +227,7 @@ impl Drop for SessionGuard {
     }
 }
 
-/// `UnlockKey { session_id, passphrase }` (API.md §6.2): verify the
+/// `UnlockKey { session_id, passphrase }` (docs/interface.md API §6.2): verify the
 /// passphrase, derive the key, hand it to the stream. No token is returned
 /// and no unlock is created.
 pub(crate) async fn satisfy_session(

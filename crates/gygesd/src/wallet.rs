@@ -1,4 +1,4 @@
-//! The read side of a key's wallet (API.md §7: `address`, `notes`,
+//! The read side of a key's wallet (docs/interface.md API §7: `address`, `notes`,
 //! `tx list`, `tx status`): `GetCurrentAddress`, `NewAddress`,
 //! `InspectAddress`, `ListNotes`, `ListTransactions` and
 //! `GetTransactionStatus`. The wallet work is in `gyges_core::{addresses,
@@ -27,7 +27,7 @@ use crate::service::{DaemonState, invalid, proto_network};
 use crate::tex;
 use crate::wallet_rpc;
 
-/// `ListTransactions.limit = 0` (API.md).
+/// `ListTransactions.limit = 0` (docs/interface.md API).
 pub(crate) const DEFAULT_TX_LIMIT: usize = 50;
 /// The most one page returns.
 pub(crate) const MAX_TX_LIMIT: usize = 1000;
@@ -92,7 +92,7 @@ pub(crate) async fn get_current_address(
         .map(proto_address)
 }
 
-/// The receivers `address new` uses without `--receivers` (CLI_SPEC.md
+/// The receivers `address new` uses without `--receivers` (docs/interface.md CLI
 /// §2.4): shielded only, except that a Keystone account has no Sapling key
 /// for the wallet to use and pairs Orchard with transparent.
 pub(crate) fn default_receivers(mode: SigningMode) -> Vec<Pool> {
@@ -331,7 +331,7 @@ pub(crate) async fn list_transactions(
     })
 }
 
-/// `GetTransactionStatus` (CLI_SPEC.md §2.5): asked of the node, so that a
+/// `GetTransactionStatus` (docs/interface.md CLI §2.5): asked of the node, so that a
 /// fully transparent transaction the wallet cannot see mined is reported
 /// too. The wallet and the ZIP 320 queue settle what the node no longer
 /// holds: expired, failed, or (when the node has dropped a mined
@@ -343,7 +343,7 @@ pub(crate) async fn get_transaction_status(
 ) -> Result<GetTransactionStatusResponse, Status> {
     if req.via_pir {
         return Err(invalid(
-            "status over zakura-pir-status is not implemented yet (ROADMAP.md M6)",
+            "status over zakura-pir-status is not implemented yet",
         ));
     }
     let txid = parse_txid(&req.txid, "txid")?;

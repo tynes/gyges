@@ -20,7 +20,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/tynes/gyges"
 
 # ---------------------------------------------------------------------------
-# Dependency policy (OVERVIEW.md Q-D3)
+# Dependency policy (docs/decisions.md Q-D3)
 #
 # * Every `zakura-*` crate is pinned with `=` and `Cargo.lock` is committed;
 #   CI runs `cargo build --locked`. Bumps are one PR per Zakura release.
@@ -41,7 +41,7 @@ repository = "https://github.com/tynes/gyges"
 zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc9.1", features = [
     "lightwalletd-tonic",            # CompactTxStreamer client for the Tor backfill route
     "lightwalletd-tonic-transport",  # tonic transport for direct gRPC (use_tor = false: regtest and CI)
-    "lightwalletd-tonic-tls-webpki-roots",  # gates `tor::Client::connect_to_lightwalletd` (rustls + webpki roots for https endpoints; OVERVIEW.md §4.4)
+    "lightwalletd-tonic-tls-webpki-roots",  # gates `tor::Client::connect_to_lightwalletd` (rustls + webpki roots for https endpoints; docs/decisions.md §2.4)
     "tor",                           # embedded arti-client; pulls arti-client/tor-rtcompat at the version the backend wants
     "pczt",                          # PCZT construction via `create_pczt_from_proposal`
     "orchard",
@@ -59,7 +59,7 @@ pczt = { package = "zakura-pczt", version = "=0.1.0-rc7", features = [
     "zcp-builder", "io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor",
     "orchard", "sapling", "transparent",
 ] }
-zakura-pir-status = { version = "=0.0.1-rc1" }   # experimental; no member uses it yet: reserved for `gyges tx status --pir` (ROADMAP.md M6)
+zakura-pir-status = { version = "=0.0.1-rc1" }   # experimental; no member uses it yet: reserved for `gyges tx status --pir`
 
 # --- Zakura common crates (zakura-core/common) ---
 zcash_keys        = { package = "zakura-keys",           version = "=4.0.0-rc2", features = ["orchard", "sapling", "transparent-inputs"] }
@@ -93,7 +93,7 @@ tonic        = { version = "0.14", features = ["transport"] }
 tonic-prost  = "0.14"                                         # prost codec for tonic 0.14
 prost        = "0.14"
 prost-types  = "0.14"                                         # `google.protobuf.Any` for grpc-status-details-bin
-pbjson       = "0.9"                                          # proto3 JSON (de)serialisation of the generated types (API.md §5)
+pbjson       = "0.9"                                          # proto3 JSON (de)serialisation of the generated types (docs/interface.md API §5)
 http         = "1"                                            # request paths in the gygesd policy layer
 tower        = "0.5"                                          # service_fn connector for UDS clients
 hyper-util   = { version = "0.1", features = ["tokio"] }      # TokioIo adapter between tonic and UnixStream
@@ -133,7 +133,7 @@ pbjson-build      = "0.9"
 
 # --- Tests ---
 tempfile       = "3"
-criterion      = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }  # gyges-core/benches (docs/BENCHMARKS.md)
+criterion      = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }  # gyges-core/benches (docs/testing.md §9)
 proptest   = { version = "1", default-features = false, features = ["std"] }  # property tests of the PCZT role pipeline
 hyper          = { version = "1", features = ["server", "http1"] }   # fake zakurad JSON-RPC server (gyges-chain `test-util`)
 http-body-util = "0.1"

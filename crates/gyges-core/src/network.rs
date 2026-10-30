@@ -1,5 +1,5 @@
 //! The three Zcash networks a daemon can serve (one daemon per network,
-//! OVERVIEW.md Q-C2).
+//! docs/decisions.md Q-C2).
 
 use std::fmt;
 use std::str::FromStr;
@@ -34,7 +34,7 @@ impl Network {
         }
     }
 
-    /// Sapling activation height, the default restore birthday (CLI_SPEC.md
+    /// Sapling activation height, the default restore birthday (docs/interface.md CLI
     /// `key restore`).
     pub const fn sapling_activation_height(self) -> u32 {
         match self {
@@ -45,7 +45,7 @@ impl Network {
     }
 
     /// NU5 activation height, the default Keystone import birthday
-    /// (CLI_SPEC.md `key import-keystone`).
+    /// (docs/interface.md CLI `key import-keystone`).
     pub const fn nu5_activation_height(self) -> u32 {
         match self {
             Network::Mainnet => 1_687_104,
@@ -69,7 +69,7 @@ impl Network {
 ///
 /// Mainnet and testnet are the upstream constants. Regtest activates every
 /// network upgrade at height 1; a regtest `zakurad` does so only when its
-/// `[network.testnet_parameters.activation_heights]` says so (OVERVIEW.md
+/// `[network.testnet_parameters.activation_heights]` says so (docs/decisions.md
 /// §4.3). The heights a node reports (`getblockchaininfo.upgrades`) are
 /// checked against this table when the node backend connects
 /// (`ZakuraRpcBackend::check_upgrades`).

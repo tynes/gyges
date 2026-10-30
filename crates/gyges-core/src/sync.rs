@@ -1,4 +1,4 @@
-//! Per-key synchronisation primitives for Case A (SYNC.md §3–§4, §6).
+//! Per-key synchronisation primitives for Case A (docs/architecture.md Sync §3–§4, §6).
 //!
 //! Everything here runs against one key's `WalletDb` and the shared
 //! `BlockDb`, synchronously and under the key's wallet lock; the daemon's
@@ -6,7 +6,7 @@
 //! node, and publishes the resulting [`KeyProgress`]. Keeping the two apart
 //! lets this part be tested with a wallet, an in-memory cache and no node.
 //!
-//! Terms (SYNC.md §6): a key is **scanned** when `block_fully_scanned()` has
+//! Terms (docs/architecture.md Sync §6): a key is **scanned** when `block_fully_scanned()` has
 //! reached the node's tip, and **spendable** when, in addition,
 //! `suggest_scan_ranges()` returns nothing above priority `Ignored`.
 
@@ -30,11 +30,11 @@ use zcash_protocol::consensus::BlockHeight;
 use crate::network::ConsensusParams;
 use crate::registry::Wallet;
 
-/// How far back a fork point is searched (OVERVIEW.md Q-Y1: the Zebra
+/// How far back a fork point is searched (docs/decisions.md Q-Y1: the Zebra
 /// lineage's finality depth, **needs verification** against Zakura).
 pub const FINALITY_DEPTH: u32 = 100;
 
-/// Why a key cannot make progress without operator action (SYNC.md §3).
+/// Why a key cannot make progress without operator action (docs/architecture.md Sync §3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StallReason {
@@ -43,7 +43,7 @@ pub enum StallReason {
     PrunedPastScanTip,
     /// No fork point within [`FINALITY_DEPTH`] blocks.
     ChainInconsistent,
-    /// Handoff validation failed (SYNC.md §5.2) and the endpoint is marked
+    /// Handoff validation failed (docs/architecture.md Sync §5.2) and the endpoint is marked
     /// untrusted; cleared only by configuring another endpoint. The
     /// endpoint and the failed check are in `KeyProgress.detail` and
     /// `GetInfo.fallback`.
@@ -67,7 +67,7 @@ impl StallReason {
     }
 }
 
-/// The per-key state machine (SYNC.md §3).
+/// The per-key state machine (docs/architecture.md Sync §3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncState {
     /// Profile loaded, nothing decided yet.
@@ -75,7 +75,7 @@ pub enum SyncState {
     /// Case B: scanning `[from, to)` from blocks the fallback endpoint
     /// served (over Tor unless `via_tor` is false), below the node's
     /// retention window; handed back to Case A once the handoff checks of
-    /// SYNC.md §5.2 pass at `to - 1`.
+    /// docs/architecture.md Sync §5.2 pass at `to - 1`.
     Backfilling {
         via_tor: bool,
         from: BlockHeight,
@@ -116,7 +116,7 @@ impl SyncState {
     }
 }
 
-/// What `GetSyncStatus` reports for one key (SYNC.md §6).
+/// What `GetSyncStatus` reports for one key (docs/architecture.md Sync §6).
 #[derive(Clone, Debug, PartialEq)]
 pub struct KeyProgress {
     pub key_id: String,
@@ -212,7 +212,7 @@ pub struct WalletView {
 impl WalletView {
     /// Tell the wallet the node's tip (when known) and read back its scan
     /// position and queue. `update_chain_tip` is what lets upstream
-    /// prioritise the ranges (SYNC.md §4.1 step 1).
+    /// prioritise the ranges (docs/architecture.md Sync §4.1 step 1).
     pub fn read(wallet: &mut Wallet, chain_tip: Option<BlockHeight>) -> Result<Self, SyncError> {
         if let Some(tip) = chain_tip {
             wallet.update_chain_tip(tip).map_err(wallet_err)?;
@@ -256,7 +256,7 @@ impl WalletView {
     }
 
     /// The next batch: the highest-priority pending range, cut to `batch`
-    /// blocks (SYNC.md §4.1 step 2).
+    /// blocks (docs/architecture.md Sync §4.1 step 2).
     pub fn next_range(&self, batch: usize) -> Option<ScanRange> {
         let first = self.pending().next()?;
         if first.len() <= batch {
@@ -288,11 +288,11 @@ pub enum ScanOutcome {
         transparent_outputs: usize,
     },
     /// A continuity check failed at `at_height`: the wallet's view has
-    /// diverged from the cached chain (SYNC.md §4.3). Nothing was written.
+    /// diverged from the cached chain (docs/architecture.md Sync §4.3). Nothing was written.
     Reorg { at_height: BlockHeight },
 }
 
-/// SYNC.md §4.1 step 4: scan `range` from the cache, starting from the chain
+/// docs/architecture.md Sync §4.1 step 4: scan `range` from the cache, starting from the chain
 /// state as of `range.start - 1`, then credit the key's transparent
 /// receivers from the same blocks.
 pub fn scan_range(
@@ -364,7 +364,7 @@ pub fn tree_refusal(e: &SqliteClientError) -> Option<String> {
 }
 
 /// Credit every transparent output in the cached blocks of `range` that pays
-/// one of the key's receivers through [`credit_transparent`] (SYNC.md §2.1).
+/// one of the key's receivers through [`credit_transparent`] (docs/architecture.md Sync §2.1).
 pub fn index_transparent(
     cache: &BlockDb,
     wallet: &mut Wallet,
@@ -466,7 +466,7 @@ pub fn credit_transparent(
 pub type WalletHashes = Vec<(BlockHeight, Option<[u8; 32]>)>;
 
 /// The wallet's stored block hashes from `from` downwards, at most
-/// [`FINALITY_DEPTH`] of them, for the fork search (SYNC.md §4.3). `None`
+/// [`FINALITY_DEPTH`] of them, for the fork search (docs/architecture.md Sync §4.3). `None`
 /// where the wallet has no block at that height (below its history), which
 /// ends the search: there is nothing to rewind beyond it.
 pub fn wallet_hashes(wallet: &Wallet, from: BlockHeight) -> Result<WalletHashes, SyncError> {
@@ -487,7 +487,7 @@ pub fn wallet_hashes(wallet: &Wallet, from: BlockHeight) -> Result<WalletHashes,
     Ok(out)
 }
 
-/// SYNC.md §4.3 step 2: rewind notes, nullifiers, received outputs and
+/// docs/architecture.md Sync §4.3 step 2: rewind notes, nullifiers, received outputs and
 /// ShardTree checkpoints to `fork_point`. Returns the height actually
 /// truncated to, which upstream may choose lower. Fails with
 /// [`SyncError::RewindInvalid`] when the wallet has scanned nothing at or
@@ -510,7 +510,7 @@ pub fn rewind(wallet: &mut Wallet, fork_point: BlockHeight) -> Result<BlockHeigh
 /// Truncate to `state`'s height when [`rewind`] cannot (no block row at
 /// that height, e.g. the block before a restore's birthday): upstream
 /// inserts the frontier as a checkpoint there and truncates to it. Used to
-/// drop what an untrusted endpoint served (SYNC.md §5.2).
+/// drop what an untrusted endpoint served (docs/architecture.md Sync §5.2).
 pub fn truncate_to_chain_state(wallet: &mut Wallet, state: &ChainState) -> Result<(), SyncError> {
     wallet
         .truncate_to_chain_state(state.clone())
@@ -525,7 +525,7 @@ pub fn max_scanned(wallet: &Wallet) -> Result<Option<BlockHeight>, SyncError> {
         .map(|m| m.block_height()))
 }
 
-/// SYNC.md §4.3 step 2 when the fork is at or below the key's first scanned
+/// docs/architecture.md Sync §4.3 step 2 when the fork is at or below the key's first scanned
 /// block: reset the wallet's trees to the node's state at the end of the
 /// fork block (`z_gettreestate(fork)`), lowering account birthdays to
 /// `fork + 1` where the fork is below them. Scan ranges from `fork + 1`

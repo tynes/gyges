@@ -11,7 +11,7 @@ publish = false
 [features]
 default = []
 # The x86-64 assembly field arithmetic (MULX, ADCX/ADOX) for proving and
-# trial decryption (OVERVIEW.md Q-D6, docs/BENCHMARKS.md). Off by default:
+# trial decryption (docs/decisions.md Q-D6, docs/testing.md §9). Off by default:
 # upstream has no runtime CPU detection, so the binary needs BMI2 and ADX
 # (Broadwell / Zen or newer) and faults with an illegal instruction without
 # them. Multi-threading and the AArch64 assembly need no feature: upstream's
@@ -65,7 +65,7 @@ prost = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 
-# Proving and trial-decryption timings (docs/BENCHMARKS.md).
+# Proving and trial-decryption timings (docs/testing.md §9).
 [[bench]]
 name = "prove"
 harness = false

@@ -1,4 +1,4 @@
-//! The on-disk layout under `GYGES_HOME` (DATA_MODEL.md §1).
+//! The on-disk layout under `GYGES_HOME` (docs/architecture.md Data model §1).
 //!
 //! ```text
 //! $GYGES_HOME/                 default ~/.gyges
@@ -90,7 +90,7 @@ pub fn home_dir() -> Option<PathBuf> {
     std::env::home_dir()
 }
 
-/// Expand a leading `~` or `~/` in a configured path (DATA_MODEL.md §1:
+/// Expand a leading `~` or `~/` in a configured path (docs/architecture.md Data model §1:
 /// "tilde in any configured path is expanded by the daemon").
 pub fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
@@ -105,7 +105,7 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
-/// Validate a key id against `^[a-z0-9][a-z0-9_-]{0,31}$` (DATA_MODEL.md §1).
+/// Validate a key id against `^[a-z0-9][a-z0-9_-]{0,31}$` (docs/architecture.md Data model §1).
 pub fn is_valid_key_id(id: &str) -> bool {
     let mut chars = id.chars();
     let Some(first) = chars.next() else {

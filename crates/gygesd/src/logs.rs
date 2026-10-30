@@ -1,6 +1,6 @@
 //! Logging: the layer stack behind `logs/gygesd.<date>.log` and
 //! `logs/audit.log`, and the in-process hub behind `StreamLogs`
-//! (API.md §4.5, DATA_MODEL.md §1, OVERVIEW.md Q-O1).
+//! (docs/interface.md API §4.5, docs/architecture.md Data model §1, docs/decisions.md Q-O1).
 //!
 //! Three layers see every event:
 //!
@@ -11,7 +11,7 @@
 //!   [`AUDIT_TARGET`] to `audit.log` as one JSON object per line, *regardless*
 //!   of the configured level, so a `log_level = "warn"` daemon still audits;
 //!   the file is never rotated (it must survive a database wipe and a
-//!   migration, DATA_MODEL.md §7) and carries only what the events do: a
+//!   migration, docs/architecture.md Data model §7) and carries only what the events do: a
 //!   timestamp, the level, the event name, the key id and, where applicable,
 //!   the unlock scope or the signing path;
 //! * the **capture** layer keeps the last `RING_CAPACITY` entries of each
@@ -50,7 +50,7 @@ use crate::keys::AUDIT_TARGET;
 pub(crate) const RING_CAPACITY: usize = 1000;
 /// How far a slow follower may fall behind before it skips entries.
 const FOLLOW_CAPACITY: usize = 256;
-/// The file beside the rotated main log (DATA_MODEL.md §1).
+/// The file beside the rotated main log (docs/architecture.md Data model §1).
 pub(crate) const AUDIT_FILE: &str = "audit.log";
 
 /// What the generated service returns for `StreamLogs`.
@@ -271,8 +271,8 @@ impl Visit for Fields {
 }
 
 /// Upstream targets that put txids or addresses in their messages, capped
-/// under `daemon.log_level` so the main log keeps none (THREAT_MODEL.md log
-/// redaction, TESTING.md §5).
+/// under `daemon.log_level` so the main log keeps none (docs/security.md log
+/// redaction, docs/testing.md §5).
 /// - `ll::wallet`: `store_decrypted_tx` logs every txid it stores at `info`
 ///   (the mempool loop stores each transaction of ours), and its `warn`s
 ///   about unsupported scripts and unknown recipients name the txid too.

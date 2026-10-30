@@ -1,4 +1,4 @@
-//! Handoff validation for the Case B backfill (SYNC.md §5.2).
+//! Handoff validation for the Case B backfill (docs/architecture.md Sync §5.2).
 //!
 //! Blocks below the node's retention window come from an untrusted
 //! lightwalletd / zaino endpoint. Before the scheduler hands a key back to
@@ -33,7 +33,7 @@ use zcash_protocol::consensus::BlockHeight;
 use crate::registry::Wallet;
 use crate::sync::SyncError;
 
-/// Which of the three checks of SYNC.md §5.2 failed.
+/// Which of the three checks of docs/architecture.md Sync §5.2 failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Check {
     /// Check 1: note commitment tree size or root at `V`.

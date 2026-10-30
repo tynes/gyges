@@ -1,5 +1,5 @@
-//! The shared compact block cache, `cache/blocks.sqlite` (DATA_MODEL.md §6,
-//! SYNC.md §2.2, OVERVIEW.md Q-Y3).
+//! The shared compact block cache, `cache/blocks.sqlite` (docs/architecture.md Data model §6,
+//! docs/architecture.md Sync §2.2, docs/decisions.md Q-Y3).
 //!
 //! One file per network, shared by every key, so the node is asked for each
 //! block once however many profiles exist. It implements the upstream
@@ -27,7 +27,7 @@ use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_protocol::consensus::BlockHeight;
 
 /// Schema this build writes; an older file is upgraded in place, a newer one
-/// is refused (DATA_MODEL.md §7).
+/// is refused (docs/architecture.md Data model §7).
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Where a cached block came from.
@@ -114,7 +114,7 @@ impl BlockDb {
             source,
         })?;
         // The daemon's umask makes this a no-op; tools without it still get
-        // a private file (DATA_MODEL.md §1).
+        // a private file (docs/architecture.md Data model §1).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -249,7 +249,7 @@ impl BlockDb {
     }
 
     /// The cached hash at `height` (internal byte order), for the per-tick
-    /// reorg check against `getblockhash` (SYNC.md §4.3).
+    /// reorg check against `getblockhash` (docs/architecture.md Sync §4.3).
     pub fn hash_at(&self, height: BlockHeight) -> Result<Option<[u8; 32]>, CacheError> {
         let conn = self.lock();
         let hash: Option<Vec<u8>> = conn
@@ -290,7 +290,7 @@ impl BlockDb {
     }
 
     /// Delete every block below `height` (eviction behind the slowest key,
-    /// SYNC.md §2.2). Returns how many rows went.
+    /// docs/architecture.md Sync §2.2). Returns how many rows went.
     pub fn evict_below(&self, height: BlockHeight) -> Result<usize, CacheError> {
         let conn = self.lock();
         conn.execute(
@@ -328,7 +328,7 @@ impl BlockDb {
         Ok(pages * page_size)
     }
 
-    /// `PRAGMA wal_checkpoint(TRUNCATE)`, run on daemon stop (SYNC.md §8).
+    /// `PRAGMA wal_checkpoint(TRUNCATE)`, run on daemon stop (docs/architecture.md Sync §8).
     pub fn checkpoint(&self) -> Result<(), CacheError> {
         let conn = self.lock();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")

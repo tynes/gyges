@@ -27,7 +27,7 @@ sapling = { workspace = true }
 prost = { workspace = true }
 # `tls-ring`: tonic's TLS connector falls back to the ring provider when no
 # process-wide rustls provider is installed, so the https path cannot panic
-# if a future dependency also enables aws-lc-rs (OVERVIEW.md §4.4).
+# if a future dependency also enables aws-lc-rs (docs/decisions.md §2.4).
 tonic = { workspace = true, features = ["tls-ring"] }
 tonic-prost = { workspace = true, optional = true }  # codec of the generated fake lightwalletd server
 rusqlite = { workspace = true }

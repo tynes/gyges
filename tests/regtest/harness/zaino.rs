@@ -1,5 +1,5 @@
-//! The archival endpoint for the backfill scenarios (ROADMAP.md M2, sixth
-//! item; `OVERVIEW.md` §4.5).
+//! The archival endpoint for the backfill scenarios
+//! (`docs/decisions.md` §2.5).
 //!
 //! zaino cannot sit in front of the wallet's pruned node: it fetches mined
 //! transactions and subtree roots from its node on every request, and those
@@ -170,7 +170,7 @@ impl Zaino {
         self.dir.path().join("zindexer.toml")
     }
 
-    /// The configuration of `OVERVIEW.md` §4.5's smoke test.
+    /// The configuration of `docs/decisions.md` §2.5's smoke test.
     fn write_config(&self, node: &Node) -> anyhow::Result<()> {
         let config = format!(
             r#"# Written by the gyges regtest harness.

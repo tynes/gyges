@@ -2,7 +2,15 @@
 
 A pure-Rust Zcash wallet daemon (`gygesd`) and CLI (`gyges`) that talks straight to a pruned [Zakura](https://github.com/zakura-core/zakura) node, backfills older history over Tor, isolates keys per profile, and supports Keystone 3 Pro hardware signing and ZIP 320 `tex1` payments.
 
-**Status: pre-alpha.** The daemon starts, enforces the 0700/0600 layout and the peer-credential check on its Unix socket, keeps `local-seed` key profiles (`key init / restore / unlock / lock / export-*`), syncs them against a local Zakura node's JSON-RPC through a shared block cache (`sync status / wait / run`), hands out addresses (`address current / new / inspect`), shows what arrived and what happened (`balance`, `notes`, `tx list`, `tx status`), and builds, proves, signs, verifies and broadcasts transactions (`tx send`, `tx shield`, with inline passphrase unlock and `--dry-run`). The core loop (restore → mine → shield → send to the `u1` a second key's `address current` printed and to a `t1` → 3-block reorg) and ZIP 320 `tex1` payments (two transactions, a durable queue that finishes them across node and daemon restarts, `tx resume` for an expired second step) run against a pinned real `zakurad` in the regtest harness. The PCZT pipeline is exposed as commands over files and pipes (`pczt create | prove | sign | broadcast`, plus `inspect` and `combine`, with the Verifier checking a file against the proposal approved at `create` before anything is broadcast); A key restored below the node's retention window, or one the node prunes past, is backfilled from a configured lightwalletd / zaino endpoint and validated against the node at the handoff (tested over a direct connection; the Tor transport is built but its bootstrap is untested). Still ahead: transparent history below the window, `--via-tor` broadcasts, transparent inputs on a `signer-only` air-gapped daemon, Keystone signing and terminal QR codes. See [`ROADMAP.md`](ROADMAP.md) for the MVP cut.
+**Status: pre-alpha.** Milestones M0–M5 and most of M6 have landed and run against a pinned real `zakurad` in the regtest harness:
+
+- `local-seed`, `signer-only` and Keystone 3 Pro key profiles, each with its own database (`watch-only` UFVK import is not built yet).
+- Sync through a shared block cache, with reorg handling.
+- Backfill below the node's retention window from a configured lightwalletd / zaino endpoint, validated against the node at the handoff.
+- Sends to `u1`, `zs1`, `t1` and ZIP 320 `tex1` recipients, with a durable queue for the two-step `tex1` flow.
+- The PCZT pipeline over files and pipes, an air-gapped `signer-only` daemon, Keystone signing over animated terminal QR codes, and `--via-tor` broadcasts.
+
+The Tor transport is built, but its bootstrap is untested, and there is no release pipeline yet. [`docs/decisions.md`](docs/decisions.md) §3 lists what is still open.
 
 ## Why
 
@@ -16,18 +24,16 @@ Gyges consumes [`zakura-core/common`](https://github.com/zakura-core/common) and
 
 ## Documents
 
+The design documents live in [`docs/`](docs/README.md):
+
 | Document | Contents |
 |---|---|
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Components, sync pipeline, vault, ZIP 320, Keystone, air-gapped flow, directory layout |
-| [`CLI_SPEC.md`](CLI_SPEC.md) | Every `gyges` command, exit codes, non-interactive rules |
-| [`API.md`](API.md) + [`proto/gyges.proto`](proto/gyges.proto) | The gRPC contract between `gyges` and `gygesd` |
-| [`SYNC.md`](SYNC.md) | Per-key sync state machine, reorgs, pruning race, handoff validation |
-| [`DATA_MODEL.md`](DATA_MODEL.md) | `config.toml`, `profile.json`, `seed.age`, Gyges-owned SQLite tables, migrations, backups |
-| [`THREAT_MODEL.md`](THREAT_MODEL.md) | Assets, adversaries, controls, open security questions |
-| [`TESTING.md`](TESTING.md) | Test tiers, regtest harness, Keystone fixtures, CI |
-| [`ROADMAP.md`](ROADMAP.md) | Milestones and the MVP cut |
-| [`GLOSSARY.md`](GLOSSARY.md) | Terms used across the documents |
-| [`OVERVIEW.md`](OVERVIEW.md) | The design review that produced the documents above, with its open questions and proposals |
+| [`docs/architecture.md`](docs/architecture.md) | Components, vault, ZIP 320, Keystone, the air-gapped flow; the per-key sync state machine; every file on disk |
+| [`docs/interface.md`](docs/interface.md) + [`proto/gyges.proto`](proto/gyges.proto) | Every `gyges` command, and the gRPC contract between `gyges` and `gygesd` |
+| [`docs/security.md`](docs/security.md) | Threat model: assets, adversaries, controls and the tests that prove them |
+| [`docs/testing.md`](docs/testing.md) | Test tiers, the regtest harness, Keystone fixtures, CI, benchmarks |
+| [`docs/decisions.md`](docs/decisions.md) | Design decisions (`Q-*`), verified upstream facts, open work |
+| [`docs/glossary.md`](docs/glossary.md) | Terms used across the documents |
 
 ## Building
 
@@ -41,7 +47,7 @@ cargo build --locked --workspace
 cargo test --locked --workspace
 ```
 
-The test run includes the end-to-end scenarios in `tests/regtest/`, which build and spawn both binaries against a temporary `GYGES_HOME`. The scenarios against the real node download the `zakurad` release pinned in `tests/regtest/versions.toml` on Linux; elsewhere they skip unless `ZAKURAD_BIN` points at a locally built one (see `TESTING.md` §8).
+The test run includes the end-to-end scenarios in `tests/regtest/`, which build and spawn both binaries against a temporary `GYGES_HOME`. The scenarios against the real node download the `zakurad` release pinned in `tests/regtest/versions.toml` on Linux; elsewhere they skip unless `ZAKURAD_BIN` points at a locally built one (see `docs/testing.md` §8).
 
 To try the daemon by hand on regtest (without a node it reports the node as unreachable and keeps keys initialising; point it at one with `--zakura-rpc` and `--zakura-cookie`):
 

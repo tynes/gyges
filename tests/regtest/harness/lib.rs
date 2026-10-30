@@ -1,9 +1,9 @@
-//! Test harness for the end-to-end scenarios (TESTING.md §2).
+//! Test harness for the end-to-end scenarios (docs/testing.md §2).
 //!
 //! [`Fixture`] runs `gygesd` and `gyges` against a temporary `GYGES_HOME`;
 //! [`Node`] runs the pinned `zakurad` in regtest (`versions.toml`) and drives
 //! it over JSON-RPC; [`Fallback`] adds an archive node and `zaino` in front of
-//! it as the fallback endpoint (ROADMAP.md M2). Gyges
+//! it as the fallback endpoint. Gyges
 //! binaries are taken from `GYGES_DAEMON_BIN` / `GYGES_CLI_BIN` when set;
 //! otherwise they are built (once per test process, a no-op when fresh)
 //! into the same target directory as the test executable, so a `cargo test
@@ -356,7 +356,7 @@ impl Fixture {
         self.network_dir().join("keys").join(key_id)
     }
 
-    /// SIGKILL the daemon this fixture started (a crash, TESTING.md §3 row
+    /// SIGKILL the daemon this fixture started (a crash, docs/testing.md §3 row
     /// 12). The pid file's advisory lock dies with the process, so
     /// `start_daemon` works again afterwards.
     pub fn kill_daemon(&mut self) {
@@ -422,7 +422,7 @@ fn varint(mut v: u64) -> Vec<u8> {
 }
 
 /// A PCZT with the one occurrence of the value `old` replaced by `new`
-/// (same encoded length): a file tampered with on the way (TESTING.md §3
+/// (same encoded length): a file tampered with on the way (docs/testing.md §3
 /// row 13), which still parses and only differs in that one output value.
 pub fn tamper_value(bytes: &[u8], old: u64, new: u64) -> Vec<u8> {
     let from = varint(old);

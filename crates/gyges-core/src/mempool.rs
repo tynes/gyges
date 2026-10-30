@@ -1,4 +1,4 @@
-//! Trial decryption of mempool transactions (SYNC.md §7).
+//! Trial decryption of mempool transactions (docs/architecture.md Sync §7).
 //!
 //! The daemon lists the node's mempool each poll tick, fetches every
 //! transaction it has not seen once, and hands it to [`scan_tx`] for each

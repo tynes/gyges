@@ -1,5 +1,5 @@
 //! Case B: backfill below the node's retention window from the fallback
-//! endpoint, and the handoff back to Case A (SYNC.md §3, §4.2, §5).
+//! endpoint, and the handoff back to Case A (docs/architecture.md Sync §3, §4.2, §5).
 //!
 //! A key whose next scan range starts below `retained_from` (a restore
 //! with an old birthday, or the pruning race after a long downtime) opens a
@@ -334,7 +334,7 @@ impl Scheduler {
         Some(fallback)
     }
 
-    /// SYNC.md §4.2: the next range starts below the node's window. With a
+    /// docs/architecture.md Sync §4.2: the next range starts below the node's window. With a
     /// usable endpoint, open a session (check 3 first) and backfill;
     /// otherwise stall.
     pub(crate) async fn enter_backfill(
@@ -630,7 +630,7 @@ impl Scheduler {
         Ok((true, height))
     }
 
-    /// SYNC.md §5.3: ask the endpoint for the unspent outputs of the key's
+    /// docs/architecture.md Sync §5.3: ask the endpoint for the unspent outputs of the key's
     /// transparent receivers mined in `[from, to]`, check each against its
     /// raw transaction and the node's chain (`gyges_core::recovery`), and
     /// credit the ones that pass. Crediting can reveal new receivers (the

@@ -1,7 +1,7 @@
 //! The end of every send: the Verifier against what the user approved,
 //! then the broadcast. Where a signed transaction goes is the node's
 //! `sendrawtransaction`, or the fallback endpoint over Tor for `--via-tor`
-//! (THREAT_MODEL.md §3 row 10).
+//! (docs/security.md §3 row 10).
 //!
 //! `SendTransaction`, `BroadcastPczt` and `CompleteKeystoneSign` all end
 //! here: [`verified`], then the wallet's own record of the transaction
@@ -26,7 +26,7 @@ use crate::sessions::set_session_state;
 use crate::wallet_rpc;
 
 /// The Verifier (Q-K7): `pczt` against the approved proposal, every change
-/// output against what the key owns (THREAT_MODEL.md §6 item 8). Runs under
+/// output against what the key owns (docs/security.md §6 item 8). Runs under
 /// the key's wallet lock, which reading the owner needs. The outer error is
 /// the wallet's (the key's typed error); the inner one is the Verifier's
 /// refusal, which each caller maps itself (`INVALID_ARGUMENT` for a file or
@@ -118,7 +118,7 @@ pub(crate) fn connected_chain(
 
 /// Where a transaction goes: the node's `sendrawtransaction`, or the
 /// fallback endpoint's `SendTransaction` for `--via-tor` and
-/// `broadcast_via_tor` (THREAT_MODEL.md §3 row 10).
+/// `broadcast_via_tor` (docs/security.md §3 row 10).
 #[derive(Clone)]
 pub(crate) enum Route {
     Node,
@@ -171,7 +171,7 @@ impl Route {
 /// `config.toml` turns it on for every broadcast. Asking for Tor never falls
 /// back to the node: without a Tor endpoint the request is refused. A
 /// `use_tor = false` endpoint stands in on regtest only, as it does for
-/// backfill in CI (TESTING.md §2).
+/// backfill in CI (docs/testing.md §2).
 pub(crate) fn broadcast_route(
     state: &DaemonState,
     requested: bool,

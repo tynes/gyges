@@ -1,6 +1,6 @@
-//! `gyges sync …` (CLI_SPEC.md §2.3, API.md §4.4).
+//! `gyges sync …` (docs/interface.md CLI §2.3, docs/interface.md API §4.4).
 //!
-//! `status`, `wait`, `run` and `mempool` (SYNC.md §7).
+//! `status`, `wait`, `run` and `mempool` (docs/architecture.md Sync §7).
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -126,7 +126,7 @@ async fn status(ctx: &Ctx, args: StatusArgs) -> Result<(), CliError> {
     ctx.print(&resp, || render_status(&resp.keys))
 }
 
-/// The state word of CLI_SPEC.md §2.3: `initializing`, `scanning`,
+/// The state word of docs/interface.md CLI §2.3: `initializing`, `scanning`,
 /// `rewinding`, `synced`, `stalled(<reason>)`.
 pub fn state_word(k: &KeySyncStatus) -> String {
     match k.state() {

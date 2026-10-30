@@ -1,5 +1,5 @@
 //! `gyges balance`, `gyges tx send` and `gyges tx shield` through the
-//! binaries against the in-process fake `zakurad` (TESTING.md §3 rows 1–3
+//! binaries against the in-process fake `zakurad` (docs/testing.md §3 rows 1–3
 //! and 14 in miniature; the real-node versions are in `scenarios/node.rs`).
 //!
 //! Covers: the zero balance of a fresh key, the funded transparent balance,
@@ -128,7 +128,7 @@ fn balance_send_and_shield_through_the_binaries() {
         .run()
         .stdout_has("ironwood");
 
-    // TESTING.md §5, system level: neither log shows the address, the txid,
+    // docs/testing.md §5, system level: neither log shows the address, the txid,
     // an amount (as zatoshis or decimal) or the passphrase.
     let log_dir = fx.network_dir().join("logs");
     let secrets = [
@@ -194,7 +194,7 @@ fn balance_send_and_shield_through_the_binaries() {
     );
     assert_eq!(lines[broadcast - 1]["via"], "session", "{events:?}");
 
-    // `gyges daemon logs` serves both logs through `StreamLogs` (API.md
+    // `gyges daemon logs` serves both logs through `StreamLogs` (docs/interface.md API
     // §4.5), as JSON `LogEntry` messages or rendered lines.
     let run = fx
         .gyges(&["daemon", "logs", "--audit", "--lines", "200", "--json"])
@@ -225,9 +225,9 @@ fn balance_send_and_shield_through_the_binaries() {
     }
 }
 
-/// A ZIP 320 send through the binaries (CLI_SPEC.md §2.5 `tex1`), against a
+/// A ZIP 320 send through the binaries (docs/interface.md CLI §2.5 `tex1`), against a
 /// node that will not chain mempool transactions, then a daemon crash
-/// (SIGKILL) with the row pending (TESTING.md §3 row 12): the restarted
+/// (SIGKILL) with the row pending (docs/testing.md §3 row 12): the restarted
 /// daemon finishes the transfer from the stored bytes, without a passphrase,
 /// and step 2 keeps its txid. Also `--dry-run` with both steps, `tx
 /// sessions`, and the `tx abort` / `tx resume` refusals.
@@ -535,7 +535,7 @@ fn addresses_notes_and_history_through_the_binaries() {
         .run();
     assert_eq!(run.json()["transactions"][0]["txid"], funding_txid.as_str());
 
-    // None of this reaches the logs (TESTING.md §5).
+    // None of this reaches the logs (docs/testing.md §5).
     sweep_logs(
         &fx.network_dir().join("logs"),
         &[&current, &fresh_addr, &shield, "shop"],

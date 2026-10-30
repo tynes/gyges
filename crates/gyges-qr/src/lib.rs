@@ -1,6 +1,6 @@
 //! Terminal QR rendering and BC-UR encoding/decoding for the Keystone flow.
 //!
-//! Responsibilities (ARCHITECTURE.md §3.4, OVERVIEW.md Q-K2/Q-K6):
+//! Responsibilities (docs/architecture.md Components §3.4, docs/decisions.md Q-K2/Q-K6):
 //! * [`render`]: a QR code as UTF-8 half-block characters, for an address
 //!   ([`render_str`]) or one `ur:` frame ([`render_frame`]);
 //! * [`Frames`] / [`Assembler`]: a payload split into BC-UR fountain frames
@@ -70,7 +70,7 @@ mod tests {
     use ur_registry::registry_types as reg;
 
     /// Q-K6: a change in the `ur-registry` crate must fail CI, not silently
-    /// mis-tag a payload (TESTING.md §4 `registry_tags`). The tags are the
+    /// mis-tag a payload (docs/testing.md §4 `registry_tags`). The tags are the
     /// literals from `keystone-sdk-rust/registry_types.rs`; 49202 (reserved
     /// upstream, no implementation) and 49206 have no UR type in Gyges and
     /// are refused.

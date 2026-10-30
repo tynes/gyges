@@ -1,5 +1,5 @@
-//! What the wallet has received and sent (CLI_SPEC.md §2.4–2.5,
-//! API.md `ListNotes`, `ListTransactions`, `GetTransactionStatus`): the
+//! What the wallet has received and sent (docs/interface.md CLI §2.4–2.5,
+//! docs/interface.md API `ListNotes`, `ListTransactions`, `GetTransactionStatus`): the
 //! decrypted notes and UTXOs, and the transaction history with each
 //! transaction's outputs.
 //!
@@ -21,8 +21,7 @@
 //! Compact blocks carry no memos, so a received note shows its memo when
 //! the wallet holds the full transaction: always for the wallet's own sends
 //! (their `sent_notes` row is the fallback), for incoming payments once
-//! transaction enhancement fetches them (not yet: ROADMAP.md, the "Not done"
-//! list of the M1 follow-up item).
+//! transaction enhancement fetches them (not yet).
 
 use zcash_client_backend::data_api::WalletRead as _;
 use zcash_protocol::memo::{Memo, MemoBytes};

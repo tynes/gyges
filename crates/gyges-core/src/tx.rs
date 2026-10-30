@@ -1,5 +1,5 @@
-//! The `TxEngine` (ARCHITECTURE.md §2.1, §3.2; API.md §4.1, §6.4;
-//! OVERVIEW.md Q-K3, Q-K7): one send, from a recipient and an amount to a
+//! The `TxEngine` (docs/architecture.md Components §2.1, §3.2; docs/interface.md API §4.1, §6.4;
+//! docs/decisions.md Q-K3, Q-K7): one send, from a recipient and an amount to a
 //! raw transaction the node can take.
 //!
 //! The steps are the ZIP 374 roles, each a function here so that the
@@ -17,7 +17,7 @@
 //!    transparent (Q-K3) and so runs while the vault is locked. A Sapling
 //!    spend is the exception: its proof needs the proof generation key,
 //!    which [`insert_proof_generation_keys`] derives from the unlocked
-//!    spending key first (THREAT_MODEL.md §6 item 1);
+//!    spending key first (docs/security.md §6 item 1);
 //! 5. [`sign`] — the Signer role with the `UnifiedSpendingKey` derived from
 //!    the decrypted entropy; the key lives for this call only;
 //! 6. [`verify`] — the Verifier role against what was proposed: a PCZT
@@ -79,11 +79,11 @@ use crate::network::ConsensusParams;
 use crate::registry::Wallet;
 use crate::vault::{Entropy, seed_from_entropy};
 
-/// The longest memo `tx send --memo` accepts (CLI_SPEC.md §1.5).
+/// The longest memo `tx send --memo` accepts (docs/interface.md CLI §1.5).
 pub const MAX_MEMO_BYTES: usize = 512;
 
 /// Why a send could not be built, in the terms the daemon maps to
-/// `GygesError` reasons (API.md §3).
+/// `GygesError` reasons (docs/interface.md API §3).
 #[derive(Debug, thiserror::Error)]
 pub enum TxError {
     /// `INSUFFICIENT_FUNDS`: both values in zatoshis.
@@ -111,7 +111,7 @@ pub(crate) fn internal(context: &str, e: impl fmt::Display) -> TxError {
     TxError::Internal(format!("{context}: {e}"))
 }
 
-/// What `tx send --amount` resolved to (CLI_SPEC.md §1.4).
+/// What `tx send --amount` resolved to (docs/interface.md CLI §1.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AmountSpec {
     Zatoshis(Zatoshis),
@@ -127,7 +127,7 @@ pub type ShieldProposal = Proposal<StandardFeeRule, Infallible>;
 
 /// Parse a recipient for the network. A ZIP 320 (`tex1`) recipient parses
 /// like any other; `propose_send` then yields the two-step proposal of
-/// ARCHITECTURE.md §3.3.
+/// docs/architecture.md Components §3.3.
 pub fn parse_recipient(params: &ConsensusParams, s: &str) -> Result<Address, TxError> {
     let s = s.trim();
     Address::decode(params, s).ok_or_else(|| {
@@ -137,7 +137,7 @@ pub fn parse_recipient(params: &ConsensusParams, s: &str) -> Result<Address, TxE
     })
 }
 
-/// CLI_SPEC.md §1.5: a memo goes only to a recipient with a shielded
+/// docs/interface.md CLI §1.5: a memo goes only to a recipient with a shielded
 /// receiver and is at most 512 bytes; it is never silently dropped.
 pub fn memo_for(recipient: &Address, memo: &[u8]) -> Result<Option<MemoBytes>, TxError> {
     if memo.is_empty() {
@@ -618,7 +618,7 @@ pub fn build_pczt<N: fmt::Display>(
 }
 
 /// The proving and verifying keys, built on first use (about 0.1 s for
-/// Orchard in a release build, `docs/BENCHMARKS.md`, with its commitment
+/// Orchard in a release build, `docs/testing.md` §9, with its commitment
 /// tables prepared; the bundled Sapling
 /// parameters are tens of megabytes) and kept for the daemon's lifetime.
 #[derive(Default)]
@@ -650,7 +650,7 @@ impl Provers {
             // Commitment tables (about 30 MiB, kept with the key) that make
             // each proof some 20% faster on pools of at most eight threads,
             // ten on AArch64 macOS; wider pools ignore them
-            // (docs/BENCHMARKS.md). Not called from a Rayon worker: `prove`
+            // (docs/testing.md §9). Not called from a Rayon worker: `prove`
             // runs on a blocking thread.
             let prepared = pk.prepare_proving();
             let vk = VerifyingKey::build(version);
@@ -698,7 +698,7 @@ pub fn proving_work(pczt: &Pczt) -> ProvingWork {
 /// [`insert_proof_generation_keys`]; a dummy carries its own): [`prove`]
 /// and [`sign`] call it, and so does `SignPczt` before it asks for a
 /// passphrase. The key is derived from the seed and never leaves the
-/// stream that unlocked it (THREAT_MODEL.md §6 item 1), so only `tx send`
+/// stream that unlocked it (docs/security.md §6 item 1), so only `tx send`
 /// proves and signs one.
 pub fn refuse_unkeyed_sapling_spends(pczt: Pczt) -> Result<Pczt, TxError> {
     if pczt.sapling().spends().is_empty() {
@@ -718,7 +718,7 @@ pub fn refuse_unkeyed_sapling_spends(pczt: Pczt) -> Result<Pczt, TxError> {
         .finish();
     if unkeyed > 0 {
         return Err(TxError::UnsupportedPool(format!(
-            "this PCZT spends {unkeyed} Sapling note(s); a Sapling spend is proven and signed only inside `gyges tx send` on the key that owns it (THREAT_MODEL.md §6 item 1)"
+            "this PCZT spends {unkeyed} Sapling note(s); a Sapling spend is proven and signed only inside `gyges tx send` on the key that owns it (docs/security.md §6 item 1)"
         )));
     }
     Ok(pczt)
@@ -742,7 +742,7 @@ fn sapling_scopes(
 }
 
 /// Step 4a, for a proposal that spends Sapling notes (Q-K3,
-/// THREAT_MODEL.md §6 item 1): the Updater role sets each spend's
+/// docs/security.md §6 item 1): the Updater role sets each spend's
 /// `proof_generation_key` from the unlocked spending key. A spend that
 /// already carries one (a dummy) keeps it. Every other spend must be a note
 /// of this account: its nullifier is recomputed under the external and then
@@ -1058,7 +1058,7 @@ fn wallet_path(receivers: &Receivers, script: &[u8], i: usize) -> Result<Bip44Pa
 pub const TRANSPARENT_CHANGE_SEARCH: u32 = 1000;
 
 /// What a key owns, for the change checks at sign and broadcast time
-/// (THREAT_MODEL.md §6 item 8): the account's viewing keys and, when the
+/// (docs/security.md §6 item 8): the account's viewing keys and, when the
 /// profile has a wallet, its transparent receivers (change included).
 pub struct Owner {
     params: ConsensusParams,
@@ -1214,7 +1214,7 @@ fn recipient_problem(
 }
 
 /// Check what a PCZT says about its outputs before anything relies on it,
-/// and refuse change this key does not own (THREAT_MODEL.md §6 item 8; the
+/// and refuse change this key does not own (docs/security.md §6 item 8; the
 /// upstream Signer role checks neither).
 ///
 /// 1. Every Orchard, Ironwood and Sapling output's `recipient`, `value` and
@@ -1498,7 +1498,7 @@ mod address_pairs {
 /// Orchard-protocol (Orchard or Ironwood bundle) and Sapling payment
 /// (recipient and value), the change totals, the fee (inputs minus
 /// outputs) and the expiry must match `expected`, every change output
-/// must belong to `owner` (THREAT_MODEL.md §6 item 8), and every Sapling
+/// must belong to `owner` (docs/security.md §6 item 8), and every Sapling
 /// spend must open its value commitment and spend a note of `owner`;
 /// otherwise the PCZT is refused and nothing is broadcast.
 pub fn verify(pczt: Pczt, expected: &Expected, owner: &Owner) -> Result<Pczt, TxError> {
@@ -1694,7 +1694,7 @@ pub fn extract_and_store(
 }
 
 // ---------------------------------------------------------------------------
-// ZIP 320 (ARCHITECTURE.md §3.3)
+// ZIP 320 (docs/architecture.md Components §3.3)
 // ---------------------------------------------------------------------------
 
 /// Whether a proposal is the two-step shape a `tex1` recipient produces.
@@ -1738,7 +1738,7 @@ fn stored_transaction(
 /// `create_proposed_transactions` (the upstream PCZT path takes
 /// single-step proposals only, so for ZIP 320 the roles run inside the
 /// builder with the key present: `SignatureRequired` precedes `Proving`
-/// for these sends, API.md §9). Both steps share `expiry_height`.
+/// for these sends, docs/interface.md API §9). Both steps share `expiry_height`.
 pub fn create_tex_transactions(
     wallet: &mut Wallet,
     params: &ConsensusParams,
@@ -1844,8 +1844,8 @@ fn run_create_proposed<N: fmt::Display>(
     Ok(txids.into_iter().collect())
 }
 
-/// `tx resume` after step 1 was mined and step 2 expired (ARCHITECTURE.md
-/// §3.3, TESTING.md §3 row 11): a fresh single transparent transaction
+/// `tx resume` after step 1 was mined and step 2 expired (docs/architecture.md Components
+/// §3.3, docs/testing.md §3 row 11): a fresh single transparent transaction
 /// spending the ephemeral output of `step1_txid` to the recipient for
 /// `amount`, paying whatever the ephemeral output holds above it as the
 /// fee (step 2's ZIP 317 fee was fixed at proposal time). Returns the new
@@ -1966,7 +1966,7 @@ pub struct PoolBalance {
     pub pending: u64,
 }
 
-/// `GetBalance` (API.md): per pool, at `min_confirmations`.
+/// `GetBalance` (docs/interface.md API): per pool, at `min_confirmations`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BalanceSummary {
     pub pools: Vec<PoolBalance>,

@@ -1,6 +1,6 @@
 //! In-process daemon against a temporary `GYGES_HOME`, driven with the
-//! generated client over the Unix socket (THREAT_MODEL.md §5 rows for the
-//! peer check, socket mode and permission sweep; API.md §8 air-gapped list).
+//! generated client over the Unix socket (docs/security.md §5 rows for the
+//! peer check, socket mode and permission sweep; docs/interface.md API §8 air-gapped list).
 
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
@@ -533,7 +533,7 @@ fn fallback_without_endpoint_refuses_start() {
     assert!(format!("{err:#}").contains("grpc_url"), "{err:#}");
 }
 
-/// ROADMAP.md M2, first item: the fallback endpoint backend is built at
+/// The fallback endpoint backend is built at
 /// start from `[fallback_lightwalletd]` and contacts nothing until a backfill
 /// needs it (no Tor directory, no connection).
 #[tokio::test]
@@ -870,7 +870,7 @@ fn keystone_req(key_id: &str, payload: &str, birthday_height: u32) -> ImportKeys
     }
 }
 
-/// ROADMAP.md M5, second item. The same seed restored as `local-seed` and
+/// `key import-keystone`. The same seed restored as `local-seed` and
 /// imported from its Keystone export is the same account: same seed
 /// fingerprint and account index, the same payment seen by both. The
 /// Keystone key has no Sapling receiver, spends Orchard, Ironwood and
@@ -1220,7 +1220,7 @@ async fn keystone_import_refusals_and_account_choice() {
 }
 
 // ---------------------------------------------------------------------------
-// An emulated Keystone (ROADMAP.md M5, third item)
+// An emulated Keystone
 // ---------------------------------------------------------------------------
 
 /// The spending key a Keystone paired with [`keystone_export`] holds for
@@ -1307,7 +1307,7 @@ fn keystone_answer(req: &gyges_proto::v1::SignatureRequired) -> Vec<u8> {
     }
 }
 
-/// TESTING.md §4's Redactor test, on what the device is actually shown: no
+/// docs/testing.md §4's Redactor test, on what the device is actually shown: no
 /// `gyges.*` tag, no witness, no existing signature in the batch view, and
 /// every output's value as the approved proposal has it (the batch view
 /// after `resolve_fields`, since it compacts what can be recomputed).
@@ -1494,7 +1494,7 @@ async fn the_device_never_sees_gyges_tags() {
     running.task.abort();
 }
 
-/// ROADMAP.md M5, third item, the happy path and every refused answer.
+/// Keystone signing: the happy path and every refused answer.
 /// Shielding (transparent inputs) goes by the single-PCZT protocol, a
 /// shielded send by the batch protocol; the device is shown a redacted,
 /// unproven PCZT; the stream resumes once `CompleteKeystoneSign` arrives
@@ -2007,7 +2007,7 @@ async fn wrong_passphrases_are_rate_limited_per_key() {
     running.task.abort();
 }
 
-/// `StreamLogs` (API.md §4.5): the audit tail replays the events of an
+/// `StreamLogs` (docs/interface.md API §4.5): the audit tail replays the events of an
 /// unlock with key id, event and scope only; a follower sees the lock that
 /// comes next; the main tail carries no passphrase. Air-gapped, so the key
 /// is `signer-only` and nothing else writes to the logs meanwhile.
@@ -2601,7 +2601,7 @@ fn tex_config() -> String {
     format!("{ONE_CONF_CONFIG}[tex]\nrebroadcast_interval = \"1s\"\n")
 }
 
-/// TESTING.md §3 row 16: `daemon stop` mid-scan. The node holds the
+/// docs/testing.md §3 row 16: `daemon stop` mid-scan. The node holds the
 /// scheduler's next fetch, so the stop lands deterministically inside a
 /// batch. Shutdown waits for that batch to finish (one more batch is
 /// committed after the stop was asked for, not zero), checkpoints the
@@ -2689,7 +2689,7 @@ async fn daemon_stop_mid_scan_finishes_the_batch_and_restart_does_not_rescan() {
     running.task.abort();
 }
 
-/// TESTING.md §3 row 17: three keys over one node share the block cache, so
+/// docs/testing.md §3 row 17: three keys over one node share the block cache, so
 /// each block is fetched from the node once. A block costs two `getblock`
 /// calls (verbosity 0 for the body, 1 for the tree sizes), so the count is
 /// twice the chain's length, not six times.
@@ -2716,7 +2716,7 @@ async fn three_keys_fetch_each_block_from_the_node_once() {
 }
 
 // ---------------------------------------------------------------------------
-// The transaction engine (ROADMAP.md M1, TxEngine)
+// The transaction engine
 // ---------------------------------------------------------------------------
 
 /// Every event of a send stream, or the status that ended it.
@@ -2775,7 +2775,7 @@ fn mined_height(events: &[SendEvent]) -> u32 {
 }
 
 /// Answer a passphrase `SignatureRequired` with `passphrase` through
-/// `UnlockKey { session_id }` (the inline unlock flow of API.md §6.2).
+/// `UnlockKey { session_id }` (the inline unlock flow of docs/interface.md API §6.2).
 async fn answer_session(
     c: &mut GygesClient<Channel>,
     r: &gyges_proto::v1::SignatureRequired,
@@ -2992,7 +2992,7 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
     lock(&mut c, "main").await;
 
     // Mined: the transparent value is gone and the change is Ironwood (the
-    // live Orchard-protocol pool after NU6.3; see OVERVIEW.md §4.3).
+    // live Orchard-protocol pool after NU6.3; see docs/decisions.md §2.3).
     node.mine(2);
     wait_spendable(&mut c, "main").await;
     let b = balance(&mut c, "main").await;
@@ -3240,7 +3240,7 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
 /// and no shielded output. Upstream queues it for a status lookup, and the
 /// scheduler asks the node and records the mined height, so
 /// `wait_for_mined`, `WaitSync { txid }` and `ListTransactions` see it
-/// (ROADMAP.md M1 leftovers). Before that, `wait_for_mined` never ended.
+///. Before that, `wait_for_mined` never ended.
 #[tokio::test]
 async fn a_fully_transparent_send_is_marked_mined_from_the_node() {
     use gyges_proto::v1::Pool;
@@ -3354,7 +3354,7 @@ async fn pay_bob_unmined(node: &FakeNode, c: &mut GygesClient<Channel>, amount: 
     txid
 }
 
-/// SYNC.md §7 with `mempool.scan` on (the default): a payment to another
+/// docs/architecture.md Sync §7 with `mempool.scan` on (the default): a payment to another
 /// key of the daemon shows as pending for it while still in the mempool,
 /// and becomes spendable once mined. `ScanMempool` reports the pass.
 #[tokio::test]
@@ -3411,7 +3411,7 @@ async fn the_mempool_loop_shows_an_unmined_payment_as_pending() {
 }
 
 /// With `mempool.scan = false` nothing is pending until `ScanMempool`
-/// forces a pass (CLI_SPEC.md `sync mempool`).
+/// forces a pass (docs/interface.md CLI `sync mempool`).
 #[tokio::test]
 async fn scan_mempool_forces_a_pass_when_the_loop_is_off() {
     const AMOUNT: i64 = 20_000_000;
@@ -3440,7 +3440,7 @@ async fn scan_mempool_forces_a_pass_when_the_loop_is_off() {
 }
 
 // ---------------------------------------------------------------------------
-// ZIP 320 (ROADMAP.md M3)
+// ZIP 320
 // ---------------------------------------------------------------------------
 
 /// The ZIP 320 row for `step1_txid`, once it reaches `want` (polling
@@ -3540,7 +3540,7 @@ fn tex_queued(events: &[SendEvent]) -> (String, String) {
         .expect("a TexQueued event")
 }
 
-/// Pay a ZIP 320 address three times through the fake node (TESTING.md §3
+/// Pay a ZIP 320 address three times through the fake node (docs/testing.md §3
 /// rows 9–11 in miniature): chained in the mempool and mined together;
 /// against a node that refuses step 2 until step 1 is mined (the queue
 /// finishes it); and with step 2 left to expire after step 1 was mined, so
@@ -3577,7 +3577,7 @@ async fn zip320_sends_through_the_fake_node() {
     let tex_addr = zcash_keys::address::Address::Tex(tex_pkh).encode(&params);
     assert!(tex_addr.starts_with("texregtest1"), "{tex_addr}");
 
-    // --dry-run: both steps, every fee (ARCHITECTURE.md §3.3 step 4).
+    // --dry-run: both steps, every fee (docs/architecture.md Components §3.3 step 4).
     let dry = collect_events(
         c.send_transaction(SendTransactionRequest {
             dry_run: true,
@@ -3877,7 +3877,7 @@ async fn zip320_sends_through_the_fake_node() {
 }
 
 // ---------------------------------------------------------------------------
-// The PCZT pipeline (ROADMAP.md M4, first item)
+// The PCZT pipeline
 // ---------------------------------------------------------------------------
 
 /// Postcard's unsigned varint (LEB128: seven bits per byte, low bits
@@ -4115,7 +4115,7 @@ async fn pczt_pipeline_round_trips_and_the_verifier_refuses_a_tampered_file() {
 
     // A tampered file: one output value changed on the way, which inspect
     // shows and the Verifier refuses (exit 6), nothing broadcast
-    // (TESTING.md §3 row 13). The bytes still parse.
+    // (docs/testing.md §3 row 13). The bytes still parse.
     let tampered = replace_once(&unsigned, &varint(50_000_000), &varint(50_000_001));
     let insp = inspect(&mut c, tampered.clone(), "").await.unwrap();
     assert!(
@@ -4573,8 +4573,8 @@ async fn addresses_notes_and_history_through_the_fake_node() {
 }
 
 // ---------------------------------------------------------------------------
-// Case B: backfill below the node's window and the handoff (ROADMAP.md M2,
-// second and third items; SYNC.md §4.2, §5)
+// Case B: backfill below the node's window and the handoff
+// (docs/architecture.md Sync §4.2, §5)
 // ---------------------------------------------------------------------------
 
 /// Poll `GetSyncStatus` until `done` holds for the key's row.
@@ -4809,7 +4809,7 @@ async fn a_fallback_serving_a_fork_is_refused_and_marked_untrusted() {
     running.task.abort();
 }
 
-/// ROADMAP.md M2, the ShardTree item: an endpoint serving the node's blocks
+/// Backfill into the ShardTree: an endpoint serving the node's blocks
 /// (every hash and tree size right) but a forged tree state at a batch
 /// boundary below the window. The next batch's prior frontier then
 /// disagrees with the leaves the wallet already holds, so `put_blocks`
@@ -4963,7 +4963,7 @@ async fn node_pruning_past_the_scan_tip_mid_scan_falls_back_and_recovers() {
     running.task.abort();
 }
 
-/// `--via-tor` (ROADMAP.md M2): without a Tor endpoint the send is refused
+/// `--via-tor`: without a Tor endpoint the send is refused
 /// before anything is proposed, and with one the transaction goes to the
 /// endpoint's `SendTransaction`, never to the node. The endpoint is reached
 /// directly here (`use_tor = false`, accepted on regtest only); the Tor
@@ -5066,7 +5066,7 @@ async fn via_tor_broadcasts_through_the_fallback_endpoint_and_never_falls_back_t
     running.task.abort();
 }
 
-/// TESTING.md §3 row 13, air-gapped half (ROADMAP.md M4): the online daemon
+/// docs/testing.md §3 row 13, air-gapped half: the online daemon
 /// creates and proves a transparent-funded PCZT, an `--airgapped` daemon
 /// holding the same seed as a `signer-only` profile (no `wallet.sqlite`)
 /// signs it from the inputs' BIP 44 derivations, and the online daemon
@@ -5269,7 +5269,7 @@ fn replace_once(bytes: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
     out
 }
 
-/// THREAT_MODEL.md §6 item 8 (ROADMAP.md M4, third item): a PCZT whose
+/// docs/security.md §6 item 8: a PCZT whose
 /// change output is redirected to another key's address is refused by
 /// `pczt sign` before anything is signed, and a signed file with its change
 /// redirected afterwards is refused by the Verifier at `pczt broadcast`,
@@ -5512,7 +5512,7 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
     running.task.abort();
 }
 
-/// SYNC.md §5.3 (ROADMAP.md M2, fourth item): a restore below the node's
+/// docs/architecture.md Sync §5.3: a restore below the node's
 /// window recovers the key's transparent outputs from the endpoint's
 /// `GetAddressUtxos`, one below `retained_from` (placed through the
 /// endpoint's block, whose hash is the node's) and one between
@@ -5522,7 +5522,7 @@ async fn redirected_change_is_refused_at_sign_and_at_broadcast() {
 /// the endpoint does not have, one claiming an output index its transaction
 /// lacks. The endpoint answers errors as zaino does, so the missing
 /// transaction comes back as `Internal` with the node's -5 rather than
-/// NOT_FOUND, and is still discarded rather than retried (OVERVIEW.md §4.5,
+/// NOT_FOUND, and is still discarded rather than retried (docs/decisions.md §2.5,
 /// deviation 1). The restore warns that transparent history below the
 /// window is best-effort, and `GetInfo` repeats it for the key.
 #[tokio::test(flavor = "multi_thread")]
@@ -5693,7 +5693,7 @@ fn files_under(dir: &std::path::Path) -> Vec<PathBuf> {
     out
 }
 
-/// ROADMAP.md M6, first item (THREAT_MODEL.md §6 item 1): a `local-seed`
+/// Sapling spends (docs/security.md §6 item 1): a `local-seed`
 /// key whose only money is Sapling sends it. The stream asks for the key
 /// before it proves; the Updater inserts the proof generation key, the
 /// PCZT is proven, signed, verified and broadcast; a second send spends

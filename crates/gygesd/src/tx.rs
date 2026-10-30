@@ -1,5 +1,5 @@
 //! The spending RPCs `SendTransaction`, `ShieldFunds` and `GetBalance`
-//! (API.md §4.1).
+//! (docs/interface.md API §4.1).
 //!
 //! A send is one task per stream that walks `gyges_core::tx` step by step
 //! and emits an event after each (`Proposed`, `Proving`,
@@ -11,7 +11,7 @@
 //! vault is locked, except when it spends Sapling notes, whose proofs need
 //! the proof generation key: then the key is obtained first, inserted by
 //! the Updater role, and the PCZT is proven and signed in this stream
-//! without ever being written (THREAT_MODEL.md §6 item 1). The spending
+//! without ever being written (docs/security.md §6 item 1). The spending
 //! key is obtained from, in order, the
 //! connection-scoped token the request carries, a daemon-scoped unlock, or
 //! a **signing session** (`crate::sessions`): the stream pauses on
@@ -252,7 +252,7 @@ enum Built {
     /// A single-step proposal as its PCZT, with what the Verifier checks.
     Pczt(Expected, Box<Pczt>),
     /// A two-step ZIP 320 proposal; the builder takes it whole once the key
-    /// is there (ARCHITECTURE.md §3.3).
+    /// is there (docs/architecture.md Components §3.3).
     Tex(Box<core_tx::SendProposal>),
 }
 
@@ -260,7 +260,7 @@ enum Built {
 /// dry-run, what the rest of the pipeline needs.
 type Proposed = (ProposalSummary, Option<Built>);
 
-/// `SendTransaction` (API.md §4.1).
+/// `SendTransaction` (docs/interface.md API §4.1).
 pub(crate) fn send_transaction(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
@@ -293,13 +293,13 @@ pub(crate) fn send_transaction(
     }
     let keystone = is_keystone(&prepared);
     if keystone && matches!(to, zcash_keys::address::Address::Tex(_)) {
-        // THREAT_MODEL.md §6 item 7: how the device shows ZIP 320's
+        // docs/security.md §6 item 7: how the device shows ZIP 320's
         // transparent step 2 needs verification on hardware, and upstream
         // builds a PCZT from a single-step proposal only.
         return Err(GygesError::new(
             ErrorReason::HardwareSigner,
             "a tex1 recipient cannot be paid from a Keystone yet: its two-step transfer needs \
-             verification on the device (THREAT_MODEL.md §6 item 7); nothing was sent",
+             verification on the device (docs/security.md §6 item 7); nothing was sent",
         )
         .with_key(&key_id)
         .into_status());
@@ -369,7 +369,7 @@ fn refuse_if_pending(prepared: &Prepared) -> Result<(), Status> {
     Ok(())
 }
 
-/// `ShieldFunds` (API.md §4.1): the same stream for a transparent → Orchard
+/// `ShieldFunds` (docs/interface.md API §4.1): the same stream for a transparent → Orchard
 /// proposal.
 pub(crate) fn shield_funds(
     state: Arc<DaemonState>,
@@ -516,7 +516,7 @@ async fn idle_or_closed<E>(tx: &mpsc::Sender<E>) -> Result<(), Status> {
     }
 }
 
-/// The pipeline proper (API.md §4.1 event order for `n = 1`).
+/// The pipeline proper (docs/interface.md API §4.1 event order for `n = 1`).
 async fn pipeline(
     state: &Arc<DaemonState>,
     prepared: &Prepared,
@@ -560,7 +560,7 @@ async fn pipeline(
     // so the vault stays locked (Q-S3). A Sapling spend needs its proof
     // generation key, derived from the seed, so the spending key comes
     // first and the PCZT is keyed, proven and signed here in memory
-    // (THREAT_MODEL.md §6 item 1); `SignatureRequired` then precedes
+    // (docs/security.md §6 item 1); `SignatureRequired` then precedes
     // `Proving`.
     let work = core_tx::proving_work(&pczt);
     let early_key = if work.sapling_spends == 0 {
@@ -718,7 +718,7 @@ pub(crate) fn signature_required(r: SignatureRequired) -> SendEvent {
 /// daemon-scoped unlock, else a signing session the client satisfies with
 /// `UnlockKey { session_id }`. A session that times out is replaced by a
 /// fresh `SignatureRequired` while the proposal can still be mined
-/// (API.md §4.1), and ends the stream with `NOT_SYNCED` otherwise (without
+/// (docs/interface.md API §4.1), and ends the stream with `NOT_SYNCED` otherwise (without
 /// a node, as in `SignPczt`, the file's expiry is the client's to watch, so
 /// a fresh session always follows). `wrap` makes the stream's event type
 /// out of the `SignatureRequired`.
@@ -796,7 +796,7 @@ pub(crate) async fn obtain_key<E: Send + 'static>(
     }
 }
 
-/// The ZIP 320 branch of the pipeline (ARCHITECTURE.md §3.3, API.md §4.1
+/// The ZIP 320 branch of the pipeline (docs/architecture.md Components §3.3, docs/interface.md API §4.1
 /// for `n = 2`): the key comes first, because `create_proposed_transactions`
 /// proves and signs both steps in one go; then both are stored, the row is
 /// inserted, step 1 and step 2 are offered to the node, and the queue owns
@@ -849,7 +849,7 @@ async fn tex_pipeline(
     emit(tx, send_event::Event::Signed(v1::StepSigned { step: 2 })).await?;
 
     // Persist before the first broadcast, so a crash between the two leaves
-    // a row the queue finishes (TESTING.md §3 row 12).
+    // a row the queue finishes (docs/testing.md §3 row 12).
     let id = *built.step1_txid.as_ref();
     let row = TexRow {
         step1_txid: id,
@@ -977,7 +977,7 @@ async fn tex_pipeline(
     Ok(())
 }
 
-/// `GetBalance` (API.md): per pool at `min_confirmations`.
+/// `GetBalance` (docs/interface.md API): per pool at `min_confirmations`.
 pub(crate) async fn get_balance(
     state: Arc<DaemonState>,
     req: GetBalanceRequest,

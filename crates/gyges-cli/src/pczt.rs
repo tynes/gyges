@@ -1,4 +1,4 @@
-//! `gyges pczt …` (CLI_SPEC.md §2.6, API.md §4.2, §7.1): the ZIP 374 roles
+//! `gyges pczt …` (docs/interface.md CLI §2.6, docs/interface.md API §4.2, §7.1): the ZIP 374 roles
 //! as commands that read a `.pczt` from a positional file (or stdin when
 //! absent or `-`) and write one to `-o FILE` (or stdout, never a terminal).
 //!
@@ -429,7 +429,7 @@ async fn broadcast(ctx: &Ctx, args: BroadcastArgs) -> Result<(), CliError> {
 }
 
 /// `--session` is required for now: a PCZT file is not redacted for the
-/// device (THREAT_MODEL.md §5 row 9), so only daemon sessions are shown.
+/// device (docs/security.md §5 row 9), so only daemon sessions are shown.
 fn session_arg(session: Option<String>, what: &'static str) -> Result<String, CliError> {
     session.ok_or(CliError::NotImplemented(what))
 }

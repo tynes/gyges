@@ -1,4 +1,4 @@
-//! Socket resolution, connection and the `GetInfo` handshake (API.md §1).
+//! Socket resolution, connection and the `GetInfo` handshake (docs/interface.md API §1).
 
 use std::path::PathBuf;
 
@@ -18,7 +18,7 @@ pub struct Ctx {
     /// Given explicitly (flag or `GYGES_NETWORK`); checked against the daemon.
     pub network: Option<Network>,
     /// `--key` / `GYGES_KEY`, passed through verbatim; empty means the
-    /// daemon's default (API.md §1.4).
+    /// daemon's default (docs/interface.md API §1.4).
     pub key: String,
     pub json: bool,
     pub quiet: bool,
@@ -103,7 +103,7 @@ impl Ctx {
         self.network.unwrap_or(Network::Mainnet).name()
     }
 
-    /// Connect and run the handshake checks of API.md §1.3.
+    /// Connect and run the handshake checks of docs/interface.md API §1.3.
     pub async fn connect(&self) -> Result<Conn, CliError> {
         let channel = match uds::connect(&self.socket).await {
             Ok(c) => c,
@@ -163,7 +163,7 @@ pub fn check_handshake(
     Ok(())
 }
 
-/// `$GYGES_HOME`, else `~/.gyges` (DATA_MODEL.md §1). Duplicated from
+/// `$GYGES_HOME`, else `~/.gyges` (docs/architecture.md Data model §1). Duplicated from
 /// `gyges-core` on purpose: the CLI must not link the wallet stack.
 pub fn gyges_home() -> Result<PathBuf, CliError> {
     match std::env::var_os("GYGES_HOME") {

@@ -1,4 +1,4 @@
-//! Node polling (SYNC.md §1): refresh `NodeBounds` every
+//! Node polling (docs/architecture.md Sync §1): refresh `NodeBounds` every
 //! `zakura_rpc.poll_interval_secs`, log connectivity transitions, and warn
 //! once when the node's retention window is shorter than
 //! `zakura_rpc.min_retention_blocks`.
@@ -29,7 +29,7 @@ const UP: u8 = 1;
 const DOWN: u8 = 2;
 
 /// Whether `url` points at this machine: `localhost` or a loopback address.
-/// Anything else is a remote node, which THREAT_MODEL.md §3 row 6 says
+/// Anything else is a remote node, which docs/security.md §3 row 6 says
 /// moves the node operator into the trusted base; the first successful poll
 /// warns once.
 pub(crate) fn is_local_host(url: &str) -> bool {
@@ -68,7 +68,7 @@ pub(crate) async fn poll_once(state: &DaemonState, chain: &dyn ChainBackend, lin
                         url = %url,
                         "zakura_rpc.url is not this machine: the node's operator sees every \
                          block the wallet fetches, every transaction it broadcasts and when \
-                         (THREAT_MODEL.md §3 row 6)"
+                         (docs/security.md §3 row 6)"
                     );
                 }
                 let window = tip.saturating_sub(retained_from);
@@ -79,7 +79,7 @@ pub(crate) async fn poll_once(state: &DaemonState, chain: &dyn ChainBackend, lin
                         min_retention_blocks = min,
                         "the node retains fewer blocks than zakura_rpc.min_retention_blocks; \
                          a daemon that is down longer than that will need the Tor fallback \
-                         (SYNC.md §4.2)"
+                         (docs/architecture.md Sync §4.2)"
                     );
                 }
             }

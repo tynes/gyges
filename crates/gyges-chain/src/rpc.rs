@@ -1,10 +1,10 @@
 //! `ZakuraRpcBackend`: [`ChainBackend`] over the JSON-RPC of a local
-//! `zakurad` (ARCHITECTURE.md §3.1 step 1, SYNC.md §1–2, OVERVIEW.md Q-D1,
+//! `zakurad` (docs/architecture.md Components §3.1 step 1, docs/architecture.md Sync §1–2, docs/decisions.md Q-D1,
 //! Q-D2).
 //!
 //! Zakura's JSON-RPC is zcashd-style (Zebra-derived); the facts this module
 //! relies on were read from `crates/zakura-rpc/src/methods.rs` and are
-//! recorded in OVERVIEW.md §4.2:
+//! recorded in docs/decisions.md §2.2:
 //!
 //! * `getblockchaininfo` has `blocks`, `bestblockhash`, `pruned` and, only
 //!   when pruned, `pruneheight`;
@@ -159,7 +159,7 @@ pub(crate) fn branch_key(nu: NetworkUpgrade) -> String {
 }
 
 impl BlockchainInfo {
-    /// Reduce to [`NodeBounds`] (SYNC.md §1).
+    /// Reduce to [`NodeBounds`] (docs/architecture.md Sync §1).
     fn bounds(&self) -> Result<NodeBounds, ChainError> {
         Ok(NodeBounds {
             tip_height: BlockHeight::from_u32(self.blocks),
@@ -259,7 +259,7 @@ struct Commitments {
     final_state: Option<String>,
 }
 
-/// `z_getsubtreesbyindex`, as Zakura serialises it (OVERVIEW.md §4.4):
+/// `z_getsubtreesbyindex`, as Zakura serialises it (docs/decisions.md §2.4):
 /// the pool and start index echoed, then `{root, end_height}` per subtree.
 #[derive(Deserialize)]
 struct SubtreesObject {
@@ -542,7 +542,7 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
                     // The pool is active, yet the node sent no frontier. An
                     // empty tree is the only reading; say so loudly because
                     // a wrong frontier makes notes unspendable until a
-                    // rescan (SYNC.md §9, needs verification).
+                    // rescan (docs/architecture.md Sync §9, needs verification).
                     tracing::warn!(
                         %height,
                         pool,
@@ -761,7 +761,7 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
     /// `z_getsubtreesbyindex(pool, start_index, max_entries)`: completed
     /// 2^16-leaf subtree roots, raw node bytes as hex. The node answers for
     /// every index it has built, pruned bodies or not, because the
-    /// commitment tree is consensus state (SYNC.md §5.2, **needs
+    /// commitment tree is consensus state (docs/architecture.md Sync §5.2, **needs
     /// verification** on a pruned node). `max_entries` 0 means all.
     fn subtree_roots(
         &self,

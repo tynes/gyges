@@ -1,4 +1,4 @@
-//! `VaultManager` (ARCHITECTURE.md §2.1, §3.2; API.md §6.3; OVERVIEW.md
+//! `VaultManager` (docs/architecture.md Components §2.1, §3.2; docs/interface.md API §6.3; docs/decisions.md
 //! Q-S1…S3): decrypts `seed.age`, keeps the entropy in RAM for exactly as
 //! long as an unlock allows, and rate-limits failed passphrases.
 //!
@@ -377,7 +377,7 @@ impl VaultManager {
     }
 
     /// Daemon-scoped unlocks, the only ones visible to other clients
-    /// (API.md §6.3: `key list` shows the window).
+    /// (docs/interface.md API §6.3: `key list` shows the window).
     pub fn daemon_unlocks(&self) -> Vec<UnlockState> {
         self.daemon_unlocks_at(Instant::now())
     }

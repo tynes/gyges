@@ -1,8 +1,8 @@
-//! Addresses (CLI_SPEC.md §2.4, API.md `GetCurrentAddress` / `NewAddress` /
+//! Addresses (docs/interface.md CLI §2.4, docs/interface.md API `GetCurrentAddress` / `NewAddress` /
 //! `InspectAddress`): the key's current and fresh unified addresses through
 //! upstream's address APIs, the network-independent parse behind
 //! `address inspect`, and the `ext_gyges_address_labels` table behind
-//! `address new --label` (DATA_MODEL.md §5.3, `crate::db::labels`).
+//! `address new --label` (docs/architecture.md Data model §5.3, `crate::db::labels`).
 //!
 //! The receiver list is built the same way for all three, from the encoded
 //! address, so `address current` and `address inspect` of the same string
@@ -26,7 +26,7 @@ use crate::db;
 use crate::registry::Wallet;
 use crate::tx::{TxError, account_of, internal};
 
-/// `address new` without `--receivers` (CLI_SPEC.md §2.4): shielded only,
+/// `address new` without `--receivers` (docs/interface.md CLI §2.4): shielded only,
 /// so a fresh address never links to a transparent receiver.
 pub const DEFAULT_RECEIVERS: [Pool; 2] = [Pool::Orchard, Pool::Sapling];
 

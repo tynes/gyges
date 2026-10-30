@@ -2,9 +2,9 @@
 //! `zcash_primitives::block::Block::read` accepts, and an in-process fake
 //! `zakurad` JSON-RPC server speaking the subset of methods
 //! [`crate::ZakuraRpcBackend`] uses, with the response shapes recorded in
-//! OVERVIEW.md §4.2. Used by this crate's tests, by `gygesd`'s, and by the
+//! docs/decisions.md §2.2. Used by this crate's tests, by `gygesd`'s, and by the
 //! regtest harness's fake-node scenarios, alongside the ones that run a
-//! pinned `zakurad` (TESTING.md §2).
+//! pinned `zakurad` (docs/testing.md §2).
 //!
 //! Blocks the fake mines itself are transparent-only, but `sendrawtransaction`
 //! puts any transaction (shielded bundles included) into a mempool that the
@@ -311,7 +311,7 @@ struct State {
     /// When set, `sendrawtransaction` refuses transactions without any
     /// shielded bundle with this text: a stand-in for a node that does not
     /// chain mempool transactions (ZIP 320 step 2 before step 1 is mined,
-    /// TESTING.md §3 rows 10 and 11).
+    /// docs/testing.md §3 rows 10 and 11).
     reject_transparent_only: Option<String>,
     /// `z_getsubtreesbyindex` answers, per pool, index order (a real node
     /// computes them from 2^16 commitments, which no test mines).

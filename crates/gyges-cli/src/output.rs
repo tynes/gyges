@@ -1,5 +1,5 @@
 //! `--json` output: the response message as proto3 JSON plus
-//! `schema_version` (API.md §5).
+//! `schema_version` (docs/interface.md API §5).
 
 use serde_json::{Map, Value};
 

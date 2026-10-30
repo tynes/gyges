@@ -1,5 +1,5 @@
 //! `gygesd` binary: flags, daemonising, logging and signals around
-//! [`gygesd::Daemon`] (CLI_SPEC.md §2.1 `gyges daemon start`).
+//! [`gygesd::Daemon`] (docs/interface.md CLI §2.1 `gyges daemon start`).
 
 #![forbid(unsafe_code)]
 
@@ -91,11 +91,11 @@ impl Args {
 
 fn main() -> ExitCode {
     // Every file the daemon creates (logs, SQLite, sockets) must be 0600/0700
-    // (DATA_MODEL.md §1); a restrictive umask makes that hold without
+    // (docs/architecture.md Data model §1); a restrictive umask makes that hold without
     // per-site care.
     nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
     // A core dump of this process would hold decrypted key material
-    // (THREAT_MODEL.md §6 item 10). Refusing is not fatal: the daemon still
+    // (docs/security.md §6 item 10). Refusing is not fatal: the daemon still
     // starts on a platform that will not let it, and says so once.
     if let Err(e) = gygesd::disable_core_dumps() {
         eprintln!("gygesd: cannot disable core dumps: {e}");
@@ -173,7 +173,7 @@ fn signals() -> anyhow::Result<impl std::future::Future<Output = ()> + Send> {
 }
 
 /// `logs/gygesd.<date>.log` (daily rotation, seven files kept),
-/// `logs/audit.log` and the `StreamLogs` tail (DATA_MODEL.md §1,
+/// `logs/audit.log` and the `StreamLogs` tail (docs/architecture.md Data model §1,
 /// `gygesd::logs`); plus stderr when running in the foreground of a
 /// terminal. `RUST_LOG` overrides `daemon.log_level`.
 fn init_logging(

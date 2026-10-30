@@ -10,7 +10,7 @@ publish = false
 
 [features]
 # Opt-in x86-64 assembly; needs BMI2 and ADX on the machine that runs it
-# (gyges-core's feature of the same name, docs/BENCHMARKS.md).
+# (gyges-core's feature of the same name, docs/testing.md §9).
 perf-asm-x86_64 = ["gyges-core/perf-asm-x86_64"]
 
 [lib]

@@ -1,5 +1,5 @@
-//! Daemon lifecycle and handshake scenarios (TESTING.md §3 row 15 and the
-//! THREAT_MODEL.md §5 rows for socket mode, permission sweep and the
+//! Daemon lifecycle and handshake scenarios (docs/testing.md §3 row 15 and the
+//! docs/security.md §5 rows for socket mode, permission sweep and the
 //! single-instance lock). No node is involved.
 
 use std::os::unix::fs::PermissionsExt as _;
@@ -43,7 +43,7 @@ fn status_reports_version_network_and_json_schema() {
     assert_eq!(run.json()["network"], "NETWORK_REGTEST");
 }
 
-/// TESTING.md scenario 15.
+/// docs/testing.md scenario 15.
 #[test]
 fn network_mismatch_exits_6_before_any_other_rpc() {
     let mut fx = Fixture::new("regtest");
@@ -220,7 +220,7 @@ fn unimplemented_commands_exit_1_not_2() {
 }
 
 /// `gyges daemon logs` replays the in-memory tail through `StreamLogs`
-/// (API.md §4.5): the startup line is there, `--lines` bounds the replay,
+/// (docs/interface.md API §4.5): the startup line is there, `--lines` bounds the replay,
 /// `--json` prints `LogEntry` messages, and an empty audit log is an empty
 /// replay, not an error.
 #[test]

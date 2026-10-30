@@ -1,12 +1,12 @@
-//! `gyges` – thin gRPC client for `gygesd` (CLI_SPEC.md, API.md).
+//! `gyges` – thin gRPC client for `gygesd` (docs/interface.md CLI, docs/interface.md API).
 //!
 //! The CLI reads flags and environment variables only, never `config.toml`
-//! (OVERVIEW.md Q-C1). Every command that talks to the daemon first connects
+//! (docs/decisions.md Q-C1). Every command that talks to the daemon first connects
 //! to the Unix socket and runs the `GetInfo` handshake (API version,
 //! network). Subcommands not implemented yet (`key import-ufvk` /
 //! `backup` / `import-backup` / `delete`, `tx status --pir`,
 //! `pczt sign --qr-out`, `pczt qr-export FILE`, and `pczt qr-*` without
-//! `--session`) exit 1 with a pointer to ROADMAP.md.
+//! `--session`) exit 1 with a pointer to docs/decisions.md §3.
 
 #![forbid(unsafe_code)]
 // Printing to stdout is this binary's purpose.
@@ -47,7 +47,7 @@ struct Cli {
     command: Command,
 }
 
-/// Global options (CLI_SPEC.md §1.1).
+/// Global options (docs/interface.md CLI §1.1).
 #[derive(Debug, Clone, Args)]
 pub struct Global {
     /// gygesd Unix Domain Socket [default: $GYGES_HOME/<network>/gygesd.sock].

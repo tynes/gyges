@@ -1,5 +1,5 @@
 //! `gyges pczt create | prove | sign | broadcast` through the binaries
-//! against the in-process fake `zakurad` (TESTING.md §3 row 13): over
+//! against the in-process fake `zakurad` (docs/testing.md §3 row 13): over
 //! files, over a pipe, across a daemon restart, with a tampered file refused
 //! by the Verifier (exit 6), and signed on an `--airgapped` daemon.
 
@@ -197,7 +197,7 @@ fn pczt_pipeline_over_files_and_pipes_through_the_binaries() {
     fx.gyges(&["pczt", "prove"]).code(6).stderr_has("stdin");
 }
 
-/// TESTING.md §3 row 13, air-gapped half: `pczt create` on the online
+/// docs/testing.md §3 row 13, air-gapped half: `pczt create` on the online
 /// daemon, the file carried to an `--airgapped` daemon whose `signer-only`
 /// key holds the same seed and no wallet, `pczt prove` and `sign` there,
 /// and `pczt broadcast` back online. The funds are transparent, so the

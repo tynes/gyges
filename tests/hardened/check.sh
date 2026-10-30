@@ -1,5 +1,5 @@
 #!/bin/sh
-# The hardened deployment (THREAT_MODEL.md §6 item 4), checked as root inside
+# The hardened deployment (docs/security.md §6 item 4), checked as root inside
 # a container whose PID 1 is systemd. `run.sh` builds the image and runs
 # this. Users:
 #   alice   - admitted by `daemon install --hardened --user alice`

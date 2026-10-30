@@ -1,4 +1,4 @@
-//! `ext_gyges_address_labels` (DATA_MODEL.md §5.3): the labels given with
+//! `ext_gyges_address_labels` (docs/architecture.md Data model §5.3): the labels given with
 //! `address new --label`, keyed on the encoded address.
 
 use rusqlite::named_params;

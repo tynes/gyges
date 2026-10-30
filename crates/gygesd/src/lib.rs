@@ -1,4 +1,4 @@
-//! `gygesd` – the Gyges wallet daemon (ARCHITECTURE.md §3.6).
+//! `gygesd` – the Gyges wallet daemon (docs/architecture.md Components §3.6).
 //!
 //! The binary in `main.rs` is a thin wrapper: it parses flags, daemonises,
 //! installs logging and signal handlers, and calls [`Daemon::prepare`] then
@@ -8,7 +8,7 @@
 //! Startup order (each step refuses to continue on failure, naming the fix):
 //!
 //! 1. create `$GYGES_HOME/<network>/` (0700) and sweep its permissions
-//!    (DATA_MODEL.md §1, Q-S7);
+//!    (docs/architecture.md Data model §1, Q-S7);
 //! 2. load `config.toml`, apply the command-line overrides, validate;
 //! 3. take the advisory lock on `gygesd.pid`;
 //! 4. load every `keys/<id>/` profile and open its wallet database
@@ -135,7 +135,7 @@ pub(crate) async fn wallet_rpc<T: Send + 'static>(
     with_wallet(key, f).await.for_key(key.key_id())
 }
 
-/// What the command line decided (CLI_SPEC.md §2.1 `gyges daemon start`).
+/// What the command line decided (docs/interface.md CLI §2.1 `gyges daemon start`).
 #[derive(Clone, Debug)]
 pub struct Options {
     pub home: Home,
@@ -308,7 +308,7 @@ impl Daemon {
                 tracing::warn!(
                     endpoint = %fb.grpc_url,
                     "fallback_lightwalletd.use_tor = false: the endpoint sees this host's address \
-                     and every block range it asks for (THREAT_MODEL.md §3 row 10)"
+                     and every block range it asks for (docs/security.md §3 row 10)"
                 );
                 Transport::Direct
             };
@@ -319,7 +319,7 @@ impl Daemon {
                 tracing::info!(
                     endpoint = %fb.grpc_url,
                     "the fallback endpoint is reached through a Tor exit relay; an .onion address, \
-                     where the operator offers one, removes that hop (OVERVIEW.md Q-D5)"
+                     where the operator offers one, removes that hop (docs/decisions.md Q-D5)"
                 );
             }
             Some(Arc::new(backend))
@@ -417,7 +417,7 @@ impl Daemon {
         // Ask the node once before accepting clients, so that the `daemon
         // status` a user runs right after `daemon start` reflects it; then
         // hand the polling to the sync scheduler, which keeps every key at
-        // the tip (SYNC.md §1, §3).
+        // the tip (docs/architecture.md Sync §1, §3).
         let scheduler = match (&self.state.chain, &self.state.block_cache) {
             (Some(chain), Some(cache)) => {
                 let link = node::Link::default();
@@ -436,7 +436,7 @@ impl Daemon {
             _ => None,
         };
         // The ZIP 320 queue finishes transfers the sends left in flight,
-        // across restarts (ARCHITECTURE.md §3.3).
+        // across restarts (docs/architecture.md Components §3.3).
         let tex_queue = self
             .state
             .chain
@@ -468,7 +468,7 @@ impl Daemon {
             .context("gRPC server failed");
 
         sweeper.abort();
-        // SYNC.md §8 step 1: the scheduler finishes the batch in hand (each
+        // docs/architecture.md Sync §8 step 1: the scheduler finishes the batch in hand (each
         // `scan_cached_blocks` call commits one batch) and returns before
         // the cache is checkpointed. A batch stuck on the node past the
         // bound is cancelled; nothing of it is committed.
@@ -490,12 +490,12 @@ impl Daemon {
             t.abort();
         }
         // Zeroize every decrypted key before the process goes away
-        // (CLI_SPEC.md §2.1 `daemon stop`).
+        // (docs/interface.md CLI §2.1 `daemon stop`).
         let locked = self.state.vault.lock_all();
         if !locked.is_empty() {
             tracing::info!(keys = locked.len(), "keys zeroized on stop");
         }
-        // SYNC.md §8 step 3: leave the cache without a WAL to replay.
+        // docs/architecture.md Sync §8 step 3: leave the cache without a WAL to replay.
         if let Some(cache) = &self.state.block_cache
             && let Err(e) = cache.checkpoint()
         {
@@ -516,7 +516,7 @@ impl Daemon {
 }
 
 /// Bind the listener and apply the socket mode: `0600`, or `0660` owned by
-/// `socket_group` when that is set (API.md §1.1, DATA_MODEL.md §1).
+/// `socket_group` when that is set (docs/interface.md API §1.1, docs/architecture.md Data model §1).
 fn bind(socket: &Path, socket_group: &str) -> anyhow::Result<UnixListener> {
     // We hold the pid lock, so an existing socket file is stale.
     match std::fs::remove_file(socket) {
@@ -539,7 +539,7 @@ fn bind(socket: &Path, socket_group: &str) -> anyhow::Result<UnixListener> {
 
 /// Refuse to write core dumps: a core of a process that holds decrypted
 /// entropy or a spending key is a plaintext copy of the vault on disk
-/// (THREAT_MODEL.md §6 item 10). Both limits go to zero, so nothing later in
+/// (docs/security.md §6 item 10). Both limits go to zero, so nothing later in
 /// the process can raise them again.
 pub fn disable_core_dumps() -> nix::Result<()> {
     nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0)
@@ -602,7 +602,7 @@ mod tests {
         assert!(setrlimit(Resource::RLIMIT_CORE, 1, 1).is_err());
     }
 
-    /// The hardened deployment (THREAT_MODEL.md §3 row 1): with
+    /// The hardened deployment (docs/security.md §3 row 1): with
     /// `daemon.socket_group` set the socket is `0660` and owned by that
     /// group; without it, `0600`. The test uses the process's own gid, the
     /// one group it can always chgrp to.

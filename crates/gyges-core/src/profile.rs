@@ -1,4 +1,4 @@
-//! `keys/<key_id>/profile.json` (DATA_MODEL.md §3).
+//! `keys/<key_id>/profile.json` (docs/architecture.md Data model §3).
 //!
 //! The profile is the one file that describes a key without opening SQLite:
 //! how it signs, which pools it may spend from and receive to, its birthday,
@@ -19,23 +19,23 @@ use crate::{Pool, SigningMode};
 
 /// File name inside the key directory.
 pub const PROFILE_FILE: &str = "profile.json";
-/// File name of the encrypted entropy (DATA_MODEL.md §4).
+/// File name of the encrypted entropy (docs/architecture.md Data model §4).
 pub const SEED_FILE: &str = "seed.age";
-/// File name of the `zcash_client_sqlite` database (DATA_MODEL.md §5).
+/// File name of the `zcash_client_sqlite` database (docs/architecture.md Data model §5).
 pub const WALLET_FILE: &str = "wallet.sqlite";
 
 /// The `schema_version` this build writes and understands.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// What `local-seed` profiles spent from before Sapling spending landed
-/// (ROADMAP.md M6); see [`KeyProfile::upgrade`].
+///; see [`KeyProfile::upgrade`].
 pub const PRE_SAPLING_LOCAL_SEED_SPEND_POOLS: [Pool; 3] =
     [Pool::Orchard, Pool::Ironwood, Pool::Transparent];
 /// The only `seed_format` today: an armored age file with one scrypt
 /// passphrase recipient over the 32-byte BIP 39 entropy.
 pub const SEED_FORMAT_AGE_SCRYPT_V1: &str = "age-scrypt-v1";
 
-/// One key's metadata. Field semantics are the table in DATA_MODEL.md §3;
+/// One key's metadata. Field semantics are the table in docs/architecture.md Data model §3;
 /// [`KeyProfile::validate`] enforces the per-mode rules.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,7 +155,7 @@ impl KeyProfile {
     /// M6 every `local-seed` profile was written with exactly
     /// [`PRE_SAPLING_LOCAL_SEED_SPEND_POOLS`] and no command could change
     /// it, so that list is a default, not a choice: it gains Sapling now
-    /// that Sapling notes can be spent (ROADMAP.md M6, first item). Any
+    /// that Sapling notes can be spent. Any
     /// other list is left alone.
     pub fn upgrade(&mut self) -> bool {
         if self.signing_mode == SigningMode::LocalSeed
@@ -167,7 +167,7 @@ impl KeyProfile {
         false
     }
 
-    /// The per-mode rules of DATA_MODEL.md §3 plus the identity checks:
+    /// The per-mode rules of docs/architecture.md Data model §3 plus the identity checks:
     /// schema version, key id grammar and directory name, network.
     pub fn validate(&self, expected_network: Network, directory: &str) -> Result<(), ProfileError> {
         if self.schema_version > SCHEMA_VERSION {
@@ -295,13 +295,17 @@ mod tests {
         }
     }
 
-    /// The JSON blocks in DATA_MODEL.md §3 are the schema's documentation;
+    /// The JSON blocks in docs/architecture.md Data model §3 are the schema's documentation;
     /// the full example must parse (the mode fragments are not complete
     /// profiles and are checked by hand in the validation tests).
     #[test]
     fn data_model_example_parses_and_validates() {
-        let doc = include_str!("../../../DATA_MODEL.md");
-        let section = doc.find("## 3. `profile.json`").expect("section 3");
+        let doc = include_str!("../../../docs/architecture.md");
+        let part = doc.find("\n## Data model\n").expect("Data model part");
+        let section = doc[part..]
+            .find("### 3. `profile.json`")
+            .expect("section 3")
+            + part;
         let start = doc[section..].find("```json\n").expect("json block") + section + 8;
         let end = doc[start..].find("```").expect("closed") + start;
         let text = doc[start..end].replace("f0a1…", &"f0a1".repeat(16));
@@ -429,7 +433,7 @@ mod tests {
         keystone.device_version = None;
         assert!(keystone.validate(Network::Mainnet, "main").is_err());
 
-        // Ironwood is the live shielded pool after NU6.3 (OVERVIEW.md §4.3).
+        // Ironwood is the live shielded pool after NU6.3 (docs/decisions.md §2.3).
         let mut ironwood = base;
         ironwood.spend_pools.push(Pool::Ironwood);
         ironwood.validate(Network::Mainnet, "main").unwrap();

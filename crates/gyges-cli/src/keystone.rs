@@ -1,4 +1,4 @@
-//! The CLI's half of a Keystone signature (API.md §4.3, CLI_SPEC.md §2.6):
+//! The CLI's half of a Keystone signature (docs/interface.md API §4.3, docs/interface.md CLI §2.6):
 //! show the device the daemon's request as an animated QR code, read the
 //! device's answer back as `ur:` frames, and hand it to
 //! `CompleteKeystoneSign`.
