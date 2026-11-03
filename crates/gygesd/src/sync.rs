@@ -764,6 +764,7 @@ impl Scheduler {
             ScanOutcome::Scanned {
                 summary,
                 transparent_outputs,
+                ironwood_received,
             } => {
                 let scanned = summary.scanned_range();
                 let n = u32::from(scanned.end).saturating_sub(u32::from(scanned.start));
@@ -774,6 +775,7 @@ impl Scheduler {
                     to = u32::from(scanned.end) - 1,
                     sapling_received = summary.received_sapling_note_count(),
                     orchard_received = summary.received_orchard_note_count(),
+                    ironwood_received,
                     transparent_outputs,
                     ms = t0.elapsed().as_millis(),
                     "batch scanned"
