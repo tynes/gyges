@@ -239,6 +239,22 @@ async fn status(ctx: &Ctx) -> Result<(), CliError> {
 }
 
 /// Human-readable `daemon status` (docs/interface.md CLI §2.1).
+/// The pruning part of the `node:` line. `tx_retention` is 0 when the node
+/// does not report it (Zakura never does), so it is printed only when set;
+/// otherwise the line gives the window the node actually holds.
+fn pruning(n: &gyges_proto::v1::NodeStatus) -> String {
+    if !n.pruned {
+        String::new()
+    } else if n.tx_retention > 0 {
+        format!(", tx_retention {}", n.tx_retention)
+    } else if n.retained_from > 0 {
+        let held = (n.tip_height + 1).saturating_sub(n.retained_from);
+        format!(", pruned, holds {held} blocks")
+    } else {
+        ", pruned".to_string()
+    }
+}
+
 pub fn render_status(info: &GetInfoResponse) -> String {
     let api = info.api_version.unwrap_or_default();
     let mut s = String::new();
@@ -260,11 +276,7 @@ pub fn render_status(info: &GetInfoResponse) -> String {
                 n.tip_height,
                 &n.tip_hash[..n.tip_hash.len().min(12)],
                 n.retained_from,
-                if n.pruned {
-                    format!(", tx_retention {}", n.tx_retention)
-                } else {
-                    String::new()
-                }
+                pruning(n)
             );
         }
         Some(n) => {
@@ -390,6 +402,44 @@ fn render_log(e: &LogEntry) -> String {
 mod tests {
     use super::*;
     use gyges_proto::v1::{ApiVersion, Network, NodeStatus};
+
+    fn pruned_node(tip: u32, retained_from: u32, tx_retention: u32) -> NodeStatus {
+        NodeStatus {
+            connected: true,
+            tip_height: tip,
+            tip_hash: "00001999e937c01a".into(),
+            retained_from,
+            pruned: true,
+            tx_retention,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pruning_shows_the_window_and_never_an_unknown_retention_as_zero() {
+        // Zakura does not report `tx_retention`, so the daemon sends 0.
+        let s = pruning(&pruned_node(4_579_076, 4_568_077, 0));
+        assert_eq!(s, ", pruned, holds 11000 blocks");
+        assert!(!s.contains("tx_retention"));
+        // During initial sync the node held nothing below `tip + 1`.
+        assert_eq!(
+            pruning(&pruned_node(2_261_600, 2_261_601, 0)),
+            ", pruned, holds 0 blocks"
+        );
+        // Pruned, but nothing pruned yet.
+        assert_eq!(pruning(&pruned_node(500, 0, 0)), ", pruned");
+        assert_eq!(
+            pruning(&pruned_node(4_579_076, 4_568_077, 10_000)),
+            ", tx_retention 10000"
+        );
+        assert_eq!(
+            pruning(&NodeStatus {
+                pruned: false,
+                ..pruned_node(10, 0, 0)
+            }),
+            ""
+        );
+    }
 
     #[test]
     fn status_rendering_mentions_the_essentials() {
