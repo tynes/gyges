@@ -478,6 +478,14 @@ The harness therefore runs the three as `gyges_regtest::Fallback`:
 
 One consequence: a transaction broadcast through zaino (`--via-tor`) reaches only the archive node's mempool, and nothing mines there.
 
+### 2.6 Facts from a pruned testnet node syncing from genesis (2026-10-31 to 2026-11-03)
+
+A zakurad 1.6.0 testnet node with `tx_retention = 10000`, started from genesis, with `gygesd` beside it from the start.
+
+- **During initial sync the node holds almost no block bodies.** `gygesd` warned `retains=0` at its first poll. After a restart at height 2,261,600 the node reported `pruneheight` 2,261,601, one above its tip. Once caught up it held 11,000 blocks (`pruneheight` 4,568,077 at tip 4,579,076): the 10,000 of `tx_retention` counted from the finalized tip, as on regtest (§2.5).
+- **`estimatedheight` tells a syncing node from a synced one.** It was 4,579,077 at tip 4,579,076 (`verificationprogress` 0.99999978). Gyges reads it as `NodeBounds::estimated_height`; `birthday::resolve` refuses a birthday while the node is more than `NODE_SYNCING_GAP` (1,000) blocks behind it, except on regtest.
+- **What that guard prevents.** Two keys made by `key init` while the node was near height 47,200 took the node's tip as their birthday, raised to Sapling activation (280,000). The node had pruned block 279,999's tree state before the wallet asked for it, so both keys stalled with `pruned-past-scan-tip` within the hour and stayed stalled. Upstream kept scanning the chain-tip ranges as the node advanced and found both funding notes at 4,562,697 and 4,562,699, but the history from 280,000 can only come from an archival endpoint now. The keys showed 1 testnet ZEC each with `no-witness` notes.
+
 ---
 
 ## 3. Open work

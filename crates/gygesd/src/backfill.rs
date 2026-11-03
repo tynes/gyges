@@ -919,6 +919,7 @@ mod tests {
             tip_height: BlockHeight::from_u32(100),
             tip_hash: [0; 32],
             retained_from: BlockHeight::from_u32(50),
+            estimated_height: None,
         };
         assert_eq!(handoff_height(&b, 10), BlockHeight::from_u32(60));
         assert_eq!(handoff_height(&b, 80), BlockHeight::from_u32(100));

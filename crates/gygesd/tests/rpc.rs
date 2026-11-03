@@ -309,7 +309,11 @@ async fn lock(c: &mut GygesClient<Channel>, key_id: &str) {
 
 /// A fixed chain backend at `tip`, retaining blocks from `retained_from`.
 fn fixed(tip: u32, retained_from: u32) -> Arc<FixedChain> {
-    Arc::new(FixedChain { tip, retained_from })
+    Arc::new(FixedChain {
+        tip,
+        retained_from,
+        estimated: None,
+    })
 }
 
 /// `Shutdown`, then the daemon's task ends cleanly within `within`.
