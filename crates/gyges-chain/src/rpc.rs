@@ -125,6 +125,9 @@ struct BlockchainInfo {
     /// Present only when `pruned`.
     #[serde(default)]
     pruneheight: Option<u32>,
+    /// The node's estimate of the network's tip.
+    #[serde(default)]
+    estimatedheight: Option<u32>,
     /// Network upgrades keyed by consensus branch id (eight hex digits),
     /// pending ones included.
     #[serde(default)]
@@ -167,6 +170,7 @@ impl BlockchainInfo {
             retained_from: BlockHeight::from_u32(
                 self.pruneheight.filter(|_| self.pruned).unwrap_or(0),
             ),
+            estimated_height: self.estimatedheight.map(BlockHeight::from_u32),
         })
     }
 }
@@ -833,12 +837,15 @@ mod tests {
         assert_eq!(b.tip_height, h(120));
         assert_eq!(b.retained_from, h(100));
         assert_eq!(b.tip_hash[0], 0xab, "display order is reversed");
+        assert_eq!(b.estimated_height, Some(h(120)));
+        assert_eq!(b.blocks_behind(), 0);
 
         let info: BlockchainInfo = serde_json::from_value(json!({
             "chain": "main", "blocks": 5, "bestblockhash": "00".repeat(32), "pruned": false
         }))
         .unwrap();
         assert_eq!(info.bounds().unwrap().retained_from, h(0));
+        assert_eq!(info.bounds().unwrap().estimated_height, None);
     }
 
     #[test]

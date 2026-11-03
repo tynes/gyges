@@ -62,12 +62,24 @@ pub struct NodeBounds {
     /// `pruneheight` when `pruned == true`, otherwise 0. The lowest height
     /// whose block body the node still stores.
     pub retained_from: BlockHeight,
+    /// `getblockchaininfo.estimatedheight`, the node's own estimate of the
+    /// network's tip; `None` when the backend reports none. Far above
+    /// `tip_height` while the node is in initial sync.
+    pub estimated_height: Option<BlockHeight>,
 }
 
 impl NodeBounds {
     /// Whether the node can serve block `height`'s body (and tree state).
     pub fn retains(&self, height: BlockHeight) -> bool {
         height >= self.retained_from && height <= self.tip_height
+    }
+
+    /// Blocks between the node's tip and its estimate of the network's
+    /// tip, 0 when it reports no estimate.
+    pub fn blocks_behind(&self) -> u32 {
+        self.estimated_height.map_or(0, |e| {
+            u32::from(e).saturating_sub(u32::from(self.tip_height))
+        })
     }
 }
 
@@ -411,10 +423,23 @@ mod tests {
             tip_height: BlockHeight::from_u32(100),
             tip_hash: [0; 32],
             retained_from: BlockHeight::from_u32(50),
+            estimated_height: None,
         };
         assert!(b.retains(BlockHeight::from_u32(50)));
         assert!(b.retains(BlockHeight::from_u32(100)));
         assert!(!b.retains(BlockHeight::from_u32(49)));
         assert!(!b.retains(BlockHeight::from_u32(101)));
+        assert_eq!(b.blocks_behind(), 0);
+        let syncing = NodeBounds {
+            estimated_height: Some(BlockHeight::from_u32(4_579_077)),
+            ..b.clone()
+        };
+        assert_eq!(syncing.blocks_behind(), 4_578_977);
+        // An estimate below the tip is not "ahead".
+        let ahead = NodeBounds {
+            estimated_height: Some(BlockHeight::from_u32(90)),
+            ..b
+        };
+        assert_eq!(ahead.blocks_behind(), 0);
     }
 }

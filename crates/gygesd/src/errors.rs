@@ -147,6 +147,9 @@ pub(crate) fn birthday_error(e: BirthdayError) -> GygesError {
             ErrorReason::InvalidArgument,
             format!("birthday {height} is above the node's tip {tip}"),
         ),
+        e @ BirthdayError::NodeSyncing { .. } => {
+            GygesError::new(ErrorReason::NotSynced, e.to_string())
+        }
         BirthdayError::BelowRetention {
             height,
             retained_from,
@@ -247,6 +250,16 @@ mod tests {
             })
             .reason(),
             ErrorReason::FallbackUnavailable
+        );
+        let syncing = birthday_error(BirthdayError::NodeSyncing {
+            tip: 47_200,
+            estimated: 4_579_077,
+        });
+        assert_eq!(syncing.reason(), ErrorReason::NotSynced);
+        assert!(
+            syncing.detail.contains("still syncing"),
+            "{}",
+            syncing.detail
         );
     }
 }

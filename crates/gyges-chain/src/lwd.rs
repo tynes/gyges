@@ -409,6 +409,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
                 tip_height: height_of(id.height, "GetLatestBlock")?,
                 tip_hash: bytes32(&id.hash, "GetLatestBlock: hash")?,
                 retained_from: BlockHeight::from_u32(0),
+                estimated_height: None,
             })
         })
         .await

@@ -123,6 +123,7 @@ Generates 24-word BIP 39 entropy, sets `birthday_height` to the node's current t
 
 - **Scripted form.** With `--json` *and* a passphrase source (`--passphrase-fd` or `GYGES_PASSPHRASE_FILE`) no terminal is needed: the `InitKeyResponse` (mnemonic included) is printed as JSON and nothing is typed back. This is the form the regtest suite uses. `--json` without a passphrase source is still refused (exit 4, `CONFIRMATION_REQUIRED`).
 - **Air-gapped daemon.** Against `gygesd --airgapped` the command creates a `signer-only` profile (seed and profile, no wallet, no birthday), the only mode an air-gapped box needs.
+- **Node still syncing.** On mainnet and testnet the command exits 7 (`NOT_SYNCED`, "the node is still syncing (tip T, network tip about E)") while the node is more than 1,000 blocks behind its own `getblockchaininfo.estimatedheight`. Its tip then is no birthday: below Sapling activation it would be raised to activation, and a pruned node drops those blocks before the wallet can scan them, which stalls the key for good without a fallback endpoint (decisions.md §2.6). `key restore` is refused the same way, except for a birthday below the node's window, which takes the fallback path. Regtest is not checked.
 - `--set-default` applies until the daemon restarts; the daemon never rewrites `config.toml`, so the CLI prints the `default_key = "<id>"` line to add. The same holds for `key restore --set-default`.
 
 ##### `gyges key restore --id <KEY_ID> [--birthday <HEIGHT>] [--stdin] [--yes] [--set-default]`

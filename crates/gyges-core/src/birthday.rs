@@ -41,6 +41,14 @@ pub enum BirthdayError {
          a historical restore over Tor is needed"
     )]
     BelowRetention { height: u32, retained_from: u32 },
+    /// The node is more than [`NODE_SYNCING_GAP`] blocks behind its own
+    /// estimate of the network's tip.
+    #[error(
+        "the node is still syncing (tip {tip}, network tip about {estimated}); a birthday taken now \
+         would be far behind the chain, and a pruned node drops those blocks before the wallet can \
+         scan them. Wait until the node has caught up"
+    )]
+    NodeSyncing { tip: u32, estimated: u32 },
     #[error(transparent)]
     Chain(#[from] ChainError),
     /// The fallback endpoint could not serve the tree state.
@@ -58,9 +66,34 @@ pub enum BirthdayError {
     },
 }
 
+/// How far behind its own estimate of the network's tip a node may be
+/// before it counts as still syncing. A synced node's estimate drifts a few
+/// blocks between blocks (it extrapolates from the tip's time), and a slow
+/// testnet can go an hour without one; initial sync is millions behind.
+pub const NODE_SYNCING_GAP: u32 = 1_000;
+
+/// A node in initial sync gives no usable birthday: its tip is far behind
+/// the chain (below Sapling activation the birthday is raised to it), and
+/// a pruned node drops those blocks before the wallet can scan them, which
+/// stalls the key for good without a fallback endpoint. Regtest has no
+/// network to catch up with, and its estimate counts from an old genesis
+/// time, so it is never checked.
+fn ensure_synced(network: Network, bounds: &gyges_chain::NodeBounds) -> Result<(), BirthdayError> {
+    let behind = bounds.blocks_behind();
+    if network == Network::Regtest || behind <= NODE_SYNCING_GAP {
+        return Ok(());
+    }
+    Err(BirthdayError::NodeSyncing {
+        tip: u32::from(bounds.tip_height),
+        estimated: u32::from(bounds.tip_height) + behind,
+    })
+}
+
 /// Resolve `requested` (or, when `None`, the node's current tip) into a
 /// birthday. The result is never below Sapling activation, because nothing
-/// shielded can exist before it.
+/// shielded can exist before it. Refused with [`BirthdayError::NodeSyncing`]
+/// while the connected node is in initial sync, unless the birthday is
+/// below its window, which the fallback endpoint serves instead.
 pub async fn resolve(
     network: Network,
     chain: Option<&dyn ChainBackend>,
@@ -76,6 +109,7 @@ pub async fn resolve(
                 ))?
                 .node_bounds()
                 .await?;
+            ensure_synced(network, &bounds)?;
             u32::from(bounds.tip_height)
         }
     }
@@ -99,6 +133,7 @@ pub async fn resolve(
                     retained_from,
                 });
             }
+            ensure_synced(network, &bounds)?;
         }
         // The scanner only checks continuity between blocks it has scanned
         // itself, so the hash is informational; take the real one when a node
@@ -133,6 +168,7 @@ pub async fn resolve(
             retained_from,
         });
     }
+    ensure_synced(network, &bounds)?;
     let state = chain.chain_state(BlockHeight::from_u32(prior)).await?;
     Ok(ResolvedBirthday {
         height,
@@ -177,6 +213,8 @@ pub async fn resolve_from_fallback(
 pub struct FixedChain {
     pub tip: u32,
     pub retained_from: u32,
+    /// `getblockchaininfo.estimatedheight`; `None` reports none.
+    pub estimated: Option<u32>,
 }
 
 impl FixedChain {
@@ -185,6 +223,7 @@ impl FixedChain {
             tip_height: BlockHeight::from_u32(self.tip),
             tip_hash: [0xaa; 32],
             retained_from: BlockHeight::from_u32(self.retained_from),
+            estimated_height: self.estimated.map(BlockHeight::from_u32),
         }
     }
 }
@@ -329,6 +368,7 @@ mod tests {
         let chain = FixedChain {
             tip: 1000,
             retained_from: 800,
+            estimated: None,
         };
         let r = resolve(Network::Regtest, Some(&chain), None).await.unwrap();
         assert_eq!(r.height, 1000);
@@ -377,10 +417,87 @@ mod tests {
         let unpruned = FixedChain {
             tip: 1000,
             retained_from: 0,
+            estimated: None,
         };
         let r = resolve(Network::Regtest, Some(&unpruned), Some(1))
             .await
             .unwrap();
         assert_eq!(r.height, 1);
+    }
+
+    /// The testnet run of 2026-10-31: `key init` while the node was at
+    /// 47,200 of 4.5M took the Sapling activation birthday (the tip, raised
+    /// to 280,000), the pruned node dropped those blocks during its sync,
+    /// and the key stalled for good.
+    #[tokio::test]
+    async fn a_syncing_node_gives_no_birthday() {
+        let syncing = FixedChain {
+            tip: 47_200,
+            retained_from: 47_201,
+            estimated: Some(4_579_077),
+        };
+        for requested in [None, Some(280_000)] {
+            let err = resolve(Network::Testnet, Some(&syncing), requested)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    BirthdayError::NodeSyncing {
+                        tip: 47_200,
+                        estimated: 4_579_077
+                    }
+                ),
+                "{requested:?}: {err}"
+            );
+            assert!(err.to_string().contains("still syncing"), "{err}");
+        }
+
+        // Inside the window of a node far behind: still refused.
+        let catching_up = FixedChain {
+            tip: 4_000_000,
+            retained_from: 3_990_000,
+            estimated: Some(4_579_077),
+        };
+        let err = resolve(Network::Testnet, Some(&catching_up), Some(3_995_000))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BirthdayError::NodeSyncing { .. }), "{err}");
+        // Below its window the fallback endpoint serves the history, so the
+        // caller's backfill path still applies.
+        let err = resolve(Network::Testnet, Some(&catching_up), Some(3_000_000))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BirthdayError::BelowRetention { .. }), "{err}");
+
+        // Synced to within the gap: the tip is the birthday.
+        let synced = FixedChain {
+            tip: 4_579_076,
+            retained_from: 4_568_077,
+            estimated: Some(4_579_076 + NODE_SYNCING_GAP),
+        };
+        let r = resolve(Network::Testnet, Some(&synced), None)
+            .await
+            .unwrap();
+        assert_eq!(r.height, 4_579_076);
+        // A node that reports no estimate is taken at its word.
+        let silent = FixedChain {
+            estimated: None,
+            ..syncing.clone()
+        };
+        let r = resolve(Network::Testnet, Some(&silent), None)
+            .await
+            .unwrap();
+        assert_eq!(r.height, 280_000);
+        // Regtest is never checked.
+        let regtest = FixedChain {
+            tip: 10,
+            retained_from: 0,
+            estimated: Some(5_000_000),
+        };
+        let r = resolve(Network::Regtest, Some(&regtest), None)
+            .await
+            .unwrap();
+        assert_eq!(r.height, 10);
     }
 }
