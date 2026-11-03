@@ -137,12 +137,28 @@ impl KeyEntry {
             .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// Highest block the wallet has scanned, 0 if none yet.
+    /// The highest block every earlier block of which is scanned, as
+    /// `GetSyncStatus` reports it (`crate::sync::WalletView::scanned_tip`):
+    /// the block before the birthday when nothing is scanned yet, 0 for a
+    /// profile without a wallet.
     pub fn scanned_tip(&self) -> u32 {
+        let Some(w) = self.wallet() else { return 0 };
+        if let Some(m) = w.block_fully_scanned().ok().flatten() {
+            return u32::from(m.block_height());
+        }
+        w.get_wallet_birthday()
+            .ok()
+            .flatten()
+            .map_or(0, |b| u32::from(b).saturating_sub(1))
+    }
+
+    /// Highest block the wallet has scanned anywhere, 0 if none yet. Above
+    /// [`Self::scanned_tip`] while lower ranges are still open, as when
+    /// upstream scans the chain tip before history.
+    pub fn highest_scanned(&self) -> u32 {
         self.wallet()
             .and_then(|w| w.block_max_scanned().ok().flatten())
-            .map(|m| u32::from(m.block_height()))
-            .unwrap_or(0)
+            .map_or(0, |m| u32::from(m.block_height()))
     }
 
     /// Derive the account's UFVK from decrypted entropy, for profiles whose
@@ -762,7 +778,9 @@ mod tests {
             .unwrap();
         assert_eq!(key.key_id(), "main");
         assert_eq!(key.profile().birthday_height, Some(1));
+        // Nothing scanned: the block before the birthday, as sync status says.
         assert_eq!(key.scanned_tip(), 0);
+        assert_eq!(key.highest_scanned(), 0);
         let ufvk = key.ufvk().expect("ufvk");
         assert!(ufvk.starts_with("uviewregtest1"), "{ufvk}");
 

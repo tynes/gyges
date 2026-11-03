@@ -106,7 +106,7 @@ Writes or removes a per-user service that runs `gygesd --foreground` for `--netw
 Finishes the current scan batch, checkpoints SQLite WAL, aborts in-progress proving, leaves pending ZIP 320 and signing-session rows to resume on next start, and zeroizes all unlocked keys before exit.
 
 ##### `gyges daemon status`
-Daemon version and API version, network, airgapped flag, `zakurad` connection state, node bounds (`tip_height`, `retained_from`, and on a pruned node the node's `tx_retention` when it reports one, otherwise the blocks it holds; Zakura does not report it, so `tx_retention` is never printed as 0), Tor bootstrap state, fallback endpoint trust state, and a per-key line with signing mode, lock state, `scanned_tip` and sync state.
+Daemon version and API version, network, airgapped flag, `zakurad` connection state, node bounds (`tip_height`, `retained_from`, and on a pruned node the node's `tx_retention` when it reports one, otherwise the blocks it holds; Zakura does not report it, so `tx_retention` is never printed as 0), Tor bootstrap state, fallback endpoint trust state, and a per-key line with signing mode, lock state, `scanned_tip` and sync state. `scanned_tip` here and in `key list` is the height `sync status` reports (every block up to it scanned, `birthday - 1` before the first batch); when blocks above it are already scanned, as when upstream scans the chain tip before history, the line adds `(blocks up to H scanned out of order)` from `KeySummary.highest_scanned`.
 
 ##### `gyges daemon logs [--follow] [--lines <N>] [--audit]`
 Streams structured daemon logs through the `StreamLogs` RPC (the CLI never tails the file). Replays the last `N` entries (default 100, at most the 1,000 the daemon keeps), then with `--follow` keeps printing until Ctrl-C. `--audit` streams the audit log instead (API §4.5). `--json` prints one `LogEntry` per line.
@@ -200,7 +200,7 @@ Static QR for the current address or any address given.
 Parses any Zcash address (`u1`, `utest1`, `zs1`, `t1`, `t3`, `tex1`, `textest1`), validates checksum and network, lists embedded receivers and whether the address is a ZIP 320 TEX address.
 
 ##### `gyges balance [--min-conf <N>]`
-**Spendable** and **Pending** balances per pool (Orchard, Ironwood, Sapling, Transparent) with totals and the height they are as of. *Spendable* means confirmed to the daemon's anchor depth (`--min-conf`, default `policy.min_confirmations` = 10, the upstream default), with witnesses available; *pending* is received but below that depth, unmined, or change awaiting confirmation.
+**Spendable** and **Pending** balances per pool (Orchard, Ironwood, Sapling, Transparent) with totals and the height they are as of. *Spendable* means confirmed to the daemon's anchor depth (`--min-conf`, default `policy.min_confirmations` = 10, the upstream default); *pending* is received but below that depth, unmined, or change awaiting confirmation. The pools follow the wallet's note rules, and a send also needs the key's sync to be *spendable* (architecture.md Sync §6): until it is, `GetBalance.not_spendable_reason` carries the sentence `tx send` would refuse with (`NOT_SYNCED`), and the table ends with ``warning: `tx send` refuses these funds until sync completes: <reason>``.
 
 ##### `gyges notes [--pool <orchard|ironwood|sapling|transparent>] [--unspent | --spent | --all]`
 Decrypted notes and UTXOs with heights, values, memo previews and witness readiness.
