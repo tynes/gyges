@@ -331,12 +331,17 @@ pub fn render_status(info: &GetInfoResponse) -> String {
         for k in &info.keys {
             let _ = writeln!(
                 s,
-                "    {:<16} {:<12} {:<8} birthday {} scanned {}{}",
+                "    {:<16} {:<12} {:<8} birthday {} scanned {}{}{}",
                 k.key_id,
                 crate::key::mode_name(k.signing_mode()),
                 if k.locked { "locked" } else { "UNLOCKED" },
                 k.birthday_height,
                 k.scanned_tip,
+                if k.highest_scanned > k.scanned_tip {
+                    format!(" (blocks up to {} scanned out of order)", k.highest_scanned)
+                } else {
+                    String::new()
+                },
                 if k.is_default { " (default)" } else { "" }
             );
             if k.transparent_best_effort_below > 0 {
@@ -415,6 +420,35 @@ mod tests {
         assert!(s.contains("node:         not connected"));
         assert!(s.contains("default key:  main"));
         assert!(s.contains("keys:         (none)"));
+    }
+
+    #[test]
+    fn key_line_shows_the_fully_scanned_height_and_flags_out_of_order_scans() {
+        let key = |id: &str, scanned_tip, highest_scanned| gyges_proto::v1::KeySummary {
+            key_id: id.into(),
+            birthday_height: 280_000,
+            scanned_tip,
+            highest_scanned,
+            locked: true,
+            ..Default::default()
+        };
+        let info = GetInfoResponse {
+            keys: vec![
+                key("alice", 279_999, 4_579_076),
+                key("synced", 4_579_076, 4_579_076),
+            ],
+            ..Default::default()
+        };
+        let s = render_status(&info);
+        let alice = s.lines().find(|l| l.contains("alice")).expect("alice");
+        assert!(
+            alice.ends_with(
+                "birthday 280000 scanned 279999 (blocks up to 4579076 scanned out of order)"
+            ),
+            "{alice}"
+        );
+        let synced = s.lines().find(|l| l.contains("synced")).expect("synced");
+        assert!(synced.ends_with("scanned 4579076"), "{synced}");
     }
 
     #[test]

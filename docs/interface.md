@@ -106,7 +106,7 @@ Writes or removes a per-user service that runs `gygesd --foreground` for `--netw
 Finishes the current scan batch, checkpoints SQLite WAL, aborts in-progress proving, leaves pending ZIP 320 and signing-session rows to resume on next start, and zeroizes all unlocked keys before exit.
 
 ##### `gyges daemon status`
-Daemon version and API version, network, airgapped flag, `zakurad` connection state, node bounds (`tip_height`, `retained_from`, the node's `tx_retention`), Tor bootstrap state, fallback endpoint trust state, and a per-key line with signing mode, lock state, `scanned_tip` and sync state.
+Daemon version and API version, network, airgapped flag, `zakurad` connection state, node bounds (`tip_height`, `retained_from`, the node's `tx_retention`), Tor bootstrap state, fallback endpoint trust state, and a per-key line with signing mode, lock state, `scanned_tip` and sync state. `scanned_tip` here and in `key list` is the height `sync status` reports (every block up to it scanned, `birthday - 1` before the first batch); when blocks above it are already scanned, as when upstream scans the chain tip before history, the line adds `(blocks up to H scanned out of order)` from `KeySummary.highest_scanned`.
 
 ##### `gyges daemon logs [--follow] [--lines <N>] [--audit]`
 Streams structured daemon logs through the `StreamLogs` RPC (the CLI never tails the file). Replays the last `N` entries (default 100, at most the 1,000 the daemon keeps), then with `--follow` keeps printing until Ctrl-C. `--audit` streams the audit log instead (API §4.5). `--json` prints one `LogEntry` per line.
