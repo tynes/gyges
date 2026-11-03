@@ -286,6 +286,9 @@ pub enum ScanOutcome {
         summary: ScanSummary,
         /// Transparent outputs credited to this key from the batch.
         transparent_outputs: usize,
+        /// Ironwood notes received in the batch, which `summary` does not
+        /// count.
+        ironwood_received: usize,
     },
     /// A continuity check failed at `at_height`: the wallet's view has
     /// diverged from the cached chain (docs/architecture.md Sync §4.3). Nothing was written.
@@ -325,10 +328,16 @@ pub fn scan_range(
         Err(ScanChainError::BlockSource(e)) => return Err(SyncError::Cache(e)),
         Err(other) => return Err(SyncError::Scan(other.to_string())),
     };
-    let transparent_outputs = index_transparent(cache, wallet, summary.scanned_range())?;
+    let scanned = summary.scanned_range();
+    let transparent_outputs = index_transparent(cache, wallet, scanned.clone())?;
+    let ironwood_received = crate::db::with_db(wallet, |db| {
+        crate::db::history::ironwood_received_in(db, scanned.start.into(), scanned.end.into())
+    })
+    .map_err(wallet_err)?;
     Ok(ScanOutcome::Scanned {
         summary,
         transparent_outputs,
+        ironwood_received,
     })
 }
 

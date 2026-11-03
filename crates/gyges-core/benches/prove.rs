@@ -254,9 +254,11 @@ fn scan(
     wallet: &mut Wallet,
     range: &ScanRange,
     prior: &ChainState,
-) {
+) -> usize {
     match sync::scan_range(params, cache, wallet, range, prior).expect("the range scans") {
-        ScanOutcome::Scanned { .. } => {}
+        ScanOutcome::Scanned {
+            ironwood_received, ..
+        } => ironwood_received,
         ScanOutcome::Reorg { at_height } => panic!("reorg at {at_height}"),
     }
 }
@@ -283,11 +285,12 @@ fn scanning(c: &mut Criterion) {
 
     // Check the fixture once, outside the timing: the wallet finds exactly
     // its own notes. Upstream's `ScanSummary` does not count Ironwood notes,
-    // so this reads the wallet's table.
+    // so this reads the wallet's table, and checks the count the scan
+    // outcome reports for the daemon's log against it.
     {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let mut wallet = wallet(&dir, &ufvk, &prior);
-        scan(&params, &cache, &mut wallet, &range, &prior);
+        let reported = scan(&params, &cache, &mut wallet, &range, &prior);
         let notes: u32 = rusqlite::Connection::open(dir.path().join("wallet.sqlite"))
             .and_then(|c| {
                 c.query_row("SELECT COUNT(*) FROM ironwood_received_notes", [], |r| {
@@ -296,6 +299,10 @@ fn scanning(c: &mut Criterion) {
             })
             .expect("the wallet's notes");
         assert_eq!(notes, 2 * BLOCKS, "the wallet's Ironwood notes");
+        assert_eq!(
+            reported, notes as usize,
+            "the scan outcome's Ironwood count"
+        );
     }
 
     let mut group = c.benchmark_group("scan-range");

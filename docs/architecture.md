@@ -437,7 +437,7 @@ A failure discards the output with a log line naming the height and the reason, 
 | Term | Definition | Source of truth |
 |---|---|---|
 | **scanned** | `block_fully_scanned().height >= bounds.tip_height` | `WalletRead::block_fully_scanned` |
-| **spendable** | scanned, and `suggest_scan_ranges()` returns no range with priority above `Ignored` | `WalletRead::suggest_scan_ranges` |
+| **spendable** | scanned, not stalled, and `suggest_scan_ranges()` returns no range with priority above `Ignored` | `WalletRead::suggest_scan_ranges` |
 
 `GetSyncStatus` returns both booleans plus `scanned_tip`, `tip_height`, the `SyncState`, blocks per second over the last minute, the blocks remaining across open ranges and the active source (`retained_from` is in `GetInfo.node`). The CLI never computes them itself. `WaitSync` wakes the scheduler and reports `done` only from a tick that began after the request, so a `sync wait` issued right after new blocks never returns a stale "spendable"; a stalled key fails the stream at once with `NOT_SYNCED` (interface.md API §4.4).
 

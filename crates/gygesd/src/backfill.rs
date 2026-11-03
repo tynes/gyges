@@ -504,7 +504,11 @@ impl Scheduler {
             Err(e) => return Err(e),
         };
         match outcome {
-            ScanOutcome::Scanned { summary, .. } => {
+            ScanOutcome::Scanned {
+                summary,
+                ironwood_received,
+                ..
+            } => {
                 let scanned = summary.scanned_range();
                 let n = u32::from(scanned.end).saturating_sub(u32::from(scanned.start));
                 self.record_rate(&key_id, n);
@@ -514,6 +518,7 @@ impl Scheduler {
                     to = u32::from(scanned.end) - 1,
                     sapling_received = summary.received_sapling_note_count(),
                     orchard_received = summary.received_orchard_note_count(),
+                    ironwood_received,
                     "backfill batch scanned"
                 );
                 let rate = self.rate(&key_id);

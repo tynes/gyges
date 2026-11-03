@@ -710,7 +710,9 @@ async fn init_and_restore_against_a_fake_node() {
     assert!(keys[0].is_default, "set_default was honoured");
     assert!(keys[0].locked);
     assert_eq!(keys[0].birthday_height, 50);
-    assert_eq!(keys[0].scanned_tip, 0);
+    // Nothing scanned yet: the block before the birthday, as `sync status` says.
+    assert_eq!(keys[0].scanned_tip, 49);
+    assert_eq!(keys[0].highest_scanned, 0);
     assert_eq!(keys[0].seed_fingerprint.len(), 64);
     let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
     assert_eq!(info.default_key, "main");
@@ -2483,6 +2485,14 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
         "{}",
         typed.detail
     );
+    // GetBalance says why a send would be refused, whatever the pools show.
+    let stalled_balance = balance(&mut c, "main").await;
+    assert!(
+        stalled_balance
+            .not_spendable_reason
+            .contains("pruned-past-scan-tip"),
+        "{stalled_balance:?}"
+    );
 
     // Widen the window again: the next tick re-evaluates the invariant and
     // the key leaves STALLED on its own. (WaitSync on a stalled key fails
@@ -2494,6 +2504,11 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
     .await;
     let status = wait_spendable(&mut c, "main").await;
     assert_eq!(status.scanned_tip, 19, "{status:?}");
+    let synced_balance = balance(&mut c, "main").await;
+    assert_eq!(
+        synced_balance.not_spendable_reason, "",
+        "{synced_balance:?}"
+    );
 
     // GetSyncStatus of an unknown key is typed.
     let err = c

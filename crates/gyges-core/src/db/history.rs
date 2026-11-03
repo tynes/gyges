@@ -65,6 +65,20 @@ pub(crate) fn received_outputs(db: &Db<'_>, tip: u32) -> Result<Vec<RawNote>, Db
     )
 }
 
+/// Ironwood notes the wallet received in blocks `[start, end)`. Upstream's
+/// `ScanSummary` counts only Sapling and Orchard, so the scan log reads
+/// Ironwood here.
+pub(crate) fn ironwood_received_in(db: &Db<'_>, start: u32, end: u32) -> rusqlite::Result<usize> {
+    db.row(
+        "SELECT COUNT(*)
+         FROM v_received_outputs ro
+         JOIN transactions t ON t.id_tx = ro.transaction_id
+         WHERE ro.pool = 4 AND t.mined_height >= :start AND t.mined_height < :end",
+        named_params! { ":start": start, ":end": end },
+        |r| r.get(0),
+    )
+}
+
 /// One output of a transaction, as the view gives it.
 #[derive(Deserialize)]
 pub(crate) struct RawOutput {

@@ -104,12 +104,14 @@ impl SyncHub {
     }
 
     /// Mark `key_id` stalled for `reason`: it scans nothing until the cause
-    /// is gone.
+    /// is gone. A stalled key is not spendable, whatever it was before: the
+    /// send gate reads `spendable`, and blocks past the stall are unscanned.
     pub(crate) fn stall(&self, key_id: &str, reason: StallReason, detail: String) {
         self.update(key_id, |p| {
             p.state = SyncState::Stalled(reason);
             p.detail = detail;
             p.blocks_per_sec = 0.0;
+            p.spendable = false;
         });
     }
 
@@ -764,6 +766,7 @@ impl Scheduler {
             ScanOutcome::Scanned {
                 summary,
                 transparent_outputs,
+                ironwood_received,
             } => {
                 let scanned = summary.scanned_range();
                 let n = u32::from(scanned.end).saturating_sub(u32::from(scanned.start));
@@ -774,6 +777,7 @@ impl Scheduler {
                     to = u32::from(scanned.end) - 1,
                     sapling_received = summary.received_sapling_note_count(),
                     orchard_received = summary.received_orchard_note_count(),
+                    ironwood_received,
                     transparent_outputs,
                     ms = t0.elapsed().as_millis(),
                     "batch scanned"
