@@ -747,7 +747,9 @@ message InspectAddressResponse {
 
 message PoolBalance {
   Pool pool = 1;
-  // Confirmed at or beyond min_confirmations and witnessed.
+  // Confirmed at or beyond min_confirmations, by the wallet's own note
+  // rules. A send also needs the key's sync to be spendable: see
+  // `GetBalanceResponse.not_spendable_reason`.
   int64 spendable = 2;
   // Received but below min_confirmations or unmined.
   int64 pending = 3;
@@ -767,6 +769,10 @@ message GetBalanceResponse {
   int64 total_pending = 3;
   uint32 min_confirmations = 4;
   uint32 as_of_height = 5;
+  // Empty when the key's sync is spendable. Otherwise the sentence
+  // `SendTransaction` would refuse with (`NOT_SYNCED`): until the key
+  // syncs, no amount above can be spent.
+  string not_spendable_reason = 6;
 }
 
 enum SpentFilter {

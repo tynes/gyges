@@ -65,6 +65,15 @@ pub fn render(b: &GetBalanceResponse) -> String {
         "(spendable at {} confirmations, as of height {})",
         b.min_confirmations, b.as_of_height
     );
+    // The pools follow the wallet's note rules; `tx send` also needs the
+    // key synced, and says so with this same sentence.
+    if !b.not_spendable_reason.is_empty() {
+        let _ = writeln!(
+            s,
+            "warning: `tx send` refuses these funds until sync completes: {}",
+            b.not_spendable_reason
+        );
+    }
     s
 }
 
@@ -94,11 +103,37 @@ mod tests {
             total_pending: 5,
             min_confirmations: 10,
             as_of_height: 42,
+            not_spendable_reason: String::new(),
         };
         let s = render(&b);
         assert!(s.contains("orchard") && s.contains("1.50000000"), "{s}");
         assert!(s.contains("transparent") && s.contains("0.00070000"), "{s}");
         assert!(s.contains("total") && s.contains("1.50070000"), "{s}");
         assert!(s.contains("10 confirmations, as of height 42"), "{s}");
+        assert!(!s.contains("warning"), "{s}");
+    }
+
+    #[test]
+    fn a_key_that_cannot_send_says_so_under_the_table() {
+        let reason = "key 'alice' is not spendable yet (stalled(pruned-past-scan-tip): node pruned \
+                      past key 'alice'); run `gyges sync wait`";
+        let b = GetBalanceResponse {
+            pools: vec![PoolBalance {
+                pool: Pool::Ironwood as i32,
+                spendable: 100_000_000,
+                ..Default::default()
+            }],
+            total_spendable: 100_000_000,
+            min_confirmations: 10,
+            as_of_height: 4_579_076,
+            not_spendable_reason: reason.into(),
+            ..Default::default()
+        };
+        let s = render(&b);
+        let last = s.lines().last().expect("a line");
+        assert_eq!(
+            last,
+            format!("warning: `tx send` refuses these funds until sync completes: {reason}")
+        );
     }
 }

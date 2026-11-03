@@ -141,6 +141,23 @@ enum PreAuth {
     None,
 }
 
+/// Why a spend from `kid` is refused with `NOT_SYNCED`, `None` when the
+/// key's sync is spendable (docs/architecture.md Sync §6). `GetBalance`
+/// reports the same sentence, so `balance` never shows funds as usable
+/// while `tx send` refuses them.
+pub(crate) fn not_synced(state: &DaemonState, kid: &str) -> Option<String> {
+    match state.sync.get(kid) {
+        Some(p) if p.spendable => None,
+        Some(p) => Some(format!(
+            "key '{kid}' is not spendable yet ({}); run `gyges sync wait`",
+            crate::sync::to_proto(&p).detail
+        )),
+        None => Some(
+            "synchronisation has not started for this key yet; run `gyges sync wait`".to_string(),
+        ),
+    }
+}
+
 pub(crate) fn prepare(
     state: &DaemonState,
     conn: Option<ConnInfo>,
@@ -182,23 +199,8 @@ pub(crate) fn prepare(
         None
     } else {
         let chain = connected_chain(state, &kid)?;
-        match state.sync.get(&kid) {
-            Some(p) if p.spendable => {}
-            Some(p) => {
-                return Err(typed(
-                    ErrorReason::NotSynced,
-                    &format!(
-                        "key '{kid}' is not spendable yet ({}); run `gyges sync wait`",
-                        crate::sync::to_proto(&p).detail
-                    ),
-                ));
-            }
-            None => {
-                return Err(typed(
-                    ErrorReason::NotSynced,
-                    "synchronisation has not started for this key yet; run `gyges sync wait`",
-                ));
-            }
+        if let Some(why) = not_synced(state, &kid) {
+            return Err(typed(ErrorReason::NotSynced, &why));
         }
         Some(chain)
     };
@@ -987,8 +989,10 @@ pub(crate) async fn get_balance(
         "a signer-only profile has no wallet and no balance",
     )?;
     let min_confirmations = state.min_confirmations(req.min_confirmations);
+    let not_spendable_reason = not_synced(&state, key.key_id()).unwrap_or_default();
     let b = wallet_rpc(&key, move |w| core_tx::balance(w, min_confirmations)).await?;
     Ok(GetBalanceResponse {
+        not_spendable_reason,
         pools: b
             .pools
             .iter()

@@ -104,12 +104,14 @@ impl SyncHub {
     }
 
     /// Mark `key_id` stalled for `reason`: it scans nothing until the cause
-    /// is gone.
+    /// is gone. A stalled key is not spendable, whatever it was before: the
+    /// send gate reads `spendable`, and blocks past the stall are unscanned.
     pub(crate) fn stall(&self, key_id: &str, reason: StallReason, detail: String) {
         self.update(key_id, |p| {
             p.state = SyncState::Stalled(reason);
             p.detail = detail;
             p.blocks_per_sec = 0.0;
+            p.spendable = false;
         });
     }
 

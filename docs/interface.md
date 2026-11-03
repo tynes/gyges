@@ -200,7 +200,7 @@ Static QR for the current address or any address given.
 Parses any Zcash address (`u1`, `utest1`, `zs1`, `t1`, `t3`, `tex1`, `textest1`), validates checksum and network, lists embedded receivers and whether the address is a ZIP 320 TEX address.
 
 ##### `gyges balance [--min-conf <N>]`
-**Spendable** and **Pending** balances per pool (Orchard, Ironwood, Sapling, Transparent) with totals and the height they are as of. *Spendable* means confirmed to the daemon's anchor depth (`--min-conf`, default `policy.min_confirmations` = 10, the upstream default), with witnesses available; *pending* is received but below that depth, unmined, or change awaiting confirmation.
+**Spendable** and **Pending** balances per pool (Orchard, Ironwood, Sapling, Transparent) with totals and the height they are as of. *Spendable* means confirmed to the daemon's anchor depth (`--min-conf`, default `policy.min_confirmations` = 10, the upstream default); *pending* is received but below that depth, unmined, or change awaiting confirmation. The pools follow the wallet's note rules, and a send also needs the key's sync to be *spendable* (architecture.md Sync §6): until it is, `GetBalance.not_spendable_reason` carries the sentence `tx send` would refuse with (`NOT_SYNCED`), and the table ends with ``warning: `tx send` refuses these funds until sync completes: <reason>``.
 
 ##### `gyges notes [--pool <orchard|ironwood|sapling|transparent>] [--unspent | --spent | --all]`
 Decrypted notes and UTXOs with heights, values, memo previews and witness readiness.
