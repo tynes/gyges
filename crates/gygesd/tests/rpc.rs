@@ -706,7 +706,9 @@ async fn init_and_restore_against_a_fake_node() {
     assert!(keys[0].is_default, "set_default was honoured");
     assert!(keys[0].locked);
     assert_eq!(keys[0].birthday_height, 50);
-    assert_eq!(keys[0].scanned_tip, 0);
+    // Nothing scanned yet: the block before the birthday, as `sync status` says.
+    assert_eq!(keys[0].scanned_tip, 49);
+    assert_eq!(keys[0].highest_scanned, 0);
     assert_eq!(keys[0].seed_fingerprint.len(), 64);
     let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
     assert_eq!(info.default_key, "main");

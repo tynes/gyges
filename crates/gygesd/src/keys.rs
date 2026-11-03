@@ -83,6 +83,7 @@ pub(crate) fn summary(entry: &KeyEntry, default_key: &str, unlocks: &[UnlockStat
         seed_fingerprint: p.seed_fingerprint.clone().unwrap_or_default(),
         transparent_best_effort_below: crate::backfill::load_report(entry)
             .map_or(0, |r| r.best_effort_below),
+        highest_scanned: entry.highest_scanned(),
     }
 }
 
