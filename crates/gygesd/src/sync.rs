@@ -4,7 +4,8 @@
 //!
 //! One task per daemon. Each tick: poll the node, reconcile the shared block
 //! cache with the node's chain (the cheap per-tick reorg detector), then for
-//! every key with a wallet: apply a requested rewind, check the wallet's own
+//! every key with a wallet, up to `cache.parallel_scans` keys at a time
+//! (backfill sessions after, one at a time): apply a requested rewind, check the wallet's own
 //! chain view against the cache, enforce the Case A invariant, fetch the
 //! next batch into the cache if needed, fetch the prior tree state, scan,
 //! and publish [`KeyProgress`]. Ticks run back to back while any key has
@@ -22,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use std::time::{Duration, Instant, SystemTime};
 
+use futures_util::StreamExt as _;
 use gyges_chain::{
     BlockDb, CacheError, ChainBackend, ChainError, FillError, NodeBounds, Source, TxStatus,
 };
@@ -221,6 +223,23 @@ impl SyncHub {
     }
 }
 
+/// One key's [`Scheduler::step_node`], tagged with its index.
+type StepFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (usize, Result<Step, SyncError>)> + Send + 'a>,
+>;
+
+/// What [`Scheduler::step_node`] did, or left to the caller.
+enum Step {
+    /// `(scanned a batch, scanned_tip)`.
+    Done(bool, BlockHeight),
+    /// The key has an open backfill session: step it.
+    Backfill(BlockHeight),
+    /// The key's scanned tip is below the node's window: open a session.
+    EnterBackfill(BlockHeight),
+    /// The scheduler is stopping; the key was not stepped.
+    Stopping,
+}
+
 /// Blocks scanned per key over the last minute.
 #[derive(Debug, Default)]
 struct Rate {
@@ -260,7 +279,11 @@ pub(crate) struct Scheduler {
     link: node::Link,
     /// `zakura_rpc.poll_interval_secs`, at least one second.
     poll: Duration,
-    rates: BTreeMap<String, Rate>,
+    /// Per key; keys scan concurrently, so behind a (short-held) lock.
+    rates: Mutex<BTreeMap<String, Rate>>,
+    /// Held while filling the cache, so that keys scanning the same range
+    /// at once fetch it once: the second finds it cached.
+    fetching: tokio::sync::Mutex<()>,
     started: Instant,
     last_connected: Option<Instant>,
     /// Open Case B sessions per key, loaded from disk on first use
@@ -299,7 +322,8 @@ pub(crate) fn spawn(
         cache,
         link,
         poll,
-        rates: BTreeMap::new(),
+        rates: Mutex::new(BTreeMap::new()),
+        fetching: tokio::sync::Mutex::new(()),
         started: Instant::now(),
         last_connected: None,
         backfills: BTreeMap::new(),
@@ -341,15 +365,15 @@ impl Scheduler {
         &self.state.sync
     }
 
-    pub(crate) fn record_rate(&mut self, key_id: &str, blocks: u32) {
-        self.rates
+    pub(crate) fn record_rate(&self, key_id: &str, blocks: u32) {
+        lock(&self.rates)
             .entry(key_id.to_string())
             .or_default()
             .record(blocks);
     }
 
     pub(crate) fn rate(&self, key_id: &str) -> f64 {
-        self.rates.get(key_id).map_or(0.0, Rate::per_sec)
+        lock(&self.rates).get(key_id).map_or(0.0, Rate::per_sec)
     }
 
     /// One pass over the node and every key. Returns whether any key
@@ -392,14 +416,49 @@ impl Scheduler {
             return false;
         }
 
+        // Keys step concurrently, up to `cache.parallel_scans` at once: each
+        // has its own wallet, and scanning one key leaves most cores idle
+        // (docs/testing.md §9.6 items 2 and 3). What needs the scheduler's
+        // own state (a backfill session) runs after, one key at a time.
+        let backfilling: Vec<bool> = keys.iter().map(|k| self.in_backfill(k)).collect();
+        let parallel = (self.state.config.cache.parallel_scans as usize).max(1);
+        let steps: Vec<(usize, Result<Step, SyncError>)> = {
+            let this = &*self;
+            let bounds = &bounds;
+            // Boxed up front: a closure building them inside the stream
+            // trips the compiler's lifetime inference in a spawned task.
+            let futures: Vec<StepFuture<'_>> = keys
+                .iter()
+                .zip(backfilling)
+                .enumerate()
+                .map(|(i, (key, backfilling))| -> StepFuture<'_> {
+                    Box::pin(async move { (i, this.step_node(key, bounds, backfilling).await) })
+                })
+                .collect();
+            futures_util::stream::iter(futures)
+                .buffer_unordered(parallel)
+                .collect()
+                .await
+        };
+        let mut steps = steps;
+        steps.sort_by_key(|(i, _)| *i);
+
         let mut did_work = false;
         let mut slowest: Option<BlockHeight> = None;
-        for key in &keys {
-            // Shutdown: the batch in hand is committed; leave the rest.
-            if self.hub().stopping() {
-                break;
-            }
-            match self.step_key(key, &bounds).await {
+        for (i, step) in steps {
+            let key = &keys[i];
+            let stepped = match step {
+                Ok(Step::Done(worked, tip)) => Ok((worked, tip)),
+                Ok(Step::Backfill(scanned_tip)) => {
+                    self.step_backfill(key, &bounds, scanned_tip).await
+                }
+                Ok(Step::EnterBackfill(scanned_tip)) => {
+                    self.enter_backfill(key, &bounds, scanned_tip).await
+                }
+                Ok(Step::Stopping) => continue,
+                Err(e) => Err(e),
+            };
+            match stepped {
                 Ok((worked, scanned_tip)) => {
                     did_work |= worked;
                     slowest = Some(slowest.map_or(scanned_tip, |s| s.min(scanned_tip)));
@@ -715,12 +774,20 @@ impl Scheduler {
         }
     }
 
-    /// One key, one batch at most. Returns `(scanned a batch, scanned_tip)`.
-    async fn step_key(
-        &mut self,
+    /// One key, one batch at most, from the node (Case A), with only shared
+    /// access to the scheduler, so that keys run concurrently. What needs
+    /// the scheduler's own state, a backfill session, is handed back as
+    /// [`Step::Backfill`] or [`Step::EnterBackfill`] for the caller to run.
+    async fn step_node(
+        &self,
         key: &Arc<KeyEntry>,
         bounds: &NodeBounds,
-    ) -> Result<(bool, BlockHeight), SyncError> {
+        backfilling: bool,
+    ) -> Result<Step, SyncError> {
+        // Shutdown: batches in hand are committed; start no new one.
+        if self.hub().stopping() {
+            return Ok(Step::Stopping);
+        }
         let key_id = key.key_id().to_string();
         let tip = bounds.tip_height;
 
@@ -748,13 +815,13 @@ impl Scheduler {
             && self.trusted_hash(h).await? != Some(wallet_hash)
         {
             self.handle_reorg(key, h + 1).await?;
-            return Ok((true, scanned_tip));
+            return Ok(Step::Done(true, scanned_tip));
         }
 
         // An open backfill session runs to its handoff before anything is
         // scanned from the node (docs/architecture.md Sync §5).
-        if self.in_backfill(key) {
-            return self.step_backfill(key, bounds, scanned_tip).await;
+        if backfilling {
+            return Ok(Step::Backfill(scanned_tip));
         }
         // docs/architecture.md Sync §3: a key whose scanned tip is below the window backfills
         // first, from its scanned tip up, before upstream's queue sends it
@@ -766,14 +833,14 @@ impl Scheduler {
             && scanned_tip < retained_from
             && scanned_tip < tip
         {
-            return self.enter_backfill(key, bounds, scanned_tip).await;
+            return Ok(Step::EnterBackfill(scanned_tip));
         }
 
         // docs/architecture.md Sync §4.2 invariant: the next batch starts at a height whose
         // body the node has, and its prior tree state is still served.
         let Some(range) = view.next_range(self.state.config.cache.scan_batch as usize) else {
             self.publish_synced(&key_id, &view, bounds);
-            return Ok((false, scanned_tip));
+            return Ok(Step::Done(false, scanned_tip));
         };
         let start = range.block_range().start;
         if start < retained_from
@@ -783,13 +850,13 @@ impl Scheduler {
             // is inside the window, which a backfill would not reach) the
             // key cannot go on.
             self.stall_pruned(&key_id, u32::from(start), bounds);
-            return Ok((false, scanned_tip));
+            return Ok(Step::Done(false, scanned_tip));
         }
 
         let range = clamp_end(&range, tip + 1);
         if range.is_empty() {
             self.publish_synced(&key_id, &view, bounds);
-            return Ok((false, scanned_tip));
+            return Ok(Step::Done(false, scanned_tip));
         }
         let Range { start, end } = range.block_range().clone();
         self.publish_view(
@@ -846,11 +913,11 @@ impl Scheduler {
                     }
                 };
                 self.publish_view(&key_id, &view, bounds, state, String::new());
-                Ok((true, new_tip))
+                Ok(Step::Done(true, new_tip))
             }
             ScanOutcome::Reorg { at_height } => {
                 self.handle_reorg(key, at_height).await?;
-                Ok((true, scanned_tip))
+                Ok(Step::Done(true, scanned_tip))
             }
         }
     }
@@ -861,6 +928,7 @@ impl Scheduler {
     /// chain: drop it and let the next tick's reconciliation find the fork
     /// point.
     async fn ensure_cached(&self, range: &ScanRange) -> Result<(), SyncError> {
+        let _fetching = self.fetching.lock().await;
         let Range { start, end } = range.block_range().clone();
         let have = self.cached_prefix(range).await?;
         if start + have >= end {

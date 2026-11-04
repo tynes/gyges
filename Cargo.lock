@@ -2605,6 +2605,7 @@ dependencies = [
  "arc-swap",
  "bip32",
  "clap",
+ "futures-util",
  "gyges-chain",
  "gyges-core",
  "gyges-proto",
