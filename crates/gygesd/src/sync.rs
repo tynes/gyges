@@ -85,6 +85,11 @@ struct MempoolRequest {
     reply: oneshot::Sender<Result<(u32, u32), String>>,
 }
 
+/// `cache.fetch_batch` chunks requested from the node at once while filling
+/// the cache; with `ZakuraRpcBackend`'s eight concurrent block fetches per
+/// chunk, up to 32 `getblock` pairs in flight.
+const FETCH_PIPELINE: usize = 4;
+
 /// At most this many transactions are fetched per pass (forced passes
 /// included), so a burst cannot hold up block sync or outlast
 /// `ScanMempool`'s wait; the rest are taken next pass.
@@ -875,51 +880,61 @@ impl Scheduler {
             ),
         );
 
-        self.ensure_cached(&range).await?;
-        let prior = self.chain.chain_state(start - 1).await?;
+        // The batch and its prior tree state come from the node at once,
+        // and the next batch is fetched while this one is scanned
+        // (docs/testing.md §9.6 item 4).
+        let ((), prior) = tokio::try_join!(self.ensure_cached(&range), async {
+            Ok::<_, SyncError>(self.chain.chain_state(start - 1).await?)
+        })?;
+        let next = end..(end + self.state.config.cache.scan_batch).min(tip + 1);
         let t0 = Instant::now();
-        let outcome = self.scan(key, &range, prior).await?;
-
-        match outcome {
-            ScanOutcome::Scanned {
-                summary,
-                transparent_outputs,
-                ironwood_received,
-            } => {
-                let scanned = summary.scanned_range();
-                let n = u32::from(scanned.end).saturating_sub(u32::from(scanned.start));
-                self.record_rate(&key_id, n);
-                tracing::info!(
-                    key_id,
-                    from = u32::from(scanned.start),
-                    to = u32::from(scanned.end) - 1,
-                    sapling_received = summary.received_sapling_note_count(),
-                    orchard_received = summary.received_orchard_note_count(),
-                    ironwood_received,
+        // The batch's outcome is logged and published as soon as its scan
+        // ends, whether or not the next batch's download has.
+        let scanned = async {
+            let outcome = self.scan(key, &range, prior).await?;
+            match outcome {
+                ScanOutcome::Scanned {
+                    summary,
                     transparent_outputs,
-                    ms = t0.elapsed().as_millis(),
-                    "batch scanned"
-                );
-                let view = with_scan_wallet(key, move |w| WalletView::read(w, None)).await?;
-                let new_tip = view.scanned_tip();
-                let state = if view.next_range(1).is_none() {
-                    SyncState::Synced {
-                        spendable: view.is_spendable(tip),
-                    }
-                } else {
-                    SyncState::Scanning {
-                        from: start,
-                        to: end,
-                    }
-                };
-                self.publish_view(&key_id, &view, bounds, state, String::new());
-                Ok(Step::Done(true, new_tip))
+                    ironwood_received,
+                } => {
+                    let scanned = summary.scanned_range();
+                    let n = u32::from(scanned.end).saturating_sub(u32::from(scanned.start));
+                    self.record_rate(&key_id, n);
+                    tracing::info!(
+                        key_id,
+                        from = u32::from(scanned.start),
+                        to = u32::from(scanned.end) - 1,
+                        sapling_received = summary.received_sapling_note_count(),
+                        orchard_received = summary.received_orchard_note_count(),
+                        ironwood_received,
+                        transparent_outputs,
+                        ms = t0.elapsed().as_millis(),
+                        "batch scanned"
+                    );
+                    let view = with_scan_wallet(key, move |w| WalletView::read(w, None)).await?;
+                    let new_tip = view.scanned_tip();
+                    let state = if view.next_range(1).is_none() {
+                        SyncState::Synced {
+                            spendable: view.is_spendable(tip),
+                        }
+                    } else {
+                        SyncState::Scanning {
+                            from: start,
+                            to: end,
+                        }
+                    };
+                    self.publish_view(&key_id, &view, bounds, state, String::new());
+                    Ok(Step::Done(true, new_tip))
+                }
+                ScanOutcome::Reorg { at_height } => {
+                    self.handle_reorg(key, at_height).await?;
+                    Ok(Step::Done(true, scanned_tip))
+                }
             }
-            ScanOutcome::Reorg { at_height } => {
-                self.handle_reorg(key, at_height).await?;
-                Ok(Step::Done(true, scanned_tip))
-            }
-        }
+        };
+        let (step, ()) = tokio::join!(scanned, self.prefetch(next));
+        step
     }
 
     /// Make sure every block of `range` is in the cache, fetching from the
@@ -934,11 +949,12 @@ impl Scheduler {
         if start + have >= end {
             return Ok(());
         }
-        let filled = gyges_chain::fill_cache(
+        let filled = gyges_chain::fill_cache_pipelined(
             self.chain.as_ref(),
             &self.cache,
             start + have..end,
             self.state.config.cache.fetch_batch,
+            FETCH_PIPELINE,
         )
         .await;
         match filled {
@@ -954,6 +970,43 @@ impl Scheduler {
                     "cached block {off_chain} is not on the node's chain; re-syncing"
                 )))
             }
+        }
+    }
+
+    /// Fetch `next` into the cache while the current batch is scanned, so
+    /// that the next step finds it there. Best effort: skipped when another
+    /// fill is running (a key's current batch goes first), abandoned when
+    /// the scheduler stops, and any failure is left to that step's
+    /// [`Self::ensure_cached`], which fetches what is missing and reports it.
+    async fn prefetch(&self, next: Range<BlockHeight>) {
+        if next.is_empty() {
+            return;
+        }
+        let Ok(_fetching) = self.fetching.try_lock() else {
+            return;
+        };
+        let range = ScanRange::from_parts(next.clone(), ScanPriority::Historic);
+        let have = match self.cached_prefix(&range).await {
+            Ok(have) => have,
+            Err(_) => return,
+        };
+        if next.start + have >= next.end {
+            return;
+        }
+        let fill = gyges_chain::fill_cache_pipelined(
+            self.chain.as_ref(),
+            &self.cache,
+            next.start + have..next.end,
+            self.state.config.cache.fetch_batch,
+            FETCH_PIPELINE,
+        );
+        tokio::select! {
+            filled = fill => {
+                if let Err(e) = filled {
+                    tracing::debug!(error = %e, "next batch prefetch failed; the next step fetches it");
+                }
+            }
+            () = self.hub().stopped() => {}
         }
     }
 

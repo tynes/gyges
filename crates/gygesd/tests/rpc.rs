@@ -2630,11 +2630,12 @@ fn tex_config() -> String {
 }
 
 /// docs/testing.md §3 row 16: `daemon stop` mid-scan. The node holds the
-/// scheduler's next fetch, so the stop lands deterministically inside a
-/// batch. Shutdown waits for that batch to finish (one more batch is
-/// committed after the stop was asked for, not zero), checkpoints the
-/// cache, and the restarted daemon goes on from where the wallet is,
-/// scanning no range it had scanned before.
+/// scheduler's next fetch, which (past the first batch) is the download of
+/// the next batch while the current one is scanned, so the stop lands
+/// deterministically inside a step. Shutdown finishes the batch in hand,
+/// abandons the download without waiting for the node, starts no other
+/// batch, checkpoints the cache, and the restarted daemon goes on from
+/// where the wallet is, scanning no range it had scanned before.
 #[tokio::test]
 async fn daemon_stop_mid_scan_finishes_the_batch_and_restart_does_not_rescan() {
     let node = mined_node(300).await;
@@ -2653,26 +2654,23 @@ async fn daemon_stop_mid_scan_finishes_the_batch_and_restart_does_not_rescan() {
     c.shutdown(ShutdownRequest { graceful: true })
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
     let Running {
         home, state, task, ..
     } = running;
-    assert!(
-        !task.is_finished(),
-        "shutdown waits for the batch the scheduler is fetching"
-    );
-    node.release();
-    tokio::time::timeout(Duration::from_secs(30), task)
+    // The held download is abandoned: shutdown completes with the node
+    // still holding it.
+    let finished = tokio::time::timeout(Duration::from_secs(30), task)
         .await
-        .expect("shutdown within 30 s")
-        .unwrap()
-        .unwrap();
+        .expect("shutdown within 30 s without the held download");
+    node.release();
+    finished.unwrap().unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     let stopped: Vec<(u32, u32)> = batches.lock().unwrap().clone();
-    assert_eq!(
-        stopped.len(),
-        before + 1,
-        "exactly the batch in hand was finished: {stopped:?}"
+    // The batch in hand when the stop came is finished (it may have been
+    // logged before the stop was asked for), and none after it is started.
+    assert!(
+        stopped.len() == before || stopped.len() == before + 1,
+        "only the batch in hand was finished: {stopped:?} (before: {before})"
     );
 
     // What the wallet committed is exactly what was logged as scanned: no
