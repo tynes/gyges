@@ -114,6 +114,15 @@ impl Pool {
     }
 }
 
+/// `N` bytes of operating-system randomness (`getrandom`), for keys,
+/// tokens and ids. Panics only if the OS has none, like [`registry::Rng`].
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    use rand::Rng as _;
+    let mut bytes = [0u8; N];
+    registry::Rng::default().fill_bytes(&mut bytes);
+    bytes
+}
+
 /// States of a `tex_queue` row (Q-T1, Q-T2; docs/architecture.md Data model §5.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

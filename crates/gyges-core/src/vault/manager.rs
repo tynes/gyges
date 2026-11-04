@@ -37,10 +37,7 @@ pub struct Token([u8; 32]);
 
 impl Token {
     fn random() -> Self {
-        use rand::Rng as _;
-        let mut t = [0u8; 32];
-        rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut t);
-        Self(t)
+        Self(crate::random_bytes())
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {

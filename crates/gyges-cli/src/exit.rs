@@ -52,7 +52,11 @@ pub fn exit_for_reason(reason: ErrorReason) -> Exit {
         | R::SessionNotFound
         | R::UnsupportedPool
         | R::ApiVersionMismatch => Exit::InvalidArgument,
-        R::NotSynced | R::NodeUnreachable | R::Airgapped | R::FallbackUnavailable => Exit::NotReady,
+        R::NotSynced
+        | R::NodeUnreachable
+        | R::Airgapped
+        | R::FallbackUnavailable
+        | R::InputsReserved => Exit::NotReady,
         R::Cancelled => Exit::Cancelled,
         R::HardwareSigner => Exit::HardwareSigner,
         R::NodeRejected => Exit::NodeRejected,
@@ -224,6 +228,7 @@ mod tests {
             (R::NodeUnreachable, 7),
             (R::Airgapped, 7),
             (R::FallbackUnavailable, 7),
+            (R::InputsReserved, 7),
             (R::Cancelled, 8),
             (R::HardwareSigner, 9),
             (R::NodeRejected, 10),

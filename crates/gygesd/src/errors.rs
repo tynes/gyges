@@ -37,6 +37,7 @@ pub(crate) fn tx_error(e: TxError, key_id: &str) -> GygesError {
         TxError::NotSynced(detail) => GygesError::new(ErrorReason::NotSynced, detail),
         TxError::InvalidArgument(detail) => GygesError::new(ErrorReason::InvalidArgument, detail),
         TxError::UnsupportedPool(detail) => GygesError::new(ErrorReason::UnsupportedPool, detail),
+        TxError::InputsReserved(detail) => GygesError::new(ErrorReason::InputsReserved, detail),
         // A tampered or stale PCZT is the client's problem (exit 6), not a
         // daemon failure.
         TxError::Verifier(detail) => GygesError::new(ErrorReason::InvalidArgument, detail),
@@ -203,6 +204,10 @@ mod tests {
         assert_eq!(
             tx_error(TxError::UnsupportedPool("x".into()), "k").reason(),
             ErrorReason::UnsupportedPool
+        );
+        assert_eq!(
+            tx_error(TxError::InputsReserved("x".into()), "k").reason(),
+            ErrorReason::InputsReserved
         );
         let e = broadcast_error(ChainError::Rejected("tx-expired".into()), "k");
         assert_eq!(e.reason(), ErrorReason::NodeRejected);
