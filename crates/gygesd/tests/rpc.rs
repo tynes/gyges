@@ -3615,10 +3615,11 @@ async fn the_sender_picks_the_inputs() {
         .into_inner()
         .notes
     };
+    let outpoint = |n: &Note| format!("{}:{}", n.txid, n.output_index);
     let unspent = notes(&mut c).await;
     let find = |pool: Pool| {
         let n = unspent.iter().find(|n| n.pool() == pool).unwrap();
-        (format!("{}:{}", n.txid, n.output_index), n.value)
+        (outpoint(n), n.value)
     };
     let (iw, iw_value) = find(Pool::Ironwood);
     let (utxo, _) = find(Pool::Transparent);
@@ -3735,18 +3736,9 @@ async fn the_sender_picks_the_inputs() {
     );
     node.mine(2);
     wait_spendable(&mut c, "main").await;
-    let left = notes(&mut c).await;
-    assert!(
-        left.iter()
-            .any(|n| format!("{}:{}", n.txid, n.output_index) == utxo),
-        "{left:?}"
-    );
-    assert!(
-        !left
-            .iter()
-            .any(|n| format!("{}:{}", n.txid, n.output_index) == iw),
-        "{left:?}"
-    );
+    let left: Vec<String> = notes(&mut c).await.iter().map(outpoint).collect();
+    assert!(left.contains(&utxo), "{left:?}");
+    assert!(!left.contains(&iw), "{left:?}");
     running.task.abort();
 }
 

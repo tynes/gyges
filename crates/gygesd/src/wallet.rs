@@ -118,10 +118,7 @@ pub(crate) async fn new_address(
         if !profile.receive_pools.contains(p) {
             return Err(GygesError::new(
                 ErrorReason::UnsupportedPool,
-                format!(
-                    "this profile does not receive to the {} pool",
-                    format!("{p:?}").to_lowercase()
-                ),
+                format!("this profile does not receive to the {} pool", p.as_str()),
             )
             .with_key(key.key_id())
             .into_status());
