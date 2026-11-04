@@ -64,6 +64,13 @@ fn the_dashboard_shows_the_tip_the_wallet_and_a_receipt() {
     assert!(s.contains(n.url()), "{s}");
     assert!(s.contains("gygesd.sock"), "{s}");
     assert!(s.contains("archival fallback   not configured"), "{s}");
+
+    // The live log: under --dump the stream replays without following, and
+    // the newest entries fill the pane.
+    let s = dump(&fx, "logs");
+    assert!(s.contains("Logs · daemon log · level daemon's"), "{s}");
+    assert!(s.contains(" INFO "), "{s}");
+    assert!(s.contains("replayed"), "{s}");
 }
 
 #[test]

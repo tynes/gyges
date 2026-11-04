@@ -10,13 +10,14 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use gyges_proto::v1::{
-    AddressInfo, GetBalanceResponse, GetInfoResponse, KeySummary, KeySyncStatus, Note, SigningMode,
-    TransactionSummary,
+    AddressInfo, GetBalanceResponse, GetInfoResponse, KeySummary, KeySyncStatus, LogEntry, Note,
+    SigningMode, TransactionSummary,
 };
 
 use crate::amount::format_zec;
 
 use super::addresses::{AddrView, AddressBook, Modal};
+use super::logs::{LogRequest, LogStatus, LogView};
 use super::notify::{Notice, Seen};
 
 /// The longest label `n` accepts.
@@ -50,6 +51,16 @@ pub enum Event {
         key_id: String,
         result: Result<AddressInfo, String>,
     },
+    /// One `StreamLogs` entry of stream `generation`.
+    Log {
+        generation: u64,
+        entry: Box<LogEntry>,
+    },
+    /// Stream `generation` ended; `error` unless it was asked to.
+    LogsEnded {
+        generation: u64,
+        error: Option<String>,
+    },
 }
 
 /// One key's wallet reads. Each one fails on its own.
@@ -74,6 +85,10 @@ pub enum Action {
     NewAddress { key_id: String, label: String },
     /// Put text on the terminal's clipboard (OSC 52).
     Copy(String),
+    /// Open a `StreamLogs` stream, closing any earlier one.
+    StartLogs(LogRequest),
+    /// Close the log stream.
+    StopLogs,
 }
 
 /// A short message in the top-right corner that goes away by itself.
@@ -141,6 +156,7 @@ pub enum Tab {
     Transactions,
     Addresses,
     Endpoints,
+    Logs,
 }
 
 impl Tab {
@@ -150,6 +166,7 @@ impl Tab {
         Tab::Transactions,
         Tab::Addresses,
         Tab::Endpoints,
+        Tab::Logs,
     ];
 
     /// `--tab`: the title, any case.
@@ -167,6 +184,7 @@ impl Tab {
             Tab::Transactions => "Transactions",
             Tab::Addresses => "Addresses",
             Tab::Endpoints => "Endpoints",
+            Tab::Logs => "Logs",
         }
     }
 }
@@ -195,6 +213,8 @@ pub struct App {
     /// The form of the current address shown (`p`).
     pub addr_view: AddrView,
     pub book: AddressBook,
+    /// The Logs tab's stream and buffer.
+    pub logs: LogView,
     /// The receive overlays (QR, new-address prompt).
     pub modal: Option<Modal>,
     /// `c` pressed before the address was loaded: copy it when it arrives.
@@ -225,6 +245,7 @@ impl App {
             seen: Seen::default(),
             addr_view: AddrView::Unified,
             book: AddressBook::default(),
+            logs: LogView::default(),
             modal: None,
             copy_pending: None,
             loaded: false,
@@ -246,7 +267,11 @@ impl App {
     /// `--dump` draws once this holds: the first cycle is done, or the
     /// daemon is known to be down.
     pub fn settled(&self) -> bool {
-        (self.loaded && !self.book.has_pending()) || matches!(self.daemon, Daemon::Down { .. })
+        // On the Logs tab, `--dump` streams without following and waits for
+        // the replay to end.
+        let logs_done = self.tab != Tab::Logs || matches!(self.logs.status, LogStatus::Ended(_));
+        (self.loaded && !self.book.has_pending() && logs_done)
+            || matches!(self.daemon, Daemon::Down { .. })
     }
 
     pub fn keys(&self) -> &[KeySummary] {
@@ -357,7 +382,16 @@ impl App {
                 if self.tab == Tab::Addresses || self.modal == Some(Modal::Qr) {
                     self.want_address();
                 }
+                // Open the log stream on first contact, and again after it
+                // failed (the daemon went away and came back).
+                if self.tab == Tab::Logs
+                    && matches!(self.logs.status, LogStatus::Off | LogStatus::Ended(Some(_)))
+                {
+                    self.start_logs();
+                }
             }
+            Event::Log { generation, entry } => self.logs.push(generation, *entry),
+            Event::LogsEnded { generation, error } => self.logs.ended(generation, error),
             Event::Address {
                 key_id,
                 view,
@@ -461,10 +495,24 @@ impl App {
     }
 
     fn set_tab(&mut self, t: Tab) {
+        let was = self.tab;
         self.tab = t;
         if t == Tab::Addresses {
             self.want_address();
         }
+        // The log stream runs only while its tab is open.
+        if was == Tab::Logs && t != Tab::Logs {
+            self.logs.stop();
+            self.act(Action::StopLogs);
+        }
+        if t == Tab::Logs && was != Tab::Logs && self.daemon == Daemon::Up {
+            self.start_logs();
+        }
+    }
+
+    fn start_logs(&mut self) {
+        let req = self.logs.restart();
+        self.act(Action::StartLogs(req));
     }
 
     /// Keys while a receive overlay is open.
@@ -557,6 +605,8 @@ impl App {
         let cursor = match self.tab {
             Tab::Notes => &mut self.notes_cursor,
             Tab::Transactions => &mut self.tx_cursor,
+            // Up moves back in time: the scroll counts lines from the newest.
+            Tab::Logs => return self.logs.scroll_by(delta.saturating_neg()),
             Tab::Overview | Tab::Addresses | Tab::Endpoints => return,
         };
         *cursor = (*cursor as isize).saturating_add(delta).max(0) as usize;
@@ -617,6 +667,15 @@ impl App {
             KeyCode::Char('p') if self.tab == Tab::Addresses => {
                 self.addr_view = self.addr_view.next();
                 self.want_address();
+            }
+            KeyCode::Char('L') => self.set_tab(Tab::Logs),
+            KeyCode::Char('v') if self.tab == Tab::Logs => {
+                self.logs.next_level();
+                self.start_logs();
+            }
+            KeyCode::Char('a') if self.tab == Tab::Logs => {
+                self.logs.audit = !self.logs.audit;
+                self.start_logs();
             }
             KeyCode::Char('?') => self.help = true,
             KeyCode::Tab => self.move_selection(1),

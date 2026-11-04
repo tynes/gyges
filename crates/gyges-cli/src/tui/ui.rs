@@ -25,7 +25,7 @@ use crate::sync::state_word;
 
 use super::addresses::{self, Modal};
 use super::app::{App, Daemon, Level, Tab};
-use super::{endpoints, lists};
+use super::{endpoints, lists, logs};
 
 /// Width of the wallet list.
 const SIDEBAR: u16 = 30;
@@ -359,6 +359,7 @@ fn draw_main(f: &mut Frame, area: Rect, app: &App) {
         Tab::Transactions => lists::draw_txs(f, content, app),
         Tab::Addresses => addresses::draw_tab(f, content, app),
         Tab::Endpoints => endpoints::draw(f, content, app),
+        Tab::Logs => logs::draw(f, content, &app.logs),
     }
 }
 
@@ -620,7 +621,13 @@ pub fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
         Tab::Notes => keys.extend([("↑↓", "move"), ("f", "filter")]),
         Tab::Transactions => keys.push(("↑↓", "move")),
         Tab::Addresses => keys.push(("p", "form")),
-        Tab::Overview | Tab::Endpoints => {}
+        Tab::Logs => keys.extend([
+            ("↑↓", "scroll"),
+            ("End", "follow"),
+            ("v", "level"),
+            ("a", "audit"),
+        ]),
+        Tab::Overview | Tab::Endpoints => keys.push(("L", "logs")),
     }
     keys.extend([("r", "receive"), ("n", "new address"), ("c", "copy")]);
     keys.extend([("R", "refresh"), ("?", "help"), ("q", "quit")]);
@@ -657,6 +664,8 @@ const HELP: &[(&str, &str)] = &[
     ("n", "derive a new address (with a label)"),
     ("c", "copy the current address (OSC 52)"),
     ("p", "Addresses: unified, ironwood, sapling, transparent"),
+    ("L", "open the live logs (tab 6)"),
+    ("v / a", "Logs: minimum level / daemon or audit log"),
     ("Esc", "dismiss notifications"),
     ("R", "poll the daemon now and reload every wallet"),
     ("?", "this help"),

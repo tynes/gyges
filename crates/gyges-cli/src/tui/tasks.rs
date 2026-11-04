@@ -8,7 +8,7 @@
 use std::future::Future;
 
 use gyges_proto::v1::gyges_client::GygesClient;
-use gyges_proto::v1::{GetCurrentAddressRequest, NewAddressRequest};
+use gyges_proto::v1::{GetCurrentAddressRequest, NewAddressRequest, StreamLogsRequest};
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
 
@@ -17,6 +17,7 @@ use crate::exit::CliError;
 
 use super::addresses::AddrView;
 use super::app::Event;
+use super::logs::{LogRequest, REPLAY};
 
 /// Connect, run `call`, and send what `answer` makes of the result.
 pub fn spawn<T, F, Fut>(
@@ -57,6 +58,56 @@ pub fn load_address(ctx: &Ctx, tx: &mpsc::UnboundedSender<Event>, key_id: String
             result,
         },
     );
+}
+
+/// `StreamLogs` for the Logs tab, until the stream ends or the task is
+/// aborted (the tab was left or the request changed). `follow` is false only
+/// for `--dump`, which wants the replay and then an end.
+pub fn stream_logs(
+    ctx: &Ctx,
+    tx: &mpsc::UnboundedSender<Event>,
+    req: LogRequest,
+    follow: bool,
+) -> tokio::task::JoinHandle<()> {
+    let ctx = ctx.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let generation = req.generation;
+        let run = async {
+            let mut conn = ctx.connect().await.map_err(|e| e.message())?;
+            let mut stream = conn
+                .client
+                .stream_logs(StreamLogsRequest {
+                    lines: REPLAY,
+                    follow,
+                    min_level: req.level as i32,
+                    audit: req.audit,
+                })
+                .await
+                .map_err(|s| CliError::from_status(s).message())?
+                .into_inner();
+            while let Some(entry) = stream
+                .message()
+                .await
+                .map_err(|s| CliError::from_status(s).message())?
+            {
+                let ev = Event::Log {
+                    generation,
+                    entry: Box::new(entry),
+                };
+                if tx.send(ev).is_err() {
+                    return Ok(());
+                }
+            }
+            if follow {
+                Err("the daemon closed the stream".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        let error = run.await.err();
+        let _ = tx.send(Event::LogsEnded { generation, error });
+    })
 }
 
 pub fn new_address(ctx: &Ctx, tx: &mpsc::UnboundedSender<Event>, key_id: String, label: String) {

@@ -18,6 +18,7 @@ mod addresses;
 mod app;
 mod endpoints;
 mod lists;
+mod logs;
 mod notify;
 mod poll;
 mod tasks;
@@ -99,6 +100,7 @@ pub async fn run(ctx: &Ctx, args: TuiArgs) -> Result<(), CliError> {
         tx,
         refresh,
         terminal: args.dump.is_none(),
+        logs: None,
     };
 
     let result = match args.dump {
@@ -124,6 +126,16 @@ struct Effects {
     refresh: poll::RefreshHandle,
     /// False for `--dump`, whose stdout is the frame: no bell, no clipboard.
     terminal: bool,
+    /// The Logs tab's stream, while it runs.
+    logs: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Effects {
+    fn drop(&mut self) {
+        if let Some(t) = self.logs.take() {
+            t.abort();
+        }
+    }
 }
 
 impl Effects {
@@ -148,6 +160,18 @@ impl Effects {
             }
             Action::NewAddress { key_id, label } => {
                 tasks::new_address(&self.ctx, &self.tx, key_id, label)
+            }
+            Action::StartLogs(req) => {
+                if let Some(t) = self.logs.take() {
+                    t.abort();
+                }
+                let follow = self.terminal;
+                self.logs = Some(tasks::stream_logs(&self.ctx, &self.tx, req, follow));
+            }
+            Action::StopLogs => {
+                if let Some(t) = self.logs.take() {
+                    t.abort();
+                }
             }
         }
     }
