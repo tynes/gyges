@@ -45,12 +45,14 @@ pub mod google {
 /// API major version. The CLI requires an equal major (docs/decisions.md Q-O3).
 pub const API_MAJOR: u32 = 0;
 /// API minor version. A newer daemon minor produces a warning, never an error.
-pub const API_MINOR: u32 = 1;
+///
+/// - 0.2: `NodeStatus.rpc_url` / `indexer_url`, `FallbackStatus.broadcast_via_tor`.
+pub const API_MINOR: u32 = 2;
 
 /// `"<major>.<minor>"`, the `schema_version` value in `--json` output.
 pub const fn schema_version() -> &'static str {
     // Kept in step with API_MAJOR / API_MINOR by `tests::schema_version_matches`.
-    "0.1"
+    "0.2"
 }
 
 /// Type URL of the one detail every failed Gyges RPC carries (docs/interface.md API §3).
@@ -275,7 +277,7 @@ mod tests {
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["network"], "NETWORK_REGTEST");
-        assert_eq!(json["api_version"]["minor"], 1);
+        assert_eq!(json["api_version"]["minor"], API_MINOR);
         // int64 is a JSON string in proto3 JSON.
         assert_eq!(json["started_at"], "1700000000");
         // Unset / default fields are omitted.

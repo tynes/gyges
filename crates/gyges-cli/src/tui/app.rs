@@ -140,10 +140,17 @@ pub enum Tab {
     Notes,
     Transactions,
     Addresses,
+    Endpoints,
 }
 
 impl Tab {
-    pub const ALL: &'static [Tab] = &[Tab::Overview, Tab::Notes, Tab::Transactions, Tab::Addresses];
+    pub const ALL: &'static [Tab] = &[
+        Tab::Overview,
+        Tab::Notes,
+        Tab::Transactions,
+        Tab::Addresses,
+        Tab::Endpoints,
+    ];
 
     /// `--tab`: the title, any case.
     pub fn from_name(s: &str) -> Option<Tab> {
@@ -159,6 +166,7 @@ impl Tab {
             Tab::Notes => "Notes",
             Tab::Transactions => "Transactions",
             Tab::Addresses => "Addresses",
+            Tab::Endpoints => "Endpoints",
         }
     }
 }
@@ -166,6 +174,8 @@ impl Tab {
 #[derive(Debug)]
 pub struct App {
     pub interval: Duration,
+    /// The socket the TUI talks to, for the Endpoints tab.
+    pub socket: String,
     pub daemon: Daemon,
     pub info: Option<GetInfoResponse>,
     pub sync: Result<Vec<KeySyncStatus>, String>,
@@ -200,6 +210,7 @@ impl App {
     pub fn new(interval: Duration) -> Self {
         Self {
             interval,
+            socket: String::new(),
             daemon: Daemon::Connecting,
             info: None,
             sync: Ok(Vec::new()),
@@ -546,7 +557,7 @@ impl App {
         let cursor = match self.tab {
             Tab::Notes => &mut self.notes_cursor,
             Tab::Transactions => &mut self.tx_cursor,
-            Tab::Overview | Tab::Addresses => return,
+            Tab::Overview | Tab::Addresses | Tab::Endpoints => return,
         };
         *cursor = (*cursor as isize).saturating_add(delta).max(0) as usize;
         self.clamp_cursors();

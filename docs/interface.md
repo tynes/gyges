@@ -299,12 +299,12 @@ A full-screen dashboard over the same socket and API as the other commands (deci
 ```text
 Flags:
       --interval <DURATION>   How often to ask for the tip and sync state [default: 2s]
-      --tab <NAME>            The tab to open on: overview, notes, transactions, addresses [default: overview]
+      --tab <NAME>            The tab to open on: overview, notes, transactions, addresses, endpoints [default: overview]
       --dump <COLSxROWS>      Draw one frame to stdout after the first full load and exit (no terminal needed)
 ```
 
 ```text
- gyges │ mainnet │ gygesd 0.1.0 · API 0.1
+ gyges │ mainnet │ gygesd 0.1.0 · API 0.2
  tip 3,141,592 00ab12cd34… │ node ● connected │ Tor ● on │ fallback ● verified via Tor
 ┌ Wallets ───────────────────┐1 Overview
 │▸ main ★                    │┌ Overview ───────────────────────────────────────────────┐
@@ -327,6 +327,7 @@ Flags:
 - **New address** (`n`, any tab). A prompt for an optional label (up to 64 characters, typed or pasted), then `NewAddress` with the profile's default receivers; the new address becomes current and its QR code opens. A refusal (for example before the first sync) shows in the prompt.
 - **Copy** (`c`). Puts the shown address on the clipboard with the OSC 52 escape sequence, which works over SSH but which some terminals refuse or ask about first. A toast says it was sent.
 - Air-gapped daemons and `signer-only` keys do not receive: the keys do nothing and the tab says why.
+- **Endpoints** (tab 5). Everything the daemon is attached to, from `GetInfo` (API §2, 0.2): the socket the TUI uses and the daemon's version; the node's JSON-RPC URL with its connection, tip and pruning window; the indexer gRPC URL and whether its stream is in use; the archival fallback's URL, trust and route (over Tor or direct); where broadcasts go (the node, or the fallback over Tor with `broadcast_via_tor`); and the embedded Tor client's state. The daemon strips credentials from the URLs. A daemon older than API 0.2 sends no node URLs, and the row says so. Long paths are cut in the middle, keeping both ends.
 - **Notifications.** Each history reload is compared with the last one for that key. The first load of a key only records what is there, so history is never announced. After it, a new txid with a positive net value raises a toast (`+0.50000000 ZEC received by main (pending)`) and rings the terminal bell; a known txid that becomes mined raises a quieter toast (received, confirmed at height N; or sent, mined at height N). Toasts stack in the top-right corner for 8 s (`Esc` clears them). They stay inside the TUI: there are no desktop notifications, so no amount leaves the terminal. A mempool arrival is seen by the next reload (at most 30 s later).
 - **Refresh.** `GetInfo` and `GetSyncStatus` every `--interval`. Balances, notes (`ListNotes`, all) and history (`ListTransactions`, latest 50) reload only when the tip hash, the set of keys or a key's sync state changes; while only a scan's height moves, at most every 10 s; and every 30 s regardless, so that a mempool arrival is seen. `R` reloads now.
 - **Degrading.** Each pane fails on its own: a refused read shows its error in its pane and the rest still draw. With no daemon the body says so and the TUI reconnects every `--interval` (it never starts one, Q-C5). Air-gapped, the wallet panes say that wallet reads are not served; a `signer-only` key has no wallet pane.
@@ -427,6 +428,13 @@ Compatibility policy (Q-O3):
 
 The first released API version is `1.0`. Until then the number is `0.x` and
 nothing in this document is stable.
+
+Minors so far:
+
+| Version | Added |
+|---|---|
+| 0.1 | The first contract. |
+| 0.2 | `NodeStatus.rpc_url` and `indexer_url`, `FallbackStatus.broadcast_via_tor`, for `gyges tui`'s Endpoints tab (CLI §2.7). `GetInfo` reports the node URLs as configured (`[zakura_rpc] url`, or `gygesd --zakura-rpc`), and every URL it reports, `FallbackStatus.grpc_url` included, with any `user:password@` removed. Air-gapped, the node URLs are empty and `broadcast_via_tor` is false. |
 
 ---
 

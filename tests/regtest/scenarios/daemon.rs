@@ -13,16 +13,16 @@ fn status_reports_version_network_and_json_schema() {
     fx.start_daemon(&[]).unwrap();
 
     let run = fx.gyges(&["daemon", "status"]).ok();
-    run.stdout_has("(API 0.1) on regtest");
+    run.stdout_has("(API 0.2) on regtest");
     run.stdout_has("node:         not connected");
 
     let run = fx.gyges(&["daemon", "status", "--json"]).ok();
     let json = run.json();
-    assert_eq!(json["schema_version"], "0.1");
+    assert_eq!(json["schema_version"], "0.2");
     assert_eq!(json["network"], "NETWORK_REGTEST");
     // proto3 JSON omits zero values, so a major of 0 is absent.
     assert_eq!(json["api_version"]["major"].as_u64().unwrap_or(0), 0);
-    assert_eq!(json["api_version"]["minor"], 1);
+    assert_eq!(json["api_version"]["minor"], 2);
     assert_eq!(json["daemon_version"], env!("CARGO_PKG_VERSION"));
     assert!(
         json.get("airgapped").is_none(),
@@ -74,7 +74,7 @@ fn network_mismatch_exits_6_before_any_other_rpc() {
         ])
         .code(6);
     let json = run.json();
-    assert_eq!(json["schema_version"], "0.1");
+    assert_eq!(json["schema_version"], "0.2");
     assert_eq!(json["error"]["reason"], "ERROR_REASON_NETWORK_MISMATCH");
 }
 

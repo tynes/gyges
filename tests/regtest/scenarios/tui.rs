@@ -56,6 +56,14 @@ fn the_dashboard_shows_the_tip_the_wallet_and_a_receipt() {
     assert!(s.contains(&ua[..40]), "{s}");
     assert!(s.contains("receiver transparent"), "{s}");
     assert!(s.contains('█'), "the QR code is drawn: {s}");
+
+    // The node URL comes from GetInfo (API 0.2), not from a config file.
+    let info = fx.gyges(&["daemon", "status", "--json"]).ok().json();
+    assert_eq!(info["node"]["rpc_url"], n.url(), "{info}");
+    let s = dump(&fx, "endpoints");
+    assert!(s.contains(n.url()), "{s}");
+    assert!(s.contains("gygesd.sock"), "{s}");
+    assert!(s.contains("archival fallback   not configured"), "{s}");
 }
 
 #[test]

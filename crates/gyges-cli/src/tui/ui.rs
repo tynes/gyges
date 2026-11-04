@@ -25,7 +25,7 @@ use crate::sync::state_word;
 
 use super::addresses::{self, Modal};
 use super::app::{App, Daemon, Level, Tab};
-use super::lists;
+use super::{endpoints, lists};
 
 /// Width of the wallet list.
 const SIDEBAR: u16 = 30;
@@ -358,6 +358,7 @@ fn draw_main(f: &mut Frame, area: Rect, app: &App) {
         Tab::Notes => lists::draw_notes(f, content, app),
         Tab::Transactions => lists::draw_txs(f, content, app),
         Tab::Addresses => addresses::draw_tab(f, content, app),
+        Tab::Endpoints => endpoints::draw(f, content, app),
     }
 }
 
@@ -619,7 +620,7 @@ pub fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
         Tab::Notes => keys.extend([("↑↓", "move"), ("f", "filter")]),
         Tab::Transactions => keys.push(("↑↓", "move")),
         Tab::Addresses => keys.push(("p", "form")),
-        Tab::Overview => {}
+        Tab::Overview | Tab::Endpoints => {}
     }
     keys.extend([("r", "receive"), ("n", "new address"), ("c", "copy")]);
     keys.extend([("R", "refresh"), ("?", "help"), ("q", "quit")]);
