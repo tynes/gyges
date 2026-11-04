@@ -857,11 +857,15 @@ impl Scheduler {
         });
         let hashes = with_wallet(key, move |w| core_sync::wallet_hashes(w, from)).await?;
         let mut fork = None;
+        // Whether the wallet holds no block hash at the fork, so nothing
+        // shows that its state there is the node's.
+        let mut unverified = false;
         for (h, wallet_hash) in hashes {
             match wallet_hash {
                 // The wallet has nothing at `h`: nothing older to disagree about.
                 None => {
                     fork = Some(h);
+                    unverified = true;
                     break;
                 }
                 Some(wh) => {
@@ -874,13 +878,33 @@ impl Scheduler {
         }
         match fork {
             Some(f) => {
-                let actual = match with_wallet(key, move |w| core_sync::rewind(w, f)).await {
+                // A fork found where the wallet holds no block hash (below
+                // its first scanned block) proves nothing about that height:
+                // the wallet's tree may still hold it from a block the reorg
+                // replaced, as for a key born one block above a reorged
+                // block, whose birthday state (`birthday - 1`) has no block
+                // row. Such a key is reset to the node's state one block
+                // lower. Truncating to the fork would keep the replaced
+                // checkpoint (upstream truncates to `birthday - 1` since
+                // zakura-client-sqlite rc9.6), and so would a reset at the
+                // fork itself, which leaves an existing checkpoint in place;
+                // every later scan conflicted with it.
+                let rewound = if unverified {
+                    Err(SyncError::RewindInvalid {
+                        requested: f,
+                        safe: None,
+                    })
+                } else {
+                    with_wallet(key, move |w| core_sync::rewind(w, f)).await
+                };
+                let reset_at = if unverified { f.saturating_sub(1) } else { f };
+                let actual = match rewound {
                     Ok(h) => h,
                     // Nothing scanned at or below the fork (the key was born
-                    // in a reorged block): reset to the node's tree state
-                    // at the fork instead of truncating.
+                    // in a reorged block), or nothing to check it by: reset
+                    // to the node's tree state instead of truncating.
                     Err(SyncError::RewindInvalid { .. }) => {
-                        let state = self.chain.chain_state(f).await?;
+                        let state = self.chain.chain_state(reset_at).await?;
                         with_wallet(key, move |w| core_sync::rewind_to_chain_state(w, &state))
                             .await?
                     }

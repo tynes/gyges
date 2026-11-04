@@ -1591,7 +1591,8 @@ async fn keystone_shield_and_send_through_both_protocols() {
         .await
         .unwrap_err();
     assert_eq!(reason(&err), ErrorReason::SessionNotFound, "{err:?}");
-    node.mine(1);
+    // One block past the note's: the anchor is min_confirmations behind the tip.
+    node.mine(2);
     wait_spendable(&mut c, "ks").await;
     let b = balance(&mut c, "ks").await;
     let shielded = balance_of(&b, gyges_proto::v1::Pool::Ironwood).0;
@@ -1671,7 +1672,8 @@ async fn keystone_shield_and_send_through_both_protocols() {
     );
     let rest: Vec<SendEvent> = s.map(|e| e.unwrap()).collect().await;
     assert_eq!(event_names(&rest), ["signed", "broadcast"], "{rest:?}");
-    node.mine(1);
+    // The change needs one block past its own (anchor min_confirmations behind the tip).
+    node.mine(2);
     wait_spendable(&mut c, "ks").await;
     let after = balance_of(
         &balance(&mut c, "ks").await,
@@ -1752,7 +1754,8 @@ async fn a_keystone_session_survives_a_restart_and_expires_with_its_transaction(
         .await
         .unwrap();
     assert!(done.result.is_some(), "{done:?}");
-    node.mine(1);
+    // One block past the note's: the anchor is min_confirmations behind the tip.
+    node.mine(2);
     wait_spendable(&mut c, "ks").await;
     assert!(
         balance_of(
@@ -2361,8 +2364,9 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
     );
 
     // A second key born at the tip (13): its only scanned blocks are about
-    // to be reorged away, so its rewind cannot truncate (nothing scanned at
-    // or below the fork) and resets to the node's tree state instead.
+    // to be reorged away, and so is block 12, whose state it was born
+    // from, so it resets to the node's tree state below that instead of
+    // truncating.
     let late = init_key(&mut c, "late").await;
     assert_eq!(late.birthday_height, 13);
     let status = wait_spendable(&mut c, "late").await;
@@ -2379,19 +2383,24 @@ async fn scheduler_scans_to_the_tip_credits_transparent_outputs_and_survives_a_r
     let status = wait_spendable(&mut c, "late").await;
     assert_eq!(status.scanned_tip, 14, "{status:?}");
     {
-        // Its fork point is 12 (it never scanned lower, so there is nothing
-        // older to disagree about): the reset to the node's state at 12
-        // keeps the birthday at 13 and rescans 13 and 14 on the new chain.
+        // Its fork point is 12, where it holds no block hash (its birthday
+        // state came from the old block 12), so it is reset to the node's
+        // state one block lower: the birthday drops to 12 and 12, 13 and 14
+        // are rescanned on the new chain.
         let late_key = running.state.registry.resolve("late").unwrap();
         let w = late_key.wallet().unwrap();
         assert_eq!(
             w.get_wallet_birthday().unwrap(),
-            Some(BlockHeight::from_u32(13))
+            Some(BlockHeight::from_u32(12))
         );
-        assert!(
+        assert_eq!(
             w.block_metadata(BlockHeight::from_u32(12))
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .block_hash()
+                .0,
+            new_12,
+            "the late key rescanned the replaced block"
         );
         assert_eq!(
             w.block_metadata(BlockHeight::from_u32(13))
@@ -3416,7 +3425,8 @@ async fn the_mempool_loop_shows_an_unmined_payment_as_pending() {
         .unwrap_err();
     assert_eq!(reason(&err), ErrorReason::KeyNotFound);
 
-    node.mine(1);
+    // One block past the note's: the anchor is min_confirmations behind the tip.
+    node.mine(2);
     wait_spendable(&mut c, "bob").await;
     let b = balance(&mut c, "bob").await;
     assert_eq!((b.total_spendable, b.total_pending), (AMOUNT, 0), "{b:?}");
@@ -3718,6 +3728,8 @@ async fn zip320_sends_through_the_fake_node() {
     assert!(err.message().contains("nothing to resume"), "{err:?}");
     node.set_cookie(None);
     wait_connected(true).await;
+    // The change of step 1 needs one block past its own.
+    node.mine(1);
     wait_spendable(&mut c, "main").await;
     let after_a = ironwood(&mut c).await;
     assert_eq!(
@@ -3760,6 +3772,9 @@ async fn zip320_sends_through_the_fake_node() {
     let bundle = tx2.transparent_bundle().expect("transparent");
     assert_eq!(bundle.vout[0].value().into_u64(), 20_000_000);
     assert_eq!(bundle.vin[0].prevout().txid().to_string(), s1);
+    // The queue saw step 2 mined, but the scan of that block may still be
+    // running, and the send gate refuses a key mid-scan.
+    wait_spendable(&mut c, "main").await;
 
     // 3. Step 1 mined, step 2 expired (row 11): `step2_failed`, then
     //    `ResumeTexTransfer` through a session builds a new step 2.
@@ -4627,6 +4642,8 @@ async fn chain_with_a_shielded_note(node: &FakeNode) -> (String, i64, u32) {
     fund_and_shield(node, &running.state, &mut c, "orig", 100_000_000).await;
     node.mine(1);
     let shield_height = node.tip().0;
+    // One block past the note's: the anchor is min_confirmations behind the tip.
+    node.mine(1);
     wait_spendable(&mut c, "orig").await;
     let b = balance(&mut c, "orig").await;
     let (ironwood, pending) = balance_of(&b, Pool::Ironwood);
@@ -5168,7 +5185,8 @@ async fn an_airgapped_signer_only_daemon_signs_transparent_inputs() {
         .into_inner()
         .txid;
     wait_in_mempool(&node, &txid).await;
-    node.mine(1);
+    // One block past the note's: the anchor is min_confirmations behind the tip.
+    node.mine(2);
     wait_spendable(&mut on, "main").await;
     let b = balance(&mut on, "main").await;
     assert_eq!(balance_of(&b, Pool::Transparent), (0, 0), "{b:?}");
@@ -5762,7 +5780,8 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
             .await
             .unwrap();
         let _ = broadcast_txid(&events);
-        node.mine(1);
+        // The change pays the next send: one block past its own.
+        node.mine(2);
         wait_spendable(&mut c, "main").await;
     }
     node.mine(1);
@@ -5868,6 +5887,8 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
         )),
         "{names:?}"
     );
+    // The change needs one block past its own (anchor min_confirmations behind the tip).
+    node.mine(1);
     wait_spendable(&mut c, "bob").await;
     let after = balance(&mut c, "bob").await;
     let total = |b: &GetBalanceResponse| b.pools.iter().map(|p| p.spendable).sum::<i64>();
@@ -5934,7 +5955,8 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
         p.steps[0].inputs.iter().all(|i| i.pool() == Pool::Sapling),
         "{p:?}"
     );
-    node.mine(1);
+    // The change needs one block past its own (anchor min_confirmations behind the tip).
+    node.mine(2);
     wait_spendable(&mut c, "bob").await;
     let b = balance(&mut c, "bob").await;
     assert_eq!(total(&b), 100_000_000 - 60_000_000 - p.total_fee, "{b:?}");

@@ -98,7 +98,7 @@ fn prune_race_stalls_without_a_fallback_then_backfills_through_zaino() {
     let log = fb.node.log_path();
     let (mut fx, pw, _) = funded_wallet(&fb.node);
     let (shield_txid, _) = shield(&fx, &pw, &log, |_| {
-        fb.mine(1);
+        fb.mine(2);
     });
 
     fx.gyges(&["key", "init", "--id", "bob", "--json"])
