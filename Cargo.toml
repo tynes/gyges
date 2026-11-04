@@ -101,6 +101,7 @@ hyper-util   = { version = "0.1", features = ["tokio"] }      # TokioIo adapter 
 reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }  # zakurad JSON-RPC client
 async-trait  = "0.1"                                          # `BlockCache` is an async-trait trait upstream
 futures-util = "0.3"                                          # ordered concurrent `getblock` fetches
+arc-swap     = "1.7"                                          # lock-free snapshots read by the RPC handlers (sync progress, node status)
 
 # --- Key encryption ---
 age = { version = "0.12", features = ["armor"] }              # scrypt passphrase recipient (Q-S5); no Argon2id

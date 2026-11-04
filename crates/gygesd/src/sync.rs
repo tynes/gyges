@@ -17,7 +17,9 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ops::Range;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
+
+use arc_swap::ArcSwap;
 use std::time::{Duration, Instant, SystemTime};
 
 use gyges_chain::{
@@ -42,14 +44,22 @@ use zcash_protocol::consensus::BlockHeight;
 use crate::backfill;
 use crate::node;
 use crate::service::{DaemonState, invalid};
-use crate::{lock, read, with_wallet, write};
+use crate::{lock, with_scan_wallet, with_wallet};
+
+/// One channel per key carrying its latest progress. The map is replaced
+/// whole (copy on write) when a key first appears and read without a lock;
+/// a key's progress changes through its own channel.
+type ProgressMap = BTreeMap<String, Arc<watch::Sender<KeyProgress>>>;
 
 /// What the RPC handlers and the scheduler share: the latest progress per
-/// key, a change counter for streams to wait on, a wake-up for the
-/// scheduler, and pending rewind requests.
+/// key (each on its own `watch`, so a stream wakes only for its key), a
+/// tick counter for streams to wait on, a wake-up for the scheduler, and
+/// pending rewind requests.
 #[derive(Debug, Default)]
 pub struct SyncHub {
-    progress: RwLock<BTreeMap<String, KeyProgress>>,
+    progress: ArcSwap<ProgressMap>,
+    /// Completed scheduler ticks, for streams that need a view of the node
+    /// newer than their own start.
     generation: watch::Sender<u64>,
     wake: Notify,
     /// `key_id` → first height to rescan (`RunSync.from_height`).
@@ -80,7 +90,34 @@ const MEMPOOL_MAX_NEW: usize = 500;
 
 impl SyncHub {
     pub(crate) fn get(&self, key_id: &str) -> Option<KeyProgress> {
-        read(&self.progress).get(key_id).cloned()
+        self.progress
+            .load()
+            .get(key_id)
+            .map(|tx| tx.borrow().clone())
+    }
+
+    /// `key_id`'s channel, created as `Initializing` on first use.
+    fn channel(&self, key_id: &str) -> Arc<watch::Sender<KeyProgress>> {
+        if let Some(tx) = self.progress.load().get(key_id) {
+            return tx.clone();
+        }
+        let fresh = Arc::new(watch::Sender::new(KeyProgress::initializing(key_id)));
+        let mut out = fresh.clone();
+        self.progress.rcu(|map| {
+            let mut map = ProgressMap::clone(map);
+            out = map
+                .entry(key_id.to_string())
+                .or_insert_with(|| fresh.clone())
+                .clone();
+            map
+        });
+        out
+    }
+
+    /// A receiver of `key_id`'s progress, which changes whenever the
+    /// scheduler publishes for that key.
+    pub(crate) fn watch_key(&self, key_id: &str) -> watch::Receiver<KeyProgress> {
+        self.channel(key_id).subscribe()
     }
 
     /// A key's progress, `Initializing` before the scheduler reached it.
@@ -89,11 +126,10 @@ impl SyncHub {
             .unwrap_or_else(|| KeyProgress::initializing(key_id))
     }
 
-    /// Replace a key's progress and notify waiters.
+    /// Replace a key's progress and notify its waiters.
     pub(crate) fn publish(&self, mut progress: KeyProgress) {
         progress.updated_at = SystemTime::now();
-        write(&self.progress).insert(progress.key_id.clone(), progress);
-        self.generation.send_modify(|g| *g += 1);
+        self.channel(&progress.key_id).send_replace(progress);
     }
 
     /// Edit a key's progress in place (creating it as `Initializing`).
@@ -115,7 +151,7 @@ impl SyncHub {
         });
     }
 
-    /// A receiver that wakes whenever any progress changes.
+    /// A receiver that wakes whenever a scheduler tick completes.
     pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
         self.generation.subscribe()
     }
@@ -694,7 +730,7 @@ impl Scheduler {
                 p.state = SyncState::Rewinding { to };
                 p.detail = format!("rewinding to {} on request", u32::from(to));
             });
-            let actual = with_wallet(key, move |w| core_sync::rewind(w, to)).await?;
+            let actual = with_scan_wallet(key, move |w| core_sync::rewind(w, to)).await?;
             tracing::info!(
                 key_id,
                 requested = u32::from(to),
@@ -703,7 +739,7 @@ impl Scheduler {
             );
         }
 
-        let view = with_wallet(key, move |w| WalletView::read(w, Some(tip))).await?;
+        let view = with_scan_wallet(key, move |w| WalletView::read(w, Some(tip))).await?;
         let scanned_tip = view.scanned_tip();
 
         // docs/architecture.md Sync §4.3 detector 1: does the node still have the block the
@@ -797,7 +833,7 @@ impl Scheduler {
                     ms = t0.elapsed().as_millis(),
                     "batch scanned"
                 );
-                let view = with_wallet(key, move |w| WalletView::read(w, None)).await?;
+                let view = with_scan_wallet(key, move |w| WalletView::read(w, None)).await?;
                 let new_tip = view.scanned_tip();
                 let state = if view.next_range(1).is_none() {
                     SyncState::Synced {
@@ -910,7 +946,7 @@ impl Scheduler {
                         safe: None,
                     })
                 } else {
-                    with_wallet(key, move |w| core_sync::rewind(w, f)).await
+                    with_scan_wallet(key, move |w| core_sync::rewind(w, f)).await
                 };
                 let reset_at = if unverified { f.saturating_sub(1) } else { f };
                 let actual = match rewound {
@@ -920,7 +956,7 @@ impl Scheduler {
                     // to the node's tree state instead of truncating.
                     Err(SyncError::RewindInvalid { .. }) => {
                         let state = self.chain.chain_state(reset_at).await?;
-                        with_wallet(key, move |w| core_sync::rewind_to_chain_state(w, &state))
+                        with_scan_wallet(key, move |w| core_sync::rewind_to_chain_state(w, &state))
                             .await?
                     }
                     Err(e) => return Err(e),
@@ -968,7 +1004,7 @@ impl Scheduler {
         let params = self.state.registry.params();
         let cache = self.cache.clone();
         let range = range.clone();
-        with_wallet(key, move |w| {
+        with_scan_wallet(key, move |w| {
             core_sync::scan_range(&params, &cache, w, &range, &prior)
         })
         .await
@@ -1258,7 +1294,8 @@ fn progress_stream(
     let (tx, rx) = mpsc::channel::<Result<SyncProgress, Status>>(8);
     tokio::spawn(async move {
         let key_id = key.key_id().to_string();
-        let mut changes = state.sync.subscribe();
+        let mut ticks = state.sync.subscribe();
+        let mut changes = state.sync.watch_key(&key_id);
         // The snapshot in the hub may predate blocks the node has since
         // mined, and a tick already in flight polled the node before now:
         // ask for a tick and only call it done once a tick that began after
@@ -1295,9 +1332,11 @@ fn progress_stream(
             if tx.send(Ok(item)).await.is_err() || done {
                 return;
             }
-            // Wake on a change, or heartbeat once per second when idle.
+            // Wake on this key's change or a completed tick, or heartbeat
+            // once per second when idle.
             tokio::select! {
                 _ = changes.changed() => {}
+                _ = ticks.changed() => {}
                 () = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
         }
@@ -1336,13 +1375,20 @@ mod tests {
     }
 
     #[test]
-    fn hub_publishes_and_bumps_generation() {
+    fn hub_publishes_per_key() {
         let hub = SyncHub::default();
-        let rx = hub.subscribe();
-        assert_eq!(*rx.borrow(), 0);
+        let mut a = hub.watch_key("a");
+        let b = hub.watch_key("b");
+        assert!(!a.has_changed().unwrap());
         hub.update("a", |p| p.scanned_tip = 5);
         assert_eq!(hub.get("a").unwrap().scanned_tip, 5);
-        assert_eq!(*rx.borrow(), 1);
+        assert!(a.has_changed().unwrap());
+        assert_eq!(a.borrow_and_update().scanned_tip, 5);
+        // Another key's publish does not wake "b"'s waiters.
+        assert!(!b.has_changed().unwrap());
+        let ticks = hub.subscribe();
+        hub.tick_completed();
+        assert_eq!(*ticks.borrow(), 1);
         hub.request_rewind("a", BlockHeight::from_u32(3));
         assert!(hub.rewind_pending("a"));
         assert_eq!(hub.take_rewind("a"), Some(BlockHeight::from_u32(3)));

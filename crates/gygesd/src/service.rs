@@ -253,7 +253,9 @@ impl Gyges for GygesService {
         request: Request<SendTransactionRequest>,
     ) -> Result<Response<SendStream>, Status> {
         let conn = crate::conn::of_request(&request);
-        tx::send_transaction(self.state.clone(), conn, request.into_inner()).map(Response::new)
+        tx::send_transaction(self.state.clone(), conn, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn shield_funds(
@@ -261,7 +263,9 @@ impl Gyges for GygesService {
         request: Request<ShieldFundsRequest>,
     ) -> Result<Response<SendStream>, Status> {
         let conn = crate::conn::of_request(&request);
-        tx::shield_funds(self.state.clone(), conn, request.into_inner()).map(Response::new)
+        tx::shield_funds(self.state.clone(), conn, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn get_balance(

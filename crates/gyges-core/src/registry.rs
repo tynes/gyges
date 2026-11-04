@@ -10,7 +10,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use age::secrecy::SecretString;
 use secrecy::ExposeSecret as _;
@@ -94,11 +95,20 @@ pub enum RegistryError {
 
 /// One loaded key: its profile, its directory and (except for
 /// `signer-only`) its open wallet database.
+///
+/// The scan position and the UFVK are kept beside the wallet so that
+/// `ListKeys` and `GetInfo` read them without the wallet lock, which a scan
+/// holds for a whole batch: the position is refreshed by whoever moves it
+/// ([`KeyEntry::refresh_scan_position`], called by the sync scheduler after
+/// every scan and rewind), the UFVK never changes.
 pub struct KeyEntry {
     profile: KeyProfile,
     dir: PathBuf,
     params: ConsensusParams,
     wallet: Option<Mutex<Wallet>>,
+    scanned_tip: AtomicU32,
+    highest_scanned: AtomicU32,
+    ufvk: OnceLock<Option<String>>,
 }
 
 impl fmt::Debug for KeyEntry {
@@ -113,6 +123,30 @@ impl fmt::Debug for KeyEntry {
 }
 
 impl KeyEntry {
+    fn new(
+        profile: KeyProfile,
+        dir: PathBuf,
+        params: ConsensusParams,
+        wallet: Option<Wallet>,
+    ) -> Self {
+        let (scanned_tip, highest_scanned) = wallet.as_ref().map_or((0, 0), scan_position);
+        let ufvk = OnceLock::new();
+        if let Some(u) = &profile.ufvk {
+            let _ = ufvk.set(Some(u.clone()));
+        } else if let Some(w) = &wallet {
+            let _ = ufvk.set(wallet_ufvk(w, &params));
+        }
+        Self {
+            profile,
+            dir,
+            params,
+            wallet: wallet.map(Mutex::new),
+            scanned_tip: AtomicU32::new(scanned_tip),
+            highest_scanned: AtomicU32::new(highest_scanned),
+            ufvk,
+        }
+    }
+
     pub fn key_id(&self) -> &str {
         &self.profile.key_id
     }
@@ -129,6 +163,12 @@ impl KeyEntry {
         self.dir.join(SEED_FILE)
     }
 
+    /// Whether the profile has a wallet database (all but `signer-only`),
+    /// without taking its lock.
+    pub fn has_wallet(&self) -> bool {
+        self.wallet.is_some()
+    }
+
     /// The wallet database, `None` for `signer-only` profiles. A poisoned
     /// lock is recovered: the database has its own transactions.
     pub fn wallet(&self) -> Option<MutexGuard<'_, Wallet>> {
@@ -140,25 +180,27 @@ impl KeyEntry {
     /// The highest block every earlier block of which is scanned, as
     /// `GetSyncStatus` reports it (`crate::sync::WalletView::scanned_tip`):
     /// the block before the birthday when nothing is scanned yet, 0 for a
-    /// profile without a wallet.
+    /// profile without a wallet. As of the last
+    /// [`Self::refresh_scan_position`]; never takes the wallet lock.
     pub fn scanned_tip(&self) -> u32 {
-        let Some(w) = self.wallet() else { return 0 };
-        if let Some(m) = w.block_fully_scanned().ok().flatten() {
-            return u32::from(m.block_height());
-        }
-        w.get_wallet_birthday()
-            .ok()
-            .flatten()
-            .map_or(0, |b| u32::from(b).saturating_sub(1))
+        self.scanned_tip.load(Ordering::Acquire)
     }
 
     /// Highest block the wallet has scanned anywhere, 0 if none yet. Above
     /// [`Self::scanned_tip`] while lower ranges are still open, as when
-    /// upstream scans the chain tip before history.
+    /// upstream scans the chain tip before history. As of the last
+    /// [`Self::refresh_scan_position`]; never takes the wallet lock.
     pub fn highest_scanned(&self) -> u32 {
-        self.wallet()
-            .and_then(|w| w.block_max_scanned().ok().flatten())
-            .map_or(0, |m| u32::from(m.block_height()))
+        self.highest_scanned.load(Ordering::Acquire)
+    }
+
+    /// Re-read the scan position from `wallet`, which must be this key's
+    /// (the caller holds its lock). Called after anything that scans or
+    /// rewinds.
+    pub fn refresh_scan_position(&self, wallet: &Wallet) {
+        let (tip, highest) = scan_position(wallet);
+        self.scanned_tip.store(tip, Ordering::Release);
+        self.highest_scanned.store(highest, Ordering::Release);
     }
 
     /// Derive the account's UFVK from decrypted entropy, for profiles whose
@@ -171,15 +213,35 @@ impl KeyEntry {
 
     /// The account's encoded UFVK. `None` for `signer-only` (whose viewing
     /// key lives behind the passphrase) and for a wallet without accounts.
+    /// Read once, when the key is loaded.
     pub fn ufvk(&self) -> Option<String> {
-        if let Some(u) = &self.profile.ufvk {
-            return Some(u.clone());
-        }
-        let wallet = self.wallet()?;
-        let id = *wallet.get_account_ids().ok()?.first()?;
-        let account = wallet.get_account(id).ok()??;
-        account.ufvk().map(|k| k.encode(&self.params))
+        self.ufvk.get().cloned().flatten()
     }
+}
+
+/// `(scanned_tip, highest_scanned)` of a wallet, as [`KeyEntry`] reports them.
+fn scan_position(w: &Wallet) -> (u32, u32) {
+    let tip = match w.block_fully_scanned().ok().flatten() {
+        Some(m) => u32::from(m.block_height()),
+        None => w
+            .get_wallet_birthday()
+            .ok()
+            .flatten()
+            .map_or(0, |b| u32::from(b).saturating_sub(1)),
+    };
+    let highest = w
+        .block_max_scanned()
+        .ok()
+        .flatten()
+        .map_or(0, |m| u32::from(m.block_height()));
+    (tip, highest)
+}
+
+/// The first account's encoded UFVK.
+fn wallet_ufvk(w: &Wallet, params: &ConsensusParams) -> Option<String> {
+    let id = *w.get_account_ids().ok()?.first()?;
+    let account = w.get_account(id).ok()??;
+    account.ufvk().map(|k| k.encode(params))
 }
 
 /// What `key import-keystone` hands to [`KeyRegistry::create_keystone`],
@@ -328,16 +390,16 @@ impl KeyRegistry {
                     detail: "no account; the database was never initialised".into(),
                 });
             }
-            Some(Mutex::new(wallet))
+            Some(wallet)
         } else {
             None
         };
-        Ok(KeyEntry {
+        Ok(KeyEntry::new(
             profile,
-            dir: dir.to_path_buf(),
-            params: self.params,
+            dir.to_path_buf(),
+            self.params,
             wallet,
-        })
+        ))
     }
 
     /// Open (creating if absent) and migrate a wallet database.
@@ -494,12 +556,7 @@ impl KeyRegistry {
             let fingerprint = self.write_seed(&dir, key_id, entropy, passphrase)?;
             let profile = self.seeded_profile(key_id, SigningMode::SignerOnly, fingerprint, label);
             self.write_profile(&dir, key_id, &profile)?;
-            Ok(KeyEntry {
-                profile,
-                dir: dir.clone(),
-                params: self.params,
-                wallet: None,
-            })
+            Ok(KeyEntry::new(profile, dir.clone(), self.params, None))
         })();
         self.finish_create(dir, result)
     }
@@ -548,12 +605,12 @@ impl KeyRegistry {
                 label: req.label,
             };
             self.write_profile(&dir, key_id, &profile)?;
-            Ok(KeyEntry {
+            Ok(KeyEntry::new(
                 profile,
-                dir: dir.clone(),
-                params: self.params,
-                wallet: Some(Mutex::new(wallet)),
-            })
+                dir.clone(),
+                self.params,
+                Some(wallet),
+            ))
         })();
         self.finish_create(dir, result)
     }
@@ -630,12 +687,12 @@ impl KeyRegistry {
             ..self.seeded_profile(key_id, SigningMode::LocalSeed, fingerprint, req.label)
         };
         self.write_profile(dir, key_id, &profile)?;
-        Ok(KeyEntry {
+        Ok(KeyEntry::new(
             profile,
-            dir: dir.to_path_buf(),
-            params: self.params,
-            wallet: Some(Mutex::new(wallet)),
-        })
+            dir.to_path_buf(),
+            self.params,
+            Some(wallet),
+        ))
     }
 
     /// Encrypt and write `seed.age`; returns the hex ZIP 32 seed fingerprint.

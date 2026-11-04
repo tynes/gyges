@@ -43,7 +43,7 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::service::DaemonState;
 use crate::sync::Scheduler;
-use crate::with_wallet;
+use crate::{with_scan_wallet, with_wallet};
 
 /// What the daemon knows about the fallback endpoint (`GetInfo.fallback`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -990,7 +990,7 @@ impl Scheduler {
         {
             return Ok(None);
         }
-        match with_wallet(key, move |w| core_sync::rewind(w, to)).await {
+        match with_scan_wallet(key, move |w| core_sync::rewind(w, to)).await {
             Ok(actual) => return Ok(Some(actual)),
             Err(SyncError::RewindInvalid { .. }) => {}
             Err(e) => return Err(e),
@@ -1007,7 +1007,7 @@ impl Scheduler {
                 }
             },
         };
-        with_wallet(key, move |w| core_sync::truncate_to_chain_state(w, &state)).await?;
+        with_scan_wallet(key, move |w| core_sync::truncate_to_chain_state(w, &state)).await?;
         Ok(Some(to))
     }
 

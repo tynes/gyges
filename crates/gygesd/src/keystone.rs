@@ -206,11 +206,14 @@ pub(crate) async fn list(
 
 /// A pending session that blocks another spend from the same key: until
 /// it is completed or aborted, a second proposal could pick the same notes.
-pub(crate) fn pending_for(key: &KeyEntry) -> Result<Option<String>, Status> {
-    let Some(mut wallet) = key.wallet() else {
+/// Runs on a blocking thread: it reads (and may expire) the key's session
+/// rows under the wallet lock.
+pub(crate) async fn pending_for(key: &Arc<KeyEntry>) -> Result<Option<String>, Status> {
+    if !key.has_wallet() {
         return Ok(None);
-    };
-    let pending = key_sessions(&mut wallet, key.key_id(), false).for_key(key.key_id())?;
+    }
+    let id = key.key_id().to_string();
+    let pending = wallet_rpc(key, move |w| key_sessions(w, &id, false)).await?;
     Ok(pending.into_iter().next().map(|s| s.session_id))
 }
 

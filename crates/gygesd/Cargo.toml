@@ -33,6 +33,7 @@ zip32 = { workspace = true }
 pczt = { workspace = true }
 age = { workspace = true }
 zeroize = { workspace = true }
+arc-swap = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }  # BroadcastStream for StreamLogs followers
 tonic = { workspace = true }
