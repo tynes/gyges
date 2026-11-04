@@ -25,7 +25,7 @@ use zcash_protocol::consensus::{NetworkType, Parameters as _};
 use crate::keys::{proto_pool, wire_pool};
 use crate::service::{DaemonState, invalid, proto_network};
 use crate::tex;
-use crate::wallet_rpc;
+use crate::{read_rpc, wallet_rpc};
 
 /// `ListTransactions.limit = 0` (docs/interface.md API).
 pub(crate) const DEFAULT_TX_LIMIT: usize = 50;
@@ -218,7 +218,7 @@ pub(crate) async fn list_notes(
         Ok(SpentFilter::All) => None,
         Err(_) => return Err(invalid("unknown spent filter")),
     };
-    let notes = wallet_rpc(&key, history::notes).await?;
+    let notes = read_rpc(&key, history::notes).await?;
     Ok(ListNotesResponse {
         notes: notes
             .iter()
@@ -304,7 +304,7 @@ pub(crate) async fn list_transactions(
     } else {
         Some(parse_txid(&req.before_txid, "before_txid")?)
     };
-    let (rows, tex_rows) = wallet_rpc(&key, move |w| {
+    let (rows, tex_rows) = read_rpc(&key, move |w| {
         let rows = history::transactions(w, limit, before)?;
         let tex_rows = core_tex::list(w, true)?;
         Ok((rows, tex_rows))
@@ -339,7 +339,7 @@ pub(crate) async fn get_transaction_status(
         GygesError::new(ErrorReason::Airgapped, "air-gapped: no node interface").into_status()
     })?;
     let key_id = key.key_id().to_string();
-    let (row, tex_row) = wallet_rpc(&key, move |w| {
+    let (row, tex_row) = read_rpc(&key, move |w| {
         let row = history::transaction(w, txid)?;
         let tex_rows = core_tex::list(w, true)?;
         Ok((row, tex_row_of(&tex_rows, &txid).cloned()))

@@ -740,6 +740,51 @@ mod tests {
         assert_eq!(view.scanned_tip(), chain.tip());
     }
 
+    /// A read-only handle answers while the writer is held (as during a scan
+    /// batch), sees what the writer committed, and refuses to write.
+    #[test]
+    fn readers_do_not_wait_for_the_writer() {
+        use zcash_client_backend::data_api::WalletWrite as _;
+
+        let key = TestKey::new(Network::Regtest, 0);
+        let chain = SyntheticChain::generate(ChainSpec::sparse(100), &[key.recipient]);
+        let cache = gyges_chain::BlockDb::in_memory("regtest").unwrap();
+        cache.insert_from(Source::Node, &chain.blocks).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::perms::set_mode(dir.path(), 0o700).unwrap();
+        let reg = registry(dir.path(), Network::Regtest);
+        let entry = restore(&reg, "bench", &key, &chain.birthday(1));
+        crate::perms::check_tree(dir.path()).expect("the WAL files are private too");
+
+        let params = Network::Regtest.consensus_params();
+        let mut writer = entry.wallet().unwrap();
+        let range = zcash_client_backend::data_api::scanning::ScanRange::from_parts(
+            BlockHeight::from_u32(1)..chain.tip() + 1,
+            zcash_client_backend::data_api::scanning::ScanPriority::Historic,
+        );
+        crate::sync::scan_range(&params, &cache, &mut writer, &range, chain.state(0.into()))
+            .unwrap();
+        crate::sync::WalletView::read(&mut writer, Some(chain.tip())).unwrap();
+
+        // The writer's lock is still held here.
+        let notes = entry
+            .with_reader(crate::history::notes)
+            .expect("a wallet")
+            .expect("a reader")
+            .expect("notes");
+        // Notes and UTXOs alike.
+        assert_eq!(
+            notes.len(),
+            (chain.notes_per_recipient + chain.transparent_per_recipient) as usize
+        );
+        let refused = entry
+            .with_reader(|w| w.update_chain_tip(chain.tip() + 1))
+            .unwrap()
+            .unwrap();
+        assert!(refused.is_err(), "a read-only handle must not write");
+        drop(writer);
+    }
+
     /// The benchmarks' fixtures, pinned: a change to the generator (or to
     /// an upstream crate it calls) that alters a chain must show up here,
     /// not as a silent change in benchmark numbers. Update the digests

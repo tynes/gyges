@@ -47,7 +47,7 @@ use crate::keys::{AUDIT_TARGET, proto_pool};
 use crate::service::{DaemonState, invalid, unix_now};
 use crate::sessions::SessionGuard;
 use crate::tex::{self, DriveError, Offered};
-use crate::{blocking, wallet_rpc};
+use crate::{blocking, read_rpc, wallet_rpc};
 
 /// The server-streaming response type for `SendTransaction` / `ShieldFunds`.
 pub(crate) type SendStream = tonic::codegen::BoxStream<SendEvent>;
@@ -1066,7 +1066,7 @@ pub(crate) async fn get_balance(
     )?;
     let min_confirmations = state.min_confirmations(req.min_confirmations);
     let not_spendable_reason = not_synced(&state, key.key_id()).unwrap_or_default();
-    let b = wallet_rpc(&key, move |w| core_tx::balance(w, min_confirmations)).await?;
+    let b = read_rpc(&key, move |w| core_tx::balance(w, min_confirmations)).await?;
     Ok(GetBalanceResponse {
         not_spendable_reason,
         pools: b

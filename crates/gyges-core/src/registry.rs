@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use age::secrecy::SecretString;
@@ -106,6 +106,10 @@ pub struct KeyEntry {
     dir: PathBuf,
     params: ConsensusParams,
     wallet: Option<Mutex<Wallet>>,
+    /// Read-only handles on the same database, for RPCs that only read:
+    /// with the database in WAL mode they see the last committed state and
+    /// never wait for the writer (a scan batch, a send).
+    readers: Option<Readers>,
     scanned_tip: AtomicU32,
     highest_scanned: AtomicU32,
     ufvk: OnceLock<Option<String>>,
@@ -136,11 +140,15 @@ impl KeyEntry {
         } else if let Some(w) = &wallet {
             let _ = ufvk.set(wallet_ufvk(w, &params));
         }
+        let readers = wallet
+            .as_ref()
+            .map(|_| Readers::new(dir.join(WALLET_FILE), params));
         Self {
             profile,
             dir,
             params,
             wallet: wallet.map(Mutex::new),
+            readers,
             scanned_tip: AtomicU32::new(scanned_tip),
             highest_scanned: AtomicU32::new(highest_scanned),
             ufvk,
@@ -194,6 +202,18 @@ impl KeyEntry {
         self.highest_scanned.load(Ordering::Acquire)
     }
 
+    /// Run `f` on a read-only handle of the wallet, `None` for `signer-only`
+    /// profiles. Nothing `f` does can write: use [`Self::wallet`] for
+    /// anything that might (a fresh key's first address, expiring rows).
+    /// It sees the last committed state, so it never waits for a scan.
+    pub fn with_reader<T>(
+        &self,
+        f: impl FnOnce(&mut Wallet) -> T,
+    ) -> Option<Result<T, RegistryError>> {
+        let readers = self.readers.as_ref()?;
+        Some(readers.with(self.key_id(), f))
+    }
+
     /// Re-read the scan position from `wallet`, which must be this key's
     /// (the caller holds its lock). Called after anything that scans or
     /// rewinds.
@@ -216,6 +236,67 @@ impl KeyEntry {
     /// Read once, when the key is loaded.
     pub fn ufvk(&self) -> Option<String> {
         self.ufvk.get().cloned().flatten()
+    }
+}
+
+/// Read-only handles per key. Few RPCs read at once, and each handle costs
+/// an open connection and its page cache.
+const READERS: usize = 4;
+
+/// A small pool of read-only [`Wallet`] handles, opened on first use.
+struct Readers {
+    path: PathBuf,
+    params: ConsensusParams,
+    slots: [Mutex<Option<Wallet>>; READERS],
+    next: AtomicUsize,
+}
+
+impl Readers {
+    fn new(path: PathBuf, params: ConsensusParams) -> Self {
+        Self {
+            path,
+            params,
+            slots: std::array::from_fn(|_| Mutex::new(None)),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// Run `f` on a free handle: the first slot not in use from a rotating
+    /// start, else wait for the start slot.
+    fn with<T>(&self, key_id: &str, f: impl FnOnce(&mut Wallet) -> T) -> Result<T, RegistryError> {
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let mut slot = (0..READERS)
+            .find_map(|i| self.slots[(start + i) % READERS].try_lock().ok())
+            .unwrap_or_else(|| {
+                self.slots[start % READERS]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+            });
+        if slot.is_none() {
+            *slot = Some(self.open().map_err(|e| wallet_error(key_id, e))?);
+        }
+        Ok(f(slot.as_mut().expect("opened above")))
+    }
+
+    fn open(&self) -> Result<Wallet, rusqlite::Error> {
+        use rusqlite::OpenFlags;
+        let conn = rusqlite::Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // What `WalletDb::for_path` does to a connection it opens.
+        rusqlite::vtab::array::load_module(&conn)?;
+        Ok(WalletDb::from_connection(
+            conn,
+            self.params,
+            SystemClock,
+            rand::rand_core::UnwrapErr(rand::rngs::SysRng),
+        )
+        .with_transparent_ledger_mode(TransparentLedgerMode::Public)
+        .with_status_mode(TransactionStatusMode::Public))
     }
 }
 
@@ -404,6 +485,26 @@ impl KeyRegistry {
 
     /// Open (creating if absent) and migrate a wallet database.
     fn open_wallet(&self, key_id: &str, path: &Path) -> Result<Wallet, RegistryError> {
+        // WAL, so that the read-only handles of `KeyEntry::with_reader`
+        // read while a scan or a send writes. The mode is a property of
+        // the file, kept from now on; the `-wal` and `-shm` files SQLite
+        // creates beside it take the database file's mode, so the file is
+        // made private first.
+        let private = if path.exists() {
+            perms::set_mode(path, 0o600)
+        } else {
+            perms::create_private_file(path).map(drop)
+        };
+        private.map_err(|source| RegistryError::Io {
+            context: "cannot create",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        rusqlite::Connection::open(path)
+            .and_then(|c| {
+                c.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))
+            })
+            .map_err(|e| wallet_error(key_id, e))?;
         let mut wallet = WalletDb::for_path(
             path,
             self.params,
