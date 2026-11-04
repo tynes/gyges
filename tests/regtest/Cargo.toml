@@ -76,6 +76,8 @@ bip0039 = { workspace = true }
 zip32 = { workspace = true }
 # Frames of the Keystone pairing export harness/common.rs passes to `key import-keystone`.
 gyges-qr = { workspace = true }
+# `schema_version()` and the API version the JSON output carries.
+gyges-proto = { workspace = true }
 # A pseudo-terminal for driving `gyges tui` with keys (scenarios/tui.rs).
 nix = { workspace = true, features = ["term"] }
 

@@ -6,6 +6,11 @@
 //! or removed, a key's sync state moving), plus a slow sweep so that a
 //! mempool arrival, which changes neither, is still seen.
 //!
+//! A daemon of API 0.3 or later also serves `WatchEvents`: while that stream
+//! runs, each event (a new tip, a transaction found or mined, a sync or Tor
+//! change) runs a cycle at once. A daemon that answers `UNIMPLEMENTED` is
+//! polled only, as before.
+//!
 //! This connection only reads. It never calls `UnlockKey`, so it never holds
 //! a connection-scoped unlock token (docs/interface.md API §6.3) however long
 //! the TUI stays open; sends get a connection of their own.
@@ -135,15 +140,25 @@ impl Poller {
         let mut last: Option<Fingerprint> = None;
         let mut last_load = Instant::now();
         let mut force = true;
+        let mut watcher = Watcher::default();
         loop {
-            if let Err(error) = self
+            match self
                 .cycle(&mut client, &mut last, &mut last_load, force)
                 .await
             {
-                client = None;
-                last = None;
-                if self.tx.send(Event::Down { error }).is_err() {
-                    return;
+                Ok(airgapped) => {
+                    if !airgapped {
+                        watcher.ensure(&self.ctx, &self.tx, &self.refresh);
+                    }
+                }
+                Err(error) => {
+                    client = None;
+                    last = None;
+                    // A daemon that comes back may be a newer one.
+                    watcher.reset();
+                    if self.tx.send(Event::Down { error }).is_err() {
+                        return;
+                    }
                 }
             }
             force = tokio::select! {
@@ -161,7 +176,7 @@ impl Poller {
         last: &mut Option<Fingerprint>,
         last_load: &mut Instant,
         force: bool,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let (c, info) = match client.take() {
             Some(mut c) => match c.get_info(GetInfoRequest {}).await {
                 Ok(r) => (c, r.into_inner()),
@@ -178,7 +193,7 @@ impl Poller {
             // GetSyncStatus and the wallet reads are refused air-gapped
             // (docs/interface.md API §8); the screen says so instead.
             self.send(Event::Loaded);
-            return Ok(());
+            return Ok(true);
         }
         let sync = match c.get_sync_status(GetSyncStatusRequest::default()).await {
             Ok(r) => {
@@ -205,11 +220,104 @@ impl Poller {
             *last = Some(fp);
         }
         self.send(Event::Loaded);
-        Ok(())
+        Ok(false)
     }
 
     fn send(&self, ev: Event) {
         let _ = self.tx.send(ev);
+    }
+}
+
+/// How the TUI learns that something changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventsMode {
+    /// Not known yet.
+    Unknown,
+    /// `WatchEvents` (API 0.3): changes wake a reload as they happen.
+    Streaming,
+    /// Polling only, and why.
+    Polling(String),
+}
+
+/// The `WatchEvents` stream, while it runs. Each event asks the poller for
+/// a cycle now, so a payment shows (and toasts) as soon as the daemon sees
+/// it instead of at the next tip change or sweep.
+#[derive(Debug, Default)]
+struct Watcher {
+    task: Option<tokio::task::JoinHandle<()>>,
+    /// The daemon answered `UNIMPLEMENTED` (older than API 0.3): do not ask
+    /// again until it reconnects.
+    unsupported: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Watcher {
+    fn ensure(&mut self, ctx: &Ctx, tx: &mpsc::UnboundedSender<Event>, refresh: &Arc<Notify>) {
+        use std::sync::atomic::Ordering;
+        if self.unsupported.load(Ordering::Relaxed)
+            || self.task.as_ref().is_some_and(|t| !t.is_finished())
+        {
+            return;
+        }
+        let (ctx, tx, refresh) = (ctx.clone(), tx.clone(), refresh.clone());
+        // The task replaces it with what it learns.
+        let unsupported = self.unsupported.clone();
+        self.task = Some(tokio::spawn(async move {
+            let (mode, never) = watch(&ctx, &tx, &refresh).await;
+            unsupported.store(never, Ordering::Relaxed);
+            let _ = tx.send(Event::Events(mode));
+        }));
+    }
+
+    fn reset(&mut self) {
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+        self.unsupported
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+    }
+}
+
+/// Follow `WatchEvents` until it ends: what to fall back to and why, and
+/// whether this daemon never serves it (so it is not asked again).
+async fn watch(
+    ctx: &Ctx,
+    tx: &mpsc::UnboundedSender<Event>,
+    refresh: &Notify,
+) -> (EventsMode, bool) {
+    let polling = |why: String| (EventsMode::Polling(why), false);
+    let mut conn = match ctx.connect().await {
+        Ok(c) => c,
+        Err(e) => return polling(e.message()),
+    };
+    let mut stream = match conn
+        .client
+        .watch_events(gyges_proto::v1::WatchEventsRequest::default())
+        .await
+    {
+        Ok(s) => s.into_inner(),
+        Err(s) if s.code() == tonic::Code::Unimplemented => {
+            return (
+                EventsMode::Polling("the daemon is older than API 0.3".into()),
+                true,
+            );
+        }
+        Err(s) => return polling(CliError::from_status(s).message()),
+    };
+    let _ = tx.send(Event::Events(EventsMode::Streaming));
+    loop {
+        match stream.message().await {
+            Ok(Some(_)) => refresh.notify_one(),
+            Ok(None) => return polling("the event stream ended".into()),
+            Err(s) => return polling(CliError::from_status(s).message()),
+        }
     }
 }
 

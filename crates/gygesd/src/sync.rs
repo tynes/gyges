@@ -1104,7 +1104,10 @@ pub(crate) fn to_proto(p: &KeyProgress) -> KeySyncStatus {
 
 /// Resolve a request's key to one that has a wallet (sync is meaningless
 /// for `signer-only`).
-fn resolve_synced_key(state: &DaemonState, key_id: &str) -> Result<Arc<KeyEntry>, Status> {
+pub(crate) fn resolve_synced_key(
+    state: &DaemonState,
+    key_id: &str,
+) -> Result<Arc<KeyEntry>, Status> {
     state.wallet_key(key_id, "a signer-only profile has no wallet to synchronise")
 }
 

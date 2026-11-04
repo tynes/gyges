@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Row, Table, Wrap};
 
 use super::app::App;
+use super::poll::EventsMode;
 use super::ui::{bad, dim, group, ok, warn};
 
 /// The first API minor that reports node URLs.
@@ -142,6 +143,19 @@ pub fn rows(info: &GetInfoResponse, socket: &str) -> Vec<[Line<'static>; 3]> {
     out
 }
 
+/// How changes reach the TUI: the `WatchEvents` stream, or polling.
+pub fn events_row(mode: &EventsMode) -> [Line<'static>; 3] {
+    [
+        cell("wallet events", Style::new()),
+        cell("WatchEvents on the daemon socket", dim()),
+        match mode {
+            EventsMode::Streaming => cell("streaming: changes show at once", ok()),
+            EventsMode::Polling(why) => cell(format!("polling only: {why}"), warn()),
+            EventsMode::Unknown => cell("…", dim()),
+        },
+    ]
+}
+
 /// `s` cut to `width` characters in the middle, keeping both ends: a socket
 /// path or URL is told apart by its start and its end.
 pub fn middle_ellipsis(s: &str, width: usize) -> String {
@@ -168,7 +182,9 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     // The address column's share: the table splits what the first column
     // leaves in two, less the column gaps.
     let col = (area.width.saturating_sub(2 + 19 + 2) / 2) as usize;
-    let rows: Vec<Row> = rows(info, &app.socket)
+    let mut all = rows(info, &app.socket);
+    all.push(events_row(&app.events));
+    let rows: Vec<Row> = all
         .into_iter()
         .map(|[a, mut b, c]| {
             let text: String = b.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -263,6 +279,20 @@ mod tests {
         assert!(s.contains("untested · over Tor"), "{s}");
         assert!(s.contains("the archival fallback, over Tor"), "{s}");
         assert!(s.contains("bootstrapping 40%"), "{s}");
+        assert!(s.contains("wallet events"), "{s}");
+    }
+
+    #[test]
+    fn the_event_stream_or_its_absence_is_shown() {
+        let mut app = App::new(Duration::from_secs(2));
+        app.on_event(Event::Info(Box::new(info(3))));
+        press(&mut app, KeyCode::Char('5'));
+        app.on_event(Event::Events(EventsMode::Streaming));
+        assert!(render(&app, 150, 24).contains("streaming: changes show at once"));
+        app.on_event(Event::Events(EventsMode::Polling(
+            "the daemon is older than API 0.3".into(),
+        )));
+        assert!(render(&app, 150, 24).contains("polling only: the daemon is older than API 0.3"));
     }
 
     #[test]

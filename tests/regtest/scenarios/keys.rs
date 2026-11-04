@@ -20,7 +20,7 @@ fn list_is_empty_on_a_fresh_home() {
     fx.start_daemon(&[]).unwrap();
     fx.gyges(&["key", "list"]).ok().stdout_has("no keys");
     let run = fx.gyges(&["key", "list", "--json"]).ok();
-    assert_eq!(run.json()["schema_version"], "0.2");
+    assert_eq!(run.json()["schema_version"], gyges_proto::schema_version());
     assert!(
         run.json().get("keys").is_none(),
         "empty repeated is omitted"

@@ -20,6 +20,7 @@ use super::addresses::{AddrView, AddressBook, Modal};
 use super::agent::{AgentPane, AgentReply, AgentRequest, MAX_INPUT, Speaker};
 use super::logs::{LogRequest, LogStatus, LogView};
 use super::notify::{Notice, Seen};
+use super::poll::EventsMode;
 use super::send::{Flow, SendReply, SendSpec, SendUpdate, Stage};
 
 /// The longest label `n` accepts.
@@ -80,6 +81,8 @@ pub enum Event {
     Scanned(Result<Vec<u8>, String>),
     /// The agent backend's answer.
     AgentReply(Result<AgentReply, String>),
+    /// Whether `WatchEvents` is streaming.
+    Events(EventsMode),
 }
 
 /// One key's wallet reads. Each one fails on its own.
@@ -257,6 +260,8 @@ pub struct App {
     pub(super) send_id: u64,
     /// The agent bar at the bottom.
     pub agent: AgentPane,
+    /// How changes reach the TUI (the Endpoints tab shows it).
+    pub events: EventsMode,
     /// The receive overlays (QR, new-address prompt).
     pub modal: Option<Modal>,
     /// `c` pressed before the address was loaded: copy it when it arrives.
@@ -290,6 +295,7 @@ impl App {
             logs: LogView::default(),
             send: None,
             send_id: 0,
+            events: EventsMode::Unknown,
             agent: AgentPane {
                 backend_name: "backend not configured".into(),
                 ..AgentPane::default()
@@ -445,6 +451,7 @@ impl App {
             Event::ScanProgress(p) => self.on_scan_progress(p),
             Event::Scanned(r) => self.on_scanned(r),
             Event::AgentReply(r) => self.on_agent_reply(r),
+            Event::Events(mode) => self.events = mode,
             Event::Address {
                 key_id,
                 view,

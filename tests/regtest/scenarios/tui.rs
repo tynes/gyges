@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use gyges_regtest::{
     Fixture, PASSPHRASE, SPEND_CONFIG, binary, burn_t_address, fund_transparent, sweep_logs,
-    synced_key,
+    synced_key, transparent_receivers,
 };
 
 /// A frame of the TUI on `tab`, after its first full load.
@@ -253,6 +253,17 @@ fn a_send_typed_into_the_tui_reaches_the_node() {
         "the TUI shows the txid {txid}"
     );
     tui.keys("\r");
+
+    // A payment to the key while the TUI is open: a toast, without a key
+    // pressed.
+    let at = tui.screen.lock().unwrap().len();
+    let receiver = transparent_receivers(&fx, "main")[0];
+    n.node.mine_with_payments(&[(receiver, 25_000_000)]);
+    tui.wait_for(
+        "+0.25000000 ZEC received by main",
+        at,
+        Duration::from_secs(30),
+    );
     tui.keys("q");
     drop(tui);
     sweep_logs(
