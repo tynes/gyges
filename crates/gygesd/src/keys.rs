@@ -49,7 +49,9 @@ pub(crate) fn proto_signing_mode(mode: SigningMode) -> v1::SigningMode {
     }
 }
 
-/// `gyges_core::Pool` → wire enum.
+/// `gyges_core::Pool` → wire enum. The daemon is the only crate that links
+/// both: the core knows no wire format and has no `UNSPECIFIED` pool, and
+/// the CLI links only `gyges-proto`. This and [`wire_pool`] are the bridge.
 pub(crate) fn proto_pool(pool: gyges_core::Pool) -> v1::Pool {
     match pool {
         gyges_core::Pool::Transparent => v1::Pool::Transparent,

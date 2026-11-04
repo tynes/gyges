@@ -22,7 +22,7 @@ use gyges_proto::v1::{
 use tonic::Status;
 use zcash_protocol::consensus::{NetworkType, Parameters as _};
 
-use crate::keys::proto_pool;
+use crate::keys::{proto_pool, wire_pool};
 use crate::service::{DaemonState, invalid, proto_network};
 use crate::tex;
 use crate::wallet_rpc;
@@ -38,16 +38,6 @@ fn wallet_key(state: &DaemonState, key_id: &str) -> Result<Arc<KeyEntry>, Status
         key_id,
         "a signer-only profile has no wallet: no addresses, notes or history",
     )
-}
-
-fn core_pool(p: i32) -> Result<Pool, Status> {
-    match v1::Pool::try_from(p) {
-        Ok(v1::Pool::Transparent) => Ok(Pool::Transparent),
-        Ok(v1::Pool::Sapling) => Ok(Pool::Sapling),
-        Ok(v1::Pool::Orchard) => Ok(Pool::Orchard),
-        Ok(v1::Pool::Ironwood) => Ok(Pool::Ironwood),
-        _ => Err(invalid("unknown pool")),
-    }
 }
 
 fn network_of(net: NetworkType) -> Network {
@@ -113,7 +103,9 @@ pub(crate) async fn new_address(
     let profile = key.profile();
     let mut pools = Vec::new();
     for p in &req.receivers {
-        let pool = core_pool(*p)?;
+        let Some(pool) = wire_pool(*p)? else {
+            return Err(invalid("POOL_UNSPECIFIED is not a receiver"));
+        };
         if !pools.contains(&pool) {
             pools.push(pool);
         }
@@ -221,10 +213,7 @@ pub(crate) async fn list_notes(
     req: ListNotesRequest,
 ) -> Result<ListNotesResponse, Status> {
     let key = wallet_key(&state, &req.key_id)?;
-    let pool = match v1::Pool::try_from(req.pool) {
-        Ok(v1::Pool::Unspecified) => None,
-        _ => Some(core_pool(req.pool)?),
-    };
+    let pool = wire_pool(req.pool)?;
     let spent = match SpentFilter::try_from(req.spent) {
         Ok(SpentFilter::Unspecified | SpentFilter::Unspent) => Some(false),
         Ok(SpentFilter::Spent) => Some(true),
