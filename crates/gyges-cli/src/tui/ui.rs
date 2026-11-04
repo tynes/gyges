@@ -23,6 +23,7 @@ use crate::key::mode_name;
 use crate::output::format_unix;
 use crate::sync::state_word;
 
+use super::addresses::{self, Modal};
 use super::app::{App, Daemon, Level, Tab};
 use super::lists;
 
@@ -64,6 +65,15 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
     }
     draw_footer(f, footer, app);
+    if app.daemon == Daemon::Up {
+        match &app.modal {
+            Some(Modal::Qr) => addresses::draw_qr_modal(f, body, app),
+            Some(Modal::NewAddress { label, busy, error }) => {
+                addresses::draw_new_modal(f, body, label, *busy, error.as_deref())
+            }
+            None => {}
+        }
+    }
     draw_toasts(f, body, app);
     if app.help {
         draw_help(f, f.area());
@@ -87,6 +97,7 @@ fn draw_toasts(f: &mut Frame, area: Rect, app: &App) {
         let style = match t.level {
             Level::Good => ok().add_modifier(Modifier::BOLD),
             Level::Info => Style::new(),
+            Level::Bad => bad(),
         };
         f.render_widget(Clear, rect);
         f.render_widget(
@@ -346,6 +357,7 @@ fn draw_main(f: &mut Frame, area: Rect, app: &App) {
         Tab::Overview => draw_overview(f, content, app),
         Tab::Notes => lists::draw_notes(f, content, app),
         Tab::Transactions => lists::draw_txs(f, content, app),
+        Tab::Addresses => addresses::draw_tab(f, content, app),
     }
 }
 
@@ -597,12 +609,19 @@ pub fn group(n: u32) -> String {
 /// The hotkeys, as (key, what) pairs. The footer shows them and the help
 /// overlay lists them with more words.
 pub fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
+    match &app.modal {
+        Some(Modal::Qr) => return vec![("p", "form"), ("c", "copy"), ("Esc", "close")],
+        Some(Modal::NewAddress { .. }) => return vec![("Enter", "derive"), ("Esc", "cancel")],
+        None => {}
+    }
     let mut keys = vec![("1-9", "tabs"), ("⇥", "next wallet")];
     match app.tab {
         Tab::Notes => keys.extend([("↑↓", "move"), ("f", "filter")]),
         Tab::Transactions => keys.push(("↑↓", "move")),
+        Tab::Addresses => keys.push(("p", "form")),
         Tab::Overview => {}
     }
+    keys.extend([("r", "receive"), ("n", "new address"), ("c", "copy")]);
     keys.extend([("R", "refresh"), ("?", "help"), ("q", "quit")]);
     keys
 }
@@ -633,6 +652,10 @@ const HELP: &[(&str, &str)] = &[
     ("Tab / Shift-Tab", "next / previous wallet"),
     ("↑↓ j k", "move in a list (PgUp, PgDn, Home, End)"),
     ("f", "Notes: unspent, spent or all"),
+    ("r", "receive: the current address as a QR code"),
+    ("n", "derive a new address (with a label)"),
+    ("c", "copy the current address (OSC 52)"),
+    ("p", "Addresses: unified, ironwood, sapling, transparent"),
     ("Esc", "dismiss notifications"),
     ("R", "poll the daemon now and reload every wallet"),
     ("?", "this help"),

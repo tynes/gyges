@@ -14,10 +14,12 @@
 //! - [`ui`]: drawing the state with ratatui. No I/O.
 //! - this file: the terminal, the event loop and the effects of [`app::Action`]s.
 
+mod addresses;
 mod app;
 mod lists;
 mod notify;
 mod poll;
+mod tasks;
 mod ui;
 
 use std::io::IsTerminal as _;
@@ -91,8 +93,10 @@ pub async fn run(ctx: &Ctx, args: TuiArgs) -> Result<(), CliError> {
     let mut app = App::new(args.interval);
     app.tab = args.tab;
     let mut effects = Effects {
+        ctx: ctx.clone(),
+        tx,
         refresh,
-        bell: args.dump.is_none(),
+        terminal: args.dump.is_none(),
     };
 
     let result = match args.dump {
@@ -113,22 +117,36 @@ pub async fn run(ctx: &Ctx, args: TuiArgs) -> Result<(), CliError> {
 
 /// Executes the [`Action`]s the state asks for.
 struct Effects {
+    ctx: Ctx,
+    tx: mpsc::UnboundedSender<Event>,
     refresh: poll::RefreshHandle,
-    /// False for `--dump`, whose stdout is the frame.
-    bell: bool,
+    /// False for `--dump`, whose stdout is the frame: no bell, no clipboard.
+    terminal: bool,
 }
 
 impl Effects {
     fn perform(&mut self, action: Action) {
+        use std::io::Write as _;
         match action {
             Action::Refresh => self.refresh.request(),
-            Action::Bell if self.bell => {
-                use std::io::Write as _;
+            Action::Bell if self.terminal => {
                 let mut out = std::io::stdout();
                 let _ = out.write_all(b"\x07");
                 let _ = out.flush();
             }
-            Action::Bell => {}
+            Action::Copy(text) if self.terminal => {
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::clipboard::CopyToClipboard::to_clipboard_from(text)
+                );
+            }
+            Action::Bell | Action::Copy(_) => {}
+            Action::LoadAddress { key_id, view } => {
+                tasks::load_address(&self.ctx, &self.tx, key_id, view)
+            }
+            Action::NewAddress { key_id, label } => {
+                tasks::new_address(&self.ctx, &self.tx, key_id, label)
+            }
         }
     }
 

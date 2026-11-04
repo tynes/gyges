@@ -563,6 +563,10 @@ These are limits of what has landed, as recorded when each piece was merged.
   - A `systemd --user` run on a real Linux session is untested; only `verify` ran.
   - There is no hardened mode for macOS (`launchd` daemons with a dedicated user).
   - `run.sh` is not in CI.
+- **TUI (`gyges tui`, Q-C7).**
+  - The Addresses tab shows the current address and those derived in the session only: no RPC lists every address a key has handed out (with its label from `ext_gyges_address_labels`).
+  - Copying uses OSC 52, which some terminals ignore or ask about; there is no fallback to a system clipboard tool.
+  - The QR code and every pane are tested in `TestBackend` frames and `--dump`; scanning a drawn code with a phone is untested.
 
 ### 3.3 Deferred and out of scope
 
