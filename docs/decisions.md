@@ -567,6 +567,8 @@ These are limits of what has landed, as recorded when each piece was merged.
   - The Addresses tab shows the current address and those derived in the session only: no RPC lists every address a key has handed out (with its label from `ext_gyges_address_labels`).
   - Copying uses OSC 52, which some terminals ignore or ask about; there is no fallback to a system clipboard tool.
   - The QR code and every pane are tested in `TestBackend` frames and `--dump`; scanning a drawn code with a phone is untested.
+  - A passphrase send is driven end to end on a pseudo-terminal (`scenarios/tui.rs`); a Keystone send through the TUI is unit-tested against the updates the send task produces but not driven through a daemon, and its camera path is untested on hardware, like the CLI's.
+  - A send cannot be stopped while it proves or broadcasts (only at a signature prompt), and `--wait` has no counterpart: the history tab shows the confirmation.
 
 ### 3.3 Deferred and out of scope
 

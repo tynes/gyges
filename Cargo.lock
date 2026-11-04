@@ -2640,6 +2640,7 @@ dependencies = [
  "gyges-core",
  "gyges-qr",
  "hex",
+ "nix",
  "rand 0.10.3",
  "reqwest",
  "serde",

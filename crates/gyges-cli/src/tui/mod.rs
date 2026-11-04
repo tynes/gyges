@@ -21,6 +21,8 @@ mod lists;
 mod logs;
 mod notify;
 mod poll;
+mod send;
+mod send_task;
 mod tasks;
 mod ui;
 
@@ -41,8 +43,9 @@ use self::app::{Action, App, Event};
 
 /// How long `--dump` waits for the first full load before drawing anyway.
 const DUMP_TIMEOUT: Duration = Duration::from_secs(30);
-/// Redraw cadence for spinners and toast expiry when nothing else happens.
-const TICK: Duration = Duration::from_millis(250);
+/// Redraw cadence when nothing else happens: the Keystone request's frame
+/// rate, so its animation is not slowed down.
+const TICK: Duration = Duration::from_millis(1000 / gyges_qr::DEFAULT_FPS as u64);
 
 #[derive(Debug, Clone, Args)]
 pub struct TuiArgs {
@@ -101,6 +104,8 @@ pub async fn run(ctx: &Ctx, args: TuiArgs) -> Result<(), CliError> {
         refresh,
         terminal: args.dump.is_none(),
         logs: None,
+        send_reply: None,
+        scan_stop: None,
     };
 
     let result = match args.dump {
@@ -128,6 +133,10 @@ struct Effects {
     terminal: bool,
     /// The Logs tab's stream, while it runs.
     logs: Option<tokio::task::JoinHandle<()>>,
+    /// Answers to the running send's signature request.
+    send_reply: Option<mpsc::UnboundedSender<send::SendReply>>,
+    /// Stops the camera scan, while one runs.
+    scan_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Drop for Effects {
@@ -135,6 +144,7 @@ impl Drop for Effects {
         if let Some(t) = self.logs.take() {
             t.abort();
         }
+        self.stop_scan();
     }
 }
 
@@ -173,6 +183,29 @@ impl Effects {
                     t.abort();
                 }
             }
+            Action::Inspect(address) => tasks::inspect(&self.ctx, &self.tx, address),
+            Action::DryRun { id, spec } => send_task::dry_run(&self.ctx, &self.tx, id, spec),
+            Action::Execute { id, spec } => {
+                self.send_reply = Some(send_task::execute(&self.ctx, &self.tx, id, spec));
+            }
+            Action::Reply(reply) => {
+                if let Some(r) = &self.send_reply {
+                    let _ = r.send(reply);
+                }
+            }
+            Action::ScanCamera { answer, request } => {
+                self.stop_scan();
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                self.scan_stop = Some(stop.clone());
+                send_task::scan(&self.tx, answer, request, stop);
+            }
+            Action::StopScan => self.stop_scan(),
+        }
+    }
+
+    fn stop_scan(&mut self) {
+        if let Some(s) = self.scan_stop.take() {
+            s.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

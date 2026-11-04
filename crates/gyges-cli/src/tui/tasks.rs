@@ -8,7 +8,9 @@
 use std::future::Future;
 
 use gyges_proto::v1::gyges_client::GygesClient;
-use gyges_proto::v1::{GetCurrentAddressRequest, NewAddressRequest, StreamLogsRequest};
+use gyges_proto::v1::{
+    GetCurrentAddressRequest, InspectAddressRequest, NewAddressRequest, StreamLogsRequest,
+};
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
 
@@ -108,6 +110,18 @@ pub fn stream_logs(
         let error = run.await.err();
         let _ = tx.send(Event::LogsEnded { generation, error });
     })
+}
+
+pub fn inspect(ctx: &Ctx, tx: &mpsc::UnboundedSender<Event>, address: String) {
+    let req = InspectAddressRequest {
+        address: address.clone(),
+    };
+    spawn(
+        ctx,
+        tx,
+        move |mut c| async move { c.inspect_address(req).await.map(|r| r.into_inner()) },
+        move |result| Event::Inspected { address, result },
+    );
 }
 
 pub fn new_address(ctx: &Ctx, tx: &mpsc::UnboundedSender<Event>, key_id: String, label: String) {

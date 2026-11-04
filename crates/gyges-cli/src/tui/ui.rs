@@ -65,14 +65,18 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
     }
     draw_footer(f, footer, app);
-    if app.daemon == Daemon::Up {
-        match &app.modal {
-            Some(Modal::Qr) => addresses::draw_qr_modal(f, body, app),
-            Some(Modal::NewAddress { label, busy, error }) => {
-                addresses::draw_new_modal(f, body, label, *busy, error.as_deref())
-            }
-            None => {}
+    // Overlays are drawn whatever the poller last saw: keys go to an open
+    // overlay, and a send runs on a connection of its own, so a missed poll
+    // must not hide the field being typed into.
+    match &app.modal {
+        Some(Modal::Qr) => addresses::draw_qr_modal(f, body, app),
+        Some(Modal::NewAddress { label, busy, error }) => {
+            addresses::draw_new_modal(f, body, label, *busy, error.as_deref())
         }
+        None => {}
+    }
+    if let Some(stage) = &app.send {
+        super::send::draw(f, body, stage);
     }
     draw_toasts(f, body, app);
     if app.help {
@@ -611,6 +615,9 @@ pub fn group(n: u32) -> String {
 /// The hotkeys, as (key, what) pairs. The footer shows them and the help
 /// overlay lists them with more words.
 pub fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
+    if app.send.is_some() {
+        return vec![("Enter", "next"), ("Esc", "back / cancel")];
+    }
     match &app.modal {
         Some(Modal::Qr) => return vec![("p", "form"), ("c", "copy"), ("Esc", "close")],
         Some(Modal::NewAddress { .. }) => return vec![("Enter", "derive"), ("Esc", "cancel")],
@@ -629,7 +636,12 @@ pub fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
         ]),
         Tab::Overview | Tab::Endpoints => keys.push(("L", "logs")),
     }
-    keys.extend([("r", "receive"), ("n", "new address"), ("c", "copy")]);
+    keys.extend([
+        ("s", "send"),
+        ("r", "receive"),
+        ("n", "new address"),
+        ("c", "copy"),
+    ]);
     keys.extend([("R", "refresh"), ("?", "help"), ("q", "quit")]);
     keys
 }
@@ -660,6 +672,8 @@ const HELP: &[(&str, &str)] = &[
     ("Tab / Shift-Tab", "next / previous wallet"),
     ("↑↓ j k", "move in a list (PgUp, PgDn, Home, End)"),
     ("f", "Notes: unspent, spent or all"),
+    ("s", "send: form, dry run, confirm, sign"),
+    ("S", "shield transparent funds"),
     ("r", "receive: the current address as a QR code"),
     ("n", "derive a new address (with a label)"),
     ("c", "copy the current address (OSC 52)"),
