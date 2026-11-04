@@ -85,6 +85,12 @@ pub struct SpendArgs {
     /// Also spend a few extra notes of the funding pool when that changes neither the fee nor the transaction's shape.
     #[arg(long)]
     pub consolidate: bool,
+    /// Spend this note or UTXO, as `gyges notes` lists it: TXID:INDEX, or POOL:TXID:INDEX when two pools share the index. Repeatable; only these are spent unless --allow-extra-inputs.
+    #[arg(long = "input", value_name = "OUTPOINT")]
+    pub inputs: Vec<String>,
+    /// With --input: spend those first, and others too if they do not cover the payment.
+    #[arg(long, requires = "inputs")]
+    pub allow_extra_inputs: bool,
 }
 
 /// A pool a send can draw inputs from (old Orchard notes are still spendable).
@@ -132,6 +138,8 @@ impl SpendArgs {
             output_pool: self.pool.map_or(Pool::Unspecified, OutputPoolArg::to_proto) as i32,
             from_pools: self.from_pool.iter().map(|p| p.to_proto() as i32).collect(),
             consolidate: self.consolidate,
+            inputs: self.inputs.clone(),
+            allow_extra_inputs: self.allow_extra_inputs,
         };
         (options != SpendOptions::default()).then_some(options)
     }

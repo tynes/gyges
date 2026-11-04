@@ -968,6 +968,17 @@ message SpendOptions {
   // neither the fee nor the transaction's shape (upstream's
   // PreferConsolidation).
   bool consolidate = 3;
+  // Spend these unspent notes or UTXOs of the key, as `gyges notes` lists
+  // them: "<txid>:<index>", or "<pool>:<txid>:<index>" when two pools'
+  // outputs in one transaction share the index (the pool as
+  // transparent|sapling|orchard|ironwood). Only these are eligible; the
+  // proposer uses as many of them as the payment needs. INVALID_ARGUMENT
+  // for an outpoint that is not an unspent, mined output of the key;
+  // UNSUPPORTED_POOL for one outside the send's pools.
+  repeated string inputs = 4;
+  // With `inputs`: they go first, and the proposer may add other outputs
+  // when they do not cover the payment and fee.
+  bool allow_extra_inputs = 5;
 }
 
 message ShieldFundsRequest {
