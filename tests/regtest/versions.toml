@@ -12,11 +12,11 @@
 # the hashes from the new release's SHA256SUMS.txt in the same change.
 
 [zakurad]
-tag = "v1.6.0"
+tag = "v1.8.1"
 
 [zakurad.sha256]
-linux-x86_64 = "12842638072feb3b2fab500b60da979738d884b484194c4d2aef5220f7a3f372"
-linux-aarch64 = "ffc346c2279f8b9a580e7b35dee468c036d31bcd9d1dc530460583bdb049c9d5"
+linux-x86_64 = "8c745e82287b2c38edf7eaf77dd1428024c6b72bcddff3c0234306eedb33cc53"
+linux-aarch64 = "bc33059ba5221cca30c84fd1acccc739fff3b1c1382f40412ab82c022ab840cf"
 
 # The archival endpoint for the backfill scenarios
 # (docs/decisions.md §2.5). zaino publishes no binaries, so the harness pins
