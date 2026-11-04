@@ -3760,6 +3760,9 @@ async fn zip320_sends_through_the_fake_node() {
     let bundle = tx2.transparent_bundle().expect("transparent");
     assert_eq!(bundle.vout[0].value().into_u64(), 20_000_000);
     assert_eq!(bundle.vin[0].prevout().txid().to_string(), s1);
+    // The queue saw step 2 mined, but the scan of that block may still be
+    // running, and the send gate refuses a key mid-scan.
+    wait_spendable(&mut c, "main").await;
 
     // 3. Step 1 mined, step 2 expired (row 11): `step2_failed`, then
     //    `ResumeTexTransfer` through a session builds a new step 2.
