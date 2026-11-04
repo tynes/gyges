@@ -217,6 +217,7 @@ Proposes, proves, signs and broadcasts. The proposal summary (inputs per pool, o
 - **Inline unlock (`local-seed`):** on `SignatureRequired`, prompts for the passphrase, creates a connection-scoped session and continues; the key is dropped after signing. A send that spends Sapling notes asks before `proving …` rather than after, because the Sapling proofs need the key.
 - **Keystone (`keystone-qr`):** renders the animated UR QR (batch protocol for shielded-only sends, single-PCZT when transparent inputs are present) and reads the result from the camera (`qr-scan`), a file, stdin or pasted frames.
 - **Input pools (`--from-pool`, `--consolidate`):** by default the proposer spends transparent funds first (when the profile allows them), then the payment's own pool, then the others. `--from-pool ironwood` (comma-separated, any of `ironwood,orchard,sapling,transparent`) funds the send from those pools only, never falling back to others (exit 5 when they cannot cover it), and `--amount max` then means everything in them. It narrows the profile's `spend_pools`; a pool the profile does not spend from is exit 6. `--consolidate` lets a few spare notes of the funding pool ride along when the fee and shape stay the same.
+- **Explicit inputs (`--input`):** `--input <TXID:INDEX>` (repeatable; `POOL:TXID:INDEX` when two pools' outputs share an index) spends exactly the notes and UTXOs named, as `gyges notes` lists them: the proposer uses as many of them as the payment needs, exit 5 when they cannot cover it, and `--amount max` sends everything in them. `--allow-extra-inputs` spends them first and lets the proposer add others.
 - **Output pool (`--pool`):** by default the address decides (a unified address with an Orchard receiver is paid into Ironwood). `--pool sapling` or `--pool transparent` pays that receiver of a unified address instead; a recipient without one is refused (exit 6). There is no `--pool orchard`: the Orchard turnstile forbids new Orchard outputs since NU6.3. `pczt create` takes the same flag (API §4.1, `SpendOptions`).
 - **ZIP 320 (`tex1`):** runs the two-step plan through the durable `TexQueue`; the passphrase prompt comes before proving (both steps are built together, API §9), each step's txid goes to stdout as the node takes it, and `tex pending (step 2 of 2): <step1> then <step2>` goes to stderr. A node that will not take Step 2 while Step 1 is unmined leaves one txid on stdout; the queue finishes the transfer and `tx sessions` shows its state.
 ```text
@@ -227,6 +228,8 @@ Flags:
       --pool <POOL>         ironwood | sapling | transparent: pay the recipient's receiver for this pool
       --from-pool <LIST>    Fund the send only from these pools (ironwood,orchard,sapling,transparent)
       --consolidate         Spend spare notes of the funding pool when the fee and shape stay the same
+      --input <OUTPOINT>    Spend this note or UTXO ([POOL:]TXID:INDEX, as `gyges notes` lists it); repeatable
+      --allow-extra-inputs  With --input: spend those first, and others too if they do not cover the payment
       --via-tor             Broadcast through the fallback endpoint over Tor (exit 7 when none is configured; never the node)
       --dry-run             Print the full proposal (every step, every fee) and exit without signing
       --yes                 Skip the confirmation prompt
@@ -554,6 +557,21 @@ alone is `UNSUPPORTED_POOL` there. `consolidate` selects upstream's
 `PreferConsolidation`: a few spare notes of the funding pool ride along
 when that changes neither the fee nor the transaction's shape (at most five
 from the pool).
+
+`inputs` names the outputs to spend, as `gyges notes` lists them:
+`txid:index` with the txid in display order, or `pool:txid:index` when two
+pools' outputs in one transaction share the index (an ambiguous outpoint
+is `INVALID_ARGUMENT` and says so). Each must be an unspent, mined output of
+the key in one of the send's pools (`INVALID_ARGUMENT`, or
+`UNSUPPORTED_POOL` for a pool outside them). Only these are eligible: the
+proposer uses as many of them as the payment needs, a payment they cannot
+cover is `INSUFFICIENT_FUNDS`, and `max` is everything in them. With
+`allow_extra_inputs` they go first and the proposer may add others. Both
+work through upstream's output locks: for the length of the proposal the
+daemon locks every other unspent output of the key (or, with
+`allow_extra_inputs`, the chosen ones, which upstream's `PreferLocked` then
+spends first) under a fresh owner for at most three blocks past the tip,
+and releases the locks once the proposal is made or refused.
 
 #### 4.2 `SignPczt`
 
