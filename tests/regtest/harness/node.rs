@@ -492,11 +492,15 @@ use_color = false
         let tip = self.tip_height();
         self.stop();
         self.opts = opts;
-        // zakurad 1.6.0 sometimes dies while starting over a restored
-        // non-finalized backup: its legacy genesis bootstrap finds the sync
-        // lifecycle already past `LegacyBootstrap` and exits with
-        // "genesis apply handoff failed: illegal sync lifecycle transition"
-        // (seen on about one CI run in three, never on a fresh state). The
+        // zakurad (1.6.0 through at least 1.8.2, zakura-core/zakura#1110)
+        // sometimes dies while starting over an existing chain. At startup it
+        // checks once whether its header runtime is ready: on a fresh state it
+        // never is, and the node starts in `LegacyBootstrap`. On a restart it
+        // can already be, and the node starts in `Native` but still runs the
+        // genesis bootstrap, whose handoff then exits with
+        // "genesis apply handoff failed: illegal sync lifecycle transition".
+        // A fast start loses, so a warm restart can lose several times in a
+        // row (about one attempt in four on CI, once four in a row). The
         // state on disk is intact, so starting again is enough.
         let mut attempt = 1;
         loop {
@@ -506,6 +510,7 @@ use_color = false
                     eprintln!(
                         "zakurad restart attempt {attempt} hit the genesis handoff race; retrying"
                     );
+                    std::thread::sleep(Duration::from_millis(250) * attempt);
                     attempt += 1;
                 }
                 Err(e) => return Err(e),
@@ -515,10 +520,11 @@ use_color = false
 }
 
 /// How many times [`Node::restart`] starts the node before giving up on the
-/// handoff race.
-const RESTART_ATTEMPTS: u32 = 4;
+/// handoff race. Each lost attempt costs about a second and a half, plus a
+/// pause that grows by a quarter second per attempt.
+const RESTART_ATTEMPTS: u32 = 10;
 
-/// The text zakurad 1.6.0 exits with when the race in [`Node::restart`] bites.
+/// The text zakurad exits with when the race in [`Node::restart`] bites.
 const HANDOFF_RACE: &str = "genesis apply handoff failed: illegal sync lifecycle transition";
 
 impl Drop for Node {
