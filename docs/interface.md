@@ -181,8 +181,8 @@ Forces an immediate mempool pass for every key, even with `mempool.scan = false`
 
 #### 2.4 Addresses, QR codes and balances (`gyges address`, `gyges balance`, `gyges notes`)
 
-##### `gyges address current [--qr]`
-Prints the current Unified Address for `--key`; `--qr` renders it as a UTF-8 half-block QR code.
+##### `gyges address current [--pool <ironwood|sapling|transparent>] [--qr]`
+Prints the current Unified Address for `--key`; `--qr` renders it as a UTF-8 half-block QR code. `--pool` prints only that pool's receiver of it, as an address of its own, so whoever pays it can only pay that pool: `sapling` the `zs` address, `transparent` the `t` address, `ironwood` a unified address holding only the Orchard receiver (paid into Ironwood since NU6.3). A current address without the receiver is exit 6 (`UNSUPPORTED_POOL`) with the `address new --receivers` command that derives one.
 
 ##### `gyges address new [--receivers <LIST>] [--label <TEXT>] [--qr]`
 Derives a fresh diversified Unified Address.
@@ -879,7 +879,7 @@ Every command maps to exactly one RPC, or to none when it is purely local.
 | `sync wait` | `WaitSync` | `--until scanned\|spendable`, `--txid T --confirmations N` |
 | `sync run` | `RunSync` | `--from` below `scanned_tip` prompts (or `--yes`) |
 | `sync mempool` | `ScanMempool` | |
-| `address current` | `GetCurrentAddress` | `--qr` renders locally |
+| `address current` | `GetCurrentAddress` | `--pool` narrows to one receiver; `--qr` renders locally |
 | `address new` | `NewAddress` | `--tex` removed (Q-T5) |
 | `address qr [ADDR]` | `GetCurrentAddress` or — | With an explicit address, purely local |
 | `address inspect` | `InspectAddress` | |
@@ -943,7 +943,11 @@ needs two or more files and maps the Combiner's `DataMismatch` to
   any receiver set (upstream's `get_last_generated_address_matching`). On a
   fresh key that is the account's default address, which upstream exposes
   with every receiver the key has (Orchard, Sapling, transparent) when it
-  creates the account; it needs no sync.
+  creates the account; it needs no sync. With `pool` set it returns that
+  pool's receiver of the address as an address of its own (Sapling as
+  `zs`, transparent as `t`, Ironwood or Orchard as an Orchard-only unified
+  address), with the same diversifier index and label;
+  `UNSUPPORTED_POOL` when the address has no such receiver.
 - **`NewAddress`** (`get_next_available_address`) requires the listed
   receivers and omits the others; empty means `orchard,sapling` (Keystone
   profiles: `orchard,transparent`). `POOL_IRONWOOD` names the Orchard

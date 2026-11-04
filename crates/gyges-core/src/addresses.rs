@@ -323,6 +323,63 @@ fn check_label(label: &str) -> Result<(), TxError> {
 }
 
 /// `AddressInfo` for one of the account's addresses.
+/// [`current`], or with `pool` its receiver for that pool as an address of
+/// its own (`address current --pool`, docs/interface.md CLI §2.4), so that whoever pays
+/// it can only pay that pool: Sapling as the standalone `zs` encoding,
+/// transparent as the `t` address, and Ironwood (or Orchard, the same
+/// receiver) as a unified address holding only the Orchard receiver, which
+/// a sender pays into Ironwood since NU6.3. The diversifier index and label
+/// are the unified address's. A current address without that receiver is
+/// refused; `address new --receivers` derives one that has it.
+pub fn current_for_pool(wallet: &mut Wallet, pool: Option<Pool>) -> Result<AddressInfo, TxError> {
+    let info = current(wallet)?;
+    let Some(pool) = pool else {
+        return Ok(info);
+    };
+    let params = *wallet.params();
+    let missing = || {
+        TxError::UnsupportedPool(format!(
+            "the current address has no {} receiver; derive one with `gyges address new \
+             --receivers {}`",
+            format!("{pool:?}").to_lowercase(),
+            match pool {
+                Pool::Ironwood | Pool::Orchard => "orchard",
+                Pool::Sapling => "sapling",
+                Pool::Transparent => "transparent",
+            }
+        ))
+    };
+    let address = match pool {
+        Pool::Sapling | Pool::Transparent => info
+            .receivers
+            .iter()
+            .find(|r| r.pool == pool)
+            .map(|r| r.encoded.clone())
+            .ok_or_else(missing)?,
+        Pool::Ironwood | Pool::Orchard => {
+            let Some(zcash_keys::address::Address::Unified(ua)) =
+                zcash_keys::address::Address::decode(&params, &info.address)
+            else {
+                return Err(TxError::Internal(
+                    "the current address is not a unified address".into(),
+                ));
+            };
+            let orchard = ua.orchard().copied().ok_or_else(missing)?;
+            UnifiedAddress::from_receivers(Some(orchard), None, None)
+                .ok_or_else(|| TxError::Internal("an Orchard-only unified address".into()))?
+                .encode(&params)
+        }
+    };
+    let receivers = inspect(&address)
+        .map_err(|e| internal("re-parsing an own address", e))?
+        .receivers;
+    Ok(AddressInfo {
+        address,
+        receivers,
+        ..info
+    })
+}
+
 fn describe(
     wallet: &mut Wallet,
     account: zcash_client_sqlite::AccountUuid,

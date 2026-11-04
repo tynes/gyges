@@ -35,6 +35,9 @@ pub enum AddressCmd {
 
 #[derive(Debug, Clone, Args)]
 pub struct CurrentArgs {
+    /// Only this pool's receiver, as an address of its own: sapling (zs), transparent (t), or ironwood (a unified address with only the Orchard receiver).
+    #[arg(long, value_name = "POOL")]
+    pub pool: Option<crate::tx::OutputPoolArg>,
     /// Also render a QR code of the address in the terminal (stderr).
     #[arg(long)]
     pub qr: bool,
@@ -74,7 +77,10 @@ pub struct NewArgs {
 pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
     let mut conn = ctx.connect().await?;
     match cmd {
-        AddressCmd::Current(a) => print_address(ctx, &current_address(ctx, &mut conn).await?, a.qr),
+        AddressCmd::Current(a) => {
+            let pool = a.pool.map(crate::tx::OutputPoolArg::to_proto);
+            print_address(ctx, &current_address(ctx, &mut conn, pool).await?, a.qr)
+        }
         AddressCmd::Qr { address } => {
             let address = match address {
                 Some(address) => {
@@ -90,7 +96,7 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
                     }
                     address
                 }
-                None => current_address(ctx, &mut conn).await?.address,
+                None => current_address(ctx, &mut conn, None).await?.address,
             };
             let qr = qr_code(&address)?;
             ctx.print(&serde_json::json!({ "address": address, "qr": qr }), || {
@@ -128,11 +134,16 @@ pub async fn run(ctx: &Ctx, cmd: AddressCmd) -> Result<(), CliError> {
     }
 }
 
-async fn current_address(ctx: &Ctx, conn: &mut Conn) -> Result<AddressInfo, CliError> {
+async fn current_address(
+    ctx: &Ctx,
+    conn: &mut Conn,
+    pool: Option<Pool>,
+) -> Result<AddressInfo, CliError> {
     Ok(conn
         .client
         .get_current_address(GetCurrentAddressRequest {
             key_id: ctx.key.clone(),
+            pool: pool.unwrap_or(Pool::Unspecified) as i32,
         })
         .await?
         .into_inner())
