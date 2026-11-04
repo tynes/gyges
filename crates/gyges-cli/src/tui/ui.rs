@@ -23,7 +23,8 @@ use crate::key::mode_name;
 use crate::output::format_unix;
 use crate::sync::state_word;
 
-use super::app::{App, Daemon, Tab};
+use super::app::{App, Daemon, Level, Tab};
+use super::lists;
 
 /// Width of the wallet list.
 const SIDEBAR: u16 = 30;
@@ -63,8 +64,37 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
     }
     draw_footer(f, footer, app);
+    draw_toasts(f, body, app);
     if app.help {
         draw_help(f, f.area());
+    }
+}
+
+/// Toasts stack in the body's top-right corner, newest at the bottom.
+fn draw_toasts(f: &mut Frame, area: Rect, app: &App) {
+    let mut y = area.y + 1;
+    for t in &app.toasts {
+        let width = (t.text.chars().count() as u16 + 4).min(area.width);
+        if y + 3 > area.y + area.height {
+            break;
+        }
+        let rect = Rect {
+            x: area.x + area.width - width,
+            y,
+            width,
+            height: 3,
+        };
+        let style = match t.level {
+            Level::Good => ok().add_modifier(Modifier::BOLD),
+            Level::Info => Style::new(),
+        };
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(Line::styled(t.text.clone(), style))
+                .block(Block::bordered().border_style(style)),
+            rect,
+        );
+        y += 3;
     }
 }
 
@@ -199,7 +229,10 @@ fn draw_down(f: &mut Frame, area: Rect, error: &str, app: &App) {
         Line::raw(error.to_string()),
         Line::default(),
         Line::styled(
-            format!("Retrying every {}.", humantime::format_duration(app.interval)),
+            format!(
+                "Retrying every {}.",
+                humantime::format_duration(app.interval)
+            ),
             dim(),
         ),
     ];
@@ -311,6 +344,8 @@ fn draw_main(f: &mut Frame, area: Rect, app: &App) {
     );
     match app.tab {
         Tab::Overview => draw_overview(f, content, app),
+        Tab::Notes => lists::draw_notes(f, content, app),
+        Tab::Transactions => lists::draw_txs(f, content, app),
     }
 }
 
@@ -392,8 +427,21 @@ fn draw_overview(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(holdings(w)),
         ]));
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), info);
+    let recent: Vec<_> = app.visible_txs().iter().take(RECENT).collect();
+    let key_rows = lines.len() as u16;
+    let [key_area, recent_area] =
+        Layout::vertical([Constraint::Length(key_rows + 1), Constraint::Min(0)]).areas(info);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), key_area);
+    if !recent.is_empty() {
+        let table = Table::new(recent.into_iter().map(lists::tx_row), lists::tx_widths())
+            .header(lists::tx_header())
+            .block(Block::new().title(Line::styled("recent (all in tab 3)", dim())));
+        f.render_widget(table, recent_area);
+    }
 }
+
+/// History rows the Overview shows.
+const RECENT: usize = 3;
 
 /// `3 unspent notes · 12 transactions`, or what failed.
 fn holdings(w: &super::app::WalletSnapshot) -> String {
@@ -504,8 +552,12 @@ fn key_lines(k: &KeySummary, app: &App) -> Vec<Line<'static>> {
             Span::styled("sync     ", dim()),
             Span::styled(text, style),
         ]));
-        if !s.detail.is_empty() {
-            lines.push(Line::styled(format!("         {}", s.detail), bad()));
+        // `detail` is the stall's reason; other states may carry a word too.
+        if s.state() == SyncState::Stalled && !s.detail.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("         ", dim()),
+                Span::styled(s.detail.clone(), bad()),
+            ]));
         }
     } else if let Err(e) = &app.sync {
         lines.push(Line::styled(format!("sync status unavailable: {e}"), bad()));
@@ -545,14 +597,14 @@ pub fn group(n: u32) -> String {
 /// The hotkeys, as (key, what) pairs. The footer shows them and the help
 /// overlay lists them with more words.
 pub fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
-    let _ = app;
-    vec![
-        ("1-9", "tabs"),
-        ("⇥", "next wallet"),
-        ("R", "refresh"),
-        ("?", "help"),
-        ("q", "quit"),
-    ]
+    let mut keys = vec![("1-9", "tabs"), ("⇥", "next wallet")];
+    match app.tab {
+        Tab::Notes => keys.extend([("↑↓", "move"), ("f", "filter")]),
+        Tab::Transactions => keys.push(("↑↓", "move")),
+        Tab::Overview => {}
+    }
+    keys.extend([("R", "refresh"), ("?", "help"), ("q", "quit")]);
+    keys
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -579,6 +631,9 @@ pub fn centered(area: Rect, w: u16, h: u16) -> Rect {
 const HELP: &[(&str, &str)] = &[
     ("1-9", "switch tab"),
     ("Tab / Shift-Tab", "next / previous wallet"),
+    ("↑↓ j k", "move in a list (PgUp, PgDn, Home, End)"),
+    ("f", "Notes: unspent, spent or all"),
+    ("Esc", "dismiss notifications"),
     ("R", "poll the daemon now and reload every wallet"),
     ("?", "this help"),
     ("q, Ctrl-C", "quit"),

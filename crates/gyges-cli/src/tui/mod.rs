@@ -15,6 +15,8 @@
 //! - this file: the terminal, the event loop and the effects of [`app::Action`]s.
 
 mod app;
+mod lists;
+mod notify;
 mod poll;
 mod ui;
 
@@ -48,6 +50,19 @@ pub struct TuiArgs {
     /// exit, without a terminal (for scripts and tests).
     #[arg(long, value_name = "COLSxROWS", value_parser = parse_size)]
     pub dump: Option<(u16, u16)>,
+    /// The tab to open on, by name (overview, notes, transactions, …).
+    #[arg(long, value_name = "NAME", default_value = "overview", value_parser = parse_tab)]
+    pub tab: app::Tab,
+}
+
+fn parse_tab(s: &str) -> Result<app::Tab, String> {
+    app::Tab::from_name(s).ok_or_else(|| {
+        let names: Vec<String> = app::Tab::ALL
+            .iter()
+            .map(|t| t.title().to_lowercase())
+            .collect();
+        format!("expected one of {}", names.join(", "))
+    })
 }
 
 fn parse_size(s: &str) -> Result<(u16, u16), String> {
@@ -73,8 +88,12 @@ pub async fn run(ctx: &Ctx, args: TuiArgs) -> Result<(), CliError> {
     let poller = poll::Poller::new(ctx.clone(), args.interval, tx.clone());
     let refresh = poller.refresh_handle();
     let poll_task = tokio::spawn(poller.run());
-    let app = App::new(args.interval);
-    let mut effects = Effects { refresh };
+    let mut app = App::new(args.interval);
+    app.tab = args.tab;
+    let mut effects = Effects {
+        refresh,
+        bell: args.dump.is_none(),
+    };
 
     let result = match args.dump {
         Some((w, h)) => dump(app, rx, &mut effects, w, h).await,
@@ -95,12 +114,21 @@ pub async fn run(ctx: &Ctx, args: TuiArgs) -> Result<(), CliError> {
 /// Executes the [`Action`]s the state asks for.
 struct Effects {
     refresh: poll::RefreshHandle,
+    /// False for `--dump`, whose stdout is the frame.
+    bell: bool,
 }
 
 impl Effects {
     fn perform(&mut self, action: Action) {
         match action {
             Action::Refresh => self.refresh.request(),
+            Action::Bell if self.bell => {
+                use std::io::Write as _;
+                let mut out = std::io::stdout();
+                let _ = out.write_all(b"\x07");
+                let _ = out.flush();
+            }
+            Action::Bell => {}
         }
     }
 
@@ -222,5 +250,12 @@ mod tests {
         assert!(parse_size("120").is_err());
         assert!(parse_size("10x5").is_err());
         assert!(parse_size("ax40").is_err());
+    }
+
+    #[test]
+    fn tabs_parse_by_name() {
+        assert_eq!(parse_tab("notes").unwrap(), app::Tab::Notes);
+        assert_eq!(parse_tab("Transactions").unwrap(), app::Tab::Transactions);
+        assert!(parse_tab("nope").unwrap_err().contains("overview, notes"));
     }
 }

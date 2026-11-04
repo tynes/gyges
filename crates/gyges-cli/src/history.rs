@@ -102,7 +102,7 @@ pub fn render_status(r: &GetTransactionStatusResponse) -> String {
     s
 }
 
-fn memo_text(memo: &[u8]) -> Option<String> {
+pub fn memo_text(memo: &[u8]) -> Option<String> {
     if memo.is_empty() {
         return None;
     }
