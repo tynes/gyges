@@ -389,7 +389,7 @@ The `BlockCache` rows above `f` are deleted at the same time so no key re-reads 
 
 #### 5.1 Range
 
-A key with `scanned_tip + 1 < retained_from` streams `[scanned_tip + 1, V]` from `TorLwdSource`, where `V = retained_from + k`, `k = 10` (config `fallback_lightwalletd.overlap_blocks`). The overlap exists because a pruned node answers `z_gettreestate` only for heights whose bodies it still has, so validation must happen inside the node's window, not at its edge.
+A key with `scanned_tip + 1 < retained_from` streams `[scanned_tip + 1, V]` from `TorLwdSource`, where `V = retained_from + k`, `k = 10` (config `fallback_lightwalletd.overlap_blocks`). The overlap exists because a pruned node answers `z_gettreestate` only for heights whose bodies it still has, so validation must happen inside the node's window, not at its edge. Each batch's prior tree state comes from the endpoint, except below Sapling activation, where every tree is empty by consensus and the state is built from the node's block hash instead; endpoints need not serve one there (testnet.zec.rocks refuses `GetTreeState(279999)`). A restore below the window takes its birthday state the same way.
 
 Before streaming, `GetSubtreeRoots` for Sapling and Orchard populate the ShardTree via `put_*_subtree_roots`, so witnesses for notes found during backfill can be completed without every historical block.
 

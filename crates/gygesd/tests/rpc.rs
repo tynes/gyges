@@ -4994,6 +4994,42 @@ async fn backfill_downloads_the_next_batch_while_scanning_the_current_one() {
     running.task.abort();
 }
 
+/// A restore at Sapling activation below the node's window, against an
+/// endpoint that refuses the tree state one block below it, as
+/// testnet.zec.rocks refuses `GetTreeState(279999)`. The trees are empty
+/// there by consensus, so neither the birthday nor the first backfill
+/// batch asks the endpoint for it, and the backfill reaches the handoff.
+#[tokio::test]
+async fn a_restore_at_sapling_activation_needs_no_tree_state_below_it() {
+    use gyges_proto::v1::Pool;
+    let node = FakeNode::start(regtest_params()).await;
+    let (mnemonic, ironwood, _) = chain_with_a_shielded_note(&node).await;
+    node.mine(40);
+    let tip = node.tip().0;
+    node.set_prune_height(Some(30));
+    let lwd = FakeLightwalletd::from_node(&node).await;
+    // Regtest activates Sapling at 1.
+    lwd.refuse_tree_states_below(Some(1));
+
+    let (running, mut c) = start_with_fallback(&node, &lwd, TEST_CONFIG).await;
+    let resp = c
+        .restore_key(RestoreKeyRequest {
+            mnemonic,
+            allow_backfill: true,
+            ..restore_req("copy", 1)
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.birthday_height, 1);
+    let status = wait_spendable(&mut c, "copy").await;
+    assert_eq!(status.scanned_tip, tip, "{status:?}");
+    let b = balance(&mut c, "copy").await;
+    assert_eq!(balance_of(&b, Pool::Ironwood), (ironwood, 0), "{b:?}");
+    assert!(lwd.calls().iter().any(|m| m == "GetBlockRange"));
+    running.task.abort();
+}
+
 /// Item 2's hash-chain check: an endpoint serving a fork from the
 /// birthday up (well linked, but not the node's chain) is refused before
 /// anything from it is scanned, the endpoint is marked untrusted (and
