@@ -7,7 +7,8 @@
 //! node's and handed to the wallet (check 3), then each tick fetches one
 //! `cache.scan_batch` of blocks through [`gyges_chain::fill_cache`] (tagged
 //! with the endpoint's source), checks the batch's last hash against the
-//! node's `getblockhash` (check 2) and scans it. Once the key has scanned
+//! node's `getblockhash` (check 2) and scans it, while the next batch
+//! downloads in the background ([`Prefetch`]). Once the key has scanned
 //! `V = min(retained_from + overlap_blocks, tip)`, the wallet's note
 //! commitment trees and recorded hashes are compared with the node at `V`
 //! (checks 1 and 2); only then does the key return to Case A.
@@ -19,11 +20,12 @@
 //! only by configuring another endpoint), truncates the key to the block
 //! before the session began, and stalls it with `UntrustedBackfill`.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use gyges_chain::{
-    ArtiTorLwdBackend, ChainBackend, ChainError, FillError, NodeBounds, Source, TorState,
+    ArtiTorLwdBackend, BlockDb, ChainBackend, ChainError, FillError, NodeBounds, Source, TorState,
 };
 use gyges_core::KeyEntry;
 use gyges_core::handoff::{self, Check, Mismatch};
@@ -32,6 +34,7 @@ use gyges_core::recovery::{self, Placement, Report};
 use gyges_core::sync::{self as core_sync, ScanOutcome, StallReason, SyncError, SyncState};
 use gyges_proto::v1;
 use serde::{Deserialize, Serialize};
+use zcash_client_backend::data_api::chain::BlockCache as _;
 use zcash_client_backend::data_api::scanning::{ScanPriority, ScanRange};
 use zcash_protocol::ShieldedPool;
 use zcash_protocol::consensus::BlockHeight;
@@ -256,6 +259,73 @@ fn fill_error(e: FillError) -> SyncError {
     }
 }
 
+/// The next batch's download from the endpoint, running while the current
+/// batch is checked and scanned (and through the rest of the tick). It is
+/// only an optimisation: the next tick settles it first
+/// ([`Scheduler::settle_prefetches`]) and then takes whatever it cached
+/// through the usual `cached_prefix` and `fill_cache`, so every error
+/// surfaces on that synchronous path as before. Dropping it aborts the task.
+pub(crate) struct Prefetch {
+    range: Range<BlockHeight>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Fetch `range` from the endpoint into the cache, then check its last
+/// block against the node. Failures are left to the synchronous path of
+/// the next tick: a fetch that stops early keeps the linked prefix it
+/// cached (`fill_cache` writes nothing that does not link), and blocks
+/// whose last hash is not the node's are deleted so that the next tick's
+/// reorg check never walks into them; refetched, they fail check 2 there.
+async fn prefetch(
+    fallback: Arc<ArtiTorLwdBackend<ConsensusParams>>,
+    chain: Arc<dyn ChainBackend>,
+    cache: Arc<BlockDb>,
+    range: Range<BlockHeight>,
+    fetch_batch: u32,
+) {
+    let scan_range = ScanRange::from_parts(range.clone(), ScanPriority::Historic);
+    // Gap or not, `fill_cache` replaces what it fetches.
+    let have = cache.read(&scan_range).await.map_or(0, |b| b.len() as u32);
+    let from = range.start + have;
+    if from < range.end
+        && let Err(e) =
+            gyges_chain::fill_cache(fallback.as_ref(), &cache, from..range.end, fetch_batch).await
+    {
+        tracing::debug!(
+            from = u32::from(from),
+            to = u32::from(range.end) - 1,
+            error = %e,
+            "backfill prefetch stopped; the next tick fetches the rest"
+        );
+        return;
+    }
+    let last = range.end - 1;
+    let (Ok(cached), Ok(node)) = (cache.hash_at(last), chain.block_hash(last).await) else {
+        return;
+    };
+    if cached != Some(node) {
+        tracing::debug!(
+            height = u32::from(last),
+            "prefetched block is not the node's; dropped for the next tick to refetch and check"
+        );
+        if let Err(e) = cache.delete(scan_range).await {
+            tracing::warn!(error = %e, "cannot drop the prefetched blocks");
+        }
+        return;
+    }
+    tracing::debug!(
+        from = u32::from(range.start),
+        to = u32::from(last),
+        "backfill batch prefetched"
+    );
+}
+
 /// Subtree roots of every pool from one source. The node's errors are not
 /// fatal (a node without the index, or one still building it, confirms
 /// nothing); the endpoint being unreachable is.
@@ -467,6 +537,10 @@ impl Scheduler {
             )));
         }
 
+        // The batch links to the node's chain: download the next one while
+        // this one's prior tree state is fetched and it is scanned.
+        self.spawn_prefetch(&fallback, end..(end + batch).min(v + 1));
+
         // The prior tree state: the node's where it still has it, else the
         // endpoint's (checked at the handoff through the root).
         let prior = if scanned_tip >= bounds.retained_from {
@@ -536,6 +610,64 @@ impl Scheduler {
                     u32::from(at_height)
                 ),
             ))),
+        }
+    }
+
+    /// Start downloading `range` (the batch after the one in hand) into the
+    /// cache, unless it is empty (the batch in hand ends at the handoff),
+    /// the scheduler is stopping, or a download already covers its start
+    /// (another key backfilling the same heights). The end-of-tick eviction
+    /// only drops blocks below the slowest key's scanned tip + 1, at most
+    /// `range.start` once this key's step returns its tip, so nothing
+    /// prefetched is evicted before it is scanned. (A step that fails is
+    /// left out of the slowest tip; whatever is evicted then is refetched
+    /// by the next tick's synchronous path.)
+    fn spawn_prefetch(
+        &mut self,
+        fallback: &Arc<ArtiTorLwdBackend<ConsensusParams>>,
+        range: Range<BlockHeight>,
+    ) {
+        if range.is_empty()
+            || self.hub().stopping()
+            || self
+                .prefetches
+                .iter()
+                .any(|p| p.range.contains(&range.start))
+        {
+            return;
+        }
+        let task = tokio::spawn(prefetch(
+            fallback.clone(),
+            self.chain.clone(),
+            self.cache.clone(),
+            range.clone(),
+            self.state.config.cache.fetch_batch,
+        ));
+        self.prefetches.push(Prefetch { range, task });
+    }
+
+    /// Wait for the downloads started last tick, so that nothing writes to
+    /// the cache while this tick reconciles, fetches and scans. Each is
+    /// bounded by the endpoint's timeouts; a stop request aborts them.
+    pub(crate) async fn settle_prefetches(&mut self) {
+        let state = self.state.clone();
+        for mut p in std::mem::take(&mut self.prefetches) {
+            tokio::select! {
+                _ = &mut p.task => {}
+                () = state.sync.stopped() => {
+                    p.task.abort();
+                    let _ = (&mut p.task).await;
+                }
+            }
+        }
+    }
+
+    /// Abort every download and wait until none can write to the cache
+    /// any more (the endpoint was refused, or the scheduler stops).
+    pub(crate) async fn cancel_prefetches(&mut self) {
+        for mut p in std::mem::take(&mut self.prefetches) {
+            p.task.abort();
+            let _ = (&mut p.task).await;
         }
     }
 
@@ -795,6 +927,9 @@ impl Scheduler {
         );
         let reason = format!("{}: {m}", session.endpoint);
         self.state.fallback_trust.mark_untrusted(reason.clone());
+        // Nothing more from the endpoint reaches the cache after the
+        // eviction below.
+        self.cancel_prefetches().await;
 
         let to = BlockHeight::from_u32(session.from.saturating_sub(1));
         match self.truncate_untrusted(key, to).await {

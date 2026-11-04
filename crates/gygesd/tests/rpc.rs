@@ -4782,6 +4782,77 @@ async fn restore_below_the_window_backfills_from_the_fallback_and_a_wrong_root_i
     running.task.abort();
 }
 
+/// The next batch is downloaded while the current one is scanned: with the
+/// endpoint holding batch 2's prior tree state (`GetTreeState(14)`), so
+/// batch 2 cannot be scanned yet, batch 3 has already been requested. A
+/// sequential backfill would ask for batch 3 only after batch 2's scan.
+/// Every height is still fetched exactly once and the handoff passes.
+#[tokio::test]
+async fn backfill_downloads_the_next_batch_while_scanning_the_current_one() {
+    use gyges_proto::v1::FallbackTrust;
+    let node = mined_node(40).await;
+    node.set_prune_height(Some(25));
+    let lwd = FakeLightwalletd::from_node(&node).await;
+    // Batches [5, 15), [15, 25), [25, 35), [35, 36) up to the handoff at
+    // 25 + 10; batch 2's prior state (14) is below the window, so it comes
+    // from the endpoint.
+    lwd.hold_tree_state(14);
+    let config = format!("{TEST_CONFIG}[cache]\nscan_batch = 10\nfetch_batch = 10\n");
+    let (running, mut c) = start_with_fallback(&node, &lwd, &config).await;
+    c.restore_key(RestoreKeyRequest {
+        allow_backfill: true,
+        ..restore_req("old", 5)
+    })
+    .await
+    .unwrap();
+
+    poll_until(
+        "batch 3 requested while batch 2 waits for its prior tree state",
+        Duration::from_secs(30),
+        Duration::from_millis(20),
+        async || {
+            let ranges = lwd.block_ranges();
+            if lwd.held_tree_states() == 1 && ranges.contains(&(25, 34)) {
+                Ok(())
+            } else {
+                Err(ranges)
+            }
+        },
+    )
+    .await;
+    let k = wait_status(&mut c, "old", "status", |_| true).await;
+    assert_eq!(k.scanned_tip, 14, "batch 2 is not scanned yet: {k:?}");
+    assert_eq!(
+        k.backend(),
+        gyges_proto::v1::SyncBackend::DirectLwdFallback,
+        "{k:?}"
+    );
+
+    lwd.release_tree_states();
+    let status = wait_spendable(&mut c, "old").await;
+    assert_eq!(status.scanned_tip, 40, "{status:?}");
+    assert_eq!(status.backend(), gyges_proto::v1::SyncBackend::ZakuraRpc);
+    // Each batch fetched once, nothing fetched twice or past the handoff.
+    assert_eq!(
+        lwd.block_ranges(),
+        vec![(5, 14), (15, 24), (25, 34), (35, 35)],
+        "{:?}",
+        lwd.calls()
+    );
+    let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
+    assert_eq!(info.fallback.unwrap().trust(), FallbackTrust::Verified);
+    // The endpoint's blocks, prefetched ones included, are dropped once
+    // scanned (`cache.keep_historical = false`).
+    let cache = running.state.block_cache.as_ref().unwrap();
+    assert_eq!(
+        cache
+            .evict_source_below(gyges_chain::Source::TorLwd, BlockHeight::from_u32(u32::MAX))
+            .unwrap(),
+        0
+    );
+    running.task.abort();
+}
+
 /// Item 2's hash-chain check: an endpoint serving a fork from the
 /// birthday up (well linked, but not the node's chain) is refused before
 /// anything from it is scanned, the endpoint is marked untrusted (and

@@ -164,6 +164,12 @@ impl SyncHub {
         *self.stop.borrow()
     }
 
+    /// Resolves once [`Self::request_stop`] has been called.
+    pub(crate) async fn stopped(&self) {
+        let mut stop = self.stop.subscribe();
+        let _ = stop.wait_for(|s| *s).await;
+    }
+
     /// `(ticks begun, ticks completed)`.
     pub fn ticks(&self) -> (u64, u64) {
         *lock(&self.ticks)
@@ -224,6 +230,9 @@ pub(crate) struct Scheduler {
     /// Open Case B sessions per key, loaded from disk on first use
     /// (`crate::backfill`).
     pub(crate) backfills: BTreeMap<String, Option<backfill::Session>>,
+    /// Next-batch downloads from the fallback endpoint started this tick,
+    /// settled at the start of the next (`crate::backfill::Prefetch`).
+    pub(crate) prefetches: Vec<backfill::Prefetch>,
     /// When each key's transaction status work last went to the node
     /// ([`Self::check_status`]).
     status_checked: BTreeMap<String, Instant>,
@@ -258,6 +267,7 @@ pub(crate) fn spawn(
         started: Instant::now(),
         last_connected: None,
         backfills: BTreeMap::new(),
+        prefetches: Vec::new(),
         status_checked: BTreeMap::new(),
         mempool_seen: HashSet::new(),
         mempool_scanned_at: None,
@@ -270,6 +280,8 @@ impl Scheduler {
         let mut stop = self.state.sync.stop.subscribe();
         loop {
             if self.hub().stopping() {
+                // No download outlives the scheduler.
+                self.cancel_prefetches().await;
                 tracing::debug!("sync scheduler stopped");
                 return;
             }
@@ -336,6 +348,9 @@ impl Scheduler {
             return false;
         };
 
+        // Last tick's next-batch downloads finish before anything below
+        // reads or rewrites the cache.
+        self.settle_prefetches().await;
         if let Err(e) = self.reconcile_cache(&bounds).await {
             tracing::warn!(error = %e, "block cache reconciliation failed; retrying next tick");
             return false;

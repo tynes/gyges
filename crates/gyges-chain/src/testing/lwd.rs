@@ -89,6 +89,15 @@ struct LwdState {
     zaino_errors: bool,
     broadcasts: Vec<Vec<u8>>,
     calls: Vec<String>,
+    /// `(start, end)` of every `GetBlockRange`, inclusive as requested.
+    block_ranges: Vec<(u32, u32)>,
+    /// `GetTreeState` at these heights waits until
+    /// [`FakeLightwalletd::release_tree_states`].
+    held_tree_states: BTreeSet<u32>,
+    /// `GetTreeState` requests waiting at the gate.
+    held: u32,
+    /// Bumped by [`FakeLightwalletd::release_tree_states`].
+    gate: tokio::sync::watch::Sender<u64>,
 }
 
 /// The running fake. Dropping it stops the server.
@@ -312,6 +321,30 @@ impl FakeLightwalletd {
     pub fn calls(&self) -> Vec<String> {
         self.lock().calls.clone()
     }
+
+    /// `(start, end)` of every `GetBlockRange` so far, inclusive, in order.
+    pub fn block_ranges(&self) -> Vec<(u32, u32)> {
+        self.lock().block_ranges.clone()
+    }
+
+    /// Hold every `GetTreeState(height)` until
+    /// [`Self::release_tree_states`]: deterministically, an endpoint slow
+    /// to answer in the middle of a backfill batch.
+    pub fn hold_tree_state(&self, height: u32) {
+        self.lock().held_tree_states.insert(height);
+    }
+
+    /// Answer the held `GetTreeState` requests and hold no more.
+    pub fn release_tree_states(&self) {
+        let mut st = self.lock();
+        st.held_tree_states.clear();
+        st.gate.send_modify(|g| *g += 1);
+    }
+
+    /// How many `GetTreeState` requests are waiting at the gate.
+    pub fn held_tree_states(&self) -> u32 {
+        self.lock().held
+    }
 }
 
 /// `items` keyed by the height `height` reads off each.
@@ -390,7 +423,8 @@ impl CompactTxStreamer for Service {
         let range = req.into_inner();
         let start = height_arg(range.start)?;
         let end = height_arg(range.end)?;
-        let st = self.lock("GetBlockRange");
+        let mut st = self.lock("GetBlockRange");
+        st.block_ranges.push((start, end));
         // lightwalletd streams what it has and ends the stream at a hole or
         // above its tip.
         let mut items = Vec::new();
@@ -417,6 +451,19 @@ impl CompactTxStreamer for Service {
 
     async fn get_tree_state(&self, req: Request<BlockId>) -> Result<Response<TreeState>, Status> {
         let h = height_arg(Some(req.into_inner()))?;
+        // The gate of `hold_tree_state`. Subscribing under the lock that
+        // `release_tree_states` takes means no wake-up is missed.
+        let waiter = {
+            let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            st.held_tree_states.contains(&h).then(|| {
+                st.held += 1;
+                st.gate.subscribe()
+            })
+        };
+        if let Some(mut rx) = waiter {
+            let _ = rx.changed().await;
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).held -= 1;
+        }
         let st = self.lock("GetTreeState");
         st.tree_states
             .get(&h)
