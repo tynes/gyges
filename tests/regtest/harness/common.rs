@@ -294,7 +294,10 @@ pub fn funded_wallet(node: &Node) -> (Fixture, PathBuf, u64) {
 
 /// `tx shield --yes` for key `main`, then `mine` to get the txid it is
 /// handed mined, then wait until the shielded funds are spendable with
-/// nothing transparent left. A failed shield shows the node's log at `log`.
+/// nothing transparent left. `mine` must leave one block above the
+/// shield's: the wallet's anchor sits `min_confirmations` behind the tip,
+/// so a note in the tip block is not spendable yet (zakura-client-sqlite
+/// rc9.2 and later). A failed shield shows the node's log at `log`.
 /// The txid and that balance.
 pub fn shield(
     fx: &Fixture,

@@ -1682,8 +1682,12 @@ pub fn extract_and_store(
     let needs_sapling = !pczt.sapling().spends().is_empty() || !pczt.sapling().outputs().is_empty();
     let sapling_vks = needs_sapling.then(|| provers.sapling().verifying_keys());
     let (_, orchard_vk) = provers.orchard();
+    // Upstream checks the PCZT against the wallet's tip + 1 before any
+    // proof work (rc9.6), so it needs the network.
+    let params = *wallet.params();
     let txid = extract_and_store_transaction_from_pczt::<_, Infallible>(
         wallet,
+        &params,
         pczt,
         sapling_vks.as_ref().map(|(s, o)| (s, o)),
         Some(orchard_vk),

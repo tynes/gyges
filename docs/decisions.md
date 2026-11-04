@@ -24,7 +24,7 @@ Grouped by area. Each question carries the proposal written for it in the review
   **Proposed solution.** Target Zakura's native JSON-RPC and nothing else. Verification showed the premise of the question was wrong: Zakura has no second RPC dialect. Its native JSON-RPC is the Zebra-derived zcashd-style API, and "zcashd-compat mode" (`zakurad start --zcashd-compat`) means running a real `zcashd` binary as a P2P sidecar for wallet and ZMQ users, which Gyges does not need. Every method the pipeline uses (`getblockchaininfo`, `getblockhash`, `getbestblockhash`, `getblock(h, 0)`, `getrawtransaction`, `z_gettreestate`, `z_getsubtreesbyindex`, `getrawmempool`, `sendrawtransaction`) exists on the native API and is classified `Unauthenticated`, so Gyges works both with cookie auth (`enable_cookie_auth = true`, HTTP Basic from `~/.cache/zakura/.cookie`, the default) and against an unauthenticated listener. Two additions worth designing for: (1) Zakura's optional **indexer gRPC** (`[rpc] indexer_listen_addr`, `indexer` build feature) streams `get_block_range` raw blocks, `chain_tip_change` and `mempool_change` events; `ZakuraRpcBackend` should use it when present and fall back to polling JSON-RPC otherwise; (2) `z_getsubtreesbyindex` and `z_gettreestate` already expose an `ironwood` pool alongside Sapling and Orchard (see Q-D7). Remove the "native vs compat" branch from `architecture.md` Components and the `ChainBackend` trait.
 - [x] **Q-D3.** How are Zakura crate upgrades tracked while everything is `-rc`?
 
-  **Proposed solution.** Exact pins (`=0.1.0-rc9`, `=3.0.0`) for every `zakura-*` crate in `[workspace.dependencies]`, with `Cargo.lock` committed and CI running `cargo build --locked`. Bumps are deliberate, one PR per Zakura release, and must pass the regtest suite (Q-O2). Use `[patch.crates-io]` pointing at a git revision only on feature branches, never on `main`. A short `docs/ZAKURA_VERSIONS.md` records which Zakura release each Gyges tag was built against. Note from the crates.io check (§2.2): the wallet-libraries `rc9.1` / `rc7` crates pin the common crates at `=4.0.0-rc2`, so Gyges pins exactly that and moves only when wallet-libraries publishes a release that does. **Implemented:** `Cargo.toml` carries the pins with the policy as a comment and `Cargo.lock` is committed.
+  **Proposed solution.** Exact pins (`=0.1.0-rc9`, `=3.0.0`) for every `zakura-*` crate in `[workspace.dependencies]`, with `Cargo.lock` committed and CI running `cargo build --locked`. Bumps are deliberate, one PR per Zakura release, and must pass the regtest suite (Q-O2). Use `[patch.crates-io]` pointing at a git revision only on feature branches, never on `main`. A short `docs/ZAKURA_VERSIONS.md` records which Zakura release each Gyges tag was built against. Note from the crates.io check (§2.2): the wallet-libraries `rc9.1` / `rc7` crates pin the common crates at `=4.0.0-rc2`, so Gyges pins exactly that and moves only when wallet-libraries publishes a release that does. That release came with rc9.6 (`^4.0.0`), and the pins moved to the stable `=4.0.0` on 2026-11-03. **Implemented:** `Cargo.toml` carries the pins with the policy as a comment and `Cargo.lock` is committed.
 
 - [x] **Q-D4.** Should Gyges build on `zakura-wallet-lib` and the `sync` feature rather than its own `SyncScheduler` and `TxEngine`?
 
@@ -218,20 +218,27 @@ The crate versions as first checked against crates.io on 2026-10-19/20. `Cargo.t
 
 | Crate (`Cargo.toml` pin) | Published max version | Repository | Pin for Gyges today |
 |---|---|---|---|
-| `zakura-client-backend` (0.15) | 0.1.0-rc9.1 (2026-10-20) | zakura-core/wallet-libraries | `=0.1.0-rc9.1` |
-| `zakura-client-sqlite` (0.13) | 0.1.0-rc9.1 (2026-10-20) | zakura-core/wallet-libraries | `=0.1.0-rc9.1` |
-| `zakura-pczt` (0.2) | 0.1.0-rc7 (2026-10-20) | zakura-core/wallet-libraries | `=0.1.0-rc7` |
+| `zakura-client-backend` (0.15) | 0.1.0-rc9.1 (2026-10-20) | zakura-core/wallet-libraries | `=0.1.0-rc9.6` (2026-11-03) |
+| `zakura-client-sqlite` (0.13) | 0.1.0-rc9.1 (2026-10-20) | zakura-core/wallet-libraries | `=0.1.0-rc9.6` (2026-11-03) |
+| `zakura-pczt` (0.2) | 0.1.0-rc7 (2026-10-20) | zakura-core/wallet-libraries | `=0.1.0-rc9` (2026-11-03) |
 | `zakura-pir-status` (0.1) | 0.0.1-rc1 | zakura-core/wallet-libraries | `=0.0.1-rc1` (experimental) |
-| `zakura-keys` (0.5) | 4.0.0-rc3 (2026-10-20) | zakura-core/common | `=4.0.0-rc2` (see §2.2) |
-| `zakura-address` (0.6) | 4.0.0-rc3 | zakura-core/common | `=4.0.0-rc2` (see §2.2) |
-| `zakura-primitives` (0.19) | 4.0.0-rc3 | zakura-core/common | `=4.0.0-rc2` (see §2.2) |
-| `zakura-proofs` (0.19) | 4.0.0-rc3 | zakura-core/common | `=4.0.0-rc2` (see §2.2) |
-| `zakura-orchard` (0.10) | 4.0.0-rc3 | zakura-core/common | `=4.0.0-rc2` (see §2.2) |
-| `zakura-sapling-crypto` (0.4) | 4.0.0-rc3 | zakura-core/common | `=4.0.0-rc2` (see §2.2) |
-| `zakura-transparent` (0.2) | 4.0.0-rc3 | zakura-core/common | `=4.0.0-rc2` (see §2.2) |
-| `zakura-pasta-curves` (0.5) | 4.0.0-rc3 | zakura-core/common | `=4.0.0-rc2` (see §2.2) |
+| `zakura-keys` (0.5) | 4.0.0-rc3 (2026-10-20) | zakura-core/common | `=4.0.0` (2026-11-03; see §2.2) |
+| `zakura-address` (0.6) | 4.0.0-rc3 | zakura-core/common | `=4.0.0` (2026-11-03; see §2.2) |
+| `zakura-primitives` (0.19) | 4.0.0-rc3 | zakura-core/common | `=4.0.0` (2026-11-03; see §2.2) |
+| `zakura-proofs` (0.19) | 4.0.0-rc3 | zakura-core/common | `=4.0.0` (2026-11-03; see §2.2) |
+| `zakura-orchard` (0.10) | 4.0.0-rc3 | zakura-core/common | `=4.0.0` (2026-11-03; see §2.2) |
+| `zakura-sapling-crypto` (0.4) | 4.0.0-rc3 | zakura-core/common | `=4.0.0` (2026-11-03; see §2.2) |
+| `zakura-transparent` (0.2) | 4.0.0-rc3 | zakura-core/common | `=4.0.0` (2026-11-03; see §2.2) |
+| `zakura-pasta-curves` (0.5) | 4.0.0-rc3 | zakura-core/common | `=4.0.0` (2026-11-03; see §2.2) |
 
 The table reflects crates.io on 2026-10-20; the revision 2 figures (`rc9`, `rc6`, common at `3.0.0`) were current on 2026-10-19. `Cargo.toml` now carries these pins and `Cargo.lock` is committed.
+
+**Bumped 2026-11-03.** Wallet libraries `0.1.0-rc9.6` and `zakura-pczt` `0.1.0-rc9` depend on the common crates at `^4.0.0`, so the common pins moved from `=4.0.0-rc2` to the stable `=4.0.0` (the lockfile no longer carries a second `4.0.0-rc3` copy of some of them). Common `5.0.0` is published, but no wallet-libraries release depends on it yet. The one API change Gyges met: `extract_and_store_transaction_from_pczt` takes the consensus parameters and validates the PCZT against the wallet's tip + 1 before any proof work. `ScanSummary` still counts only Sapling and Orchard notes, so the scan log keeps counting Ironwood from the wallet (PR #61).
+
+Two behaviour changes came with it:
+
+- **A note needs `min_confirmations + 1` confirmations to be spendable.** Since rc9.2, upstream takes the anchor at `tip - min_confirmations` (`get_max_checkpointed_height`: `target - 1 - min_confirmations`, "ZIP 218 measures anchor depth behind the chain tip") and counts a note only when that anchor covers it. Before, the anchor was at `tip + 1 - min_confirmations`. At the regtest suites' `min_confirmations = 1` a note is spendable one block after its own, so the tests now mine one more block before they expect it; at the default of 10 it is 11 blocks. Gyges takes the upstream rule as is rather than passing `N - 1`, which cannot express `N = 1`.
+- **`truncate_to_height` now accepts `birthday - 1`.** Gyges' fork search treats a height where the wallet holds no block hash as the fork. For a key born one block above a reorged block, that height is `birthday - 1`, whose tree state the wallet took from the replaced block. With rc9.1 the truncation there was refused and Gyges reset the key from the node; with rc9.6 it succeeds and kept the replaced checkpoint, so every later scan conflicted with it (`Conflict at checkpoint id …`). A fork found without a hash is now always reset to the node's state one block lower (`gygesd::sync::handle_reorg`); a reset at the fork itself keeps an existing checkpoint too. `tests/regtest/scenarios/node.rs` row 4 covers it against `zakurad`.
 
 Other relevant facts from the upstream READMEs:
 
@@ -279,7 +286,7 @@ Checked on 2026-10-19 against the Zakura node source (`zakura-core/zakura`, `cra
 
 Each of these was discovered by `cargo generate-lockfile` / `cargo check` against crates.io and is reflected in `Cargo.toml` with a comment.
 
-- **Common crates must be pinned `=4.0.0-rc2`.** `zakura-client-backend` / `zakura-client-sqlite` `0.1.0-rc9.1` and `zakura-pczt` `0.1.0-rc7` (all published 2026-10-20) depend on every common crate at exactly `=4.0.0-rc2`. Neither `=3.0.0` (revision 2's advice) nor the newer `4.0.0-rc3` resolves alongside them. A few transitive common crates (`zakura-bellman`, `zakura-equihash`, `zakura-pairing`) resolve to `4.0.0-rc3` because the common crates use caret requirements among themselves; that is harmless. (Q-D3)
+- **Common crates must be pinned `=4.0.0-rc2`** (until 2026-11-03; the rc9.6 bump above moved them to `=4.0.0`). `zakura-client-backend` / `zakura-client-sqlite` `0.1.0-rc9.1` and `zakura-pczt` `0.1.0-rc7` (all published 2026-10-20) depend on every common crate at exactly `=4.0.0-rc2`. Neither `=3.0.0` (revision 2's advice) nor the newer `4.0.0-rc3` resolves alongside them. A few transitive common crates (`zakura-bellman`, `zakura-equihash`, `zakura-pairing`) resolve to `4.0.0-rc3` because the common crates use caret requirements among themselves; that is harmless. (Q-D3)
 - **MSRV is 1.97.** Every published Zakura crate declares `rust-version = "1.97"`; the original `1.85` could not build them. `rust-toolchain.toml` pins `1.97.1`.
 - **Shared crates must match the Zakura majors**: `rand 0.10`, `secrecy 0.8` (`zcash_keys` takes `SecretVec<u8>` from 0.8), `rusqlite 0.37`, `shardtree 0.7`, `bip0039 0.12` (which has no `zeroize` feature; the old manifest enabled one that does not exist), `tonic`/`prost` 0.14 with the new `tonic-prost` / `tonic-prost-build` split, `arti-client 0.35` (pulled in by the backend's `tor` feature; Gyges has no direct Arti dependency).
 - **`ur-registry 1.0.9` needs `default-features = false, features = ["std"]`.** Its default `core` feature depends on `thiserror-core`, which requires a nightly `#![feature]` and fails on stable. It also pulls `prost 0.11` and `minicbor 0.19`, so those majors are duplicated in the graph; `deny.toml` warns rather than denies on duplicates for now. (Q-K6)

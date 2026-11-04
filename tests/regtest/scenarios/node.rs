@@ -179,8 +179,10 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
     // Row 3, first half: shield everything into Ironwood.
     let (shield_txid, b) = shield(&fx, &pw, &log, |txid| {
         assert_eq!(node.mempool(), vec![txid], "the node accepted it");
-        node.mine(1);
+        node.mine(2);
     });
+    let shield_height = node.mined_height(&shield_txid).expect("mined");
+    assert_eq!(shield_height, 103);
     let shielded = spendable(&b, "POOL_IRONWOOD");
     assert!(shielded < funded && shielded > funded - 100_000, "{b}");
     assert_eq!(spendable(&b, "POOL_ORCHARD"), 0, "{b}");
@@ -190,7 +192,7 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
         .gyges(&["key", "init", "--id", "bob", "--json"])
         .env("GYGES_PASSPHRASE_FILE", &pw)
         .ok();
-    assert_eq!(run.json()["birthday_height"], 103);
+    assert_eq!(run.json()["birthday_height"], 104);
     // The receive address comes from `gyges address current`, as a user
     // would get it (the M1 exit criterion).
     let run = fx.gyges(&["-k", "bob", "address", "current"]).ok();
@@ -212,7 +214,8 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
             .any(|p| p["pool"] == "POOL_IRONWOOD" && p["pending"] == "100000000")
     });
     assert!(b["total_spendable"].is_null(), "{b}");
-    node.mine(1);
+    // One block past the payment's, so its note is under the anchor.
+    node.mine(2);
     wait_for_txid(&fx, "bob", &pay_bob_txid, 1);
     let b = wait_balance(&fx, "bob", |b| spendable(b, "POOL_IRONWOOD") == 100_000_000);
     assert_eq!(b["total_spendable"], "100000000", "{b}");
@@ -253,9 +256,9 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
         .stdout
         .trim()
         .to_string();
-    node.mine(1);
+    node.mine(2);
     let tip = node.tip_height();
-    assert_eq!(tip, 105);
+    assert_eq!(tip, 108);
     wait_for_txid(&fx, "main", &pay_t_txid, 1);
     let before_reorg = wait_balance(&fx, "main", |b| {
         spendable(b, "POOL_TRANSPARENT") == 50_000_000
@@ -266,16 +269,16 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
     );
     let bob_before = balance(&fx, "bob");
 
-    // Row 4: invalidate the block three below the tip (103, 104 and 105 go,
-    // and with them all three transactions), mine four, and re-mine the
+    // Row 4: invalidate the shield's block (103 to 108 go, and with them
+    // all three transactions), mine one past the old tip, and re-mine the
     // transactions in dependency order.
     let txs = [&shield_txid, &pay_bob_txid, &pay_t_txid];
     let raws: Vec<String> = txs.iter().map(|t| node.raw_transaction(t)).collect();
-    let fork = tip - 2;
+    let fork = shield_height;
     let old_hashes: Vec<String> = (fork..=tip).map(|h| node.block_hash(h)).collect();
     node.invalidate_block(&old_hashes[0]);
     assert_eq!(node.tip_height(), fork - 1);
-    node.mine(4);
+    node.mine(tip - fork + 2);
     assert_eq!(node.tip_height(), tip + 1);
     assert_ne!(node.block_hash(fork), old_hashes[0]);
     let mut heights = Vec::new();
@@ -284,6 +287,8 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
     }
     assert!(heights.windows(2).all(|w| w[0] <= w[1]), "{heights:?}");
     assert!(heights[0] > fork - 1, "{heights:?}");
+    // The last change back under the anchor.
+    node.mine(1);
     let new_tip = node.tip_height();
 
     // The daemon rewound to the fork, rescanned, and the balances are back.
@@ -308,8 +313,9 @@ fn restore_mine_shield_send_and_reorg_against_the_real_node() {
     assert_eq!(bob_after["pools"], bob_before["pools"]);
 
     // The audit log saw the three broadcasts; the main log saw both wallets
-    // rewound to the fork (bob was born in a reorged block, so its rewind is
-    // a reset to the node's tree state rather than a truncation).
+    // rewound to the fork (bob was born just above the reorged shield block,
+    // so its rewind is a reset to the node's tree state below that block
+    // rather than a truncation).
     let run = fx
         .gyges(&["daemon", "logs", "--audit", "--lines", "1000", "--json"])
         .ok();
@@ -373,7 +379,7 @@ fn zip320_against_the_real_node() {
     let log = node.log_path();
     let (mut fx, pw, funded) = funded_wallet(&node);
     let (shield_txid, b) = shield(&fx, &pw, &log, |_| {
-        node.mine(1);
+        node.mine(2);
     });
     let shielded = spendable(&b, "POOL_IRONWOOD");
 
@@ -394,9 +400,11 @@ fn zip320_against_the_real_node() {
     assert_eq!(row["step2_txid"], s2, "{row}");
     assert_eq!(row["amount"], "100000000", "{row}");
     wait_for_txid(&fx, "main", &s1, 1);
+    // One block past the transaction's, so its notes are under the anchor.
+    node.mine(1);
     // The exchange side: exactly the amount, as a plain transparent output.
     let b = wait_balance(&fx, "main", |b| {
-        spendable(b, "POOL_TRANSPARENT") == 100_000_000
+        spendable(b, "POOL_TRANSPARENT") == 100_000_000 && spendable(b, "POOL_IRONWOOD") > 0
     });
     let fees = shielded - 100_000_000 - spendable(&b, "POOL_IRONWOOD");
     assert!(fees > 0 && fees < 100_000, "two ZIP 317 fees: {fees} ({b})");
@@ -421,6 +429,8 @@ fn zip320_against_the_real_node() {
         "rebroadcast after the restart: {row}"
     );
     wait_for_txid(&fx, "main", &s1b, 1);
+    // One block past the transaction's, so its notes are under the anchor.
+    node.mine(1);
     // The recipient is this wallet, so only fees left it: the shield (two
     // transparent inputs, 20,000) and two ZIP 320 pairs (15,000 + 10,000
     // each). Where the 0.5 ZEC was funded from is the input selector's
@@ -505,7 +515,7 @@ fn sapling_spend_against_the_real_node() {
     );
     let (shield_txid, _) = shield(&fx, &pw, &log, |txid| {
         assert_eq!(node.mempool(), vec![txid], "the node accepted it");
-        node.mine(1);
+        node.mine(2);
     });
     while node.tip_height() < ZIP212_ON {
         node.mine((ZIP212_ON - node.tip_height()).min(2_000));
@@ -527,7 +537,8 @@ fn sapling_spend_against_the_real_node() {
         .trim()
         .to_string();
     assert_eq!(node.mempool(), vec![pay.clone()], "the node accepted it");
-    node.mine(1);
+    // One block past the transaction's, so its notes are under the anchor.
+    node.mine(2);
     let b = wait_balance(&fx, "bob", |b| spendable(b, "POOL_SAPLING") == 100_000_000);
     assert_eq!(b["total_spendable"], "100000000", "{b}");
 
@@ -548,7 +559,8 @@ fn sapling_spend_against_the_real_node() {
         .ok_with_log(&log);
     let spend = run.stdout.trim().to_string();
     assert_eq!(node.mempool(), vec![spend.clone()], "the node accepted it");
-    node.mine(1);
+    // One block past the transaction's, so its notes are under the anchor.
+    node.mine(2);
     wait_for_txid(&fx, "bob", &spend, 1);
     let b = wait_balance(&fx, "bob", |b| {
         b["total_spendable"]

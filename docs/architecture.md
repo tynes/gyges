@@ -381,7 +381,7 @@ Handling:
 
 The `BlockCache` rows above `f` are deleted at the same time so no key re-reads stale blocks.
 
-**Status:** detector 1 runs once per tick on the *shared cache* (`cache tip` versus `getblockhash`, walking back to the fork point and truncating the cache) and once per key (the hash the wallet holds at `block_fully_scanned` versus the reconciled cache, falling back to the node); detector 2 is the scanner's continuity error. The fork search walks the wallet's own `blocks` hashes against the cache (or node) and calls `truncate_to_height`, which may truncate lower than asked; the key then rescans from there on the next tick. When the wallet has scanned nothing at or below the fork (a key born in a reorged block, or whose first scanned block was), `truncate_to_height` answers `RequestedRewindInvalid` and the scheduler instead resets the wallet to the node's tree state at the fork (`z_gettreestate(f)` → `WalletWrite::rewind_to_chain_state`, lowering the account birthday to `f + 1` where the fork is below it); verified by a three-block reorg against a real `zakurad` in `tests/regtest/scenarios/node.rs` and by the fake-node scheduler test. The subtree-root refresh (`z_getsubtreesbyindex`) is not implemented yet; witnesses are built from the scanned blocks alone, which is sufficient inside the retention window.
+**Status:** detector 1 runs once per tick on the *shared cache* (`cache tip` versus `getblockhash`, walking back to the fork point and truncating the cache) and once per key (the hash the wallet holds at `block_fully_scanned` versus the reconciled cache, falling back to the node); detector 2 is the scanner's continuity error. The fork search walks the wallet's own `blocks` hashes against the cache (or node) and calls `truncate_to_height`, which may truncate lower than asked; the key then rescans from there on the next tick. When the wallet has scanned nothing at or below the fork (a key born in a reorged block, or whose first scanned block was), `truncate_to_height` answers `RequestedRewindInvalid` and the scheduler instead resets the wallet to the node's tree state at the fork (`z_gettreestate(f)` → `WalletWrite::rewind_to_chain_state`, lowering the account birthday to `f + 1` where the fork is below it). A fork found where the wallet holds no block hash (its `birthday - 1`, whose tree state may come from a replaced block) is never truncated to: the key is reset to the node's state at `f - 1`, since a truncation and a reset at `f` would both keep the wallet's existing checkpoint there (decisions.md §2, the rc9.6 bump); verified by a three-block reorg against a real `zakurad` in `tests/regtest/scenarios/node.rs` and by the fake-node scheduler test. The subtree-root refresh (`z_getsubtreesbyindex`) is not implemented yet; witnesses are built from the scanned blocks alone, which is sufficient inside the retention window.
 
 ---
 
@@ -599,7 +599,7 @@ rebroadcast_interval = "60s"     # how often non-terminal tex_queue rows are re-
 max_attempts = 0                 # 0 = retry until expiry_height
 
 [policy]
-min_confirmations = 10           # anchor depth used for "Spendable" and note selection
+min_confirmations = 10           # anchor depth used for "Spendable" and note selection; a note needs N + 1 confirmations
 ```
 
 Rules:

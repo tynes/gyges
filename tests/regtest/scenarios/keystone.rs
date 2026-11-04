@@ -105,7 +105,8 @@ fn keystone_signing_through_the_binaries() {
         .arg(&path)
         .ok();
     assert!(is_txid(run.stdout.trim()), "{run:?}");
-    n.node.mine(1);
+    // One block past the shield's, so its note is under the anchor.
+    n.node.mine(2);
     sync_wait_within(&fx, "ks", "60s", &[]);
     let b = fx.gyges(&["-k", "ks", "balance", "--json"]).ok().json();
     assert!(
@@ -134,7 +135,8 @@ fn keystone_signing_through_the_binaries() {
         .ok();
     assert!(is_txid(run.stdout.trim()), "{run:?}");
 
-    n.node.mine(1);
+    // One block past the transaction's, so its notes are under the anchor.
+    n.node.mine(2);
     sync_wait_within(&fx, "ks", "60s", &[]);
 
     // An aborted session cannot be completed.
