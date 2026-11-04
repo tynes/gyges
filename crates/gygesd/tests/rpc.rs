@@ -3713,6 +3713,35 @@ async fn the_sender_picks_the_inputs() {
         assert!(err.message().contains(needle), "{input}: {err:?}");
     }
 
+    // Another spend's reservation on an output this one must lock is a
+    // retryable INPUTS_RESERVED, whose detail names no txid.
+    {
+        use zcash_client_backend::data_api::OutputLockStore as _;
+        use zcash_client_backend::data_api::locking::LockOwner;
+        use zcash_client_backend::wallet::OutputRef;
+        use zcash_protocol::{PoolType, TxId};
+        let (txid, index) = utxo.split_once(':').unwrap();
+        let held = OutputRef::new(
+            TxId::from_bytes(gyges_chain::parse_display_hash(txid).unwrap()),
+            PoolType::Transparent,
+            index.parse().unwrap(),
+        );
+        let other = LockOwner::new([7; 32]);
+        let key = state.registry.resolve("main").unwrap();
+        // The guard is the daemon's wallet lock: hold it only around each call.
+        {
+            let mut w = key.wallet().unwrap();
+            let tip = w.chain_height().unwrap().unwrap();
+            w.lock_outputs(&[held], other, tip + 3).unwrap();
+        }
+        let err = dry(&mut c, zats(10_000_000), options(&[&iw], false))
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&err), ErrorReason::InputsReserved, "{err:?}");
+        assert!(!err.message().contains(txid), "{err:?}");
+        key.wallet().unwrap().unlock_output(&held, other).unwrap();
+    }
+
     // Every reservation was released: the balance is whole again and the
     // proposer picks as it did before.
     assert_eq!(balance(&mut c, "main").await, before);

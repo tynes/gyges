@@ -103,6 +103,10 @@ pub enum TxError {
     /// `UNSUPPORTED_POOL`.
     #[error("{0}")]
     UnsupportedPool(String),
+    /// `INPUTS_RESERVED`: another spend in progress holds a lock on an
+    /// output this one needs; retrying later can succeed.
+    #[error("{0}")]
+    InputsReserved(String),
     /// `INVALID_ARGUMENT`: the Verifier found the PCZT differs from the
     /// approved proposal (Q-K7); nothing is broadcast.
     #[error("{0}")]
@@ -276,24 +280,25 @@ impl fmt::Display for InputRef {
     }
 }
 
-impl std::str::FromStr for InputRef {
-    type Err = TxError;
+/// A string that is not `[pool:]txid:index`. It does not repeat the
+/// string: error details never carry txids (docs/interface.md API §3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("is not [pool:]txid:index (as `gyges notes` lists it)")]
+pub struct BadInputRef;
 
-    fn from_str(s: &str) -> Result<Self, TxError> {
-        let bad = || {
-            TxError::InvalidArgument(format!(
-                "input {s:?} is not [pool:]txid:index (as `gyges notes` lists it)"
-            ))
-        };
+impl std::str::FromStr for InputRef {
+    type Err = BadInputRef;
+
+    fn from_str(s: &str) -> Result<Self, BadInputRef> {
         let (pool, txid, index) = match s.trim().split(':').collect::<Vec<_>>()[..] {
             [txid, index] => (None, txid, index),
-            [pool, txid, index] => (Some(Pool::parse(pool).ok_or_else(bad)?), txid, index),
-            _ => return Err(bad()),
+            [pool, txid, index] => (Some(Pool::parse(pool).ok_or(BadInputRef)?), txid, index),
+            _ => return Err(BadInputRef),
         };
         Ok(InputRef {
             pool,
-            txid: gyges_chain::parse_display_hash(txid).map_err(|_| bad())?,
-            index: index.parse().map_err(|_| bad())?,
+            txid: gyges_chain::parse_display_hash(txid).map_err(|_| BadInputRef)?,
+            index: index.parse().map_err(|_| BadInputRef)?,
         })
     }
 }
@@ -322,7 +327,8 @@ fn output_ref(row: &NoteRow) -> OutputRef {
 
 impl Reservation {
     /// Resolve the chosen inputs against the account's unspent outputs and
-    /// lock what keeps the proposer to them.
+    /// lock what keeps the proposer to them. Errors name an input by its
+    /// position ("input 2"), never by txid (docs/interface.md API §3).
     fn take(
         wallet: &mut Wallet,
         spend_pools: &[Pool],
@@ -331,7 +337,7 @@ impl Reservation {
         let rows = crate::history::notes(wallet)?;
         let unspent: Vec<&NoteRow> = rows.iter().filter(|r| !r.spent()).collect();
         let mut chosen: Vec<&NoteRow> = Vec::new();
-        for want in &options.inputs {
+        for (n, want) in (1..).zip(&options.inputs) {
             let found: Vec<&NoteRow> = unspent
                 .iter()
                 .copied()
@@ -342,28 +348,28 @@ impl Reservation {
                 [row] => row,
                 [] => {
                     return Err(TxError::InvalidArgument(format!(
-                        "{want} is not an unspent note or UTXO of this key (see `gyges notes`)"
+                        "input {n} is not an unspent note or UTXO of this key (see `gyges notes`)"
                     )));
                 }
                 _ => {
-                    let named: Vec<String> = found
-                        .iter()
-                        .map(|r| format!("{}:{want}", r.pool.as_str()))
-                        .collect();
+                    let pools: Vec<&str> = found.iter().map(|r| r.pool.as_str()).collect();
                     return Err(TxError::InvalidArgument(format!(
-                        "{want} names outputs in more than one pool; prefix it with the pool: {}",
-                        named.join(" or ")
+                        "input {n} names outputs in more than one pool ({}); prefix it with \
+                         the pool, as in pool:txid:index",
+                        pools.join(", ")
                     )));
                 }
             };
             if !spend_pools.contains(&row.pool) {
                 return Err(TxError::UnsupportedPool(format!(
-                    "{want} is in the {} pool, which this send does not spend from",
+                    "input {n} is in the {} pool, which this send does not spend from",
                     row.pool.as_str()
                 )));
             }
             if row.height.is_none() {
-                return Err(TxError::InvalidArgument(format!("{want} is not mined yet")));
+                return Err(TxError::InvalidArgument(format!(
+                    "input {n} is not mined yet"
+                )));
             }
             if !chosen.contains(&row) {
                 chosen.push(row);
@@ -378,12 +384,7 @@ impl Reservation {
                 .map(|r| output_ref(r))
                 .collect()
         };
-        let owner = {
-            use rand::Rng as _;
-            let mut bytes = [0u8; 32];
-            rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut bytes);
-            LockOwner::new(bytes)
-        };
+        let owner = LockOwner::new(crate::random_bytes());
         if !locked.is_empty() {
             let tip = wallet
                 .chain_height()
@@ -392,10 +393,10 @@ impl Reservation {
             wallet
                 .lock_outputs(&locked, owner, tip + RESERVATION_BLOCKS)
                 .map_err(|e| match e {
-                    LockError::LockFailure(o) => TxError::InvalidArgument(format!(
-                        "output {}:{} is reserved by another spend in progress",
-                        o.txid(),
-                        o.output_index()
+                    LockError::LockFailure(_) => TxError::InputsReserved(format!(
+                        "an output of this key is reserved by another spend in progress; \
+                         try again once it finishes (a reservation left by a crash expires \
+                         within {RESERVATION_BLOCKS} blocks)"
                     )),
                     other => internal("reserving the inputs", other),
                 })?;
@@ -2344,11 +2345,7 @@ mod tests {
             &format!("coins:{display}:0"),
             &format!("a:b:{display}:0"),
         ] {
-            let err = bad.parse::<InputRef>().unwrap_err();
-            assert!(
-                matches!(&err, TxError::InvalidArgument(m) if m.contains("is not [pool:]txid:index")),
-                "{bad}: {err:?}"
-            );
+            assert_eq!(bad.parse::<InputRef>(), Err(BadInputRef), "{bad}");
         }
     }
     use crate::Network;

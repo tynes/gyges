@@ -19,7 +19,6 @@ use std::path::Path;
 use age::armor::{ArmoredReader, ArmoredWriter, Format};
 use age::secrecy::SecretString;
 use bip0039::{English, Mnemonic};
-use rand::Rng as _;
 use secrecy::{ExposeSecret as _, Secret, SecretVec};
 use zeroize::Zeroizing;
 
@@ -57,9 +56,7 @@ pub enum VaultError {
 
 /// Fresh entropy from the operating system (`getrandom`).
 pub fn generate_entropy() -> Entropy {
-    let mut bytes = [0u8; 32];
-    rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut bytes);
-    Secret::new(bytes)
+    Secret::new(crate::random_bytes())
 }
 
 /// The 24 English words for `entropy`.

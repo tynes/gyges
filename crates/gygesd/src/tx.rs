@@ -317,12 +317,13 @@ pub(crate) fn input_choices(
     } else {
         wanted
     };
-    let chosen = options
-        .inputs
-        .iter()
-        .map(|s| s.parse::<core_tx::InputRef>())
-        .collect::<Result<Vec<_>, _>>()
-        .for_key(key_id)?;
+    let chosen = (1..)
+        .zip(&options.inputs)
+        .map(|(n, s)| {
+            s.parse::<core_tx::InputRef>()
+                .map_err(|e| invalid(format!("input {n} {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     if chosen.is_empty() && options.allow_extra_inputs {
         return Err(invalid("allow_extra_inputs needs inputs"));
     }

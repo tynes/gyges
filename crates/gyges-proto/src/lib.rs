@@ -84,7 +84,7 @@ impl v1::ErrorReason {
             R::KeyExists => Code::AlreadyExists,
             R::NodeUnreachable => Code::Unavailable,
             R::Cancelled => Code::Cancelled,
-            R::NodeRejected => Code::Aborted,
+            R::NodeRejected | R::InputsReserved => Code::Aborted,
         }
     }
 }
