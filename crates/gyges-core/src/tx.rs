@@ -137,6 +137,51 @@ pub fn parse_recipient(params: &ConsensusParams, s: &str) -> Result<Address, TxE
     })
 }
 
+/// The recipient to pay when the sender picks the output pool (`tx send
+/// --pool`, docs/interface.md CLI §2.5). A unified address is narrowed to its receiver
+/// for `pool`; a single-pool address must already be of that pool. `None`
+/// leaves the choice to the address, as upstream makes it: a unified
+/// address with an Orchard receiver is paid into Ironwood.
+///
+/// Ironwood is reached through the Orchard receiver, so `Ironwood` keeps a
+/// unified address whole (upstream picks that receiver first). `Orchard` is
+/// refused: since NU6.3, active on every network Gyges runs on, the
+/// Orchard turnstile forbids new value in the Orchard pool. A ZIP 320
+/// (`tex1`) recipient is transparent and stays a two-step transfer.
+pub fn recipient_for_pool(to: Address, pool: Option<Pool>) -> Result<Address, TxError> {
+    let Some(pool) = pool else {
+        return Ok(to);
+    };
+    let missing = |what: &str| {
+        Err(TxError::InvalidArgument(format!(
+            "the recipient has no {what} receiver; pay it without --pool, or with the pool it has"
+        )))
+    };
+    match (pool, to) {
+        (Pool::Orchard, _) => Err(TxError::InvalidArgument(
+            "no new Orchard outputs: the Orchard turnstile forbids them since NU6.3; an Orchard \
+             receiver is paid into Ironwood (--pool ironwood)"
+                .into(),
+        )),
+        (Pool::Ironwood, Address::Unified(ua)) if ua.orchard().is_some() => {
+            Ok(Address::Unified(ua))
+        }
+        (Pool::Ironwood, _) => missing("Orchard (Ironwood)"),
+        (Pool::Sapling, to @ Address::Sapling(_)) => Ok(to),
+        (Pool::Sapling, Address::Unified(ua)) => match ua.sapling() {
+            Some(s) => Ok(Address::Sapling(*s)),
+            None => missing("Sapling"),
+        },
+        (Pool::Sapling, _) => missing("Sapling"),
+        (Pool::Transparent, to @ (Address::Transparent(_) | Address::Tex(_))) => Ok(to),
+        (Pool::Transparent, Address::Unified(ua)) => match ua.transparent() {
+            Some(t) => Ok(Address::Transparent(*t)),
+            None => missing("transparent"),
+        },
+        (Pool::Transparent, _) => missing("transparent"),
+    }
+}
+
 /// docs/interface.md CLI §1.5: a memo goes only to a recipient with a shielded
 /// receiver and is at most 512 bytes; it is never silently dropped.
 pub fn memo_for(recipient: &Address, memo: &[u8]) -> Result<Option<MemoBytes>, TxError> {
@@ -2054,6 +2099,55 @@ mod tests {
             parse_recipient(&p, "nonsense"),
             Err(TxError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn the_output_pool_narrows_a_unified_address_to_one_receiver() {
+        // A testnet unified address with Orchard, Sapling and transparent
+        // receivers.
+        let p = Network::Testnet.consensus_params();
+        let ua = parse_recipient(
+            &p,
+            "utest1xf0aacrxdq3t40lczegzxq0u35qrpzln67knj76zsz0050je9vcnkv7zjh4j8lqdet3fv9cj20h8wcg\
+             82llnvwwrshs9ef75hqu96mh2f7cclhvu2kngavss70hkajsq4glq4pqnpwel4agpjfjryfw74fadzg8psrf\
+             hgc70pscm88macfn38t3f4pt00cgl0cpv2chcgxd35w7xssf",
+        )
+        .unwrap();
+        let encode = |a: Address| a.encode(&p);
+        assert_eq!(
+            encode(recipient_for_pool(ua.clone(), None).unwrap()),
+            encode(ua.clone())
+        );
+        assert_eq!(
+            encode(recipient_for_pool(ua.clone(), Some(Pool::Ironwood)).unwrap()),
+            encode(ua.clone()),
+            "Ironwood is paid through the Orchard receiver"
+        );
+        assert_eq!(
+            encode(recipient_for_pool(ua.clone(), Some(Pool::Sapling)).unwrap()),
+            "ztestsapling1498gj8946wqmmf326vu30wgq054vdfmt6lgqc54e290mgdue2c5fc77dhn7qkpx9kv3k5wf8dkc"
+        );
+        assert_eq!(
+            encode(recipient_for_pool(ua.clone(), Some(Pool::Transparent)).unwrap()),
+            "tmPg9dC15oLPwUNYnRoax8hGMGk8y1v3swh"
+        );
+        let err = recipient_for_pool(ua.clone(), Some(Pool::Orchard)).unwrap_err();
+        assert!(err.to_string().contains("turnstile"), "{err}");
+
+        // A single-pool address keeps its own pool and refuses the others.
+        let sapling = recipient_for_pool(ua.clone(), Some(Pool::Sapling)).unwrap();
+        assert!(recipient_for_pool(sapling.clone(), Some(Pool::Sapling)).is_ok());
+        let err = recipient_for_pool(sapling, Some(Pool::Ironwood)).unwrap_err();
+        assert!(
+            err.to_string().contains("no Orchard (Ironwood) receiver"),
+            "{err}"
+        );
+        let tex = Address::Tex([9; 20]);
+        assert!(matches!(
+            recipient_for_pool(tex.clone(), Some(Pool::Transparent)),
+            Ok(Address::Tex(_))
+        ));
+        assert!(recipient_for_pool(tex, Some(Pool::Sapling)).is_err());
     }
 
     #[test]

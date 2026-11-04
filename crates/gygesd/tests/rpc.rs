@@ -3353,6 +3353,108 @@ async fn a_fully_transparent_send_is_marked_mined_from_the_node() {
     running.task.abort();
 }
 
+/// `SpendOptions.output_pool` (docs/interface.md API §4.1): the sender names the pool a
+/// unified recipient is paid in, and the payment goes to that receiver; a
+/// pool the address has no receiver for, and Orchard, are refused before
+/// anything is proposed.
+#[tokio::test]
+async fn the_sender_picks_the_output_pool() {
+    use gyges_proto::v1::{Pool, ProposedOutput, SpendOptions};
+    let (node, running, mut c) = sender_and_recipient(ONE_CONF_CONFIG).await;
+    let bob = current_address(&mut c, "bob").await;
+    let options = |pool: Pool| {
+        Some(SpendOptions {
+            output_pool: pool as i32,
+        })
+    };
+    let payment = |p: &Proposal| -> ProposedOutput {
+        p.steps[0]
+            .outputs
+            .iter()
+            .find(|o| !o.is_change)
+            .cloned()
+            .expect("a payment output")
+    };
+    let dry = async |c: &mut GygesClient<Channel>, to: &str, pool: Pool| {
+        let events = collect_events(
+            c.send_transaction(SendTransactionRequest {
+                dry_run: true,
+                options: options(pool),
+                ..send_req("main", to, 10_000_000)
+            })
+            .await,
+        )
+        .await
+        .unwrap();
+        payment(&proposal_of(&events))
+    };
+
+    // No choice and Ironwood both pay the unified address into Ironwood.
+    for pool in [Pool::Unspecified, Pool::Ironwood] {
+        let out = dry(&mut c, &bob, pool).await;
+        assert_eq!(out.pool(), Pool::Ironwood, "{pool:?}: {out:?}");
+        assert_eq!(out.address, bob);
+    }
+    // Sapling and transparent go to the unified address's own receivers.
+    let sapling = dry(&mut c, &bob, Pool::Sapling).await;
+    assert_eq!(sapling.pool(), Pool::Sapling, "{sapling:?}");
+    assert!(
+        sapling.address.starts_with("zregtestsapling1"),
+        "{sapling:?}"
+    );
+    let t = dry(&mut c, &bob, Pool::Transparent).await;
+    assert_eq!(t.pool(), Pool::Transparent, "{t:?}");
+    assert!(t.address.starts_with("tm"), "{t:?}");
+
+    // Refused before streaming: Orchard, and a pool the address lacks.
+    for (to, pool, needle) in [
+        (bob.clone(), Pool::Orchard, "turnstile"),
+        (t.address.clone(), Pool::Sapling, "no Sapling receiver"),
+        (
+            sapling.address.clone(),
+            Pool::Ironwood,
+            "no Orchard (Ironwood) receiver",
+        ),
+    ] {
+        let Err(err) = c
+            .send_transaction(SendTransactionRequest {
+                options: options(pool),
+                ..send_req("main", &to, 10_000_000)
+            })
+            .await
+        else {
+            panic!("expected {pool:?} to {to} to be refused");
+        };
+        assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+        assert!(err.message().contains(needle), "{err:?}");
+    }
+
+    // A real payment into bob's transparent receiver. (A Sapling output
+    // needs ZIP 212 enforced, far above this chain:
+    // `sapling_payments_pass_the_output_checks` pays a unified address into
+    // Sapling with the same option, through `CreatePczt`.)
+    let events = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            options: options(Pool::Transparent),
+            ..send_req("main", &bob, 10_000_000)
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        event_names(&events).last(),
+        Some(&"broadcast"),
+        "{events:?}"
+    );
+    node.mine(2);
+    wait_spendable(&mut c, "bob").await;
+    let b = balance(&mut c, "bob").await;
+    assert_eq!(balance_of(&b, Pool::Transparent), (10_000_000, 0), "{b:?}");
+    assert_eq!(balance_of(&b, Pool::Ironwood), (0, 0), "{b:?}");
+    running.task.abort();
+}
+
 /// A daemon with `main` holding 1 ZEC (less the shielding fee) in Ironwood
 /// and `bob` empty, both spendable, `main` still unlocked.
 async fn sender_and_recipient(config: &str) -> (FakeNode, Running, GygesClient<Channel>) {
@@ -5326,12 +5428,28 @@ async fn sapling_payments_pass_the_output_checks() {
     node.mine(2);
     wait_spendable(&mut c, "main").await;
 
-    // The PCZT pipeline to the same address.
+    // The PCZT pipeline to the same receiver, named as the unified address
+    // narrowed with `SpendOptions.output_pool`.
     let created = c
-        .create_pczt(create_req("main", &zs, 10_000_000))
+        .create_pczt(CreatePcztRequest {
+            options: Some(gyges_proto::v1::SpendOptions {
+                output_pool: Pool::Sapling as i32,
+            }),
+            ..create_req("main", &bob.address, 10_000_000)
+        })
         .await
         .unwrap()
         .into_inner();
+    let payment = &created.proposal.as_ref().unwrap().steps[0]
+        .outputs
+        .iter()
+        .find(|o| !o.is_change)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (payment.pool(), payment.address.as_str()),
+        (Pool::Sapling, zs.as_str())
+    );
     let proven = prove(&mut c, created.pczts[0].clone()).await.unwrap();
     let (signed, _) = sign_pczt_with_session(&mut c, proven, "pw").await.unwrap();
     let txid = broadcast(&mut c, signed).await.unwrap();

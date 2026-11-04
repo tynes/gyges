@@ -216,12 +216,14 @@ Decrypted notes and UTXOs with heights, values, memo previews and witness readin
 Proposes, proves, signs and broadcasts. The proposal summary (inputs per pool, outputs, ZIP 317 fee per step, total debit) is printed before any signature prompt; without `--yes` it comes from a dry run and is confirmed before the real send starts (no terminal: exit 4, `CONFIRMATION_REQUIRED`). The txid goes to stdout; progress goes to stderr.
 - **Inline unlock (`local-seed`):** on `SignatureRequired`, prompts for the passphrase, creates a connection-scoped session and continues; the key is dropped after signing. A send that spends Sapling notes asks before `proving …` rather than after, because the Sapling proofs need the key.
 - **Keystone (`keystone-qr`):** renders the animated UR QR (batch protocol for shielded-only sends, single-PCZT when transparent inputs are present) and reads the result from the camera (`qr-scan`), a file, stdin or pasted frames.
+- **Output pool (`--pool`):** by default the address decides (a unified address with an Orchard receiver is paid into Ironwood). `--pool sapling` or `--pool transparent` pays that receiver of a unified address instead; a recipient without one is refused (exit 6). There is no `--pool orchard`: the Orchard turnstile forbids new Orchard outputs since NU6.3. `pczt create` takes the same flag (API §4.1, `SpendOptions`).
 - **ZIP 320 (`tex1`):** runs the two-step plan through the durable `TexQueue`; the passphrase prompt comes before proving (both steps are built together, API §9), each step's txid goes to stdout as the node takes it, and `tex pending (step 2 of 2): <step1> then <step2>` goes to stderr. A node that will not take Step 2 while Step 1 is unmined leaves one txid on stdout; the queue finishes the transfer and `tx sessions` shows its state.
 ```text
 Flags:
       --to <ADDR>           u1, zs1, t1, t3, tex1 (or testnet equivalents)
       --amount <AMOUNT>     See §1.4
       --memo <TEXT_OR_HEX>  See §1.5; shielded recipients only
+      --pool <POOL>         ironwood | sapling | transparent: pay the recipient's receiver for this pool
       --via-tor             Broadcast through the fallback endpoint over Tor (exit 7 when none is configured; never the node)
       --dry-run             Print the full proposal (every step, every fee) and exit without signing
       --yes                 Skip the confirmation prompt
@@ -524,6 +526,19 @@ request as `dry_run` first, prints the proposal, asks, and only then opens
 the real stream (the daemon never waits on a prompt, and a daemon-scoped
 unlock would otherwise sign at once). The fee can differ between the two
 only if the chain moved in between.
+
+`SpendOptions` (in `SendTransaction` and `CreatePczt`) carries the sender's
+choices beyond recipient and amount; every field is optional and the
+defaults are the wallet's own. `output_pool` pays the recipient's receiver
+for that pool: a unified address is narrowed to it (Sapling to its Sapling
+receiver, transparent to its transparent receiver; Ironwood keeps the
+address whole, because an Orchard receiver is paid into Ironwood), and a
+single-pool address must already be of that pool. An address without a
+receiver for the pool, and `ORCHARD` (the Orchard turnstile forbids new
+Orchard value since NU6.3, active on every network), are refused with
+`INVALID_ARGUMENT` before anything is proposed. Inputs and change are still
+the proposer's: inputs from the payment's own pool first, change back to
+the inputs' pool.
 
 #### 4.2 `SignPczt`
 

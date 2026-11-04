@@ -152,7 +152,7 @@ pub(crate) async fn create_pczt(
     )?;
     let key_id = prepared.key.key_id().to_string();
     let params = state.registry.params();
-    let to = core_tx::parse_recipient(&params, &req.to).for_key(&key_id)?;
+    let to = tx::recipient(&params, &req.to, req.options.as_ref(), &key_id)?;
     let memo = core_tx::memo_for(&to, &req.memo).for_key(&key_id)?;
     let amount = tx::parse_amount(req.amount)?;
     // Sapling notes stay out of a file: proving one needs the proof

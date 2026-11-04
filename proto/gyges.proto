@@ -941,6 +941,18 @@ message SendTransactionRequest {
   uint32 min_confirmations = 8;
   // Wait for the mined event(s) before closing the stream.
   bool wait_for_mined = 9;
+  SpendOptions options = 10;
+}
+
+// Sender choices beyond recipient and amount (docs/interface.md API §4.1).
+// Every field is optional; the defaults are the wallet's own choices.
+message SpendOptions {
+  // Pay the recipient's receiver for this pool: a unified address is
+  // narrowed to that receiver, a single-pool address must already be of
+  // it. UNSPECIFIED lets the address decide (an Orchard receiver is paid
+  // into Ironwood). ORCHARD is refused: the Orchard turnstile forbids new
+  // Orchard outputs since NU6.3.
+  Pool output_pool = 1;
 }
 
 message ShieldFundsRequest {
@@ -1162,6 +1174,7 @@ message CreatePcztRequest {
   Amount amount = 3;
   bytes memo = 4;
   uint32 min_confirmations = 5;
+  SpendOptions options = 6;
 }
 
 message CreatePcztResponse {

@@ -59,6 +59,23 @@ pub(crate) fn proto_pool(pool: gyges_core::Pool) -> v1::Pool {
     }
 }
 
+/// Wire enum → `gyges_core::Pool`; `UNSPECIFIED` is `None` and a value this
+/// build does not know is refused.
+pub(crate) fn wire_pool(pool: i32) -> Result<Option<gyges_core::Pool>, Status> {
+    match v1::Pool::try_from(pool) {
+        Ok(v1::Pool::Unspecified) => Ok(None),
+        Ok(v1::Pool::Transparent) => Ok(Some(gyges_core::Pool::Transparent)),
+        Ok(v1::Pool::Sapling) => Ok(Some(gyges_core::Pool::Sapling)),
+        Ok(v1::Pool::Orchard) => Ok(Some(gyges_core::Pool::Orchard)),
+        Ok(v1::Pool::Ironwood) => Ok(Some(gyges_core::Pool::Ironwood)),
+        Err(_) => Err(GygesError::new(
+            ErrorReason::InvalidArgument,
+            format!("unknown pool {pool}"),
+        )
+        .into_status()),
+    }
+}
+
 fn proto_pools(pools: &[gyges_core::Pool]) -> Vec<i32> {
     pools.iter().map(|&p| proto_pool(p) as i32).collect()
 }
