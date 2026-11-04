@@ -34,6 +34,8 @@ pub mod profile;
 pub mod recovery;
 pub mod registry;
 pub mod sync;
+#[cfg(feature = "test-util")]
+pub mod testing;
 pub mod tx;
 pub mod vault;
 

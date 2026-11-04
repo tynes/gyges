@@ -12,7 +12,7 @@ How Gyges is tested, from unit tests to a nightly run through a real Tor network
 | Crate integration | `crates/*/tests/` | every PR | in-process SQLite, recorded fixtures | yes |
 | Regtest end-to-end | `tests/regtest/` | every PR | pinned `zakurad` and `zainod` (`versions.toml`); no Tor | yes |
 | Nightly Tor | same scenarios, `use_tor = true` against a local Tor test network | nightly | `chutney`-style test network | no (opens an issue on failure) |
-| Benchmarks | `crates/gyges-core/benches/prove.rs` (Criterion; §9) | manual | `cargo bench`, optionally `RAYON_NUM_THREADS` or `--features perf-asm-x86_64` | no |
+| Benchmarks | `crates/*/benches/` (Criterion, and `gygesd`'s `daemon` binary; §9) over deterministic synthetic chains | manual | `cargo bench`, optionally `RAYON_NUM_THREADS` or `--features perf-asm-x86_64` | no |
 
 ---
 
@@ -215,6 +215,8 @@ The regtest crate downloads `zakurad` into `target/regtest-bin/` on first use, k
 
 This file times the CPU-heavy work in `gygesd`: building the proving key, proving, and scanning. These numbers back the build decisions in `architecture.md` Components §3.7 and `decisions.md` Q-D6. They replace the draft's unsourced "14x" and "1.5x" figures.
 
+The other bench files time the sync pipeline (per step, and the whole daemon), the transaction engine, the key vault and wallet files, block ingest, and the Keystone QR path. They exist to find bottlenecks: §9.6 lists what they found, which orders the concurrency work in `architecture.md`.
+
 ### 9.1 What a build turns on
 
 | | x86-64 | aarch64 (Apple Silicon, Linux) |
@@ -243,24 +245,100 @@ On x86-64, also run with the assembly, on a BMI2 and ADX machine only:
 cargo bench -p gyges-core --bench prove --features perf-asm-x86_64
 ```
 
+The rest, one file each:
+
+```bash
+cargo bench -p gyges-core --bench sync
+```
+
+```bash
+cargo bench -p gyges-core --bench tx
+```
+
+```bash
+cargo bench -p gyges-core --bench keys
+```
+
+```bash
+cargo bench -p gyges-chain --bench ingest
+```
+
+```bash
+cargo bench -p gyges-qr --bench qr
+```
+
+```bash
+cargo bench -p gygesd --bench daemon
+```
+
+`daemon` is a plain binary, not Criterion: a run takes seconds and the number that matters for reads is a tail latency. It prints a table and writes `target/bench-results/daemon.json`. `GYGES_BENCH_BLOCKS` (default 3,000), `GYGES_BENCH_RUNS` (3) and `GYGES_BENCH_READERS` (8) size it, and `GYGES_BENCH_CONFIG` appends TOML to the daemon's config (for example `[cache]\nscan_batch = 500`). Any bench run with `-- --test` runs each case once, as a smoke test.
+
 Use the pinned toolchain (`rust-toolchain.toml`), run on mains power, and don't run another build at the same time.
 
-### 9.3 Cases (`crates/gyges-core/benches/prove.rs`)
+### 9.3 Fixtures (`gyges_core::testing`, feature `test-util`)
+
+Every bench outside `prove.rs`'s proving group runs on data from one generator, so a number can be reproduced byte for byte.
+
+- **`SyntheticChain::generate(spec, recipients)`** builds compact blocks of two-action Ironwood transactions and transparent outputs. Payments to the recipients are real notes (a valid commitment and encryption), so a wallet holding the key finds them by trial decryption and can spend them. Everything else pays strangers, so trial decryption fails on most actions, as it does on a real chain. Stranger transactions cycle through 64 pre-built bundles, since trial decryption costs the same on a repeated action and building each one would dominate setup.
+- **Tree states.** The generator carries the Ironwood frontier through every block, so `SyntheticChain::state(h)` is the correct prior `ChainState` for a scan from `h + 1`. A multi-batch scan therefore links up without a fake reorg or a tree refusal; a unit test scans 600 blocks in 250-block batches through a restored wallet and checks every note and transparent output is found.
+- **Determinism.** Every random choice comes from a seeded `StdRng`; hashes and times are fixed. `SyntheticChain::digest` (FNV-1a over the encoded blocks and the final root) is printed with each fixture, and a unit test checks two generations are equal.
+- **Presets** (`ChainSpec`): `dense()` is the 10-block, 1,000-action chain of `scan-range`; `sparse(n)` has two shielded and one transparent stranger transaction a block, a payment every 50 blocks and a transparent output every 100; `long()` is `sparse(5000)`, five default scan batches; `busy(n)` has ten shielded transactions and eight transparent stranger outputs a block, a payment every 10 blocks and a transparent output every 50.
+- **Keys.** `TestKey::new(network, i)` derives key `i` from entropy `[i + 1; 32]` as `key restore` would, and `testing::restore` creates it through the registry (seed file, migrations, account import). The wallet's own RNG is still the system one; nothing timed here depends on it.
+- **`MemChain`** serves a chain through `ChainBackend` (bounds, hashes, compact blocks, tree states), with an optional fixed delay per request to stand in for the node round trip. A batch of blocks pays it once per eight blocks, as `ZakuraRpcBackend`'s ordered fetches do. `set_tip` grows the chain under a running daemon.
+
+### 9.4 Cases
+
+#### `crates/gyges-core/benches/prove.rs`
 
 - **`orchard-proving-key/build`**: `Provers::orchard()`. This builds the proving key for the post-NU6.3 circuit, prepares its commitment tables and builds the verifying key. Orchard and Ironwood share these keys. The daemon builds them once, at the first send after it starts.
 - **`ironwood-prove-2-actions/first-after-key-build`**: one proof of a two-action Ironwood V3 bundle on a freshly built key. Building the key is not timed.
 - **`ironwood-prove-2-actions/steady`**: the same proof on a key that has already proven, as every later send does. Two actions is the smallest padded bundle, and the cost grows with the number of actions. The bundle comes from orchard's `Builder` with dummy spends, not from a funded wallet. The circuit and prover are the same ones `tx send` runs.
 - **`ironwood-prove-2-actions/steady-unprepared`**: the same proof on a key built with `ProvingKey::build` alone, without the prepared tables. It shows what the preparation buys.
 - **`scan-range/1000-ironwood-actions`**: `gyges_core::sync::scan_range`, the daemon's scan of one batch.
-  - Input: ten cached compact blocks holding 1,000 Ironwood actions (500 two-action transactions). The wallet is a view-only account that owns 20 of the actions.
+  - Input: `ChainSpec::dense()`, ten cached compact blocks holding 1,000 Ironwood actions (500 two-action transactions). The wallet, restored through the registry, owns 20 of the actions.
   - Timed work: trial decryption with the account's external and internal keys, which upstream spreads across the Rayon pool; the Ironwood note commitment tree; and the wallet writes.
   - Setup: each iteration starts from a fresh wallet, created outside the timing. Before timing starts, the bench checks that the wallet finds exactly its 20 notes.
 
+#### `crates/gyges-core/benches/sync.rs`
+
+Each case restores a fresh wallet outside the timing, and checks once beforehand that a full scan finds exactly the wallet's notes and transparent outputs and reaches the tip.
+
+- **`scan-chain/{long,long-shielded,busy}/batch/{100,500,1000}`**: the whole chain through repeated `sync::scan_range`, cut into batches as `WalletView::next_range` cuts them, each from the chain's prior state. `long` is 5,000 quiet blocks and `busy` is 1,000 busy ones; both hold 20,200 Ironwood actions. `long-shielded` is `long` without any transparent output, which isolates what `index_transparent` adds. The batch size is `cache.scan_batch` (default 1,000), so the sweep separates per-batch from per-block and per-action cost.
+- **`sync-steps/wallet-view-read`**: `WalletView::read` on a scanned wallet (`update_chain_tip`, birthday, `block_fully_scanned`, `suggest_scan_ranges`), which the scheduler runs twice a batch.
+- **`sync-steps/index-transparent/500-blocks`**: `sync::index_transparent` alone over 500 busy blocks (4,000 stranger outputs, 10 of the wallet's).
+- **`sync-steps/rewind/100-blocks`**: `sync::rewind` of a scanned wallet by 100 blocks.
+- **`block-cache/insert/1000-blocks`** and **`read/1000-blocks`**: `BlockDb` on disk (WAL), storing 1,000 busy blocks in `cache.fetch_batch` chunks, and `with_blocks` reading and decoding them, as a scan batch does.
+
+#### `crates/gyges-core/benches/tx.rs`
+
+A wallet funded by 20 synthetic notes sends 0.0015 ZEC to a transparent address (two Ironwood inputs, two actions), step by step as `gygesd`'s send pipeline runs them: **`propose`** (`propose_send`), **`build-pczt`** (`build_single_step`: Creator, Constructor, IO Finalizer, Updater with witnesses), **`prove`**, **`sign`**, **`verify`** (against the approved proposal), **`pczt-serialize`** / **`pczt-parse`**, and **`extract-and-store`** (proof verification, extraction and the wallet's record; a fresh funded wallet per iteration).
+
+#### `crates/gyges-core/benches/keys.rs`
+
+- **`vault-scrypt/{seal,open}/{10,15,20}`**: `vault::seal` and `vault::open` at scrypt work factors 2^10, 2^15 and 2^20 (the default). These measure a security parameter, what an unlock or key creation costs, not something to optimise.
+- **`derive/seed-from-entropy`** (BIP 39, PBKDF2) and **`derive/usk-from-seed`** (ZIP 32 / BIP 44).
+- **`wallet-file/create-local-seed`**: `key restore` at work factor 10: seed file, a wallet created and migrated, the account imported. **`registry-open/1-key`**: a daemon start's registry open with one key (permission sweep, profile, wallet open and migration check). **`new-address`**: `addresses::new_address` for an Ironwood receiver.
+
+#### `crates/gyges-chain/benches/ingest.rs`
+
+- **`compact-from-raw/outputs-per-block/{0,50,500}`**: `compact::from_raw` (parse, txids, compact outputs) on 100 raw blocks built by `testing::BlockSpec`, each with a coinbase and a payment transaction of 0, 50 or 500 outputs. Transparent only: shielded bundles, whose proofs dominate a real block's size, are not covered.
+
+#### `crates/gyges-qr/benches/qr.rs`
+
+A 10 KB PCZT (51 frames at the default fragment length): **`frames`** (splitting it into one loop of `ur:` frames), **`render`** (rendering every frame for the terminal), **`assemble`** (reassembling the message from them), and **`detect/720p-frame`** (finding and decoding one code in a 1280×720 grey frame). These run in the CLI, not the daemon.
+
+#### `crates/gygesd/benches/daemon.rs`
+
+An in-process `gygesd` on `MemChain`, driven over its Unix socket like the CLI, with the mempool pass off.
+
+- **time to synced**: restore 1, 4 or 8 keys at height 1 of a `sparse` chain while the node's tip is at 1, then raise the tip to the chain's end and time until every key's `WaitSync(SCANNED)` ends. The node answers at once or after 5 ms per request.
+- **reads under sync**: two keys on a 10,000-block chain (`GYGES_BENCH_READ_BLOCKS`), while eight clients call `GetInfo` (which every CLI command sends on connect), `ListKeys` and `GetBalance` in turn; then the same clients for as long again with the daemon idle. Samples from every run are pooled, and both phases report calls per second.
+
 All cases run in a warm process. Criterion warms up first, and earlier iterations have already paid for page faults and static tables. So none of these times is a daemon cold start.
 
-Not covered: Sapling proving (`zakura-proofs` / `bellman`, which the `pasta` assembly does not affect) and loading the bundled Sapling parameters.
+Not covered: Sapling proving (`zakura-proofs` / `bellman`, which the `pasta` assembly does not affect), loading the bundled Sapling parameters, raw blocks with shielded bundles, and the JSON-RPC and HTTP cost of the node route (`MemChain` replaces it).
 
-### 9.4 Results
+### 9.5 Results
 
 Each figure is Criterion's median of 10 samples.
 
@@ -281,3 +359,75 @@ What the rows show:
 - **Scanning gains 1.7× from 14 threads, less than proving.** Eight and fourteen threads give the same result. Why was not measured: candidates are the serial tree and SQLite work, and ten blocks giving the batch runner too few tasks to spread.
 
 **Not measured: x86-64.** No x86-64 machine was available, so there is no row for the portable backend, or for `perf-asm-x86_64` against it. Add both rows, with the CPU model, before deciding whether a release should ship a separate BMI2/ADX build.
+
+#### Sync, transaction engine, keys, ingest and QR
+
+Apple M4 Pro (14 cores), macOS 27.2, Rust 1.97.1, default build, 2026-11-05, on the change that added these benches. Criterion medians; 14 threads unless stated. The `busy` rows varied by up to 15% between runs; the others by under 3%. The `scan-range` rows of the table above were measured on the earlier fixture (a view-only account, every stranger bundle distinct); on `ChainSpec::dense` it takes the same time.
+
+| Case | Time | Throughput |
+|---|---|---|
+| `scan-chain/long/batch/100` | 2.37 s | 2.1k blocks/s |
+| `scan-chain/long/batch/500` | 1.22 s | 4.1k blocks/s |
+| `scan-chain/long/batch/1000` | 1.07 s | 4.7k blocks/s |
+| `scan-chain/long/batch/1000`, 1 thread | 1.69 s | 3.0k blocks/s |
+| `scan-chain/long-shielded/batch/100` | 2.03 s | 2.5k blocks/s |
+| `scan-chain/long-shielded/batch/500` | 964 ms | 5.2k blocks/s |
+| `scan-chain/long-shielded/batch/1000` | 818 ms | 6.1k blocks/s |
+| `scan-chain/busy/batch/100` | 1.04 s | 0.96k blocks/s |
+| `scan-chain/busy/batch/500` | 619 ms | 1.6k blocks/s |
+| `scan-chain/busy/batch/1000` | 440 ms | 2.3k blocks/s |
+| `scan-range/1000-ironwood-actions` (`prove.rs`, on this fixture) | 41.6 ms | 24k actions/s |
+| `sync-steps/wallet-view-read` | 280 µs | |
+| `sync-steps/index-transparent/500-blocks` | 47.0 ms | |
+| `sync-steps/rewind/100-blocks` | 2.8 ms | |
+| `block-cache/insert/1000-blocks` | 12.2 ms | |
+| `block-cache/read/1000-blocks` | 7.3 ms | |
+| `tx-send/propose` | 1.2 ms | |
+| `tx-send/build-pczt` | 11.8 ms | |
+| `tx-send/prove` (2 actions) | 65.3 ms | |
+| `tx-send/sign` | 3.3 ms | |
+| `tx-send/verify` | 1.8 ms | |
+| `tx-send/pczt-serialize` / `pczt-parse` (12 KB) | 5.3 µs / 5.7 µs | |
+| `tx-send/extract-and-store` | 7.1 ms | |
+| `vault-scrypt/seal/20` / `open/20` | 1.31 s / 1.36 s | |
+| `vault-scrypt/seal/10` / `open/10` | 2.6 ms / 2.3 ms | |
+| `derive/seed-from-entropy` / `usk-from-seed` | 0.63 ms / 4.0 ms | |
+| `wallet-file/create-local-seed` (work factor 10) | 179 ms | |
+| `wallet-file/registry-open/1-key` | 0.75 ms | |
+| `wallet-file/new-address` | 73 ms | |
+| `compact-from-raw` 0 / 50 / 500 outputs per block | 2.0 / 13.9 / 140 µs per block | |
+| `keystone-qr/frames` / `assemble` (51 frames) | 109 µs / 188 µs | |
+| `keystone-qr/render` (51 frames) | 63 ms | |
+| `keystone-qr/detect/720p-frame` | 3.0 ms | |
+
+#### Daemon (`daemon.rs`)
+
+Time to synced on a 3,000-block `sparse` chain, median of 3 runs. One key varied between 0.67 and 1.18 s; the other rows by under 10%.
+
+| Keys | Node delay | Time to synced | Blocks/s per key |
+|---|---|---|---|
+| 1 | 0 | 0.85 s | 3,540 |
+| 1 | 5 ms | 2.94 s | 1,020 |
+| 4 | 0 | 3.09 s | 970 |
+| 4 | 5 ms | 5.55 s | 540 |
+| 8 | 0 | 5.06 s | 590 |
+
+Reads under sync: two keys on a 10,000-block chain, eight readers, 3 runs pooled (12.6 s of sync, then as long idle).
+
+| | Calls/s | `GetInfo` p50 / p90 / p99 | `ListKeys` p50 / p90 / p99 | `GetBalance` p50 / p90 / p99 |
+|---|---|---|---|---|
+| during sync | 135 | 2.8 / 213 / 222 ms | 2.5 / 212 / 221 ms | 1.2 / 2.8 / 214 ms |
+| idle | 3,851 | 1.5 / 3.9 / 6.7 ms | 2.2 / 4.2 / 7.0 ms | 1.5 / 3.5 / 5.4 ms |
+
+### 9.6 Bottlenecks found
+
+In order of what they cost a user. Where a cause is named without a measurement, it is marked inferred.
+
+1. **Reads wait behind scan batches.** While two keys sync, readers make 135 calls a second against 3,851 idle, and one `GetInfo` or `ListKeys` in ten waits over 200 ms (idle p99: 7 ms). `GetInfo` and `ListKeys` need nothing a batch writes, but read `scanned_tip` and `highest_scanned` through the key's wallet mutex, on an async worker, while the scheduler holds it for a whole batch (inferred from the code; `GetBalance`, which takes the mutex on a blocking thread, waits less often). Every CLI command sends `GetInfo` first.
+2. **Keys sync one after another.** Time to synced grows with the number of keys (0.85 s, 3.1 s, 5.1 s for 1, 4, 8 keys), although each key has its own wallet and scanning leaves most cores idle (next item).
+3. **Scanning barely scales with threads.** A 5,000-block scan is 1.6× faster on 14 threads than on one. Per block it costs about 0.16 ms beyond its actions (`long` and `busy` hold the same actions; `long` has five times the blocks and takes 0.6 s longer), and that part does not parallelise: inferred to be upstream's per-block work (block rows, the note commitment tree, nullifier checks). Scanning keys in parallel is what would use the idle cores.
+4. **Fetching and scanning do not overlap.** A 5 ms node round trip makes one key's sync 3.5× slower (0.85 s to 2.94 s): the scheduler fetches a batch, then its tree state, then scans it, and `fill_cache` waits for every 100-block chunk.
+5. **Each scan batch has a fixed cost of about 27 ms, inside upstream's `scan_cached_blocks`.** 100-block batches take 2.5× as long as 1,000-block ones on `long-shielded`, where Gyges adds nothing per batch but a count query; the gap is the same with transparent outputs (1.21 s against 1.28 s). Shrinking `cache.scan_batch` to shorten the wallet lock would cost that throughput, so the reads of item 1 have to stop depending on the writer instead.
+6. **Transparent indexing is a quarter of a quiet chain's scan.** `long` takes 0.24 s longer than `long-shielded` at 1,000-block batches (1.06 s against 0.82 s), and `index_transparent` takes 47 ms for 500 busy blocks, of which decoding the blocks again is under 4 ms (`block-cache/read`). The rest is Gyges' own wallet round trips: `get_transparent_receivers` for every pass and an upsert per output.
+
+Not bottlenecks: proposing, building and signing a send (under 20 ms together, though build and extract run under the wallet lock), PCZT encoding, block-cache insert and read, raw-block parsing, and the QR path. Scrypt at the default work factor (1.3 s) is the cost of an unlock by design.

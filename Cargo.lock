@@ -2439,6 +2439,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "criterion",
  "futures-util",
  "gyges-chain",
  "hex",
@@ -2498,6 +2499,7 @@ dependencies = [
  "bip32",
  "criterion",
  "gyges-chain",
+ "gyges-core",
  "gyges-qr",
  "hex",
  "humantime",
@@ -2557,6 +2559,7 @@ dependencies = [
 name = "gyges-qr"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "hex",
  "nokhwa",
  "qrcode",

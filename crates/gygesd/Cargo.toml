@@ -61,6 +61,13 @@ zcash_primitives = { workspace = true }  # decoding the mined ZIP 320 transactio
 zcash_address = { workspace = true }  # a Keystone-shaped UFVK (no Sapling item) in the import tests
 bip32 = { workspace = true }  # ChildNumber, reading a PCZT input's BIP 44 path
 secrecy = { workspace = true }  # the test seed's bytes
+gyges-proto = { workspace = true }
+
+# Whole-daemon sync and read-latency timings on an in-memory node
+# (docs/testing.md §9); a plain binary, not Criterion.
+[[bench]]
+name = "daemon"
+harness = false
 
 [lints]
 workspace = true

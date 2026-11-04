@@ -50,6 +50,12 @@ tokio-stream = { workspace = true, optional = true }
 [dev-dependencies]
 gyges-chain = { path = ".", features = ["test-util"] }
 tempfile = { workspace = true }
+criterion = { workspace = true }
+
+# Raw block to compact block (docs/testing.md §9).
+[[bench]]
+name = "ingest"
+harness = false
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

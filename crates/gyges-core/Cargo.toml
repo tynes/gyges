@@ -19,7 +19,8 @@ default = []
 # `aarch64-asm` for every aarch64 Unix target.
 perf-asm-x86_64 = ["pasta_curves/x86_64-asm", "orchard/x86_64-asm"]
 # `keystone::emulator`: a Keystone in software for the tests (gygesd's and
-# the regtest crate's).
+# the regtest crate's); `testing`: deterministic synthetic chains and an
+# in-memory node for the benchmarks (docs/testing.md §9).
 test-util = []
 
 [dependencies]
@@ -62,12 +63,30 @@ hex = { workspace = true }
 prost = { workspace = true }
 
 [dev-dependencies]
+gyges-core = { path = ".", features = ["test-util"] }
+gyges-chain = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 
 # Proving and trial-decryption timings (docs/testing.md §9).
 [[bench]]
 name = "prove"
+harness = false
+
+# Multi-batch scans, the steps around them and the block cache over
+# synthetic chains (docs/testing.md §9).
+[[bench]]
+name = "sync"
+harness = false
+
+# Each step of a send from a synthetic-chain-funded wallet.
+[[bench]]
+name = "tx"
+harness = false
+
+# The seed vault, key derivation, wallet creation and opening.
+[[bench]]
+name = "keys"
 harness = false
 
 [lints]
