@@ -79,6 +79,32 @@ pub struct SpendArgs {
     /// Pay the recipient's receiver for this pool. Default: the address decides (an Orchard receiver is paid into Ironwood).
     #[arg(long, value_name = "POOL")]
     pub pool: Option<OutputPoolArg>,
+    /// Fund the send only from these pools (comma-separated: ironwood,orchard,sapling,transparent). Default: every pool the key spends from.
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    pub from_pool: Vec<InputPoolArg>,
+    /// Also spend a few extra notes of the funding pool when that changes neither the fee nor the transaction's shape.
+    #[arg(long)]
+    pub consolidate: bool,
+}
+
+/// A pool a send can draw inputs from (old Orchard notes are still spendable).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum InputPoolArg {
+    Ironwood,
+    Orchard,
+    Sapling,
+    Transparent,
+}
+
+impl InputPoolArg {
+    pub fn to_proto(self) -> Pool {
+        match self {
+            InputPoolArg::Ironwood => Pool::Ironwood,
+            InputPoolArg::Orchard => Pool::Orchard,
+            InputPoolArg::Sapling => Pool::Sapling,
+            InputPoolArg::Transparent => Pool::Transparent,
+        }
+    }
 }
 
 /// A pool a new output can go to (no Orchard: its turnstile forbids new value since NU6.3).
@@ -104,6 +130,8 @@ impl SpendArgs {
     pub fn to_proto(&self) -> Option<SpendOptions> {
         let options = SpendOptions {
             output_pool: self.pool.map_or(Pool::Unspecified, OutputPoolArg::to_proto) as i32,
+            from_pools: self.from_pool.iter().map(|p| p.to_proto() as i32).collect(),
+            consolidate: self.consolidate,
         };
         (options != SpendOptions::default()).then_some(options)
     }

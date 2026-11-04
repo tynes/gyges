@@ -280,6 +280,49 @@ pub(crate) fn recipient(
     core_tx::recipient_for_pool(to, pool).for_key(key_id)
 }
 
+/// The pools a send may fund itself from and how it picks inputs:
+/// `profile_pools` narrowed by `options.from_pools` (never widened: a pool
+/// the profile does not spend from is `UNSUPPORTED_POOL`), and
+/// `options.consolidate`.
+pub(crate) fn input_choices(
+    profile_pools: &[gyges_core::Pool],
+    options: Option<&v1::SpendOptions>,
+    key_id: &str,
+) -> Result<(Vec<gyges_core::Pool>, core_tx::InputOptions), Status> {
+    let Some(options) = options else {
+        return Ok((profile_pools.to_vec(), core_tx::InputOptions::default()));
+    };
+    let mut wanted = Vec::new();
+    for p in &options.from_pools {
+        let Some(pool) = crate::keys::wire_pool(*p)? else {
+            return Err(invalid("from_pools may not hold POOL_UNSPECIFIED"));
+        };
+        if !profile_pools.contains(&pool) {
+            return Err(GygesError::new(
+                ErrorReason::UnsupportedPool,
+                format!(
+                    "this profile does not spend from the {} pool",
+                    format!("{pool:?}").to_lowercase()
+                ),
+            )
+            .with_key(key_id)
+            .into_status());
+        }
+        if !wanted.contains(&pool) {
+            wanted.push(pool);
+        }
+    }
+    let pools = if wanted.is_empty() {
+        profile_pools.to_vec()
+    } else {
+        wanted
+    };
+    let inputs = core_tx::InputOptions {
+        consolidate: options.consolidate,
+    };
+    Ok((pools, inputs))
+}
+
 pub(crate) fn send_transaction(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
@@ -326,7 +369,11 @@ pub(crate) fn send_transaction(
     if keystone && !req.dry_run {
         refuse_if_pending(&prepared)?;
     }
-    let spend_pools = prepared.key.profile().spend_pools.clone();
+    let (spend_pools, inputs) = input_choices(
+        &prepared.key.profile().spend_pools,
+        req.options.as_ref(),
+        &key_id,
+    )?;
     let min_confirmations = prepared.min_confirmations;
     let dry_run = req.dry_run;
     let propose = move |wallet: &mut gyges_core::registry::Wallet| -> Result<Proposed, TxError> {
@@ -340,6 +387,7 @@ pub(crate) fn send_transaction(
             amount,
             memo,
             min_confirmations,
+            &inputs,
         )?;
         let expiry = keystone.then(|| crate::roles::long_expiry(proposal.min_target_height()));
         let summary = core_tx::summarize(&params, &proposal, min_confirmations, expiry);
@@ -1030,6 +1078,51 @@ pub(crate) async fn get_balance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_pools_narrow_the_profile_and_never_widen_it() {
+        use gyges_core::Pool;
+        let keystone = [Pool::Orchard, Pool::Ironwood, Pool::Transparent];
+        let options = |pools: &[v1::Pool], consolidate: bool| v1::SpendOptions {
+            from_pools: pools.iter().map(|p| *p as i32).collect(),
+            consolidate,
+            ..Default::default()
+        };
+        // Nothing chosen: the profile's pools.
+        let (pools, inputs) = input_choices(&keystone, None, "k").unwrap();
+        assert_eq!(pools, keystone);
+        assert_eq!(inputs, core_tx::InputOptions::default());
+        let (pools, _) = input_choices(&keystone, Some(&options(&[], false)), "k").unwrap();
+        assert_eq!(pools, keystone);
+        // A subset, deduplicated, with consolidation.
+        let chosen = options(
+            &[
+                v1::Pool::Transparent,
+                v1::Pool::Ironwood,
+                v1::Pool::Transparent,
+            ],
+            true,
+        );
+        let (pools, inputs) = input_choices(&keystone, Some(&chosen), "k").unwrap();
+        assert_eq!(pools, [Pool::Transparent, Pool::Ironwood]);
+        assert!(inputs.consolidate);
+        // Never wider than the profile, and never UNSPECIFIED.
+        let err =
+            input_choices(&keystone, Some(&options(&[v1::Pool::Sapling], false)), "k").unwrap_err();
+        let typed = GygesError::from_status(&err).unwrap();
+        assert_eq!(typed.reason(), ErrorReason::UnsupportedPool, "{err:?}");
+        assert!(typed.detail.contains("sapling"), "{err:?}");
+        let err = input_choices(
+            &keystone,
+            Some(&options(&[v1::Pool::Unspecified], false)),
+            "k",
+        )
+        .unwrap_err();
+        assert_eq!(
+            GygesError::from_status(&err).unwrap().reason(),
+            ErrorReason::InvalidArgument
+        );
+    }
 
     #[test]
     fn amounts_parse_per_proto() {
