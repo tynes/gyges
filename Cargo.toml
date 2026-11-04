@@ -128,6 +128,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender   = "0.2"                                    # daily rotation of gygesd.log (Q-O1)
 hex                = "0.4"
 
+# --- Terminal UI (`gyges tui`, docs/decisions.md Q-C7) ---
+# Pinned with `=` like the QR crates: the TUI draws key material prompts, so
+# a bump is reviewed. ratatui's `crossterm` feature and the direct crossterm
+# dependency resolve to the same crossterm 0.29.
+ratatui   = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = { version = "=0.29.0", default-features = false, features = ["events", "event-stream", "bracketed-paste"] }
+
 # --- Build ---
 tonic-prost-build = "0.14"
 pbjson-build      = "0.9"

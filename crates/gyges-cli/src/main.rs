@@ -27,6 +27,7 @@ mod pczt;
 mod prompt;
 mod service;
 mod sync;
+mod tui;
 mod tx;
 
 use std::path::PathBuf;
@@ -101,6 +102,8 @@ enum Command {
     /// PCZT role pipeline for Unix pipes and air-gapped signing.
     #[command(subcommand)]
     Pczt(pczt::PcztCmd),
+    /// Full-screen dashboard: tip, Tor, wallets, balances.
+    Tui(tui::TuiArgs),
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -131,6 +134,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Notes(args) => notes::run(&ctx, args).await,
         Command::Tx(cmd) => tx::run(&ctx, cmd).await,
         Command::Pczt(cmd) => pczt::run(&ctx, cmd).await,
+        Command::Tui(args) => tui::run(&ctx, args).await,
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "gyges-cli"
-description = "Gyges CLI: command router, prompts and terminal QR UI over the gygesd Unix socket"
+description = "Gyges CLI: command router, prompts, terminal QR UI and the `gyges tui` dashboard over the gygesd Unix socket"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -27,6 +27,9 @@ rand = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
 nix = { workspace = true }  # uids for the launchd domain and the hardened install's user and group lookups
+ratatui = { workspace = true }       # `gyges tui`
+crossterm = { workspace = true }     # `gyges tui` key events (EventStream) and raw mode
+futures-util = { workspace = true }  # StreamExt over crossterm's EventStream
 
 [features]
 # `pczt qr-scan` and the camera step of `tx send` (docs/architecture.md
