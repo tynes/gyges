@@ -2897,6 +2897,7 @@ fn balance_of(resp: &GetBalanceResponse, pool: gyges_proto::v1::Pool) -> (i64, i
 async fn current_address(c: &mut GygesClient<Channel>, key_id: &str) -> String {
     c.get_current_address(gyges_proto::v1::GetCurrentAddressRequest {
         key_id: key_id.into(),
+        ..Default::default()
     })
     .await
     .unwrap()
@@ -3350,6 +3351,108 @@ async fn a_fully_transparent_send_is_marked_mined_from_the_node() {
     assert_eq!(b.total_spendable, 0, "{b:?}");
     assert_eq!(b.total_pending, 0, "{b:?}");
 
+    running.task.abort();
+}
+
+/// `SpendOptions.output_pool` (docs/interface.md API §4.1): the sender names the pool a
+/// unified recipient is paid in, and the payment goes to that receiver; a
+/// pool the address has no receiver for, and Orchard, are refused before
+/// anything is proposed.
+#[tokio::test]
+async fn the_sender_picks_the_output_pool() {
+    use gyges_proto::v1::{Pool, ProposedOutput, SpendOptions};
+    let (node, running, mut c) = sender_and_recipient(ONE_CONF_CONFIG).await;
+    let bob = current_address(&mut c, "bob").await;
+    let options = |pool: Pool| {
+        Some(SpendOptions {
+            output_pool: pool as i32,
+        })
+    };
+    let payment = |p: &Proposal| -> ProposedOutput {
+        p.steps[0]
+            .outputs
+            .iter()
+            .find(|o| !o.is_change)
+            .cloned()
+            .expect("a payment output")
+    };
+    let dry = async |c: &mut GygesClient<Channel>, to: &str, pool: Pool| {
+        let events = collect_events(
+            c.send_transaction(SendTransactionRequest {
+                dry_run: true,
+                options: options(pool),
+                ..send_req("main", to, 10_000_000)
+            })
+            .await,
+        )
+        .await
+        .unwrap();
+        payment(&proposal_of(&events))
+    };
+
+    // No choice and Ironwood both pay the unified address into Ironwood.
+    for pool in [Pool::Unspecified, Pool::Ironwood] {
+        let out = dry(&mut c, &bob, pool).await;
+        assert_eq!(out.pool(), Pool::Ironwood, "{pool:?}: {out:?}");
+        assert_eq!(out.address, bob);
+    }
+    // Sapling and transparent go to the unified address's own receivers.
+    let sapling = dry(&mut c, &bob, Pool::Sapling).await;
+    assert_eq!(sapling.pool(), Pool::Sapling, "{sapling:?}");
+    assert!(
+        sapling.address.starts_with("zregtestsapling1"),
+        "{sapling:?}"
+    );
+    let t = dry(&mut c, &bob, Pool::Transparent).await;
+    assert_eq!(t.pool(), Pool::Transparent, "{t:?}");
+    assert!(t.address.starts_with("tm"), "{t:?}");
+
+    // Refused before streaming: Orchard, and a pool the address lacks.
+    for (to, pool, needle) in [
+        (bob.clone(), Pool::Orchard, "turnstile"),
+        (t.address.clone(), Pool::Sapling, "no Sapling receiver"),
+        (
+            sapling.address.clone(),
+            Pool::Ironwood,
+            "no Orchard (Ironwood) receiver",
+        ),
+    ] {
+        let Err(err) = c
+            .send_transaction(SendTransactionRequest {
+                options: options(pool),
+                ..send_req("main", &to, 10_000_000)
+            })
+            .await
+        else {
+            panic!("expected {pool:?} to {to} to be refused");
+        };
+        assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+        assert!(err.message().contains(needle), "{err:?}");
+    }
+
+    // A real payment into bob's transparent receiver. (A Sapling output
+    // needs ZIP 212 enforced, far above this chain:
+    // `sapling_payments_pass_the_output_checks` pays a unified address into
+    // Sapling with the same option, through `CreatePczt`.)
+    let events = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            options: options(Pool::Transparent),
+            ..send_req("main", &bob, 10_000_000)
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        event_names(&events).last(),
+        Some(&"broadcast"),
+        "{events:?}"
+    );
+    node.mine(2);
+    wait_spendable(&mut c, "bob").await;
+    let b = balance(&mut c, "bob").await;
+    assert_eq!(balance_of(&b, Pool::Transparent), (10_000_000, 0), "{b:?}");
+    assert_eq!(balance_of(&b, Pool::Ironwood), (0, 0), "{b:?}");
     running.task.abort();
 }
 
@@ -4252,6 +4355,7 @@ async fn addresses_notes_and_history_through_the_fake_node() {
     let err = c
         .get_current_address(GetCurrentAddressRequest {
             key_id: "main".into(),
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -4264,6 +4368,7 @@ async fn addresses_notes_and_history_through_the_fake_node() {
     let first = c
         .get_current_address(GetCurrentAddressRequest {
             key_id: "main".into(),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -4294,6 +4399,37 @@ async fn addresses_notes_and_history_through_the_fake_node() {
     assert!(first.label.is_empty());
     assert_eq!(current_address(&mut c, "main").await, first.address);
 
+    // One pool's receiver as an address of its own (`address current
+    // --pool`): the same diversified address, narrowed.
+    let narrowed = async |c: &mut GygesClient<Channel>, pool: Pool| {
+        c.get_current_address(GetCurrentAddressRequest {
+            key_id: "main".into(),
+            pool: pool as i32,
+        })
+        .await
+    };
+    let zs = narrowed(&mut c, Pool::Sapling).await.unwrap().into_inner();
+    assert_eq!(zs.address, first.receivers[1].encoded);
+    assert_eq!(zs.diversifier_index, first.diversifier_index);
+    let t = narrowed(&mut c, Pool::Transparent)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(t.address, first.receivers[2].encoded);
+    let iw = narrowed(&mut c, Pool::Ironwood).await.unwrap().into_inner();
+    assert!(iw.address.starts_with("uregtest1"), "{iw:?}");
+    assert_ne!(iw.address, first.address);
+    let pools: Vec<Pool> = iw.receivers.iter().map(|r| r.pool()).collect();
+    assert_eq!(pools, [Pool::Orchard], "{iw:?}");
+    let Some(zcash_keys::address::Address::Unified(only)) =
+        zcash_keys::address::Address::decode(&params, &iw.address)
+    else {
+        panic!("not a unified address: {iw:?}");
+    };
+    assert_eq!(only.orchard(), expected.orchard());
+    let same = narrowed(&mut c, Pool::Orchard).await.unwrap().into_inner();
+    assert_eq!(same.address, iw.address, "Orchard names the same receiver");
+
     // NewAddress needs the chain tip, which the first scan records.
     wait_spendable(&mut c, "main").await;
     let labelled = c
@@ -4312,6 +4448,7 @@ async fn addresses_notes_and_history_through_the_fake_node() {
     let now = c
         .get_current_address(GetCurrentAddressRequest {
             key_id: "main".into(),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -4320,6 +4457,10 @@ async fn addresses_notes_and_history_through_the_fake_node() {
         now, labelled,
         "the newest address is current, label included"
     );
+    // That one is shielded only: no transparent receiver to hand out.
+    let err = narrowed(&mut c, Pool::Transparent).await.unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::UnsupportedPool, "{err:?}");
+    assert!(err.message().contains("--receivers transparent"), "{err:?}");
 
     let with_t = c
         .new_address(NewAddressRequest {
@@ -5326,12 +5467,28 @@ async fn sapling_payments_pass_the_output_checks() {
     node.mine(2);
     wait_spendable(&mut c, "main").await;
 
-    // The PCZT pipeline to the same address.
+    // The PCZT pipeline to the same receiver, named as the unified address
+    // narrowed with `SpendOptions.output_pool`.
     let created = c
-        .create_pczt(create_req("main", &zs, 10_000_000))
+        .create_pczt(CreatePcztRequest {
+            options: Some(gyges_proto::v1::SpendOptions {
+                output_pool: Pool::Sapling as i32,
+            }),
+            ..create_req("main", &bob.address, 10_000_000)
+        })
         .await
         .unwrap()
         .into_inner();
+    let payment = &created.proposal.as_ref().unwrap().steps[0]
+        .outputs
+        .iter()
+        .find(|o| !o.is_change)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (payment.pool(), payment.address.as_str()),
+        (Pool::Sapling, zs.as_str())
+    );
     let proven = prove(&mut c, created.pczts[0].clone()).await.unwrap();
     let (signed, _) = sign_pczt_with_session(&mut c, proven, "pw").await.unwrap();
     let txid = broadcast(&mut c, signed).await.unwrap();

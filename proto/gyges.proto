@@ -717,6 +717,12 @@ message AddressInfo {
 
 message GetCurrentAddressRequest {
   string key_id = 1;
+  // UNSPECIFIED: the unified address. Otherwise its receiver for this pool
+  // as an address of its own: SAPLING the zs address, TRANSPARENT the t
+  // address, IRONWOOD (or ORCHARD, the same receiver) a unified address
+  // holding only the Orchard receiver. UNSUPPORTED_POOL when the current
+  // address has no such receiver.
+  Pool pool = 2;
 }
 
 message NewAddressRequest {
@@ -941,6 +947,18 @@ message SendTransactionRequest {
   uint32 min_confirmations = 8;
   // Wait for the mined event(s) before closing the stream.
   bool wait_for_mined = 9;
+  SpendOptions options = 10;
+}
+
+// Sender choices beyond recipient and amount (docs/interface.md API §4.1).
+// Every field is optional; the defaults are the wallet's own choices.
+message SpendOptions {
+  // Pay the recipient's receiver for this pool: a unified address is
+  // narrowed to that receiver, a single-pool address must already be of
+  // it. UNSPECIFIED lets the address decide (an Orchard receiver is paid
+  // into Ironwood). ORCHARD is refused: the Orchard turnstile forbids new
+  // Orchard outputs since NU6.3.
+  Pool output_pool = 1;
 }
 
 message ShieldFundsRequest {
@@ -1162,6 +1180,7 @@ message CreatePcztRequest {
   Amount amount = 3;
   bytes memo = 4;
   uint32 min_confirmations = 5;
+  SpendOptions options = 6;
 }
 
 message CreatePcztResponse {

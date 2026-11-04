@@ -49,13 +49,32 @@ pub(crate) fn proto_signing_mode(mode: SigningMode) -> v1::SigningMode {
     }
 }
 
-/// `gyges_core::Pool` → wire enum.
+/// `gyges_core::Pool` → wire enum. The daemon is the only crate that links
+/// both: the core knows no wire format and has no `UNSPECIFIED` pool, and
+/// the CLI links only `gyges-proto`. This and [`wire_pool`] are the bridge.
 pub(crate) fn proto_pool(pool: gyges_core::Pool) -> v1::Pool {
     match pool {
         gyges_core::Pool::Transparent => v1::Pool::Transparent,
         gyges_core::Pool::Sapling => v1::Pool::Sapling,
         gyges_core::Pool::Orchard => v1::Pool::Orchard,
         gyges_core::Pool::Ironwood => v1::Pool::Ironwood,
+    }
+}
+
+/// Wire enum → `gyges_core::Pool`; `UNSPECIFIED` is `None` and a value this
+/// build does not know is refused.
+pub(crate) fn wire_pool(pool: i32) -> Result<Option<gyges_core::Pool>, Status> {
+    match v1::Pool::try_from(pool) {
+        Ok(v1::Pool::Unspecified) => Ok(None),
+        Ok(v1::Pool::Transparent) => Ok(Some(gyges_core::Pool::Transparent)),
+        Ok(v1::Pool::Sapling) => Ok(Some(gyges_core::Pool::Sapling)),
+        Ok(v1::Pool::Orchard) => Ok(Some(gyges_core::Pool::Orchard)),
+        Ok(v1::Pool::Ironwood) => Ok(Some(gyges_core::Pool::Ironwood)),
+        Err(_) => Err(GygesError::new(
+            ErrorReason::InvalidArgument,
+            format!("unknown pool {pool}"),
+        )
+        .into_status()),
     }
 }
 

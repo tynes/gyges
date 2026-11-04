@@ -109,6 +109,8 @@ pub struct CreateArgs {
     /// Write the PCZT here instead of stdout.
     #[arg(short, long, value_name = "FILE")]
     pub out: Option<PathBuf>,
+    #[command(flatten)]
+    pub spend: crate::tx::SpendArgs,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -250,6 +252,7 @@ async fn create(ctx: &Ctx, args: CreateArgs) -> Result<(), CliError> {
             amount: Some(args.amount.to_proto()),
             memo: args.memo.map(|m| m.0).unwrap_or_default(),
             min_confirmations: 0,
+            options: args.spend.to_proto(),
         })
         .await?
         .into_inner();

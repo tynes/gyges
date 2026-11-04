@@ -17,12 +17,13 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use gyges_proto::v1::{
     AbortSigningSessionRequest, AbortTexTransferRequest, ErrorReason, GygesError,
     ListSigningSessionsRequest, Pool, Proposal, ResumeTexTransferRequest, SendEvent,
     SendTransactionRequest, SessionStatus, ShieldFundsRequest, SignatureKind, SignatureRequired,
-    SigningSession, TexQueueEntry, TexState, UnlockKeyRequest, UnlockScope, send_event,
+    SigningSession, SpendOptions, TexQueueEntry, TexState, UnlockKeyRequest, UnlockScope,
+    send_event,
 };
 
 use crate::amount::{MemoArg, ParsedAmount, format_zec, parse_amount, parse_memo, parse_zatoshis};
@@ -67,7 +68,45 @@ pub struct SendArgs {
     #[arg(long)]
     pub dry_run: bool,
     #[command(flatten)]
+    pub spend: SpendArgs,
+    #[command(flatten)]
     pub flow: SignFlow,
+}
+
+/// Sender choices `tx send` and `pczt create` share (docs/interface.md CLI §2.5).
+#[derive(Debug, Clone, Default, Args)]
+pub struct SpendArgs {
+    /// Pay the recipient's receiver for this pool. Default: the address decides (an Orchard receiver is paid into Ironwood).
+    #[arg(long, value_name = "POOL")]
+    pub pool: Option<OutputPoolArg>,
+}
+
+/// A pool a new output can go to (no Orchard: its turnstile forbids new value since NU6.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum OutputPoolArg {
+    Ironwood,
+    Sapling,
+    Transparent,
+}
+
+impl OutputPoolArg {
+    pub fn to_proto(self) -> Pool {
+        match self {
+            OutputPoolArg::Ironwood => Pool::Ironwood,
+            OutputPoolArg::Sapling => Pool::Sapling,
+            OutputPoolArg::Transparent => Pool::Transparent,
+        }
+    }
+}
+
+impl SpendArgs {
+    /// `None` when nothing was chosen, so the request carries no options.
+    pub fn to_proto(&self) -> Option<SpendOptions> {
+        let options = SpendOptions {
+            output_pool: self.pool.map_or(Pool::Unspecified, OutputPoolArg::to_proto) as i32,
+        };
+        (options != SpendOptions::default()).then_some(options)
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -139,6 +178,7 @@ async fn send(ctx: &Ctx, args: SendArgs) -> Result<(), CliError> {
             session_token: Vec::new(),
             min_confirmations: 0,
             wait_for_mined: args.flow.wait,
+            options: args.spend.to_proto(),
         })
     };
     run_send(ctx, "Send", args.dry_run, &args.flow, request).await

@@ -263,6 +263,23 @@ enum Built {
 type Proposed = (ProposalSummary, Option<Built>);
 
 /// `SendTransaction` (docs/interface.md API §4.1).
+/// The address a send pays: `to` parsed for the network, narrowed to one
+/// receiver when `options.output_pool` names a pool
+/// ([`core_tx::recipient_for_pool`]).
+pub(crate) fn recipient(
+    params: &gyges_core::network::ConsensusParams,
+    to: &str,
+    options: Option<&v1::SpendOptions>,
+    key_id: &str,
+) -> Result<zcash_keys::address::Address, Status> {
+    let pool = match options {
+        Some(o) => crate::keys::wire_pool(o.output_pool)?,
+        None => None,
+    };
+    let to = core_tx::parse_recipient(params, to).for_key(key_id)?;
+    core_tx::recipient_for_pool(to, pool).for_key(key_id)
+}
+
 pub(crate) fn send_transaction(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
@@ -278,7 +295,7 @@ pub(crate) fn send_transaction(
     )?;
     let key_id = prepared.key.key_id().to_string();
     let params = state.registry.params();
-    let to = core_tx::parse_recipient(&params, &req.to).for_key(&key_id)?;
+    let to = recipient(&params, &req.to, req.options.as_ref(), &key_id)?;
     let memo = core_tx::memo_for(&to, &req.memo).for_key(&key_id)?;
     let amount = parse_amount(req.amount)?;
     let route = broadcast_route(&state, req.via_tor, &key_id)?;
