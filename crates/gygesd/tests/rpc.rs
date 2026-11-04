@@ -3366,6 +3366,7 @@ async fn the_sender_picks_the_output_pool() {
     let options = |pool: Pool| {
         Some(SpendOptions {
             output_pool: pool as i32,
+            ..Default::default()
         })
     };
     let payment = |p: &Proposal| -> ProposedOutput {
@@ -3453,6 +3454,140 @@ async fn the_sender_picks_the_output_pool() {
     let b = balance(&mut c, "bob").await;
     assert_eq!(balance_of(&b, Pool::Transparent), (10_000_000, 0), "{b:?}");
     assert_eq!(balance_of(&b, Pool::Ironwood), (0, 0), "{b:?}");
+    running.task.abort();
+}
+
+/// `SpendOptions.from_pools` and `consolidate` (docs/interface.md API §4.1): the sender
+/// limits which pools fund the send, the proposer never falls back past
+/// them, `max` counts only them, and consolidation adds spare notes of the
+/// funding pool.
+#[tokio::test]
+async fn the_sender_picks_the_input_pools() {
+    use gyges_proto::v1::{self, Pool, SpendOptions};
+    use tonic::Status;
+    let (node, running, mut c) = sender_and_recipient(ONE_CONF_CONFIG).await;
+    let state = &running.state;
+    // `main`: about 1 ZEC in Ironwood plus 0.5 ZEC transparent.
+    fund(&node, state, &mut c, "main", 50_000_000).await;
+    let bob = current_address(&mut c, "bob").await;
+    let options = |from: &[Pool], consolidate: bool| {
+        Some(SpendOptions {
+            from_pools: from.iter().map(|p| *p as i32).collect(),
+            consolidate,
+            ..Default::default()
+        })
+    };
+    let dry = async |c: &mut GygesClient<Channel>,
+                     key: &str,
+                     to: &str,
+                     amount: Option<v1::Amount>,
+                     options: Option<SpendOptions>| {
+        let events = collect_events(
+            c.send_transaction(SendTransactionRequest {
+                dry_run: true,
+                options,
+                amount,
+                ..send_req(key, to, 0)
+            })
+            .await,
+        )
+        .await?;
+        Ok::<_, Status>(proposal_of(&events))
+    };
+    let input_pools = |p: &Proposal| -> Vec<Pool> {
+        let mut pools: Vec<Pool> = p.steps[0].inputs.iter().map(|i| i.pool()).collect();
+        pools.dedup();
+        pools
+    };
+
+    // No choice: upstream spends the transparent funds first, though the
+    // payment goes to Ironwood and an Ironwood note would cover it.
+    let p = dry(&mut c, "main", &bob, zats(10_000_000), None)
+        .await
+        .unwrap();
+    assert_eq!(input_pools(&p), [Pool::Transparent], "{p:?}");
+    // Ironwood only keeps the transparent funds out of it.
+    let p = dry(
+        &mut c,
+        "main",
+        &bob,
+        zats(10_000_000),
+        options(&[Pool::Ironwood], false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(input_pools(&p), [Pool::Ironwood], "{p:?}");
+    // More than either pool holds needs both, and only when both are allowed.
+    let p = dry(
+        &mut c,
+        "main",
+        &bob,
+        zats(120_000_000),
+        options(&[Pool::Ironwood, Pool::Transparent], false),
+    )
+    .await
+    .unwrap();
+    let mut pools = input_pools(&p);
+    pools.sort_by_key(|p| *p as i32);
+    assert_eq!(pools, [Pool::Transparent, Pool::Ironwood], "{p:?}");
+    for from in [&[Pool::Ironwood][..], &[Pool::Sapling][..]] {
+        let err = dry(
+            &mut c,
+            "main",
+            &bob,
+            zats(120_000_000),
+            options(from, false),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            reason(&err),
+            ErrorReason::InsufficientFunds,
+            "{from:?}: {err:?}"
+        );
+    }
+    // `max` counts the chosen pools only.
+    let max = Some(v1::Amount {
+        value: Some(v1::amount::Value::Max(true)),
+    });
+    let p = dry(
+        &mut c,
+        "main",
+        &bob,
+        max,
+        options(&[Pool::Transparent], false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(input_pools(&p), [Pool::Transparent], "{p:?}");
+    assert_eq!(p.total_debit, 50_000_000, "{p:?}");
+
+    // Consolidation: three notes for bob, then a small send from them.
+    for _ in 0..3 {
+        let events = collect_events(c.send_transaction(send_req("main", &bob, 5_000_000)).await)
+            .await
+            .unwrap();
+        assert_eq!(
+            event_names(&events).last(),
+            Some(&"broadcast"),
+            "{events:?}"
+        );
+        node.mine(2);
+        wait_spendable(&mut c, "main").await;
+    }
+    wait_spendable(&mut c, "bob").await;
+    let main = current_address(&mut c, "main").await;
+    let plain = dry(&mut c, "bob", &main, zats(1_000_000), None)
+        .await
+        .unwrap();
+    // `inputs` holds one entry per pool with the number of notes spent.
+    let notes = |p: &Proposal| p.steps[0].inputs.iter().map(|i| i.count).sum::<u32>();
+    assert_eq!(notes(&plain), 1, "{plain:?}");
+    let merged = dry(&mut c, "bob", &main, zats(1_000_000), options(&[], true))
+        .await
+        .unwrap();
+    assert_eq!(notes(&merged), 2, "a spare note rides along: {merged:?}");
+    assert_eq!(merged.total_fee, plain.total_fee, "same fee: {merged:?}");
     running.task.abort();
 }
 
@@ -5473,6 +5608,7 @@ async fn sapling_payments_pass_the_output_checks() {
         .create_pczt(CreatePcztRequest {
             options: Some(gyges_proto::v1::SpendOptions {
                 output_pool: Pool::Sapling as i32,
+                ..Default::default()
             }),
             ..create_req("main", &bob.address, 10_000_000)
         })
@@ -6041,6 +6177,7 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
             AmountSpec::Zatoshis(zcash_protocol::value::Zatoshis::const_from_u64(10_000_000)),
             None,
             1,
+            &Default::default(),
         )
         .unwrap();
         core_tx::build_pczt(&mut w, &params, account, &proposal, None).unwrap()
