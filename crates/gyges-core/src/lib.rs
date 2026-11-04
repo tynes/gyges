@@ -93,6 +93,23 @@ impl Pool {
         Pool::Sapling,
         Pool::Transparent,
     ];
+
+    /// The profile and CLI spelling (the serde one): `ironwood`, `sapling`, …
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Pool::Transparent => "transparent",
+            Pool::Sapling => "sapling",
+            Pool::Orchard => "orchard",
+            Pool::Ironwood => "ironwood",
+        }
+    }
+
+    /// [`Pool::as_str`] back to the pool, ignoring case.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|p| p.as_str().eq_ignore_ascii_case(s))
+    }
 }
 
 /// States of a `tex_queue` row (Q-T1, Q-T2; docs/architecture.md Data model §5.1).
@@ -149,5 +166,21 @@ impl TexState {
             self,
             TexState::Step2Mined | TexState::Expired | TexState::Failed | TexState::Aborted
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_names_match_serde_and_parse_back() {
+        for pool in Pool::ALL {
+            let serde = serde_json::to_string(&pool).unwrap();
+            assert_eq!(serde, format!("\"{}\"", pool.as_str()));
+            assert_eq!(Pool::parse(pool.as_str()), Some(pool));
+            assert_eq!(Pool::parse(&pool.as_str().to_uppercase()), Some(pool));
+        }
+        assert_eq!(Pool::parse("coins"), None);
     }
 }

@@ -79,6 +79,7 @@ use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, ShieldedPool, TxId};
 
 use crate::Pool;
+use crate::history::NoteRow;
 use crate::network::ConsensusParams;
 use crate::registry::Wallet;
 use crate::vault::{Entropy, seed_from_entropy};
@@ -240,8 +241,8 @@ pub struct InputOptions {
     /// extra notes of the funding pool when that changes neither the fee
     /// nor the transaction's shape.
     pub consolidate: bool,
-    /// Outputs of the account's own the sender names (`--input`). Empty:
-    /// the proposer picks. Otherwise only these are eligible, unless
+    /// The account's own outputs the sender names (`--input`). Empty: the
+    /// proposer picks. Otherwise only these are eligible, unless
     /// [`InputOptions::allow_extra_inputs`].
     pub inputs: Vec<InputRef>,
     /// With [`InputOptions::inputs`]: they go first, and the proposer may
@@ -250,7 +251,7 @@ pub struct InputOptions {
 }
 
 /// One unspent note or UTXO of the account, as `gyges notes` lists it
-/// (`[pool:]txid:index`).
+/// (`[pool:]txid:index`, the txid in display order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputRef {
     /// Needed only when outputs of two pools in one transaction share the
@@ -263,12 +264,37 @@ pub struct InputRef {
 
 impl fmt::Display for InputRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut txid = self.txid;
-        txid.reverse();
         if let Some(pool) = self.pool {
-            write!(f, "{}:", format!("{pool:?}").to_lowercase())?;
+            write!(f, "{}:", pool.as_str())?;
         }
-        write!(f, "{}:{}", hex::encode(txid), self.index)
+        write!(
+            f,
+            "{}:{}",
+            gyges_chain::display_hash(&self.txid),
+            self.index
+        )
+    }
+}
+
+impl std::str::FromStr for InputRef {
+    type Err = TxError;
+
+    fn from_str(s: &str) -> Result<Self, TxError> {
+        let bad = || {
+            TxError::InvalidArgument(format!(
+                "input {s:?} is not [pool:]txid:index (as `gyges notes` lists it)"
+            ))
+        };
+        let (pool, txid, index) = match s.trim().split(':').collect::<Vec<_>>()[..] {
+            [txid, index] => (None, txid, index),
+            [pool, txid, index] => (Some(Pool::parse(pool).ok_or_else(bad)?), txid, index),
+            _ => return Err(bad()),
+        };
+        Ok(InputRef {
+            pool,
+            txid: gyges_chain::parse_display_hash(txid).map_err(|_| bad())?,
+            index: index.parse().map_err(|_| bad())?,
+        })
     }
 }
 
@@ -286,16 +312,7 @@ struct Reservation {
     prefer: bool,
 }
 
-fn pool_type(pool: Pool) -> PoolType {
-    match pool {
-        Pool::Transparent => PoolType::Transparent,
-        Pool::Sapling => PoolType::Shielded(ShieldedPool::Sapling),
-        Pool::Orchard => PoolType::Shielded(ShieldedPool::Orchard),
-        Pool::Ironwood => PoolType::Shielded(ShieldedPool::Ironwood),
-    }
-}
-
-fn output_ref(row: &crate::history::NoteRow) -> OutputRef {
+fn output_ref(row: &NoteRow) -> OutputRef {
     OutputRef::new(
         TxId::from_bytes(row.txid),
         pool_type(row.pool),
@@ -312,33 +329,37 @@ impl Reservation {
         options: &InputOptions,
     ) -> Result<Self, TxError> {
         let rows = crate::history::notes(wallet)?;
-        let unspent: Vec<_> = rows.iter().filter(|r| !r.spent()).collect();
-        let mut chosen: Vec<&crate::history::NoteRow> = Vec::new();
+        let unspent: Vec<&NoteRow> = rows.iter().filter(|r| !r.spent()).collect();
+        let mut chosen: Vec<&NoteRow> = Vec::new();
         for want in &options.inputs {
-            let found: Vec<_> = unspent
+            let found: Vec<&NoteRow> = unspent
                 .iter()
                 .copied()
                 .filter(|r| r.txid == want.txid && r.output_index == want.index)
                 .filter(|r| want.pool.is_none_or(|p| p == r.pool))
                 .collect();
-            let row = match found.as_slice() {
-                [row] => *row,
+            let row = match found[..] {
+                [row] => row,
                 [] => {
                     return Err(TxError::InvalidArgument(format!(
                         "{want} is not an unspent note or UTXO of this key (see `gyges notes`)"
                     )));
                 }
                 _ => {
+                    let named: Vec<String> = found
+                        .iter()
+                        .map(|r| format!("{}:{want}", r.pool.as_str()))
+                        .collect();
                     return Err(TxError::InvalidArgument(format!(
-                        "{want} names outputs in more than one pool; prefix it with the pool, \
-                         e.g. sapling:{want}"
+                        "{want} names outputs in more than one pool; prefix it with the pool: {}",
+                        named.join(" or ")
                     )));
                 }
             };
             if !spend_pools.contains(&row.pool) {
                 return Err(TxError::UnsupportedPool(format!(
                     "{want} is in the {} pool, which this send does not spend from",
-                    format!("{:?}", row.pool).to_lowercase()
+                    row.pool.as_str()
                 )));
             }
             if row.height.is_none() {
@@ -396,13 +417,16 @@ impl Reservation {
         }
     }
 
+    /// Unlock every output, even after one fails (a failed one stays
+    /// locked until it expires), and report the first failure.
     fn release(self, wallet: &mut Wallet) -> Result<(), TxError> {
+        let mut first = Ok(());
         for o in &self.locked {
-            wallet
-                .unlock_output(o, self.owner)
-                .map_err(|e| internal("releasing the inputs", e))?;
+            if let Err(e) = wallet.unlock_output(o, self.owner) {
+                first = first.and(Err(internal("releasing the inputs", e)));
+            }
         }
-        Ok(())
+        first
     }
 }
 
@@ -411,11 +435,9 @@ impl Reservation {
 /// keys made before M6 until their profile is upgraded on load) never
 /// spends Sapling notes.
 fn spend_policy(spend_pools: &[Pool], inputs: &InputOptions) -> SpendPolicy {
-    let shielded = spend_pools.iter().filter_map(|p| match p {
-        Pool::Sapling => Some(ShieldedPool::Sapling),
-        Pool::Orchard => Some(ShieldedPool::Orchard),
-        Pool::Ironwood => Some(ShieldedPool::Ironwood),
-        Pool::Transparent => None,
+    let shielded = spend_pools.iter().filter_map(|p| match pool_type(*p) {
+        PoolType::Shielded(pool) => Some(pool),
+        PoolType::Transparent => None,
     });
     let mut policy = SpendPolicy::shielded_pools(shielded);
     if inputs.consolidate {
@@ -493,24 +515,17 @@ pub fn propose_send(
     min_confirmations: u32,
     inputs: &InputOptions,
 ) -> Result<SendProposal, TxError> {
-    let policy = spend_policy(spend_pools, inputs);
-    if inputs.inputs.is_empty() {
-        return propose_send_with(
-            wallet,
-            params,
-            account,
-            spend_pools,
-            to,
-            amount,
-            memo,
-            min_confirmations,
-            &policy,
-        );
-    }
     // The locks also take the other outputs out of the balance, so `max`
     // means everything in the chosen inputs.
-    let reservation = Reservation::take(wallet, spend_pools, inputs)?;
-    let policy = reservation.policy(policy);
+    let reservation = if inputs.inputs.is_empty() {
+        None
+    } else {
+        Some(Reservation::take(wallet, spend_pools, inputs)?)
+    };
+    let mut policy = spend_policy(spend_pools, inputs);
+    if let Some(r) = &reservation {
+        policy = r.policy(policy);
+    }
     let proposed = propose_send_with(
         wallet,
         params,
@@ -522,7 +537,8 @@ pub fn propose_send(
         min_confirmations,
         &policy,
     );
-    let released = reservation.release(wallet);
+    // Release whatever the outcome; a refused proposal's error comes first.
+    let released = reservation.map_or(Ok(()), |r| r.release(wallet));
     let proposal = proposed?;
     released?;
     Ok(proposal)
@@ -692,6 +708,16 @@ pub struct ProposalSummary {
     pub min_confirmations: u32,
     /// `zcash_client_backend::proto::proposal::Proposal`, serialised.
     pub upstream: Vec<u8>,
+}
+
+/// The upstream pool type for `pool`; [`pool_of`] is the inverse.
+fn pool_type(pool: Pool) -> PoolType {
+    match pool {
+        Pool::Transparent => PoolType::Transparent,
+        Pool::Sapling => PoolType::Shielded(ShieldedPool::Sapling),
+        Pool::Orchard => PoolType::Shielded(ShieldedPool::Orchard),
+        Pool::Ironwood => PoolType::Shielded(ShieldedPool::Ironwood),
+    }
 }
 
 fn pool_of(p: PoolType) -> Pool {
@@ -2298,6 +2324,33 @@ pub fn balance(wallet: &Wallet, min_confirmations: u32) -> Result<BalanceSummary
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_refs_parse_as_notes_lists_them() {
+        let display = format!("{}{}", "00".repeat(31), "01");
+        let r: InputRef = format!("{display}:7").parse().unwrap();
+        assert_eq!(r.pool, None);
+        assert_eq!(r.index, 7);
+        assert_eq!(r.txid[0], 1, "display order is reversed to internal");
+        assert_eq!(r.to_string(), format!("{display}:7"));
+        let r: InputRef = format!("Sapling:{display}:0").parse().unwrap();
+        assert_eq!(r.pool, Some(Pool::Sapling));
+        assert_eq!(r.to_string(), format!("sapling:{display}:0"));
+        for bad in [
+            "",
+            "abc:1",
+            display.as_str(),
+            &format!("{display}:x"),
+            &format!("coins:{display}:0"),
+            &format!("a:b:{display}:0"),
+        ] {
+            let err = bad.parse::<InputRef>().unwrap_err();
+            assert!(
+                matches!(&err, TxError::InvalidArgument(m) if m.contains("is not [pool:]txid:index")),
+                "{bad}: {err:?}"
+            );
+        }
+    }
     use crate::Network;
 
     fn params() -> ConsensusParams {

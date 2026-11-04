@@ -341,7 +341,7 @@ pub fn current_for_pool(wallet: &mut Wallet, pool: Option<Pool>) -> Result<Addre
         TxError::UnsupportedPool(format!(
             "the current address has no {} receiver; derive one with `gyges address new \
              --receivers {}`",
-            format!("{pool:?}").to_lowercase(),
+            pool.as_str(),
             match pool {
                 Pool::Ironwood | Pool::Orchard => "orchard",
                 Pool::Sapling => "sapling",
