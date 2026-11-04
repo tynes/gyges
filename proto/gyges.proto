@@ -959,6 +959,15 @@ message SpendOptions {
   // into Ironwood). ORCHARD is refused: the Orchard turnstile forbids new
   // Orchard outputs since NU6.3.
   Pool output_pool = 1;
+  // Fund the send only from these pools; empty means every pool the key's
+  // profile spends from. Narrows the profile's list, never widens it: a
+  // pool the profile does not spend from is UNSUPPORTED_POOL. The proposer
+  // never falls back to another pool (INSUFFICIENT_FUNDS instead).
+  repeated Pool from_pools = 2;
+  // Also spend a few extra notes of the funding pool when that changes
+  // neither the fee nor the transaction's shape (upstream's
+  // PreferConsolidation).
+  bool consolidate = 3;
 }
 
 message ShieldFundsRequest {

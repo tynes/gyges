@@ -216,6 +216,7 @@ Decrypted notes and UTXOs with heights, values, memo previews and witness readin
 Proposes, proves, signs and broadcasts. The proposal summary (inputs per pool, outputs, ZIP 317 fee per step, total debit) is printed before any signature prompt; without `--yes` it comes from a dry run and is confirmed before the real send starts (no terminal: exit 4, `CONFIRMATION_REQUIRED`). The txid goes to stdout; progress goes to stderr.
 - **Inline unlock (`local-seed`):** on `SignatureRequired`, prompts for the passphrase, creates a connection-scoped session and continues; the key is dropped after signing. A send that spends Sapling notes asks before `proving …` rather than after, because the Sapling proofs need the key.
 - **Keystone (`keystone-qr`):** renders the animated UR QR (batch protocol for shielded-only sends, single-PCZT when transparent inputs are present) and reads the result from the camera (`qr-scan`), a file, stdin or pasted frames.
+- **Input pools (`--from-pool`, `--consolidate`):** by default the proposer spends transparent funds first (when the profile allows them), then the payment's own pool, then the others. `--from-pool ironwood` (comma-separated, any of `ironwood,orchard,sapling,transparent`) funds the send from those pools only, never falling back to others (exit 5 when they cannot cover it), and `--amount max` then means everything in them. It narrows the profile's `spend_pools`; a pool the profile does not spend from is exit 6. `--consolidate` lets a few spare notes of the funding pool ride along when the fee and shape stay the same.
 - **Output pool (`--pool`):** by default the address decides (a unified address with an Orchard receiver is paid into Ironwood). `--pool sapling` or `--pool transparent` pays that receiver of a unified address instead; a recipient without one is refused (exit 6). There is no `--pool orchard`: the Orchard turnstile forbids new Orchard outputs since NU6.3. `pczt create` takes the same flag (API §4.1, `SpendOptions`).
 - **ZIP 320 (`tex1`):** runs the two-step plan through the durable `TexQueue`; the passphrase prompt comes before proving (both steps are built together, API §9), each step's txid goes to stdout as the node takes it, and `tex pending (step 2 of 2): <step1> then <step2>` goes to stderr. A node that will not take Step 2 while Step 1 is unmined leaves one txid on stdout; the queue finishes the transfer and `tx sessions` shows its state.
 ```text
@@ -224,6 +225,8 @@ Flags:
       --amount <AMOUNT>     See §1.4
       --memo <TEXT_OR_HEX>  See §1.5; shielded recipients only
       --pool <POOL>         ironwood | sapling | transparent: pay the recipient's receiver for this pool
+      --from-pool <LIST>    Fund the send only from these pools (ironwood,orchard,sapling,transparent)
+      --consolidate         Spend spare notes of the funding pool when the fee and shape stay the same
       --via-tor             Broadcast through the fallback endpoint over Tor (exit 7 when none is configured; never the node)
       --dry-run             Print the full proposal (every step, every fee) and exit without signing
       --yes                 Skip the confirmation prompt
@@ -536,9 +539,21 @@ address whole, because an Orchard receiver is paid into Ironwood), and a
 single-pool address must already be of that pool. An address without a
 receiver for the pool, and `ORCHARD` (the Orchard turnstile forbids new
 Orchard value since NU6.3, active on every network), are refused with
-`INVALID_ARGUMENT` before anything is proposed. Inputs and change are still
-the proposer's: inputs from the payment's own pool first, change back to
-the inputs' pool.
+`INVALID_ARGUMENT` before anything is proposed.
+
+Inputs are the proposer's unless the sender narrows them. By default it
+spends the account's transparent funds first when the profile allows them
+(even for a shielded payment that a shielded note would cover), then the
+payment's own pool, then the others the profile spends from; change goes
+back to the inputs' pool. `from_pools` limits the send to the pools listed,
+which must all be in the profile's `spend_pools` (`UNSUPPORTED_POOL`
+otherwise; it narrows, never widens). The proposer never falls back past
+them, so a send they cannot cover is `INSUFFICIENT_FUNDS`, and `max` counts
+only them. `CreatePczt` leaves Sapling out as before; `from_pools` of Sapling
+alone is `UNSUPPORTED_POOL` there. `consolidate` selects upstream's
+`PreferConsolidation`: a few spare notes of the funding pool ride along
+when that changes neither the fee nor the transaction's shape (at most five
+from the pool).
 
 #### 4.2 `SignPczt`
 

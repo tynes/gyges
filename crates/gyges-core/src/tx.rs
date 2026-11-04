@@ -47,7 +47,7 @@ use secrecy::ExposeSecret as _;
 use transparent::keys::{NonHardenedChildIndex, TransparentKeyScope};
 use zcash_client_backend::data_api::error::Error as WalletApiError;
 use zcash_client_backend::data_api::wallet::input_selection::{
-    CoinbasePolicy, GreedyInputSelector, SpendPolicy, TransparentSpendPolicy,
+    CoinbasePolicy, GreedyInputSelector, NoteSelection, SpendPolicy, TransparentSpendPolicy,
 };
 use zcash_client_backend::data_api::wallet::{
     ConfirmationsPolicy, SpendingKeys, create_pczt_from_proposal, create_proposed_transactions,
@@ -228,11 +228,21 @@ pub fn account_of(wallet: &Wallet) -> Result<AccountUuid, TxError> {
         .ok_or_else(|| TxError::Internal("the wallet has no account".into()))
 }
 
+/// How a send picks its inputs beyond the pools it may draw on
+/// (docs/interface.md API §4.1, `SpendOptions`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InputOptions {
+    /// Upstream's `NoteSelection::PreferConsolidation`: also spend a few
+    /// extra notes of the funding pool when that changes neither the fee
+    /// nor the transaction's shape.
+    pub consolidate: bool,
+}
+
 /// Which pools a key may fund a send from, as the upstream policy. A
 /// profile without Sapling in `spend_pools` (Keystone, and `local-seed`
 /// keys made before M6 until their profile is upgraded on load) never
 /// spends Sapling notes.
-fn spend_policy(spend_pools: &[Pool]) -> SpendPolicy {
+fn spend_policy(spend_pools: &[Pool], inputs: &InputOptions) -> SpendPolicy {
     let shielded = spend_pools.iter().filter_map(|p| match p {
         Pool::Sapling => Some(ShieldedPool::Sapling),
         Pool::Orchard => Some(ShieldedPool::Orchard),
@@ -240,6 +250,9 @@ fn spend_policy(spend_pools: &[Pool]) -> SpendPolicy {
         Pool::Transparent => None,
     });
     let mut policy = SpendPolicy::shielded_pools(shielded);
+    if inputs.consolidate {
+        policy = policy.with_note_selection(NoteSelection::PreferConsolidation);
+    }
     if spend_pools.contains(&Pool::Transparent) {
         policy = policy.with_transparent(
             TransparentSpendPolicy::any_account_addr().with_coinbase(CoinbasePolicy::NonCoinbase),
@@ -310,8 +323,9 @@ pub fn propose_send(
     amount: AmountSpec,
     memo: Option<MemoBytes>,
     min_confirmations: u32,
+    inputs: &InputOptions,
 ) -> Result<SendProposal, TxError> {
-    let policy = spend_policy(spend_pools);
+    let policy = spend_policy(spend_pools, inputs);
     let confirmations = confirmations_policy(min_confirmations);
     let recipient = to.to_zcash_address(params);
     let selector = GreedyInputSelector::<Wallet>::new();

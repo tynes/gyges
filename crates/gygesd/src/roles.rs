@@ -158,13 +158,26 @@ pub(crate) async fn create_pczt(
     // Sapling notes stay out of a file: proving one needs the proof
     // generation key, which never leaves the `tx send` stream that derives
     // it (docs/security.md §6 item 1).
-    let profile_pools = &prepared.key.profile().spend_pools;
-    let sapling_left_out = profile_pools.contains(&gyges_core::Pool::Sapling);
-    let spend_pools: Vec<_> = profile_pools
+    let (chosen_pools, inputs) = tx::input_choices(
+        &prepared.key.profile().spend_pools,
+        req.options.as_ref(),
+        &key_id,
+    )?;
+    let sapling_left_out = chosen_pools.contains(&gyges_core::Pool::Sapling);
+    let spend_pools: Vec<_> = chosen_pools
         .iter()
         .copied()
         .filter(|p| *p != gyges_core::Pool::Sapling)
         .collect();
+    if spend_pools.is_empty() {
+        return Err(GygesError::new(
+            ErrorReason::UnsupportedPool,
+            "Sapling notes cannot be spent through a PCZT file (the Sapling proofs need the \
+             spending key, docs/security.md §6 item 1); use `gyges tx send`, or another pool",
+        )
+        .with_key(&key_id)
+        .into_status());
+    }
     let min_confirmations = prepared.min_confirmations;
     let network = state.network;
     let ttl = i64::try_from(state.config.vault.signing_session_ttl.as_secs()).unwrap_or(i64::MAX);
@@ -180,6 +193,7 @@ pub(crate) async fn create_pczt(
             amount,
             memo,
             min_confirmations,
+            &inputs,
         )?;
         if core_tx::is_two_step(&proposal) {
             return Err(TxError::InvalidArgument(
