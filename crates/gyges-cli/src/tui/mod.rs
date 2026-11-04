@@ -15,6 +15,7 @@
 //! - this file: the terminal, the event loop and the effects of [`app::Action`]s.
 
 mod addresses;
+mod agent;
 mod app;
 mod endpoints;
 mod lists;
@@ -98,6 +99,8 @@ pub async fn run(ctx: &Ctx, args: TuiArgs) -> Result<(), CliError> {
     let mut app = App::new(args.interval);
     app.tab = args.tab;
     app.socket = ctx.socket.display().to_string();
+    let backend: std::sync::Arc<dyn agent::AgentBackend> = std::sync::Arc::new(agent::StubBackend);
+    app.agent.backend_name = backend.name().to_string();
     let mut effects = Effects {
         ctx: ctx.clone(),
         tx,
@@ -106,6 +109,7 @@ pub async fn run(ctx: &Ctx, args: TuiArgs) -> Result<(), CliError> {
         logs: None,
         send_reply: None,
         scan_stop: None,
+        agent: backend,
     };
 
     let result = match args.dump {
@@ -137,6 +141,8 @@ struct Effects {
     send_reply: Option<mpsc::UnboundedSender<send::SendReply>>,
     /// Stops the camera scan, while one runs.
     scan_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Answers the agent bar (only the stub exists).
+    agent: std::sync::Arc<dyn agent::AgentBackend>,
 }
 
 impl Drop for Effects {
@@ -200,6 +206,14 @@ impl Effects {
                 send_task::scan(&self.tx, answer, request, stop);
             }
             Action::StopScan => self.stop_scan(),
+            Action::Ask(request) => {
+                let backend = self.agent.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let reply = backend.respond(request).await;
+                    let _ = tx.send(Event::AgentReply(reply));
+                });
+            }
         }
     }
 

@@ -198,6 +198,7 @@ Grouped by area. Each question carries the proposal written for it in the review
   - **One long-lived connection reads; it never unlocks.** A connection-scoped unlock (interface.md API §6.3) lives as long as its connection, and the TUI may stay open for days. Anything that signs opens a connection of its own and closes it when done.
   - **Polling is driven by change.** `GetInfo` and `GetSyncStatus` are cheap and polled; the wallet reads reload when the tip or sync state changes, plus a slow sweep.
   - **Each pane degrades on its own**, and the TUI never starts a daemon (Q-C5).
+  - **An agent can only draft.** The agent bar's backends (`tui::agent::AgentBackend`) answer with text and at most a send draft (recipient, amount, memo), which opens the send form for the user to review, dry-run, confirm and sign. A backend is given the conversation and the selected key's id; it never sees key material or a passphrase, and it has no way to confirm, sign or broadcast. Because what a backend is given leaves the TUI, one that adds wallet data to its prompt must say so before it is enabled, and a local model is the natural first choice for a privacy wallet.
 
   **Landed** as `gyges-cli`'s `tui` module (interface.md CLI §2.7): `app` (state, no I/O), `poll` (the reading connection), `ui` (drawing, no I/O) and the event loop. The header, wallet list and Overview are read-only; `--dump` draws one frame without a terminal for scripts and tests.
 
@@ -569,6 +570,7 @@ These are limits of what has landed, as recorded when each piece was merged.
   - The QR code and every pane are tested in `TestBackend` frames and `--dump`; scanning a drawn code with a phone is untested.
   - A passphrase send is driven end to end on a pseudo-terminal (`scenarios/tui.rs`); a Keystone send through the TUI is unit-tested against the updates the send task produces but not driven through a daemon, and its camera path is untested on hardware, like the CLI's.
   - A send cannot be stopped while it proves or broadcasts (only at a signature prompt), and `--wait` has no counterpart: the history tab shows the confirmation.
+  - The agent bar has no backend: `StubBackend` is the only one, and there is no setting to choose another. Which provider, what wallet context it may see, and how the user consents to that are open.
 
 ### 3.3 Deferred and out of scope
 

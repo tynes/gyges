@@ -509,6 +509,23 @@ impl App {
         self.send = Some(Stage::Form(Form::new(flow, key_id)));
     }
 
+    /// An agent's draft: the form opens filled in, and from there it is a
+    /// send like any other (review, confirm, sign by the user).
+    pub(super) fn open_send_draft(&mut self, draft: super::agent::SendDraft) {
+        self.open_send(Flow::Send);
+        if let Some(Stage::Form(f)) = &mut self.send {
+            f.to = draft.to;
+            f.amount = draft.amount;
+            f.memo = draft.memo;
+            f.inspect_due = Some(self.now);
+            self.agent.focused = false;
+            self.toast(
+                Level::Info,
+                "the agent filled in the send form: review it, then Enter for the dry run",
+            );
+        }
+    }
+
     pub(super) fn on_send_tick(&mut self, now: Instant) {
         let mut inspect = None;
         match &mut self.send {
