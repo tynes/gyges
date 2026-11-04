@@ -717,6 +717,12 @@ message AddressInfo {
 
 message GetCurrentAddressRequest {
   string key_id = 1;
+  // UNSPECIFIED: the unified address. Otherwise its receiver for this pool
+  // as an address of its own: SAPLING the zs address, TRANSPARENT the t
+  // address, IRONWOOD (or ORCHARD, the same receiver) a unified address
+  // holding only the Orchard receiver. UNSUPPORTED_POOL when the current
+  // address has no such receiver.
+  Pool pool = 2;
 }
 
 message NewAddressRequest {

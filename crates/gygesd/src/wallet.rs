@@ -87,7 +87,8 @@ pub(crate) async fn get_current_address(
     req: GetCurrentAddressRequest,
 ) -> Result<AddressInfo, Status> {
     let key = wallet_key(&state, &req.key_id)?;
-    wallet_rpc(&key, addresses::current)
+    let pool = crate::keys::wire_pool(req.pool)?;
+    wallet_rpc(&key, move |w| addresses::current_for_pool(w, pool))
         .await
         .map(proto_address)
 }
