@@ -317,10 +317,46 @@ pub(crate) fn input_choices(
     } else {
         wanted
     };
+    let mut chosen = Vec::new();
+    for s in &options.inputs {
+        chosen.push(parse_input(s)?);
+    }
+    if chosen.is_empty() && options.allow_extra_inputs {
+        return Err(invalid("allow_extra_inputs needs inputs"));
+    }
     let inputs = core_tx::InputOptions {
         consolidate: options.consolidate,
+        inputs: chosen,
+        allow_extra_inputs: options.allow_extra_inputs,
     };
     Ok((pools, inputs))
+}
+
+/// `[pool:]txid:index`, the txid in display order as `gyges notes` prints it.
+fn parse_input(s: &str) -> Result<core_tx::InputRef, Status> {
+    let bad = || {
+        invalid(format!(
+            "input {s:?} is not [pool:]txid:index (as `gyges notes` lists it)"
+        ))
+    };
+    let parts: Vec<&str> = s.trim().split(':').collect();
+    let (pool, txid, index) = match parts.as_slice() {
+        [txid, index] => (None, *txid, *index),
+        [pool, txid, index] => {
+            let pool = match pool.to_ascii_lowercase().as_str() {
+                "transparent" => gyges_core::Pool::Transparent,
+                "sapling" => gyges_core::Pool::Sapling,
+                "orchard" => gyges_core::Pool::Orchard,
+                "ironwood" => gyges_core::Pool::Ironwood,
+                _ => return Err(bad()),
+            };
+            (Some(pool), *txid, *index)
+        }
+        _ => return Err(bad()),
+    };
+    let txid = gyges_chain::parse_display_hash(txid).map_err(|_| bad())?;
+    let index = index.parse::<u32>().map_err(|_| bad())?;
+    Ok(core_tx::InputRef { pool, txid, index })
 }
 
 pub(crate) fn send_transaction(
@@ -1122,6 +1158,34 @@ mod tests {
             GygesError::from_status(&err).unwrap().reason(),
             ErrorReason::InvalidArgument
         );
+    }
+
+    #[test]
+    fn inputs_parse_as_notes_lists_them() {
+        let display = format!("{}{}", "00".repeat(31), "01");
+        let r = parse_input(&format!("{display}:7")).unwrap();
+        assert_eq!(r.pool, None);
+        assert_eq!(r.index, 7);
+        assert_eq!(r.txid[0], 1, "display order is reversed to internal");
+        assert_eq!(r.to_string(), format!("{display}:7"));
+        let r = parse_input(&format!("Sapling:{display}:0")).unwrap();
+        assert_eq!(r.pool, Some(gyges_core::Pool::Sapling));
+        assert_eq!(r.to_string(), format!("sapling:{display}:0"));
+        for bad in [
+            "",
+            "abc:1",
+            display.as_str(),
+            &format!("{display}:x"),
+            &format!("coins:{display}:0"),
+            &format!("a:b:{display}:0"),
+        ] {
+            let err = parse_input(bad).unwrap_err();
+            assert_eq!(
+                GygesError::from_status(&err).unwrap().reason(),
+                ErrorReason::InvalidArgument,
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -46,19 +46,23 @@ use prost::Message as _;
 use secrecy::ExposeSecret as _;
 use transparent::keys::{NonHardenedChildIndex, TransparentKeyScope};
 use zcash_client_backend::data_api::error::Error as WalletApiError;
+use zcash_client_backend::data_api::locking::{LockError, LockOwner, LockedInputPolicy};
 use zcash_client_backend::data_api::wallet::input_selection::{
-    CoinbasePolicy, GreedyInputSelector, NoteSelection, SpendPolicy, TransparentSpendPolicy,
+    CoinbasePolicy, GreedyInputSelector, NonEmptyBTreeSet, NoteSelection, SpendPolicy,
+    TransparentSpendPolicy,
 };
 use zcash_client_backend::data_api::wallet::{
     ConfirmationsPolicy, SpendingKeys, create_pczt_from_proposal, create_proposed_transactions,
     extract_and_store_transaction_from_pczt, propose_shielding, propose_transfer,
 };
-use zcash_client_backend::data_api::{CoinbaseFilter, InputSource as _, WalletRead as _};
+use zcash_client_backend::data_api::{
+    CoinbaseFilter, InputSource as _, OutputLockStore as _, WalletRead as _,
+};
 use zcash_client_backend::fees::standard::SingleOutputChangeStrategy;
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule};
 use zcash_client_backend::proposal::{Proposal, Step, StepOutputIndex};
 use zcash_client_backend::wallet::{
-    Note, OvkPolicy, TransparentAddressSource, WalletTransparentOutput,
+    Note, OutputRef, OvkPolicy, TransparentAddressSource, WalletTransparentOutput,
 };
 use zcash_client_backend::zip321::{Payment, TransactionRequest};
 use zcash_client_sqlite::{AccountUuid, ReceivedNoteId};
@@ -236,6 +240,170 @@ pub struct InputOptions {
     /// extra notes of the funding pool when that changes neither the fee
     /// nor the transaction's shape.
     pub consolidate: bool,
+    /// Outputs of the account's own the sender names (`--input`). Empty:
+    /// the proposer picks. Otherwise only these are eligible, unless
+    /// [`InputOptions::allow_extra_inputs`].
+    pub inputs: Vec<InputRef>,
+    /// With [`InputOptions::inputs`]: they go first, and the proposer may
+    /// add others when they do not cover the payment.
+    pub allow_extra_inputs: bool,
+}
+
+/// One unspent note or UTXO of the account, as `gyges notes` lists it
+/// (`[pool:]txid:index`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputRef {
+    /// Needed only when outputs of two pools in one transaction share the
+    /// index (a Sapling output and an Ironwood action, say).
+    pub pool: Option<Pool>,
+    /// Internal byte order.
+    pub txid: [u8; 32],
+    pub index: u32,
+}
+
+impl fmt::Display for InputRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut txid = self.txid;
+        txid.reverse();
+        if let Some(pool) = self.pool {
+            write!(f, "{}:", format!("{pool:?}").to_lowercase())?;
+        }
+        write!(f, "{}:{}", hex::encode(txid), self.index)
+    }
+}
+
+/// How long a reservation of [`InputOptions::inputs`] would outlive a
+/// crash between locking and releasing: this many blocks past the tip.
+const RESERVATION_BLOCKS: u32 = 3;
+
+/// The locks that make [`InputOptions::inputs`] the proposer's choice: the
+/// other unspent outputs (strict) or the chosen ones (`allow_extra_inputs`,
+/// preferred through [`LockedInputPolicy::PreferLocked`]), under a fresh
+/// owner, released after the proposal whatever its outcome.
+struct Reservation {
+    owner: LockOwner,
+    locked: Vec<OutputRef>,
+    prefer: bool,
+}
+
+fn pool_type(pool: Pool) -> PoolType {
+    match pool {
+        Pool::Transparent => PoolType::Transparent,
+        Pool::Sapling => PoolType::Shielded(ShieldedPool::Sapling),
+        Pool::Orchard => PoolType::Shielded(ShieldedPool::Orchard),
+        Pool::Ironwood => PoolType::Shielded(ShieldedPool::Ironwood),
+    }
+}
+
+fn output_ref(row: &crate::history::NoteRow) -> OutputRef {
+    OutputRef::new(
+        TxId::from_bytes(row.txid),
+        pool_type(row.pool),
+        row.output_index,
+    )
+}
+
+impl Reservation {
+    /// Resolve the chosen inputs against the account's unspent outputs and
+    /// lock what keeps the proposer to them.
+    fn take(
+        wallet: &mut Wallet,
+        spend_pools: &[Pool],
+        options: &InputOptions,
+    ) -> Result<Self, TxError> {
+        let rows = crate::history::notes(wallet)?;
+        let unspent: Vec<_> = rows.iter().filter(|r| !r.spent()).collect();
+        let mut chosen: Vec<&crate::history::NoteRow> = Vec::new();
+        for want in &options.inputs {
+            let found: Vec<_> = unspent
+                .iter()
+                .copied()
+                .filter(|r| r.txid == want.txid && r.output_index == want.index)
+                .filter(|r| want.pool.is_none_or(|p| p == r.pool))
+                .collect();
+            let row = match found.as_slice() {
+                [row] => *row,
+                [] => {
+                    return Err(TxError::InvalidArgument(format!(
+                        "{want} is not an unspent note or UTXO of this key (see `gyges notes`)"
+                    )));
+                }
+                _ => {
+                    return Err(TxError::InvalidArgument(format!(
+                        "{want} names outputs in more than one pool; prefix it with the pool, \
+                         e.g. sapling:{want}"
+                    )));
+                }
+            };
+            if !spend_pools.contains(&row.pool) {
+                return Err(TxError::UnsupportedPool(format!(
+                    "{want} is in the {} pool, which this send does not spend from",
+                    format!("{:?}", row.pool).to_lowercase()
+                )));
+            }
+            if row.height.is_none() {
+                return Err(TxError::InvalidArgument(format!("{want} is not mined yet")));
+            }
+            if !chosen.contains(&row) {
+                chosen.push(row);
+            }
+        }
+        let locked: Vec<OutputRef> = if options.allow_extra_inputs {
+            chosen.iter().map(|r| output_ref(r)).collect()
+        } else {
+            unspent
+                .iter()
+                .filter(|r| !chosen.contains(r))
+                .map(|r| output_ref(r))
+                .collect()
+        };
+        let owner = {
+            use rand::Rng as _;
+            let mut bytes = [0u8; 32];
+            rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut bytes);
+            LockOwner::new(bytes)
+        };
+        if !locked.is_empty() {
+            let tip = wallet
+                .chain_height()
+                .map_err(|e| internal("reading the chain tip", e))?
+                .ok_or_else(|| TxError::NotSynced(NO_SCANNED_BLOCKS.into()))?;
+            wallet
+                .lock_outputs(&locked, owner, tip + RESERVATION_BLOCKS)
+                .map_err(|e| match e {
+                    LockError::LockFailure(o) => TxError::InvalidArgument(format!(
+                        "output {}:{} is reserved by another spend in progress",
+                        o.txid(),
+                        o.output_index()
+                    )),
+                    other => internal("reserving the inputs", other),
+                })?;
+        }
+        Ok(Reservation {
+            owner,
+            locked,
+            prefer: options.allow_extra_inputs,
+        })
+    }
+
+    fn policy(&self, policy: SpendPolicy) -> SpendPolicy {
+        if self.prefer && !self.locked.is_empty() {
+            policy.with_locked_input_policy(LockedInputPolicy::PreferLocked(
+                NonEmptyBTreeSet::singleton(self.owner),
+            ))
+        } else {
+            policy
+        }
+    }
+
+    fn release(self, wallet: &mut Wallet) -> Result<(), TxError> {
+        for o in &self.locked {
+            wallet
+                .unlock_output(o, self.owner)
+                .map_err(|e| internal("releasing the inputs", e))?;
+        }
+        Ok(())
+    }
 }
 
 /// Which pools a key may fund a send from, as the upstream policy. A
@@ -326,6 +494,53 @@ pub fn propose_send(
     inputs: &InputOptions,
 ) -> Result<SendProposal, TxError> {
     let policy = spend_policy(spend_pools, inputs);
+    if inputs.inputs.is_empty() {
+        return propose_send_with(
+            wallet,
+            params,
+            account,
+            spend_pools,
+            to,
+            amount,
+            memo,
+            min_confirmations,
+            &policy,
+        );
+    }
+    // The locks also take the other outputs out of the balance, so `max`
+    // means everything in the chosen inputs.
+    let reservation = Reservation::take(wallet, spend_pools, inputs)?;
+    let policy = reservation.policy(policy);
+    let proposed = propose_send_with(
+        wallet,
+        params,
+        account,
+        spend_pools,
+        to,
+        amount,
+        memo,
+        min_confirmations,
+        &policy,
+    );
+    let released = reservation.release(wallet);
+    let proposal = proposed?;
+    released?;
+    Ok(proposal)
+}
+
+/// [`propose_send`] under a given spend policy.
+#[allow(clippy::too_many_arguments)]
+fn propose_send_with(
+    wallet: &mut Wallet,
+    params: &ConsensusParams,
+    account: AccountUuid,
+    spend_pools: &[Pool],
+    to: &Address,
+    amount: AmountSpec,
+    memo: Option<MemoBytes>,
+    min_confirmations: u32,
+    policy: &SpendPolicy,
+) -> Result<SendProposal, TxError> {
     let confirmations = confirmations_policy(min_confirmations);
     let recipient = to.to_zcash_address(params);
     let selector = GreedyInputSelector::<Wallet>::new();
@@ -340,7 +555,7 @@ pub fn propose_send(
             &strategy,
             request,
             confirmations,
-            &policy,
+            policy,
             None,
             None,
         )

@@ -3591,6 +3591,165 @@ async fn the_sender_picks_the_input_pools() {
     running.task.abort();
 }
 
+/// `SpendOptions.inputs` (docs/interface.md API §4.1): the sender names the notes and
+/// UTXOs to spend as `gyges notes` lists them. Only those are eligible
+/// (strict), or they go first with `allow_extra_inputs`; `max` means
+/// everything in them; and the reservation that makes it so is gone after
+/// every proposal, refused or not.
+#[tokio::test]
+async fn the_sender_picks_the_inputs() {
+    use gyges_proto::v1::{self, ListNotesRequest, Note, Pool, SpendOptions};
+    use tonic::Status;
+    let (node, running, mut c) = sender_and_recipient(ONE_CONF_CONFIG).await;
+    let state = &running.state;
+    // `main`: one Ironwood note of about 1 ZEC plus a 0.5 ZEC UTXO.
+    fund(&node, state, &mut c, "main", 50_000_000).await;
+    let bob = current_address(&mut c, "bob").await;
+    let notes = async |c: &mut GygesClient<Channel>| -> Vec<Note> {
+        c.list_notes(ListNotesRequest {
+            key_id: "main".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .notes
+    };
+    let unspent = notes(&mut c).await;
+    let find = |pool: Pool| {
+        let n = unspent.iter().find(|n| n.pool() == pool).unwrap();
+        (format!("{}:{}", n.txid, n.output_index), n.value)
+    };
+    let (iw, iw_value) = find(Pool::Ironwood);
+    let (utxo, _) = find(Pool::Transparent);
+    let before = balance(&mut c, "main").await;
+
+    let options = |inputs: &[&str], allow_extra: bool| {
+        Some(SpendOptions {
+            inputs: inputs.iter().map(|s| s.to_string()).collect(),
+            allow_extra_inputs: allow_extra,
+            ..Default::default()
+        })
+    };
+    let dry = async |c: &mut GygesClient<Channel>,
+                     amount: Option<v1::Amount>,
+                     options: Option<SpendOptions>| {
+        let events = collect_events(
+            c.send_transaction(SendTransactionRequest {
+                dry_run: true,
+                amount,
+                options,
+                ..send_req("main", &bob, 0)
+            })
+            .await,
+        )
+        .await?;
+        Ok::<_, Status>(proposal_of(&events))
+    };
+    let spent = |p: &Proposal| -> Vec<(Pool, u32)> {
+        let mut v: Vec<_> = p.steps[0]
+            .inputs
+            .iter()
+            .map(|i| (i.pool(), i.count))
+            .collect();
+        v.sort_by_key(|(p, _)| *p as i32);
+        v
+    };
+
+    // Unasked, the proposer spends the UTXO first (see
+    // `the_sender_picks_the_input_pools`); naming the note spends the note.
+    let p = dry(&mut c, zats(10_000_000), None).await.unwrap();
+    assert_eq!(spent(&p), [(Pool::Transparent, 1)], "{p:?}");
+    let p = dry(&mut c, zats(10_000_000), options(&[&iw], false))
+        .await
+        .unwrap();
+    assert_eq!(spent(&p), [(Pool::Ironwood, 1)], "{p:?}");
+    // The pool prefix is accepted; the UTXO alone funds a payment it covers.
+    let p = dry(
+        &mut c,
+        zats(10_000_000),
+        options(&[&format!("transparent:{utxo}")], false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(spent(&p), [(Pool::Transparent, 1)], "{p:?}");
+    // More than the UTXO holds: refused when strict, topped up otherwise.
+    let err = dry(&mut c, zats(80_000_000), options(&[&utxo], false))
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InsufficientFunds, "{err:?}");
+    let p = dry(&mut c, zats(80_000_000), options(&[&utxo], true))
+        .await
+        .unwrap();
+    assert_eq!(
+        spent(&p),
+        [(Pool::Transparent, 1), (Pool::Ironwood, 1)],
+        "{p:?}"
+    );
+    // `max` is everything in the chosen inputs.
+    let max = Some(v1::Amount {
+        value: Some(v1::amount::Value::Max(true)),
+    });
+    let p = dry(&mut c, max, options(&[&iw], false)).await.unwrap();
+    assert_eq!(spent(&p), [(Pool::Ironwood, 1)], "{p:?}");
+    assert_eq!(p.total_debit, iw_value, "{p:?}");
+
+    // Refused before anything is reserved.
+    let unknown = format!("{}:0", "ab".repeat(32));
+    for (input, needle) in [
+        (unknown.as_str(), "not an unspent note"),
+        ("nonsense", "is not [pool:]txid:index"),
+        (&format!("sapling:{iw}"), "not an unspent note"),
+    ] {
+        let err = dry(&mut c, zats(10_000_000), options(&[input], false))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            reason(&err),
+            ErrorReason::InvalidArgument,
+            "{input}: {err:?}"
+        );
+        assert!(err.message().contains(needle), "{input}: {err:?}");
+    }
+
+    // Every reservation was released: the balance is whole again and the
+    // proposer picks as it did before.
+    assert_eq!(balance(&mut c, "main").await, before);
+    let p = dry(&mut c, zats(10_000_000), None).await.unwrap();
+    assert_eq!(spent(&p), [(Pool::Transparent, 1)], "{p:?}");
+
+    // A real send from the named note leaves the UTXO unspent.
+    let events = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            options: options(&[&iw], false),
+            ..send_req("main", &bob, 10_000_000)
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        event_names(&events).last(),
+        Some(&"broadcast"),
+        "{events:?}"
+    );
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    let left = notes(&mut c).await;
+    assert!(
+        left.iter()
+            .any(|n| format!("{}:{}", n.txid, n.output_index) == utxo),
+        "{left:?}"
+    );
+    assert!(
+        !left
+            .iter()
+            .any(|n| format!("{}:{}", n.txid, n.output_index) == iw),
+        "{left:?}"
+    );
+    running.task.abort();
+}
+
 /// A daemon with `main` holding 1 ZEC (less the shielding fee) in Ironwood
 /// and `bob` empty, both spendable, `main` still unlocked.
 async fn sender_and_recipient(config: &str) -> (FakeNode, Running, GygesClient<Channel>) {
