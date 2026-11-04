@@ -2897,6 +2897,7 @@ fn balance_of(resp: &GetBalanceResponse, pool: gyges_proto::v1::Pool) -> (i64, i
 async fn current_address(c: &mut GygesClient<Channel>, key_id: &str) -> String {
     c.get_current_address(gyges_proto::v1::GetCurrentAddressRequest {
         key_id: key_id.into(),
+        ..Default::default()
     })
     .await
     .unwrap()
@@ -4354,6 +4355,7 @@ async fn addresses_notes_and_history_through_the_fake_node() {
     let err = c
         .get_current_address(GetCurrentAddressRequest {
             key_id: "main".into(),
+            ..Default::default()
         })
         .await
         .unwrap_err();
@@ -4366,6 +4368,7 @@ async fn addresses_notes_and_history_through_the_fake_node() {
     let first = c
         .get_current_address(GetCurrentAddressRequest {
             key_id: "main".into(),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -4396,6 +4399,37 @@ async fn addresses_notes_and_history_through_the_fake_node() {
     assert!(first.label.is_empty());
     assert_eq!(current_address(&mut c, "main").await, first.address);
 
+    // One pool's receiver as an address of its own (`address current
+    // --pool`): the same diversified address, narrowed.
+    let narrowed = async |c: &mut GygesClient<Channel>, pool: Pool| {
+        c.get_current_address(GetCurrentAddressRequest {
+            key_id: "main".into(),
+            pool: pool as i32,
+        })
+        .await
+    };
+    let zs = narrowed(&mut c, Pool::Sapling).await.unwrap().into_inner();
+    assert_eq!(zs.address, first.receivers[1].encoded);
+    assert_eq!(zs.diversifier_index, first.diversifier_index);
+    let t = narrowed(&mut c, Pool::Transparent)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(t.address, first.receivers[2].encoded);
+    let iw = narrowed(&mut c, Pool::Ironwood).await.unwrap().into_inner();
+    assert!(iw.address.starts_with("uregtest1"), "{iw:?}");
+    assert_ne!(iw.address, first.address);
+    let pools: Vec<Pool> = iw.receivers.iter().map(|r| r.pool()).collect();
+    assert_eq!(pools, [Pool::Orchard], "{iw:?}");
+    let Some(zcash_keys::address::Address::Unified(only)) =
+        zcash_keys::address::Address::decode(&params, &iw.address)
+    else {
+        panic!("not a unified address: {iw:?}");
+    };
+    assert_eq!(only.orchard(), expected.orchard());
+    let same = narrowed(&mut c, Pool::Orchard).await.unwrap().into_inner();
+    assert_eq!(same.address, iw.address, "Orchard names the same receiver");
+
     // NewAddress needs the chain tip, which the first scan records.
     wait_spendable(&mut c, "main").await;
     let labelled = c
@@ -4414,6 +4448,7 @@ async fn addresses_notes_and_history_through_the_fake_node() {
     let now = c
         .get_current_address(GetCurrentAddressRequest {
             key_id: "main".into(),
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -4422,6 +4457,10 @@ async fn addresses_notes_and_history_through_the_fake_node() {
         now, labelled,
         "the newest address is current, label included"
     );
+    // That one is shielded only: no transparent receiver to hand out.
+    let err = narrowed(&mut c, Pool::Transparent).await.unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::UnsupportedPool, "{err:?}");
+    assert!(err.message().contains("--receivers transparent"), "{err:?}");
 
     let with_t = c
         .new_address(NewAddressRequest {
