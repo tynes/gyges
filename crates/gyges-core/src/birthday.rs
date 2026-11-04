@@ -176,6 +176,21 @@ pub async fn resolve(
     })
 }
 
+/// Whether every shielded tree is empty, by consensus, at the end of block
+/// `height`: it is below Sapling activation. The tree state there needs no
+/// endpoint, and some refuse to serve one (testnet.zec.rocks answers
+/// `GetTreeState(279999)`, one below testnet Sapling activation, with
+/// `InvalidArgument`).
+pub fn trees_empty_at(network: Network, height: BlockHeight) -> bool {
+    u32::from(height) < network.sapling_activation_height()
+}
+
+/// The chain state at the end of block `height` (hash `hash`) when
+/// [`trees_empty_at`] holds.
+pub fn empty_chain_state(height: BlockHeight, hash: [u8; 32]) -> ChainState {
+    ChainState::empty(height, BlockHash(hash))
+}
+
 /// A birthday below the node's retention window (docs/architecture.md Sync §9, "New or
 /// restored key"): the tree state at `height - 1` comes from the fallback
 /// endpoint's `GetTreeState`, and its block hash must equal the node's
@@ -183,12 +198,22 @@ pub async fn resolve(
 /// frontier itself cannot be checked against a pruned node here; the root
 /// check at the handoff height covers it, since the root there commits to
 /// every leaf before the birthday too (docs/architecture.md Sync §5.2).
+/// Below Sapling activation the trees are empty and the node's hash is
+/// taken without asking the endpoint ([`trees_empty_at`]).
 pub async fn resolve_from_fallback(
+    network: Network,
     chain: &dyn ChainBackend,
     fallback: &dyn ChainBackend,
     height: u32,
 ) -> Result<ResolvedBirthday, BirthdayError> {
     let prior = BlockHeight::from_u32(height.saturating_sub(1));
+    if trees_empty_at(network, prior) {
+        let hash = chain.block_hash(prior).await?;
+        return Ok(ResolvedBirthday {
+            height,
+            birthday: AccountBirthday::from_parts(empty_chain_state(prior, hash), None),
+        });
+    }
     let state = fallback
         .chain_state(prior)
         .await

@@ -460,7 +460,7 @@ async fn below_retention(
             ),
         ));
     }
-    let resolved = birthday::resolve_from_fallback(chain, fallback.as_ref(), height)
+    let resolved = birthday::resolve_from_fallback(state.network, chain, fallback.as_ref(), height)
         .await
         .map_err(birthday_error)?;
     let overlap = state.config.fallback_lightwalletd.overlap_blocks;

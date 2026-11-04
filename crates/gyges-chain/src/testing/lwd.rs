@@ -83,6 +83,8 @@ struct LwdState {
     omitted: BTreeSet<u32>,
     /// `GetBlockRange` sends this many blocks, then never ends.
     hang_after: Option<usize>,
+    /// `GetTreeState` refuses heights below this one.
+    tree_states_from: Option<u32>,
     /// `SendTransaction` refuses everything with this text.
     reject_broadcasts: Option<String>,
     /// Answer an unknown txid and a refused broadcast as zaino does.
@@ -291,6 +293,13 @@ impl FakeLightwalletd {
         self.lock().hang_after = n;
     }
 
+    /// Refuse `GetTreeState` below `height` as testnet.zec.rocks refuses
+    /// 279999, one below testnet Sapling activation: `InvalidArgument`,
+    /// "z_gettreestate did not return treestate".
+    pub fn refuse_tree_states_below(&self, height: Option<u32>) {
+        self.lock().tree_states_from = height;
+    }
+
     /// The subtree roots `GetSubtreeRoots` serves for `pool`, index order.
     pub fn set_subtree_roots(&self, pool: ShieldedPool, roots: Vec<FakeSubtreeRoot>) {
         self.lock().subtree_roots.insert(pool, roots);
@@ -465,6 +474,11 @@ impl CompactTxStreamer for Service {
             self.0.lock().unwrap_or_else(|e| e.into_inner()).held -= 1;
         }
         let st = self.lock("GetTreeState");
+        if st.tree_states_from.is_some_and(|from| h < from) {
+            return Err(Status::invalid_argument(
+                "z_gettreestate did not return treestate",
+            ));
+        }
         st.tree_states
             .get(&h)
             .cloned()

@@ -28,6 +28,7 @@ use gyges_chain::{
     ArtiTorLwdBackend, BlockDb, ChainBackend, ChainError, FillError, NodeBounds, Source, TorState,
 };
 use gyges_core::KeyEntry;
+use gyges_core::birthday;
 use gyges_core::handoff::{self, Check, Mismatch};
 use gyges_core::network::ConsensusParams;
 use gyges_core::recovery::{self, Placement, Report};
@@ -35,6 +36,7 @@ use gyges_core::sync::{self as core_sync, ScanOutcome, StallReason, SyncError, S
 use gyges_proto::v1;
 use serde::{Deserialize, Serialize};
 use zcash_client_backend::data_api::chain::BlockCache as _;
+use zcash_client_backend::data_api::chain::ChainState;
 use zcash_client_backend::data_api::scanning::{ScanPriority, ScanRange};
 use zcash_protocol::ShieldedPool;
 use zcash_protocol::consensus::BlockHeight;
@@ -546,10 +548,8 @@ impl Scheduler {
         let prior = if scanned_tip >= bounds.retained_from {
             self.chain.chain_state(scanned_tip).await?
         } else {
-            fallback
-                .chain_state(scanned_tip)
-                .await
-                .map_err(SyncError::Fallback)?
+            self.chain_state_below_window(fallback.as_ref(), scanned_tip)
+                .await?
         };
 
         let outcome = match self.scan(key, &range, prior).await {
@@ -961,6 +961,24 @@ impl Scheduler {
     /// at a chain state instead: the node's where it still serves one, else
     /// the endpoint's, which only seeds the checkpoint that everything
     /// above is dropped to.
+    /// The tree state at `height`, below the node's window: the endpoint's,
+    /// or empty trees under the node's block hash below Sapling activation,
+    /// where an endpoint need not serve one ([`birthday::trees_empty_at`]).
+    async fn chain_state_below_window(
+        &self,
+        fallback: &dyn ChainBackend,
+        height: BlockHeight,
+    ) -> Result<ChainState, SyncError> {
+        if birthday::trees_empty_at(self.state.network, height) {
+            let hash = self.chain.block_hash(height).await?;
+            return Ok(birthday::empty_chain_state(height, hash));
+        }
+        fallback
+            .chain_state(height)
+            .await
+            .map_err(SyncError::Fallback)
+    }
+
     async fn truncate_untrusted(
         &self,
         key: &Arc<KeyEntry>,
@@ -980,7 +998,7 @@ impl Scheduler {
         let state = match self.chain.chain_state(to).await {
             Ok(s) => s,
             Err(_) => match &self.state.fallback {
-                Some(f) => f.chain_state(to).await.map_err(SyncError::Fallback)?,
+                Some(f) => self.chain_state_below_window(f.as_ref(), to).await?,
                 None => {
                     return Err(SyncError::Wallet(format!(
                         "no chain state at {} to truncate to",
