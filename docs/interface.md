@@ -634,6 +634,18 @@ daemon locks every other unspent output of the key (or, with
 spends first) under a fresh owner for at most three blocks past the tip,
 and releases the locks once the proposal is made or refused.
 
+**Sends in flight hold their inputs.** Every `SendTransaction` and
+`ShieldFunds` that is not a dry run locks the outputs its proposal spends,
+in the same wallet step as the proposal, until the stream ends: the
+transaction is then stored (its spends keep later proposals off those
+outputs) or the send failed. A second send from the key while the first
+waits for its passphrase, is proving or is broadcasting therefore chooses
+other notes, or is `INSUFFICIENT_FUNDS` when there are none, instead of
+spending the same ones and being refused by the node as a double spend.
+Locked outputs drop out of `GetBalance` meanwhile. The locks expire at the
+transaction's expiry height, and the daemon clears any left by a crash when
+it starts. A broadcast the node refuses is logged at `warn`.
+
 #### 4.2 `SignPczt`
 
 Server-streaming with the same pause semantics as §4.1 but only two event

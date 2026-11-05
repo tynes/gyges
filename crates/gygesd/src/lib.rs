@@ -320,6 +320,24 @@ impl Daemon {
         // migrations, which must not race a running daemon.
         let registry = KeyRegistry::open(home.clone(), network, &config)
             .context("refusing to start: a key directory is unusable")?;
+        // No send is in flight yet: any input lock is one a daemon that died
+        // mid-send left behind (gyges_core::tx::SpendLock).
+        for key in registry.list() {
+            let Some(mut wallet) = key.wallet() else {
+                continue;
+            };
+            match gyges_core::tx::clear_spend_locks(&mut wallet) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    key_id = key.key_id(),
+                    outputs = n,
+                    "released input locks left by an interrupted send"
+                ),
+                Err(e) => {
+                    tracing::warn!(key_id = key.key_id(), error = %e, "cannot clear input locks; they expire on their own")
+                }
+            }
+        }
         let vault = VaultManager::new(&config.vault);
         let chain: Option<Arc<dyn ChainBackend>> = match opts.chain {
             Some(injected) => Some(injected),

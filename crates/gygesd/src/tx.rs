@@ -260,7 +260,9 @@ enum Built {
 
 /// What the proposing step produces: the summary for `Proposed`, and, unless
 /// dry-run, what the rest of the pipeline needs.
-type Proposed = (ProposalSummary, Option<Built>);
+/// Its third part locks the inputs while the send is in flight
+/// ([`core_tx::SpendLock`]); a dry run takes none.
+type Proposed = (ProposalSummary, Option<Built>, Option<core_tx::SpendLock>);
 
 /// `SendTransaction` (docs/interface.md API §4.1).
 /// The address a send pays: `to` parsed for the network, narrowed to one
@@ -403,14 +405,21 @@ pub(crate) async fn send_transaction(
         let expiry = keystone.then(|| crate::roles::long_expiry(proposal.min_target_height()));
         let summary = core_tx::summarize(&params, &proposal, min_confirmations, expiry);
         if dry_run {
-            return Ok((summary, None));
+            return Ok((summary, None, None));
         }
-        if core_tx::is_two_step(&proposal) {
-            return Ok((summary, Some(Built::Tex(Box::new(proposal)))));
-        }
-        let (expected, pczt) =
-            core_tx::build_single_step(wallet, &params, account, &proposal, expiry)?;
-        Ok((summary, Some(Built::Pczt(expected, Box::new(pczt)))))
+        let lock = core_tx::SpendLock::take(wallet, &proposal, summary.expiry_height)?;
+        let built = if core_tx::is_two_step(&proposal) {
+            Built::Tex(Box::new(proposal))
+        } else {
+            match core_tx::build_single_step(wallet, &params, account, &proposal, expiry) {
+                Ok((expected, pczt)) => Built::Pczt(expected, Box::new(pczt)),
+                Err(e) => {
+                    let _ = lock.release(wallet);
+                    return Err(e);
+                }
+            }
+        };
+        Ok((summary, Some(built), Some(lock)))
     };
     Ok(run(
         state,
@@ -480,11 +489,20 @@ pub(crate) async fn shield_funds(
         let expiry = keystone.then(|| crate::roles::long_expiry(proposal.min_target_height()));
         let summary = core_tx::summarize(&params, &proposal, min_confirmations, expiry);
         if dry_run {
-            return Ok((summary, None));
+            return Ok((summary, None, None));
         }
-        let (expected, pczt) =
-            core_tx::build_single_step(wallet, &params, account, &proposal, expiry)?;
-        Ok((summary, Some(Built::Pczt(expected, Box::new(pczt)))))
+        let lock = core_tx::SpendLock::take(wallet, &proposal, summary.expiry_height)?;
+        match core_tx::build_single_step(wallet, &params, account, &proposal, expiry) {
+            Ok((expected, pczt)) => Ok((
+                summary,
+                Some(Built::Pczt(expected, Box::new(pczt))),
+                Some(lock),
+            )),
+            Err(e) => {
+                let _ = lock.release(wallet);
+                Err(e)
+            }
+        }
     };
     Ok(run(
         state,
@@ -613,8 +631,45 @@ async fn pipeline(
     let key = &prepared.key;
     let key_id = key.key_id().to_string();
 
-    // 1–3. Propose (and, unless dry-run, build the PCZT) under the wallet lock.
-    let (summary, rest) = wallet_rpc(key, propose).await?;
+    // 1–3. Propose (and, unless dry-run, build the PCZT and lock its
+    // inputs) under the wallet lock.
+    let (summary, rest, lock) = wallet_rpc(key, propose).await?;
+    let outcome = after_proposal(
+        state,
+        prepared,
+        summary,
+        rest,
+        route,
+        dry_run,
+        wait_for_mined,
+        tx,
+    )
+    .await;
+    // The send is over, stored or not: its inputs are free again. A stored
+    // transaction's spends keep later proposals off them from here on.
+    if let Some(lock) = lock {
+        let n = lock.outputs();
+        if let Err(e) = wallet_rpc(key, move |w| lock.release(w)).await {
+            tracing::warn!(key_id, outputs = n, error = %e.message(), "input locks not released; they expire with the transaction");
+        }
+    }
+    outcome
+}
+
+/// Steps 4 onward of [`pipeline`], after the proposal and its input locks.
+#[allow(clippy::too_many_arguments)]
+async fn after_proposal(
+    state: &Arc<DaemonState>,
+    prepared: &Prepared,
+    summary: ProposalSummary,
+    rest: Option<Built>,
+    route: &Route,
+    dry_run: bool,
+    wait_for_mined: bool,
+    tx: &mpsc::Sender<Result<SendEvent, Status>>,
+) -> Result<(), Status> {
+    let key = &prepared.key;
+    let key_id = key.key_id().to_string();
     let proto = proto_proposal(&summary);
     emit(tx, send_event::Event::Proposed(proto.clone())).await?;
     let (expected, pczt) = match rest {
