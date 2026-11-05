@@ -446,8 +446,12 @@ impl Daemon {
                         tracing::debug!(uid, conn = conn.info().id.0, "connection accepted");
                         Some(Ok(conn))
                     }
-                    Err(reason) => {
+                    Err(reason) if reason.is_notable() => {
                         tracing::warn!(%reason, "connection rejected");
+                        None
+                    }
+                    Err(reason) => {
+                        tracing::debug!(%reason, "connection dropped");
                         None
                     }
                 },

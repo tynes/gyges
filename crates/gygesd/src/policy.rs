@@ -38,6 +38,19 @@ pub(crate) enum PeerRejected {
     Uid(u32),
     #[error("peer credentials unavailable: {0}")]
     Unavailable(std::io::Error),
+    /// The client hung up before its credentials were read (`ENOTCONN` on
+    /// macOS), as the CLI's reachability probe (`uds::probe`) does on every
+    /// command. Nothing was served, so it is not worth a warning.
+    #[error("peer closed the connection before its credentials were read")]
+    Gone,
+}
+
+impl PeerRejected {
+    /// Whether the rejection is worth a warning: a refused uid or
+    /// credentials that could not be read, not a client that left first.
+    pub(crate) fn is_notable(&self) -> bool {
+        !matches!(self, PeerRejected::Gone)
+    }
 }
 
 impl PeerPolicy {
@@ -57,7 +70,10 @@ impl PeerPolicy {
     /// on macOS, via tokio) and decide. Returns the admitted uid, which
     /// [`crate::conn::Conn`] carries into every request.
     pub(crate) fn admit(&self, stream: &UnixStream) -> Result<u32, PeerRejected> {
-        let cred = stream.peer_cred().map_err(PeerRejected::Unavailable)?;
+        let cred = stream.peer_cred().map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotConnected => PeerRejected::Gone,
+            _ => PeerRejected::Unavailable(e),
+        })?;
         let uid = cred.uid();
         if self.allows(uid) {
             Ok(uid)
@@ -198,6 +214,26 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client that connects and hangs up at once, as the CLI's probe
+    /// does, is admitted (Linux reads the credentials of a closed peer) or
+    /// `Gone` (macOS), never a notable rejection.
+    #[tokio::test]
+    async fn a_client_that_hangs_up_first_is_not_a_notable_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        drop(UnixStream::connect(&path).await.unwrap());
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let me = nix::unistd::getuid().as_raw();
+        match PeerPolicy::new(me, []).admit(&stream) {
+            Ok(uid) => assert_eq!(uid, me),
+            Err(e) => assert!(!e.is_notable(), "{e}"),
+        }
+        // A refused uid stays notable.
+        assert!(PeerRejected::Uid(0).is_notable());
+    }
 
     #[test]
     fn peer_policy_allows_own_uid_and_listed_uids_only() {
