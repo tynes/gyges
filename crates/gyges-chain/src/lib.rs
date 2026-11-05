@@ -48,7 +48,7 @@ use zcash_protocol::consensus::{BlockHeight, NetworkType, Parameters};
 
 pub use cache::{BlockDb, CacheError, Source};
 pub use compact::{CompactError, TransparentOutput, TreeSizes};
-pub use fetch::{FillError, fill_cache};
+pub use fetch::{FillError, fill_cache, fill_cache_pipelined};
 pub use lwd::{AddressUtxo, ArtiTorLwdBackend, LwdTimeouts, TorState, Transport};
 pub use rpc::ZakuraRpcBackend;
 

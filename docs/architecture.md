@@ -265,7 +265,7 @@ A single `BlockFetcher` task per daemon:
 3. Fills any sub-`retained_from` range a key needs from the fallback endpoint (`ArtiTorLwdBackend` through `fill_cache`, one `cache.scan_batch` per key per tick, with the next batch downloading in the background while the current one is scanned), tagging rows `source = 'tor-lwd'` (§5).
 4. Evicts a block once every registered key has scanned past it, keeping `cache.retain_blocks` (default 1000) behind the slowest key for cheap rewinds, bounded by `cache.max_mb` (default 2048). With `cache.keep_historical = false` (default) Tor-fetched rows are dropped as soon as the key that requested them has scanned them.
 
-The node is asked for each block once regardless of how many key profiles exist. Keys are stepped concurrently, up to `cache.parallel_scans` (default 4) at a time: each has its own wallet, the cache is read through a pool of read-only connections (WAL), and fills are serialised so that keys at the same heights fetch a range once. Keys with a backfill session are stepped after the others, one at a time.
+The node is asked for each block once regardless of how many key profiles exist. Keys are stepped concurrently, up to `cache.parallel_scans` (default 4) at a time: each has its own wallet, the cache is read through a pool of read-only connections (WAL), and fills are serialised so that keys at the same heights fetch a range once. Keys with a backfill session are stepped after the others, one at a time. Within a key, a batch's blocks and its prior tree state (`z_gettreestate`) are fetched at once, and while the batch is scanned the next one is downloaded into the cache (skipped when another key is filling the cache, so it never delays a current batch), so a node round trip is mostly hidden behind the scan.
 
 ---
 
@@ -469,7 +469,7 @@ The request pattern is identical whether or not the wallet has activity, so memp
 
 On `daemon stop` or `SIGTERM`:
 
-1. Stop the scheduler at the next batch boundary. A batch is at most `cache.scan_batch` blocks, and `scan_cached_blocks` commits per batch, so no partial batch is ever visible. Shutdown sets a stop flag on the `SyncHub`. The scheduler finishes the batch in hand, its fetch from the node and its scan, and then returns. A backfill's background download of the next batch (§5.1) is aborted, not waited for. Shutdown waits up to 30 s for it and cancels it after that; a cancelled batch commits nothing.
+1. Stop the scheduler at the next batch boundary. A batch is at most `cache.scan_batch` blocks, and `scan_cached_blocks` commits per batch, so no partial batch is ever visible. Shutdown sets a stop flag on the `SyncHub`. The scheduler finishes the batch in hand, its fetch from the node and its scan, and then returns; the download of the next batch that runs during a scan (§2.2) is abandoned, and the next start fetches whatever it did not cache. A backfill's background download of the next batch (§5.1) is aborted, not waited for. Shutdown waits up to 30 s for it and cancels it after that; a cancelled batch commits nothing.
 2. Close Tor streams; the Arti cache under `tor_cache/` is kept.
 3. Run `PRAGMA wal_checkpoint(TRUNCATE)` on `blocks.sqlite`. The `wallet.sqlite` files are in WAL mode too (so that read-only handles can read while a scan writes, see below); SQLite checkpoints each one and removes its `-wal` file when the daemon closes its last connection to it.
 4. Zeroize unlocked keys and destroy signing sessions held in memory (persisted sessions in `signing_sessions` survive).

@@ -47,49 +47,127 @@ pub async fn fill_cache(
     range: Range<BlockHeight>,
     batch: u32,
 ) -> Result<u32, FillError> {
+    fill_cache_pipelined(chain, cache, range, batch, 1).await
+}
+
+/// [`fill_cache`] with up to `depth` chunks requested at once. Chunks are
+/// still checked and stored one at a time, in order, so a chunk that does
+/// not link stops the fill with nothing of it (or after it) written; the
+/// requests for later chunks are dropped. A short chunk (the backend's tip
+/// moved) ends the pipeline, and the rest of the range is asked for again
+/// from where it stopped. The node route uses this so that the round trips
+/// of one chunk overlap with the next instead of draining between them.
+pub async fn fill_cache_pipelined(
+    chain: &dyn ChainBackend,
+    cache: &BlockDb,
+    range: Range<BlockHeight>,
+    batch: u32,
+    depth: usize,
+) -> Result<u32, FillError> {
+    use futures_util::StreamExt as _;
+
     let source = chain.source();
     let batch = batch.max(1);
     let mut next = range.start;
     let mut cached = 0u32;
     while next < range.end {
-        let chunk_end = (next + batch).min(range.end);
-        let blocks = chain.compact_blocks(next..chunk_end).await?;
-        let Some(first) = blocks.first() else {
-            return Err(ChainError::BlockUnavailable { height: next }.into());
-        };
-        if next > BlockHeight::from_u32(0)
-            && let Some(prev) = cache.hash_at(next - 1)?
-            && first.prev_hash != prev
-        {
-            return Err(FillError::Unlinked {
-                from: source,
-                height: u32::from(next),
-                expected: display_hash(&prev),
-                got: display_hash(&first.prev_hash),
-            });
+        let mut chunks = Vec::new();
+        let mut at = next;
+        while at < range.end {
+            let end = (at + batch).min(range.end);
+            chunks.push(at..end);
+            at = end;
         }
-        let fetched = blocks.len() as u32;
-        cache.insert_from(source, &blocks)?;
-        tracing::debug!(
-            source = source.as_str(),
-            from = u32::from(next),
-            to = u32::from(next) + fetched - 1,
-            "blocks cached"
-        );
-        cached += fetched;
-        next = next + fetched;
+        let mut answers = futures_util::stream::iter(chunks)
+            .map(|chunk| async move { (chunk.clone(), chain.compact_blocks(chunk).await) })
+            .buffered(depth.max(1));
+        let mut short = false;
+        while let Some((chunk, blocks)) = answers.next().await {
+            let blocks = blocks?;
+            let Some(first) = blocks.first() else {
+                return Err(ChainError::BlockUnavailable { height: next }.into());
+            };
+            if next > BlockHeight::from_u32(0)
+                && let Some(prev) = cache.hash_at(next - 1)?
+                && first.prev_hash != prev
+            {
+                return Err(FillError::Unlinked {
+                    from: source,
+                    height: u32::from(next),
+                    expected: display_hash(&prev),
+                    got: display_hash(&first.prev_hash),
+                });
+            }
+            let fetched = blocks.len() as u32;
+            cache.insert_from(source, &blocks)?;
+            tracing::debug!(
+                source = source.as_str(),
+                from = u32::from(next),
+                to = u32::from(next) + fetched - 1,
+                "blocks cached"
+            );
+            cached += fetched;
+            next = next + fetched;
+            if next < chunk.end {
+                short = true;
+                break;
+            }
+        }
+        if !short {
+            break;
+        }
     }
     Ok(cached)
 }
 
 #[cfg(test)]
 mod tests {
-    use zcash_client_backend::data_api::chain::BlockCache as _;
+    use zcash_client_backend::data_api::chain::{BlockCache as _, BlockSource as _};
     use zcash_client_backend::data_api::scanning::{ScanPriority, ScanRange};
 
     use super::*;
     use crate::ZakuraRpcBackend;
     use crate::testing::{FakeNode, h, regtest_params};
+
+    /// Several chunks in flight cache the same blocks, in order, as one at
+    /// a time, including when the range runs past the tip.
+    #[tokio::test]
+    async fn a_pipelined_fill_caches_the_same_blocks() {
+        let node = FakeNode::start(regtest_params()).await;
+        node.mine(25);
+        let be = ZakuraRpcBackend::new(node.url(), None, regtest_params()).unwrap();
+        let one = BlockDb::in_memory("regtest").unwrap();
+        let many = BlockDb::in_memory("regtest").unwrap();
+        assert_eq!(fill_cache(&be, &one, h(1)..h(21), 3).await.unwrap(), 20);
+        assert_eq!(
+            fill_cache_pipelined(&be, &many, h(1)..h(21), 3, 4)
+                .await
+                .unwrap(),
+            20
+        );
+        let all = |db: &BlockDb| {
+            let mut v = Vec::new();
+            db.with_blocks::<_, ()>(Some(h(1)), None, |b| {
+                v.push((b.height, b.hash));
+                Ok(())
+            })
+            .unwrap();
+            v
+        };
+        assert_eq!(all(&one), all(&many));
+        let err = fill_cache_pipelined(&be, &many, h(21)..h(40), 3, 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FillError::Chain(ChainError::BlockUnavailable { .. })),
+            "{err}"
+        );
+        // The backend refuses a chunk that runs past its tip as a whole, so
+        // both fills stop after the last whole chunk below it.
+        assert!(fill_cache(&be, &one, h(21)..h(40), 3).await.is_err());
+        assert_eq!(all(&one), all(&many));
+        assert_eq!(many.bounds().unwrap().map(|(_, hi)| hi), Some(h(23)));
+    }
 
     #[tokio::test]
     async fn fills_in_chunks_tags_the_node_source_and_stops_at_the_tip() {
