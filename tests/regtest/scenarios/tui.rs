@@ -42,6 +42,20 @@ fn the_dashboard_shows_the_tip_the_wallet_and_a_receipt() {
 
     let s = dump(&fx, "transactions");
     assert!(s.contains("+1.00000000") && s.contains("mined"), "{s}");
+
+    // The current address, the same one `address current` prints, with its
+    // code beside it.
+    let ua = fx
+        .gyges(&["-k", "main", "address", "current"])
+        .ok()
+        .stdout
+        .trim()
+        .to_string();
+    let s = dump(&fx, "addresses");
+    assert!(s.contains("current address (unified)"), "{s}");
+    assert!(s.contains(&ua[..40]), "{s}");
+    assert!(s.contains("receiver transparent"), "{s}");
+    assert!(s.contains('█'), "the QR code is drawn: {s}");
 }
 
 #[test]
