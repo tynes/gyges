@@ -251,6 +251,12 @@ impl Options {
 /// cancelling it.
 const SCHEDULER_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long requests still open when the daemon stops may run on: a send
+/// that is proving or broadcasting. The open-ended streams end at once.
+/// `daemon stop` waits 60 s for the socket to go, which covers this and
+/// [`SCHEDULER_STOP_GRACE`].
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A daemon that has passed every startup check and holds the pid lock, but
 /// is not yet listening.
 #[derive(Debug)]
@@ -489,14 +495,31 @@ impl Daemon {
                 () = shutdown => {}
             }
             tracing::info!("shutting down");
+            state.stopping.send_replace(true);
         };
 
-        let result = Server::builder()
+        // The server stops once every connection is done. The open-ended
+        // streams end on `stopping`; anything still open after the grace
+        // period (a send that is proving) is dropped with the server, so a
+        // client can never hold `daemon stop` up.
+        let stopped = self.state.stopped();
+        let server = Server::builder()
             .layer(PolicyLayer::new(peer, cfg.airgapped))
             .add_service(GygesServer::new(GygesService::new(self.state.clone())))
-            .serve_with_incoming_shutdown(incoming, signal)
-            .await
-            .context("gRPC server failed");
+            .serve_with_incoming_shutdown(incoming, signal);
+        let result = tokio::select! {
+            r = server => r.context("gRPC server failed"),
+            () = async {
+                stopped.await;
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+            } => {
+                tracing::warn!(
+                    secs = SHUTDOWN_GRACE.as_secs(),
+                    "client requests still open after the shutdown grace period; closing them"
+                );
+                Ok(())
+            }
+        };
 
         sweeper.abort();
         // docs/architecture.md Sync §8 step 1: the scheduler finishes the batch in hand (each

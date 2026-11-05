@@ -331,6 +331,51 @@ async fn shutdown(
         .unwrap();
 }
 
+/// `Shutdown` with open-ended streams open (`StreamLogs --follow`,
+/// `WatchEvents`, a send waiting for its passphrase): they end, and the
+/// daemon stops at once rather than
+/// waiting for them forever (F4 of the 2026-11-05 testnet stress run:
+/// `daemon stop` hung with a `daemon logs --follow` open, and nothing after
+/// the server ran, no key zeroize and no WAL checkpoint).
+#[tokio::test]
+async fn shutdown_ends_open_streams() {
+    use gyges_proto::v1::WatchEventsRequest;
+    let (_node, running, mut c) = sender_and_recipient(ONE_CONF_CONFIG).await;
+    let mut logs = c
+        .clone()
+        .stream_logs(StreamLogsRequest {
+            follow: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut events = c
+        .clone()
+        .watch_events(WatchEventsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    // The opening snapshot arrives; the stream then stays open.
+    events.message().await.unwrap().unwrap();
+    // A send waiting for its passphrase is open-ended too.
+    lock(&mut c, "main").await;
+    let mut send = c
+        .clone()
+        .send_transaction(send_req("main", &t_recipient(), 1_000))
+        .await
+        .unwrap()
+        .into_inner();
+    until_signature_required(&mut send).await;
+
+    // Well inside the 10 s grace period: the streams end on `stopping`.
+    shutdown(&mut c, running.task, true, Duration::from_secs(5)).await;
+    // Every stream has ended (cleanly or with the connection).
+    while let Ok(Some(_)) = logs.message().await {}
+    while let Ok(Some(_)) = events.message().await {}
+    while let Ok(Some(_)) = send.message().await {}
+}
+
 /// A regtest P2PKH address of no key here (pubkey hash `0x42…`): the
 /// transparent recipient of the send tests.
 fn t_recipient() -> String {
