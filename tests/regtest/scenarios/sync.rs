@@ -69,7 +69,7 @@ fn a_new_key_syncs_to_the_tip_and_sync_wait_follows_new_blocks() {
     let last = run.json_lines().pop().unwrap();
     assert_eq!(last["done"], true);
     assert_eq!(last["status"]["scanned_tip"], 32);
-    assert_eq!(last["schema_version"], "0.2");
+    assert_eq!(last["schema_version"], gyges_proto::schema_version());
 
     // `key list` shows the scanned tip too.
     let run = fx.gyges(&["key", "list", "--json"]).run();

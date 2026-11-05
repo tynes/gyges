@@ -232,6 +232,7 @@ mod tests {
             "WaitSync",
             "GetSyncStatus",
             "ScanMempool",
+            "WatchEvents",
             "GetCurrentAddress",
             "NewAddress",
             "InspectAddress",

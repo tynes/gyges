@@ -31,6 +31,7 @@ mod backfill;
 mod broadcast;
 mod conn;
 mod errors;
+mod events;
 mod keys;
 mod keystone;
 mod lifecycle;

@@ -24,7 +24,7 @@ fn balance_send_and_shield_through_the_binaries() {
     // Fresh key: zero everywhere, in both renderings.
     let run = fx.gyges(&["-k", "main", "balance", "--json"]).ok();
     let b = run.json();
-    assert_eq!(b["schema_version"], "0.2");
+    assert_eq!(b["schema_version"], gyges_proto::schema_version());
     assert!(b.get("total_spendable").is_none(), "zero is omitted: {b}");
     assert_eq!(b["min_confirmations"], 1);
     fx.gyges(&["-k", "main", "balance"])
@@ -69,7 +69,7 @@ fn balance_send_and_shield_through_the_binaries() {
             .unwrap()
             > 0
     );
-    assert_eq!(lines[0]["schema_version"], "0.2");
+    assert_eq!(lines[0]["schema_version"], gyges_proto::schema_version());
 
     // The confirmation prompt needs a terminal or --yes (exit 4).
     send(&[]).code(4).stderr_has("--yes");
@@ -376,7 +376,7 @@ fn addresses_notes_and_history_through_the_binaries() {
         .run();
     let v = run.json();
     assert_eq!(v["address"], current.as_str());
-    assert_eq!(v["schema_version"], "0.2");
+    assert_eq!(v["schema_version"], gyges_proto::schema_version());
     assert_eq!(v["receivers"][0]["pool"], "POOL_ORCHARD", "{v}");
 
     // `--qr`: the address alone on stdout still, the code on stderr.

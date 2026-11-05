@@ -335,7 +335,8 @@ Flags:
   4. *Done.* The txids (both, for ZIP 320) or the error. A broadcast raises a toast and reloads every wallet.
 - **Agent bar** (the line above the hotkeys; `/` focuses it, `Esc` leaves). A place to type requests to an assistant, with the conversation above it while focused. No assistant exists yet: the only backend (`tui::agent::StubBackend`) answers that none is configured. The rule any backend will live under (Q-C7): an agent can only *fill in the send form*, which then opens for the user to review, dry-run, confirm and sign as if typed by hand; it is given the conversation and the selected key's id, never key material or a passphrase; and since what it is given leaves the TUI, a backend that adds wallet data to its prompt must say so before it is turned on.
 - **Logs** (tab 6, or `L` from anywhere). The daemon log streamed live, as `daemon logs --follow` would print it: time (UTC), level, target, message and fields. The stream (`StreamLogs { lines: 200, follow: true }`, on a connection of its own) runs only while the tab is open; reopening it replays the last 200 entries, so nothing is lost in between. The TUI keeps the newest 1,000 entries, as the daemon does. `v` cycles the minimum level (the daemon's own filter, then error, warn, info, debug, trace), `a` switches between the daemon log and the audit log, and either restarts the stream. `↑` `↓` / `PgUp` `PgDn` / `Home` scroll back and hold the view still while new entries arrive; `End` follows again. A stream that fails (the daemon went away) says so in the title and is reopened when the daemon answers again. Under `--dump` the stream replays without following and the frame is drawn when the replay ends.
-- **Notifications.** Each history reload is compared with the last one for that key. The first load of a key only records what is there, so history is never announced. After it, a new txid with a positive net value raises a toast (`+0.50000000 ZEC received by main (pending)`) and rings the terminal bell; a known txid that becomes mined raises a quieter toast (received, confirmed at height N; or sent, mined at height N). Toasts stack in the top-right corner for 8 s (`Esc` clears them). They stay inside the TUI: there are no desktop notifications, so no amount leaves the terminal. A mempool arrival is seen by the next reload (at most 30 s later).
+- **Notifications.** Each history reload is compared with the last one for that key. The first load of a key only records what is there, so history is never announced. After it, a new txid with a positive net value raises a toast (`+0.50000000 ZEC received by main (pending)`) and rings the terminal bell; a known txid that becomes mined raises a quieter toast (received, confirmed at height N; or sent, mined at height N). Toasts stack in the top-right corner for 8 s (`Esc` clears them). They stay inside the TUI: there are no desktop notifications, so no amount leaves the terminal. With the change feed (below) a receipt is announced as soon as the daemon has seen it; polled only, a mempool arrival is seen by the next reload (at most 30 s later).
+- **Change feed.** Against a daemon of API 0.3 or later the TUI also follows `WatchEvents` (API §4.8) on a connection of its own, and every event (a new tip, a transaction found or mined, a sync or Tor change) runs a poll cycle with a full reload at once, so a receipt toasts as soon as the daemon has seen it. An older daemon answers `UNIMPLEMENTED` and is polled only, as below; the Endpoints tab's *wallet events* row says which.
 - **Refresh.** `GetInfo` and `GetSyncStatus` every `--interval`. Balances, notes (`ListNotes`, all) and history (`ListTransactions`, latest 50) reload only when the tip hash, the set of keys or a key's sync state changes; while only a scan's height moves, at most every 10 s; and every 30 s regardless, so that a mempool arrival is seen. `R` reloads now.
 - **Degrading.** Each pane fails on its own: a refused read shows its error in its pane and the rest still draw. With no daemon the body says so and the TUI reconnects every `--interval` (it never starts one, Q-C5). Air-gapped, the wallet panes say that wallet reads are not served; a `signer-only` key has no wallet pane.
 - **Keys.** `1`–`9` tabs, `Tab` / `Shift-Tab` wallet, `↑` `↓` (or `k` `j`, `PgUp` `PgDn`, `Home` `End`) move in a list, `f` note filter, `s` send, `S` shield, `r` receive (QR), `n` new address, `c` copy the address, `p` address form, `L` logs, `v` / `a` log level / audit log, `/` agent bar, `Esc` close a modal or clear notifications, `R` refresh, `?` help, `q` or Ctrl-C quit.
@@ -442,6 +443,7 @@ Minors so far:
 |---|---|
 | 0.1 | The first contract. |
 | 0.2 | `NodeStatus.rpc_url` and `indexer_url`, `FallbackStatus.broadcast_via_tor`, for `gyges tui`'s Endpoints tab (CLI §2.7). `GetInfo` reports the node URLs as configured (`[zakura_rpc] url`, or `gygesd --zakura-rpc`), and every URL it reports, `FallbackStatus.grpc_url` included, with any `user:password@` removed. Air-gapped, the node URLs are empty and `broadcast_via_tor` is false. |
+| 0.3 | `WatchEvents` (§4.8), the TUI's change feed. |
 
 ---
 
@@ -770,6 +772,33 @@ reading `wallet.sqlite` and holds the key's write lock for the duration.
 `ImportBackup` refuses an existing `key_id` with `KEY_EXISTS` and validates
 `profile.json` before writing anything.
 
+#### 4.8 `WatchEvents`
+
+Server-streaming `WalletEvent`s, for a client that would otherwise poll
+(`gyges tui`, CLI §2.7). Since API 0.3; an older daemon answers
+`UNIMPLEMENTED`, and a client falls back to polling.
+
+- **Scope.** An empty `key_id` watches every key with a wallet; a named key
+  is resolved like `GetSyncStatus` (`KEY_NOT_FOUND`, and a `signer-only`
+  key is refused). Not served air-gapped (`AIRGAPPED`, §8).
+- **Opening.** The stream starts with the current state: a `tip` (when the
+  node is connected), a `tor`, and one `sync` per key. The history found at
+  that point is not announced; only transactions found or mined after the
+  stream opened are.
+- **Events.** `tip` when the node's tip height or hash changes (a reorg
+  included). `sync` when a key's state word changes (state, stall reason,
+  scanned, spendable), not for every scanned batch. `tor` when Tor's state,
+  bootstrap percentage or last error changes. `detected` for a txid of the
+  key's not seen before on this stream, received or sent, with its
+  `net_value` and whether it was already mined. `mined` for one seen
+  unmined that is now mined, with its height.
+- **When.** The daemon compares its state when any key's sync progress
+  changes and once a second otherwise. History (the newest 50 rows per key)
+  is compared when a scheduler tick has completed or the tip moved, which is
+  when a mempool pass or a block can have found something; a mempool
+  arrival is therefore announced after the pass that found it.
+- The stream never ends on its own; a client closes it.
+
 ---
 
 ### 5. JSON output
@@ -994,7 +1023,7 @@ Every command maps to exactly one RPC, or to none when it is purely local, excep
 | `pczt qr-export` | — | Encodes a PCZT file as `ur:zcash-pczt` frames locally |
 | `pczt qr-scan` | `CompleteKeystoneSign` | Camera input; `--session` selects the session |
 | `pczt qr-import` | `CompleteKeystoneSign` | Frames from args, `--from-file`, or stdin; `--session` |
-| `tui` | many | The one exception: a dashboard over the read RPCs (`GetInfo`, `GetSyncStatus`, `GetBalance`, `ListNotes`, `ListTransactions`) on one long-lived connection that never unlocks, plus `GetCurrentAddress` and `NewAddress` on short-lived connections of their own and `StreamLogs` on one while the Logs tab is open; a send or shield is `InspectAddress`, a dry run, then `SendTransaction` / `ShieldFunds` with `UnlockKey { session_id }` or `CompleteKeystoneSign` (and `AbortSigningSession` on cancel) on a connection of its own (CLI §2.7, Q-C7) |
+| `tui` | many | The one exception: a dashboard over the read RPCs (`GetInfo`, `GetSyncStatus`, `GetBalance`, `ListNotes`, `ListTransactions`) on one long-lived connection that never unlocks, plus `GetCurrentAddress` and `NewAddress` on short-lived connections of their own and `StreamLogs` on one while the Logs tab is open; a send or shield is `InspectAddress`, a dry run, then `SendTransaction` / `ShieldFunds` with `UnlockKey { session_id }` or `CompleteKeystoneSign` (and `AbortSigningSession` on cancel) on a connection of its own; `WatchEvents` on another, when the daemon serves it (CLI §2.7, Q-C7) |
 
 The CLI distinguishes `tx abort SESSION_ID` from `tx abort TXID` by argument
 length; both are kept under one verb because that is what the review

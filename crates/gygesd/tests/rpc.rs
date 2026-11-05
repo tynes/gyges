@@ -6547,3 +6547,6 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
     }
     running.task.abort();
 }
+
+#[path = "rpc/events.rs"]
+mod events;

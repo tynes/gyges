@@ -68,6 +68,8 @@ service Gyges {
   rpc RunSync(RunSyncRequest) returns (stream SyncProgress);
   // `gyges sync mempool`.
   rpc ScanMempool(ScanMempoolRequest) returns (ScanMempoolResponse);
+  // `gyges tui`: what changed, as it changes (since API 0.3).
+  rpc WatchEvents(WatchEventsRequest) returns (stream WalletEvent);
 
   // --- Addresses, balance, notes -------------------------------------------
 
@@ -704,6 +706,55 @@ message ScanMempoolRequest {
 message ScanMempoolResponse {
   uint32 transactions_scanned = 1;
   uint32 notes_found = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Events (since API 0.3)
+// ---------------------------------------------------------------------------
+
+message WatchEventsRequest {
+  // Empty means every key with a wallet.
+  string key_id = 1;
+}
+
+// One change. The stream opens with the current state (a `tip`, a `tor` and
+// one `sync` per key); transactions already in the wallet are not
+// announced, only those found or mined after the stream opened. Not served
+// air-gapped.
+message WalletEvent {
+  oneof event {
+    TipAdvanced tip = 1;
+    TransactionDetected detected = 2;
+    TransactionMined mined = 3;
+    // The key's state word changed (not every scanned batch).
+    KeySyncStatus sync = 4;
+    // Tor's state or bootstrap percentage changed.
+    TorStatus tor = 5;
+  }
+}
+
+message TipAdvanced {
+  uint32 height = 1;
+  string hash = 2;
+}
+
+// A transaction of the key's not seen before on this stream: received in
+// the mempool or a block, or sent (by this or another client).
+message TransactionDetected {
+  string key_id = 1;
+  string txid = 2;
+  // As `TransactionSummary.net_value`: positive for received.
+  int64 net_value = 3;
+  // Already mined when first seen.
+  bool mined = 4;
+}
+
+// A transaction seen unmined on this stream is now mined.
+message TransactionMined {
+  string key_id = 1;
+  string txid = 2;
+  int64 net_value = 3;
+  uint32 height = 4;
 }
 
 // ---------------------------------------------------------------------------

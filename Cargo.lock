@@ -2642,6 +2642,7 @@ dependencies = [
  "bip0039",
  "gyges-chain",
  "gyges-core",
+ "gyges-proto",
  "gyges-qr",
  "hex",
  "nix",

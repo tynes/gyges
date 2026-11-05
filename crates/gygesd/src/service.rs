@@ -23,7 +23,7 @@ use gyges_proto::v1::{
     ResumeTexTransferRequest, RunSyncRequest, ScanMempoolRequest, ScanMempoolResponse,
     SendTransactionRequest, ShieldFundsRequest, ShutdownRequest, ShutdownResponse, SignPcztRequest,
     SigningSession, StreamLogsRequest, TexQueueEntry, UnlockKeyRequest, UnlockKeyResponse,
-    WaitSyncRequest,
+    WaitSyncRequest, WatchEventsRequest,
 };
 use gyges_proto::v1::{
     AddressInfo, GetCurrentAddressRequest, GetTransactionStatusRequest,
@@ -416,6 +416,13 @@ impl Gyges for GygesService {
         request: Request<RunSyncRequest>,
     ) -> Result<Response<ProgressStream>, Status> {
         sync::run_sync(self.state.clone(), request.into_inner()).map(Response::new)
+    }
+
+    async fn watch_events(
+        &self,
+        request: Request<WatchEventsRequest>,
+    ) -> Result<Response<crate::events::EventStream>, Status> {
+        crate::events::watch_events(self.state.clone(), request.into_inner()).map(Response::new)
     }
 
     async fn scan_mempool(
