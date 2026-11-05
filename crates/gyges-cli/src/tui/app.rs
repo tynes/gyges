@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use gyges_proto::v1::{
-    AddressInfo, GetBalanceResponse, GetInfoResponse, KeySummary, KeySyncStatus, LogEntry, Note,
-    SigningMode, TransactionSummary,
+    AddressInfo, GetBalanceResponse, GetInfoResponse, InspectAddressResponse, KeySummary,
+    KeySyncStatus, LogEntry, Note, SigningMode, TransactionSummary,
 };
 
 use crate::amount::format_zec;
@@ -19,6 +19,7 @@ use crate::amount::format_zec;
 use super::addresses::{AddrView, AddressBook, Modal};
 use super::logs::{LogRequest, LogStatus, LogView};
 use super::notify::{Notice, Seen};
+use super::send::{Flow, SendReply, SendSpec, SendUpdate, Stage};
 
 /// The longest label `n` accepts.
 const MAX_LABEL: usize = 64;
@@ -61,6 +62,21 @@ pub enum Event {
         generation: u64,
         error: Option<String>,
     },
+    /// Send `id` moved on.
+    Send {
+        id: u64,
+        update: SendUpdate,
+    },
+    /// An `InspectAddress` answer for the send form.
+    Inspected {
+        address: String,
+        result: Result<InspectAddressResponse, String>,
+    },
+    /// The camera's `(resolved, total)` fragments.
+    #[cfg_attr(not(feature = "camera"), allow(dead_code))]
+    ScanProgress((usize, usize)),
+    /// The camera read the device's answer, or gave up.
+    Scanned(Result<Vec<u8>, String>),
 }
 
 /// One key's wallet reads. Each one fails on its own.
@@ -89,6 +105,21 @@ pub enum Action {
     StartLogs(LogRequest),
     /// Close the log stream.
     StopLogs,
+    /// `InspectAddress` for the send form's recipient.
+    Inspect(String),
+    /// The dry run of send `id`, on a connection of its own.
+    DryRun { id: u64, spec: SendSpec },
+    /// The real request of send `id`, on a connection of its own.
+    Execute { id: u64, spec: SendSpec },
+    /// Answer the running send's signature request.
+    Reply(SendReply),
+    /// Read the Keystone's answer with the camera.
+    ScanCamera {
+        answer: &'static str,
+        request: Vec<u8>,
+    },
+    /// Stop a camera scan.
+    StopScan,
 }
 
 /// A short message in the top-right corner that goes away by itself.
@@ -215,6 +246,10 @@ pub struct App {
     pub book: AddressBook,
     /// The Logs tab's stream and buffer.
     pub logs: LogView,
+    /// The send / shield modal.
+    pub send: Option<Stage>,
+    /// The current send's number; answers for an older one are dropped.
+    pub(super) send_id: u64,
     /// The receive overlays (QR, new-address prompt).
     pub modal: Option<Modal>,
     /// `c` pressed before the address was loaded: copy it when it arrives.
@@ -246,6 +281,8 @@ impl App {
             addr_view: AddrView::Unified,
             book: AddressBook::default(),
             logs: LogView::default(),
+            send: None,
+            send_id: 0,
             modal: None,
             copy_pending: None,
             loaded: false,
@@ -260,7 +297,7 @@ impl App {
         std::mem::take(&mut self.actions)
     }
 
-    fn act(&mut self, a: Action) {
+    pub(super) fn act(&mut self, a: Action) {
         self.actions.push(a);
     }
 
@@ -392,6 +429,10 @@ impl App {
             }
             Event::Log { generation, entry } => self.logs.push(generation, *entry),
             Event::LogsEnded { generation, error } => self.logs.ended(generation, error),
+            Event::Send { id, update } => self.on_send_update(id, update),
+            Event::Inspected { address, result } => self.on_inspected(address, result),
+            Event::ScanProgress(p) => self.on_scan_progress(p),
+            Event::Scanned(r) => self.on_scanned(r),
             Event::Address {
                 key_id,
                 view,
@@ -616,9 +657,13 @@ impl App {
     pub fn on_tick(&mut self, now: Instant) {
         self.now = now;
         self.toasts.retain(|t| t.until > now);
+        self.on_send_tick(now);
     }
 
     pub fn on_paste(&mut self, text: &str) {
+        if self.send.is_some() {
+            return self.on_send_paste(text);
+        }
         if let Some(Modal::NewAddress {
             label, busy: false, ..
         }) = &mut self.modal
@@ -646,12 +691,18 @@ impl App {
             }
             return;
         }
+        if self.send.is_some() {
+            self.on_send_key(k);
+            return;
+        }
         if self.modal.is_some() {
             self.on_modal_key(k);
             return;
         }
         match k.code {
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('s') => self.open_send(Flow::Send),
+            KeyCode::Char('S') => self.open_send(Flow::Shield),
             KeyCode::Char('r') if self.can_receive().is_some() => {
                 self.modal = Some(Modal::Qr);
                 self.want_address();
