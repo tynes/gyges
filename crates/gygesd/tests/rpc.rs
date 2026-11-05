@@ -3740,6 +3740,146 @@ async fn the_sender_picks_the_inputs() {
     running.task.abort();
 }
 
+/// A send holds its inputs from the proposal until it ends (F3 of the
+/// 2026-11-05 testnet stress run: two sends at once chose the same notes
+/// and the node refused the second as a double spend, which then sat in
+/// the wallet as pending until it expired). With `main`'s only note held
+/// by a send waiting for its passphrase, a second send has nothing to
+/// spend; once the first is aborted, the note is free again.
+#[tokio::test]
+async fn a_send_waiting_for_its_passphrase_holds_its_notes() {
+    let (_node, running, mut c) = sender_and_recipient(ONE_CONF_CONFIG).await;
+    lock(&mut c, "main").await;
+    let bob = current_address(&mut c, "bob").await;
+    let mut first = c
+        .clone()
+        .send_transaction(send_req("main", &bob, 10_000_000))
+        .await
+        .unwrap()
+        .into_inner();
+    let req = until_signature_required(&mut first).await;
+
+    // Without the hold, the second send would choose the same note and
+    // wait for a passphrase of its own.
+    let err = tokio::time::timeout(
+        Duration::from_secs(20),
+        collect_events(
+            c.clone()
+                .send_transaction(send_req("main", &bob, 10_000_000))
+                .await,
+        ),
+    )
+    .await
+    .expect("the second send chose the held note and is waiting for a passphrase")
+    .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InsufficientFunds, "{err:?}");
+
+    c.abort_signing_session(AbortSigningSessionRequest {
+        session_id: req.session_id,
+    })
+    .await
+    .unwrap();
+    while first.next().await.is_some() {}
+    let dry = SendTransactionRequest {
+        dry_run: true,
+        ..send_req("main", &bob, 10_000_000)
+    };
+    let events = poll_until(
+        "the aborted send releases its note",
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        async || collect_events(c.clone().send_transaction(dry.clone()).await).await,
+    )
+    .await;
+    assert_eq!(event_names(&events), ["proposed"], "{events:?}");
+    running.task.abort();
+}
+
+/// Two sends from one key in flight at once spend different notes, and
+/// both are broadcast.
+#[tokio::test]
+async fn two_sends_in_flight_spend_different_notes() {
+    use gyges_proto::v1::{ListNotesRequest, Note, Pool, SpentFilter};
+    let (node, running, mut c) = sender_and_recipient(ONE_CONF_CONFIG).await;
+    fund_and_shield(&node, &running.state, &mut c, "main", 100_000_000).await;
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    let ironwood = |notes: &[Note]| -> Vec<Note> {
+        notes
+            .iter()
+            .filter(|n| n.pool() == Pool::Ironwood)
+            .cloned()
+            .collect()
+    };
+    let list = async |c: &mut GygesClient<Channel>, spent| {
+        c.list_notes(ListNotesRequest {
+            key_id: "main".into(),
+            spent: spent as i32,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .notes
+    };
+    let before = ironwood(&list(&mut c, SpentFilter::Unspent).await);
+    assert_eq!(before.len(), 2, "{before:?}");
+
+    lock(&mut c, "main").await;
+    let bob = current_address(&mut c, "bob").await;
+    let mut streams = Vec::new();
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let mut s = c
+            .clone()
+            .send_transaction(send_req("main", &bob, 30_000_000))
+            .await
+            .unwrap()
+            .into_inner();
+        sessions.push(until_signature_required(&mut s).await.session_id);
+        streams.push(s);
+    }
+    for session_id in sessions {
+        c.unlock_key(UnlockKeyRequest {
+            key_id: "main".into(),
+            passphrase: "pw".into(),
+            session_id,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let mut txids = Vec::new();
+    for mut s in streams {
+        let mut broadcast = None;
+        while let Some(ev) = s.next().await {
+            if let Some(send_event::Event::Broadcast(b)) = ev.unwrap().event {
+                broadcast = Some(b.txid);
+            }
+        }
+        txids.push(broadcast.expect("both sends are broadcast"));
+    }
+    assert_ne!(txids[0], txids[1]);
+
+    // Each of the two notes is spent, by a different one of the sends.
+    let after = ironwood(&list(&mut c, SpentFilter::All).await);
+    let mut spenders: Vec<String> = before
+        .iter()
+        .map(|b| {
+            let n = after
+                .iter()
+                .find(|n| n.txid == b.txid && n.output_index == b.output_index)
+                .unwrap();
+            assert!(n.spent, "{n:?}");
+            n.spent_txid.clone()
+        })
+        .collect();
+    spenders.sort();
+    txids.sort();
+    assert_eq!(spenders, txids);
+    running.task.abort();
+}
+
 /// A daemon with `main` holding 1 ZEC (less the shielding fee) in Ironwood
 /// and `bob` empty, both spendable, `main` still unlocked.
 async fn sender_and_recipient(config: &str) -> (FakeNode, Running, GygesClient<Channel>) {

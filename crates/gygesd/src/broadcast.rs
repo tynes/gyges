@@ -62,6 +62,13 @@ pub(crate) async fn broadcast(
 ) -> Result<(), GygesError> {
     let key_id = key.key_id();
     if let Err(e) = route.send(chain, raw, key_id).await {
+        tracing::warn!(
+            key_id,
+            via = route.name(),
+            reason = ?e.reason(),
+            node_error = %e.node_error,
+            "broadcast refused; the transaction stays in the wallet as unmined until it expires"
+        );
         if let Some(sid) = session_id {
             let text = if e.node_error.is_empty() {
                 &e.detail

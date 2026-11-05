@@ -378,12 +378,7 @@ impl Reservation {
                 .map(|r| output_ref(r))
                 .collect()
         };
-        let owner = {
-            use rand::Rng as _;
-            let mut bytes = [0u8; 32];
-            rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut bytes);
-            LockOwner::new(bytes)
-        };
+        let owner = fresh_owner();
         if !locked.is_empty() {
             let tip = wallet
                 .chain_height()
@@ -428,6 +423,112 @@ impl Reservation {
         }
         first
     }
+}
+
+/// A lock owner no other flow holds.
+fn fresh_owner() -> LockOwner {
+    use rand::Rng as _;
+    let mut bytes = [0u8; 32];
+    rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut bytes);
+    LockOwner::new(bytes)
+}
+
+/// The outputs a proposal spends, named by the transactions that created
+/// them (upstream's `proposal_input_refs`, which is private). A later
+/// step's spend of an earlier step's output (ZIP 320) is not a wallet
+/// output yet and is left out.
+fn proposal_inputs<FeeRuleT, NoteRef>(proposal: &Proposal<FeeRuleT, NoteRef>) -> Vec<OutputRef> {
+    proposal
+        .steps()
+        .iter()
+        .flat_map(|step| {
+            step.shielded_inputs()
+                .into_iter()
+                .flat_map(|inputs| {
+                    inputs.notes().iter().map(|note| {
+                        OutputRef::new(
+                            *note.txid(),
+                            PoolType::Shielded(note.note().pool()),
+                            u32::from(note.output_index()),
+                        )
+                    })
+                })
+                .chain(step.transparent_inputs().iter().map(|utxo| {
+                    let outpoint = utxo.outpoint();
+                    OutputRef::new(
+                        TxId::from_bytes(*outpoint.hash()),
+                        PoolType::TRANSPARENT,
+                        outpoint.n(),
+                    )
+                }))
+        })
+        .collect()
+}
+
+/// The inputs of a send in flight, locked from the proposal until the
+/// transaction is stored (its spends then keep later proposals off them)
+/// or the send fails. Taken in the same wallet step as the proposal, so
+/// the next proposal for the key, which waits for that step, cannot choose
+/// them: two sends at once pick different notes instead of the node
+/// refusing the second as a double spend. The lock expires at the
+/// transaction's expiry height, after which it could not be mined anyway;
+/// the daemon clears what a crash left behind when it starts
+/// ([`clear_spend_locks`]).
+#[derive(Debug)]
+pub struct SpendLock {
+    owner: LockOwner,
+    outputs: Vec<OutputRef>,
+}
+
+impl SpendLock {
+    pub fn take<FeeRuleT, NoteRef>(
+        wallet: &mut Wallet,
+        proposal: &Proposal<FeeRuleT, NoteRef>,
+        expiry_height: u32,
+    ) -> Result<Self, TxError> {
+        let owner = fresh_owner();
+        let outputs = proposal_inputs(proposal);
+        if !outputs.is_empty() {
+            wallet
+                .lock_outputs(&outputs, owner, BlockHeight::from_u32(expiry_height))
+                .map_err(|e| match e {
+                    LockError::LockFailure(o) => TxError::InvalidArgument(format!(
+                        "output {}:{} is reserved by another spend in progress",
+                        o.txid(),
+                        o.output_index()
+                    )),
+                    other => internal("locking the inputs", other),
+                })?;
+        }
+        Ok(SpendLock { owner, outputs })
+    }
+
+    /// The outputs this lock holds.
+    pub fn outputs(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// Unlock every output, even after one fails (a failed one stays
+    /// locked until it expires), and report the first failure.
+    pub fn release(&self, wallet: &mut Wallet) -> Result<(), TxError> {
+        let mut first = Ok(());
+        for o in &self.outputs {
+            if let Err(e) = wallet.unlock_output(o, self.owner) {
+                first = first.and(Err(internal("releasing the inputs", e)));
+            }
+        }
+        first
+    }
+}
+
+/// Release every output lock of the wallet's account: what a daemon that
+/// died during a send left behind. Only safe while no send is in flight,
+/// i.e. at startup. Returns how many outputs were unlocked.
+pub fn clear_spend_locks(wallet: &mut Wallet) -> Result<usize, TxError> {
+    let account = account_of(wallet)?;
+    wallet
+        .clear_locked_outputs(account)
+        .map_err(|e| internal("clearing output locks", e))
 }
 
 /// Which pools a key may fund a send from, as the upstream policy. A
