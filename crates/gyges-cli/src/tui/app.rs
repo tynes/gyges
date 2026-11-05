@@ -17,6 +17,7 @@ use gyges_proto::v1::{
 use crate::amount::format_zec;
 
 use super::addresses::{AddrView, AddressBook, Modal};
+use super::agent::{AgentPane, AgentReply, AgentRequest, MAX_INPUT, Speaker};
 use super::logs::{LogRequest, LogStatus, LogView};
 use super::notify::{Notice, Seen};
 use super::send::{Flow, SendReply, SendSpec, SendUpdate, Stage};
@@ -77,6 +78,8 @@ pub enum Event {
     ScanProgress((usize, usize)),
     /// The camera read the device's answer, or gave up.
     Scanned(Result<Vec<u8>, String>),
+    /// The agent backend's answer.
+    AgentReply(Result<AgentReply, String>),
 }
 
 /// One key's wallet reads. Each one fails on its own.
@@ -120,6 +123,8 @@ pub enum Action {
     },
     /// Stop a camera scan.
     StopScan,
+    /// Ask the agent backend (tui::agent: it may only draft a send).
+    Ask(AgentRequest),
 }
 
 /// A short message in the top-right corner that goes away by itself.
@@ -250,6 +255,8 @@ pub struct App {
     pub send: Option<Stage>,
     /// The current send's number; answers for an older one are dropped.
     pub(super) send_id: u64,
+    /// The agent bar at the bottom.
+    pub agent: AgentPane,
     /// The receive overlays (QR, new-address prompt).
     pub modal: Option<Modal>,
     /// `c` pressed before the address was loaded: copy it when it arrives.
@@ -283,6 +290,10 @@ impl App {
             logs: LogView::default(),
             send: None,
             send_id: 0,
+            agent: AgentPane {
+                backend_name: "backend not configured".into(),
+                ..AgentPane::default()
+            },
             modal: None,
             copy_pending: None,
             loaded: false,
@@ -433,6 +444,7 @@ impl App {
             Event::Inspected { address, result } => self.on_inspected(address, result),
             Event::ScanProgress(p) => self.on_scan_progress(p),
             Event::Scanned(r) => self.on_scanned(r),
+            Event::AgentReply(r) => self.on_agent_reply(r),
             Event::Address {
                 key_id,
                 view,
@@ -654,6 +666,46 @@ impl App {
         self.clamp_cursors();
     }
 
+    /// Keys while the agent bar has focus.
+    fn on_agent_key(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Esc => self.agent.focused = false,
+            KeyCode::Enter if !self.agent.busy && !self.agent.input.trim().is_empty() => {
+                let text = std::mem::take(&mut self.agent.input).trim().to_string();
+                self.agent.push(Speaker::User, text);
+                self.agent.busy = true;
+                let request = AgentRequest {
+                    history: self.agent.turns.clone(),
+                    key_id: self.selected.clone(),
+                };
+                self.act(Action::Ask(request));
+            }
+            KeyCode::Backspace => {
+                self.agent.input.pop();
+            }
+            KeyCode::Char(c) if self.agent.input.chars().count() < MAX_INPUT => {
+                self.agent.input.push(c)
+            }
+            _ => {}
+        }
+    }
+
+    fn on_agent_reply(&mut self, r: Result<AgentReply, String>) {
+        self.agent.busy = false;
+        match r {
+            Ok(reply) => {
+                self.agent.push(Speaker::Agent, reply.text);
+                if let Some(draft) = reply.draft {
+                    // The only thing an agent can do: fill in the form.
+                    self.open_send_draft(draft);
+                }
+            }
+            Err(e) => self
+                .agent
+                .push(Speaker::Agent, format!("(the backend failed: {e})")),
+        }
+    }
+
     pub fn on_tick(&mut self, now: Instant) {
         self.now = now;
         self.toasts.retain(|t| t.until > now);
@@ -663,6 +715,15 @@ impl App {
     pub fn on_paste(&mut self, text: &str) {
         if self.send.is_some() {
             return self.on_send_paste(text);
+        }
+        if self.agent.focused {
+            for c in text.chars().filter(|c| !c.is_control()) {
+                if self.agent.input.chars().count() >= MAX_INPUT {
+                    break;
+                }
+                self.agent.input.push(c);
+            }
+            return;
         }
         if let Some(Modal::NewAddress {
             label, busy: false, ..
@@ -695,12 +756,17 @@ impl App {
             self.on_send_key(k);
             return;
         }
+        if self.agent.focused {
+            self.on_agent_key(k);
+            return;
+        }
         if self.modal.is_some() {
             self.on_modal_key(k);
             return;
         }
         match k.code {
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('/') => self.agent.focused = true,
             KeyCode::Char('s') => self.open_send(Flow::Send),
             KeyCode::Char('S') => self.open_send(Flow::Shield),
             KeyCode::Char('r') if self.can_receive().is_some() => {

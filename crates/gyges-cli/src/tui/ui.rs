@@ -47,12 +47,15 @@ pub fn key_style() -> Style {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
-    let [header, body, footer] = Layout::vertical([
+    let agent_rows = app.agent.height(f.area().height);
+    let [header, body, agent_bar, footer] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(0),
+        Constraint::Length(agent_rows),
         Constraint::Length(1),
     ])
     .areas(f.area());
+    super::agent::draw(f, agent_bar, &app.agent);
     draw_header(f, header, app);
     match &app.daemon {
         Daemon::Connecting => draw_notice(f, body, "Connecting to gygesd…", dim()),
@@ -618,6 +621,9 @@ pub fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
     if app.send.is_some() {
         return vec![("Enter", "next"), ("Esc", "back / cancel")];
     }
+    if app.agent.focused {
+        return vec![("Enter", "ask"), ("Esc", "leave the agent bar")];
+    }
     match &app.modal {
         Some(Modal::Qr) => return vec![("p", "form"), ("c", "copy"), ("Esc", "close")],
         Some(Modal::NewAddress { .. }) => return vec![("Enter", "derive"), ("Esc", "cancel")],
@@ -641,6 +647,7 @@ pub fn hotkeys(app: &App) -> Vec<(&'static str, &'static str)> {
         ("r", "receive"),
         ("n", "new address"),
         ("c", "copy"),
+        ("/", "agent"),
     ]);
     keys.extend([("R", "refresh"), ("?", "help"), ("q", "quit")]);
     keys
@@ -679,6 +686,7 @@ const HELP: &[(&str, &str)] = &[
     ("c", "copy the current address (OSC 52)"),
     ("p", "Addresses: unified, ironwood, sapling, transparent"),
     ("L", "open the live logs (tab 6)"),
+    ("/", "ask the agent (it can only fill in the send form)"),
     ("v / a", "Logs: minimum level / daemon or audit log"),
     ("Esc", "dismiss notifications"),
     ("R", "poll the daemon now and reload every wallet"),
