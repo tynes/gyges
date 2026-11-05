@@ -135,6 +135,27 @@ pub(crate) async fn with_scan_wallet<T: Send + 'static, E: WalletTaskError>(
     .await
 }
 
+/// [`wallet_rpc`] on one of the key's read-only handles
+/// (`KeyEntry::with_reader`): for RPCs that only read, which then see the
+/// last committed state instead of waiting for a scan batch or a send to
+/// release the wallet. `f` must not write; the handle refuses it.
+pub(crate) async fn read_rpc<T: Send + 'static>(
+    key: &Arc<gyges_core::KeyEntry>,
+    f: impl FnOnce(&mut gyges_core::registry::Wallet) -> Result<T, gyges_core::TxError> + Send + 'static,
+) -> Result<T, tonic::Status> {
+    use errors::ForKey as _;
+    let entry = key.clone();
+    blocking(move || match entry.with_reader(f) {
+        Some(Ok(out)) => out,
+        Some(Err(e)) => Err(gyges_core::TxError::Internal(e.to_string())),
+        None => Err(gyges_core::TxError::wallet_task(
+            "this profile has no wallet".into(),
+        )),
+    })
+    .await
+    .for_key(key.key_id())
+}
+
 /// [`with_wallet`] for an RPC: a failure is the key's typed error.
 pub(crate) async fn wallet_rpc<T: Send + 'static>(
     key: &Arc<gyges_core::KeyEntry>,
