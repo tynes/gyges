@@ -294,11 +294,12 @@ Binary `.pczt` files use the `pczt` crate's postcard serialization; `-` means st
 
 #### 2.7 Terminal UI (`gyges tui`)
 
-##### `gyges tui [--interval <DURATION>] [--dump <COLSxROWS>]`
+##### `gyges tui [--interval <DURATION>] [--tab <NAME>] [--dump <COLSxROWS>]`
 A full-screen dashboard over the same socket and API as the other commands (decisions.md Q-C7). It takes the global `--socket`, `--network` and `--key` like any command; `--json` and `-q` have no effect.
 ```text
 Flags:
       --interval <DURATION>   How often to ask for the tip and sync state [default: 2s]
+      --tab <NAME>            The tab to open on: overview, notes, transactions [default: overview]
       --dump <COLSxROWS>      Draw one frame to stdout after the first full load and exit (no terminal needed)
 ```
 
@@ -318,10 +319,13 @@ Flags:
 
 - **Header.** The daemon's network, version and API version; the node's tip height and hash, or why it is not connected; Tor (`off`, `bootstrapping N%`, `on`, `failed`); and the archival fallback (`off`, or `untested` / `verified` / `untrusted`, `via Tor` or `direct`). A daemon whose API minor is newer than the TUI's says so here, instead of the CLI's stderr warning.
 - **Wallets.** Every key from `GetInfo`, the default marked `★`: its signing mode, lock state (`locked`, `UNLOCKED`, `Keystone`, `view only`) and sync state word (CLI §2.3) with the percentage scanned from the birthday to the tip. `Tab` / `Shift-Tab` move the selection.
-- **Overview.** The selected key's `GetBalance` table, the confirmation depth and height it is as of, the `not_spendable_reason` when the key cannot send yet, the key's pools and birthday, its sync line (scanned of tip, blocks left, blocks per second, notes awaiting witnesses, stall detail), and the count of unspent notes and transactions.
+- **Overview.** The selected key's `GetBalance` table, the confirmation depth and height it is as of, the `not_spendable_reason` when the key cannot send yet, the key's pools and birthday, its sync line (scanned of tip, blocks left, blocks per second, notes awaiting witnesses, stall detail), and the count of unspent notes and transactions, and the three newest transactions.
+- **Notes** (tab 2). The selected key's `ListNotes` rows, oldest first: pool (and `ephemeral` for ZIP 320 outputs), value, height, state (`unspent`, `unmined`, `no witness`, `spent`), outpoint and memo preview. `f` cycles unspent, spent and all; the title gives the count and total of what is listed.
+- **Transactions** (tab 3). The latest 50 `ListTransactions` rows: when, status, net value (received in green with `+`), fee, height and txid; under them the selected row's full txid, expiry while unmined, non-change outputs with their memos, ZIP 320 state and signing session.
+- **Notifications.** Each history reload is compared with the last one for that key. The first load of a key only records what is there, so history is never announced. After it, a new txid with a positive net value raises a toast (`+0.50000000 ZEC received by main (pending)`) and rings the terminal bell; a known txid that becomes mined raises a quieter toast (received, confirmed at height N; or sent, mined at height N). Toasts stack in the top-right corner for 8 s (`Esc` clears them). They stay inside the TUI: there are no desktop notifications, so no amount leaves the terminal. A mempool arrival is seen by the next reload (at most 30 s later).
 - **Refresh.** `GetInfo` and `GetSyncStatus` every `--interval`. Balances, notes (`ListNotes`, all) and history (`ListTransactions`, latest 50) reload only when the tip hash, the set of keys or a key's sync state changes; while only a scan's height moves, at most every 10 s; and every 30 s regardless, so that a mempool arrival is seen. `R` reloads now.
 - **Degrading.** Each pane fails on its own: a refused read shows its error in its pane and the rest still draw. With no daemon the body says so and the TUI reconnects every `--interval` (it never starts one, Q-C5). Air-gapped, the wallet panes say that wallet reads are not served; a `signer-only` key has no wallet pane.
-- **Keys.** `1`–`9` tabs, `Tab` / `Shift-Tab` wallet, `R` refresh, `?` help, `q` or Ctrl-C quit.
+- **Keys.** `1`–`9` tabs, `Tab` / `Shift-Tab` wallet, `↑` `↓` (or `k` `j`, `PgUp` `PgDn`, `Home` `End`) move in a list, `f` note filter, `Esc` clear notifications, `R` refresh, `?` help, `q` or Ctrl-C quit.
 - **Terminal.** Raw mode and the alternate screen, restored on exit and by a panic hook. Without a terminal on stdin and stdout the command is exit 6 and points at `--dump`.
 - **`--dump`** waits up to 30 s for the first poll (or for the daemon to be found down), prints the frame as plain text and exits 0. The regtest scenarios drive the TUI this way.
 

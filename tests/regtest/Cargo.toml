@@ -36,6 +36,10 @@ path = "scenarios/pczt.rs"
 name = "keystone"
 path = "scenarios/keystone.rs"
 
+[[test]]
+name = "tui"
+path = "scenarios/tui.rs"
+
 # Against the pinned real zakurad (docs/testing.md §3 rows 1–4); skips itself
 # where no node binary is available.
 [[test]]
