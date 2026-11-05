@@ -792,9 +792,9 @@ Server-streaming `WalletEvent`s, for a client that would otherwise poll
   key's not seen before on this stream, received or sent, with its
   `net_value` and whether it was already mined. `mined` for one seen
   unmined that is now mined, with its height.
-- **When.** The daemon compares its state when any key's sync progress
-  changes and once a second otherwise. History (the newest 50 rows per key)
-  is compared when a scheduler tick has completed or the tip moved, which is
+- **When.** The daemon compares its state when a scheduler tick completes
+  and once a second otherwise. History (the newest 50 rows per key) is
+  compared when a tick has completed or the tip moved, which is
   when a mempool pass or a block can have found something; a mempool
   arrival is therefore announced after the pass that found it.
 - The stream never ends on its own; a client closes it.

@@ -182,10 +182,9 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App) {
     // The address column's share: the table splits what the first column
     // leaves in two, less the column gaps.
     let col = (area.width.saturating_sub(2 + 19 + 2) / 2) as usize;
-    let mut all = rows(info, &app.socket);
-    all.push(events_row(&app.events));
-    let rows: Vec<Row> = all
+    let rows: Vec<Row> = rows(info, &app.socket)
         .into_iter()
+        .chain([events_row(&app.events)])
         .map(|[a, mut b, c]| {
             let text: String = b.spans.iter().map(|s| s.content.as_ref()).collect();
             if text.chars().count() > col {
