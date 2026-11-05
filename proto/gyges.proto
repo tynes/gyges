@@ -310,6 +310,12 @@ message NodeStatus {
   // Last error from the node, empty when healthy.
   string last_error = 8;
   string node_version = 9;
+  // `[zakura_rpc] url` (or `--zakura-rpc`) as configured, with any userinfo
+  // removed; empty when air-gapped. Since API 0.2.
+  string rpc_url = 10;
+  // `[zakura_rpc] indexer_url` with any userinfo removed; empty when unset or
+  // air-gapped. Since API 0.2.
+  string indexer_url = 11;
 }
 
 enum TorState {
@@ -337,9 +343,13 @@ enum FallbackTrust {
 
 message FallbackStatus {
   bool enabled = 1;
+  // With any userinfo removed (since API 0.2).
   string grpc_url = 2;
   bool use_tor = 3;
   FallbackTrust trust = 4;
+  // `[fallback_lightwalletd] broadcast_via_tor`: every broadcast goes through
+  // this endpoint over Tor, never the node. Since API 0.2.
+  bool broadcast_via_tor = 5;
 }
 
 message ShutdownRequest {

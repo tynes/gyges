@@ -132,9 +132,10 @@ impl DaemonState {
             tor: Some(crate::backfill::tor_status(self)),
             fallback: Some(FallbackStatus {
                 enabled: fb.enabled && !self.config.airgapped,
-                grpc_url: fb.grpc_url.clone(),
+                grpc_url: without_userinfo(&fb.grpc_url),
                 use_tor: fb.use_tor,
                 trust: crate::backfill::proto_trust(self) as i32,
+                broadcast_via_tor: fb.broadcast_via_tor && !self.config.airgapped,
             }),
             keys: keys::summaries(self),
             default_key: self.registry.default_key(),
@@ -214,7 +215,24 @@ impl DaemonState {
             },
             // No RPC in the set Gyges uses reports the node's version yet.
             node_version: String::new(),
+            rpc_url: without_userinfo(&self.config.zakura_rpc.url),
+            indexer_url: without_userinfo(&self.config.zakura_rpc.indexer_url),
         }
+    }
+}
+
+/// `url` with any `user:password@` removed from its authority, so `GetInfo`
+/// never repeats a credential written into a URL (the cookie is the usual
+/// way; this covers a URL with Basic credentials typed in by hand).
+pub(crate) fn without_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    match authority.rfind('@') {
+        Some(at) => format!("{scheme}://{}{tail}", &authority[at + 1..]),
+        None => url.to_string(),
     }
 }
 
@@ -565,6 +583,29 @@ mod tests {
     use gyges_core::{Home, perms};
 
     #[test]
+    fn userinfo_is_removed_from_reported_urls() {
+        assert_eq!(
+            without_userinfo("http://rpc:hunter2@127.0.0.1:8232/x?y#z"),
+            "http://127.0.0.1:8232/x?y#z"
+        );
+        assert_eq!(
+            without_userinfo("https://a@b@zec.rocks:443"),
+            "https://zec.rocks:443"
+        );
+        assert_eq!(
+            without_userinfo("http://127.0.0.1:8232"),
+            "http://127.0.0.1:8232"
+        );
+        assert_eq!(
+            without_userinfo("https://host/path@x"),
+            "https://host/path@x",
+            "an @ after the authority is not userinfo"
+        );
+        assert_eq!(without_userinfo(""), "");
+        assert_eq!(without_userinfo("not a url"), "not a url");
+    }
+
+    #[test]
     fn info_reports_version_network_and_config() {
         let dir = tempfile::tempdir().unwrap();
         perms::set_mode(dir.path(), 0o700).unwrap();
@@ -600,6 +641,10 @@ mod tests {
             node.last_error.contains("air-gapped"),
             "{}",
             node.last_error
+        );
+        assert!(
+            node.rpc_url.is_empty() && node.indexer_url.is_empty(),
+            "no node URL while air-gapped"
         );
         assert_eq!(info.tor.unwrap().state, v1::TorState::Disabled as i32);
         assert!(info.started_at > 0);

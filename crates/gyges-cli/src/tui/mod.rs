@@ -16,6 +16,7 @@
 
 mod addresses;
 mod app;
+mod endpoints;
 mod lists;
 mod notify;
 mod poll;
@@ -92,6 +93,7 @@ pub async fn run(ctx: &Ctx, args: TuiArgs) -> Result<(), CliError> {
     let poll_task = tokio::spawn(poller.run());
     let mut app = App::new(args.interval);
     app.tab = args.tab;
+    app.socket = ctx.socket.display().to_string();
     let mut effects = Effects {
         ctx: ctx.clone(),
         tx,
