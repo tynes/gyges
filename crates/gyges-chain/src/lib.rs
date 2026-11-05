@@ -191,7 +191,7 @@ pub const fn pool_name(pool: ShieldedPool) -> &'static str {
 }
 
 /// Why the node could not answer.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ChainError {
     /// The node is not reachable (connection refused, timeout, auth failure).
     #[error("node unreachable: {0}")]

@@ -85,6 +85,8 @@ struct LwdState {
     hang_after: Option<usize>,
     /// `GetTreeState` refuses heights below this one.
     tree_states_from: Option<u32>,
+    /// `GetTreeState` answers UNAVAILABLE with this text (a dead backend).
+    fail_tree_states: Option<String>,
     /// `SendTransaction` refuses everything with this text.
     reject_broadcasts: Option<String>,
     /// Answer an unknown txid and a refused broadcast as zaino does.
@@ -100,6 +102,12 @@ struct LwdState {
     held: u32,
     /// Bumped by [`FakeLightwalletd::release_tree_states`].
     gate: tokio::sync::watch::Sender<u64>,
+    /// `GetLightdInfo` waits until [`FakeLightwalletd::release_lightd_info`].
+    hold_lightd_info: bool,
+    /// `GetLightdInfo` requests waiting at their gate.
+    held_lightd_info: u32,
+    /// Bumped by [`FakeLightwalletd::release_lightd_info`].
+    info_gate: tokio::sync::watch::Sender<u64>,
 }
 
 /// The running fake. Dropping it stops the server.
@@ -300,6 +308,13 @@ impl FakeLightwalletd {
         self.lock().tree_states_from = height;
     }
 
+    /// Answer every `GetTreeState` (held ones too, once released) with
+    /// UNAVAILABLE and `message`, which the client reads as a dead
+    /// connection (`None` restores normal service).
+    pub fn fail_tree_states(&self, message: Option<String>) {
+        self.lock().fail_tree_states = message;
+    }
+
     /// The subtree roots `GetSubtreeRoots` serves for `pool`, index order.
     pub fn set_subtree_roots(&self, pool: ShieldedPool, roots: Vec<FakeSubtreeRoot>) {
         self.lock().subtree_roots.insert(pool, roots);
@@ -354,6 +369,24 @@ impl FakeLightwalletd {
     pub fn held_tree_states(&self) -> u32 {
         self.lock().held
     }
+
+    /// Make `GetLightdInfo` wait until [`Self::release_lightd_info`]: a
+    /// connection attempt that stays in progress, deterministically.
+    pub fn hold_lightd_info(&self) {
+        self.lock().hold_lightd_info = true;
+    }
+
+    /// Answer the held `GetLightdInfo` requests and hold no more.
+    pub fn release_lightd_info(&self) {
+        let mut st = self.lock();
+        st.hold_lightd_info = false;
+        st.info_gate.send_modify(|g| *g += 1);
+    }
+
+    /// How many `GetLightdInfo` requests are waiting at the gate.
+    pub fn held_lightd_info(&self) -> u32 {
+        self.lock().held_lightd_info
+    }
 }
 
 /// `items` keyed by the height `height` reads off each.
@@ -388,7 +421,23 @@ impl CompactTxStreamer for Service {
     type GetSubtreeRootsStream = BoxStream<SubtreeRoot>;
 
     async fn get_lightd_info(&self, _: Request<Empty>) -> Result<Response<LightdInfo>, Status> {
-        let st = self.lock("GetLightdInfo");
+        // The gate of `hold_lightd_info`, as for `GetTreeState` below. The
+        // call is recorded on arrival, so a test sees an attempt in progress.
+        let waiter = {
+            let mut st = self.lock("GetLightdInfo");
+            st.hold_lightd_info.then(|| {
+                st.held_lightd_info += 1;
+                st.info_gate.subscribe()
+            })
+        };
+        if let Some(mut rx) = waiter {
+            let _ = rx.changed().await;
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .held_lightd_info -= 1;
+        }
+        let st = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let tip = st.blocks.keys().next_back().copied().unwrap_or(0);
         Ok(Response::new(LightdInfo {
             version: "fake".into(),
@@ -474,6 +523,9 @@ impl CompactTxStreamer for Service {
             self.0.lock().unwrap_or_else(|e| e.into_inner()).held -= 1;
         }
         let st = self.lock("GetTreeState");
+        if let Some(message) = &st.fail_tree_states {
+            return Err(Status::unavailable(message.clone()));
+        }
         if st.tree_states_from.is_some_and(|from| h < from) {
             return Err(Status::invalid_argument(
                 "z_gettreestate did not return treestate",

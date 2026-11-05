@@ -22,17 +22,23 @@
 //! rather than waited on forever.
 //!
 //! Nothing is contacted at construction. The connection (and the Tor
-//! client) is made on first use and dropped on any transport failure, so the
-//! next call reconnects.
+//! client) belongs to a connection task, spawned on first use, which
+//! bootstraps Tor, connects, checks `GetLightdInfo` and publishes the
+//! outcome on a `watch` channel ([`ConnState`]). Requests wait there for a
+//! connection and then run concurrently on clones of its channel; no lock is
+//! held across a bootstrap or a connect. A request that fails as a
+//! transport failure reports its connection dead, and the task reconnects
+//! once however many requests report it.
 
 use std::error::Error as _;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
+use tokio::sync::watch;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint, Uri};
 use tonic::{Code, Status};
 use zcash_client_backend::data_api::chain::ChainState;
@@ -120,14 +126,67 @@ pub struct ArtiTorLwdBackend<P> {
     params: P,
     timeouts: LwdTimeouts,
     status: StatusCell,
-    tor_state: RwLock<TorState>,
-    conn: tokio::sync::Mutex<Connection>,
+    tor_state: Arc<RwLock<TorState>>,
+    /// The connection task, spawned by the first request.
+    conn: OnceLock<ConnHandle>,
 }
 
-#[derive(Default)]
-struct Connection {
-    tor: Option<tor::Client>,
-    client: Option<CompactTxStreamerClient<Channel>>,
+type Client = CompactTxStreamerClient<Channel>;
+
+/// The connection task's state, as it publishes it.
+#[derive(Clone, Debug)]
+enum ConnState {
+    /// Nothing has asked for a connection yet.
+    Idle,
+    /// Bootstrapping Tor (when needed), connecting and checking
+    /// `GetLightdInfo`.
+    Connecting,
+    /// Connected and checked. The client is a cheap handle on one HTTP/2
+    /// channel, which every request clones.
+    Ready(Client),
+    /// The last attempt failed. The next request makes a new one.
+    Failed(ChainError),
+}
+
+/// [`ConnState`] with a generation, bumped on every change, so that a
+/// request can name the connection it used or the attempt it waits for.
+#[derive(Clone, Debug)]
+struct Published {
+    generation: u64,
+    state: ConnState,
+}
+
+/// The requests' side of the connection task.
+struct ConnHandle {
+    state: watch::Receiver<Published>,
+    /// The highest generation a request found unusable: `Idle`, `Failed`,
+    /// or `Ready` with a dead channel. The task acts on it only while that
+    /// generation is current, so any number of reports of the same
+    /// connection make one attempt. A `watch` keeps only the latest value:
+    /// it is a bounded, coalescing queue that never blocks a request.
+    redo: watch::Sender<u64>,
+}
+
+impl ConnHandle {
+    /// Ask for a new attempt because `generation` is unusable.
+    fn redo(&self, generation: u64) {
+        self.redo.send_if_modified(|r| {
+            let newer = generation > *r;
+            if newer {
+                *r = generation;
+            }
+            newer
+        });
+    }
+}
+
+/// What the connection task needs to know about the endpoint.
+struct Target<P> {
+    endpoint: Uri,
+    transport: Transport,
+    params: P,
+    timeouts: LwdTimeouts,
+    tor_state: Arc<RwLock<TorState>>,
 }
 
 impl<P> fmt::Debug for ArtiTorLwdBackend<P> {
@@ -172,8 +231,8 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
             params,
             timeouts: LwdTimeouts::default(),
             status: StatusCell::default(),
-            tor_state: RwLock::new(tor_state),
-            conn: tokio::sync::Mutex::new(Connection::default()),
+            tor_state: Arc::new(RwLock::new(tor_state)),
+            conn: OnceLock::new(),
         })
     }
 
@@ -194,9 +253,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
     /// Whether the endpoint host is a Tor onion service (`.onion`), which
     /// needs no exit node and no TLS to be private (Q-D5).
     pub fn is_onion(&self) -> bool {
-        self.endpoint
-            .host()
-            .is_some_and(|h| h.to_ascii_lowercase().ends_with(".onion"))
+        is_onion(&self.endpoint)
     }
 
     pub fn tor_state(&self) -> TorState {
@@ -206,30 +263,118 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
             .clone()
     }
 
-    fn set_tor_state(&self, state: TorState) {
-        *self.tor_state.write().unwrap_or_else(|e| e.into_inner()) = state;
+    /// The connection task, spawned on first use (construction happens
+    /// outside any runtime, and must contact nothing).
+    fn conn(&self) -> &ConnHandle {
+        self.conn.get_or_init(|| {
+            let (state_tx, state) = watch::channel(Published {
+                generation: 1,
+                state: ConnState::Idle,
+            });
+            let (redo, redo_rx) = watch::channel(0);
+            let target = Target {
+                endpoint: self.endpoint.clone(),
+                transport: self.transport.clone(),
+                params: self.params.clone(),
+                timeouts: self.timeouts,
+                tor_state: self.tor_state.clone(),
+            };
+            tokio::spawn(target.run(state_tx, redo_rx));
+            ConnHandle { state, redo }
+        })
     }
 
-    /// The connected client, connecting (and bootstrapping Tor) on first
-    /// use. `GetLightdInfo` is checked once per connection so that an
-    /// endpoint for another chain is refused before any block is taken
-    /// from it.
-    async fn client(&self) -> Result<CompactTxStreamerClient<Channel>, ChainError> {
-        let mut conn = self.conn.lock().await;
-        if let Some(client) = &conn.client {
-            return Ok(client.clone());
+    /// A connected client and its generation, waiting for the connection
+    /// task: at once when it is connected, else for the outcome of the
+    /// attempt in progress, or of a new one when there is none (nothing
+    /// asked yet, or the last attempt failed, as every request without a
+    /// connection used to try again). Requests that wait on one attempt
+    /// share its outcome, failure included. The attempt is bounded by
+    /// [`LwdTimeouts`] in the task (the Tor bootstrap only by arti), so no
+    /// deadline is added here.
+    async fn client(&self) -> Result<(u64, Client), ChainError> {
+        let conn = self.conn();
+        let mut rx = conn.state.clone();
+        let seen = rx.borrow_and_update().clone();
+        match seen.state {
+            // A connection already reported dead is not handed out again,
+            // even before the task has seen the report: wait for its
+            // replacement, as the old code's cleared client made the next
+            // call reconnect.
+            ConnState::Ready(_) if seen.generation <= *conn.redo.borrow() => {}
+            ConnState::Ready(client) => return Ok((seen.generation, client)),
+            ConnState::Connecting => {}
+            ConnState::Idle | ConnState::Failed(_) => conn.redo(seen.generation),
         }
+        let outcome = rx
+            .wait_for(|p| {
+                p.generation > seen.generation
+                    && matches!(p.state, ConnState::Ready(_) | ConnState::Failed(_))
+            })
+            .await
+            .map_err(|_| {
+                ChainError::Unreachable(format!("{}: the connection task stopped", self.endpoint))
+            })?
+            .clone();
+        match outcome.state {
+            ConnState::Ready(client) => Ok((outcome.generation, client)),
+            ConnState::Failed(e) => Err(e),
+            ConnState::Idle | ConnState::Connecting => unreachable!("waited for an outcome"),
+        }
+    }
+}
+
+impl<P: Parameters + Send + Sync + 'static> Target<P> {
+    /// The connection task. It waits for a request naming the current
+    /// generation, makes one attempt and publishes its outcome, and stops
+    /// when the backend is dropped, mid-attempt included. The Tor client
+    /// lives here and survives reconnects; only a failed bootstrap leaves
+    /// none, so the next attempt bootstraps again.
+    async fn run(self, state: watch::Sender<Published>, mut redo: watch::Receiver<u64>) {
+        let mut tor: Option<tor::Client> = None;
+        let mut generation = state.borrow().generation;
+        loop {
+            if redo.wait_for(|&r| r >= generation).await.is_err() {
+                return;
+            }
+            if matches!(state.borrow().state, ConnState::Ready(_)) {
+                tracing::debug!(endpoint = %self.endpoint, "fallback endpoint connection lost; reconnecting");
+            }
+            generation += 1;
+            state.send_replace(Published {
+                generation,
+                state: ConnState::Connecting,
+            });
+            let outcome = tokio::select! {
+                outcome = self.connect(&mut tor) => outcome,
+                () = state.closed() => return,
+            };
+            generation += 1;
+            state.send_replace(Published {
+                generation,
+                state: match outcome {
+                    Ok(client) => ConnState::Ready(client),
+                    Err(e) => ConnState::Failed(e),
+                },
+            });
+        }
+    }
+
+    /// Connect (bootstrapping Tor first when needed) and check
+    /// `GetLightdInfo`, once per connection, so that an endpoint for
+    /// another chain is refused before any block is taken from it.
+    async fn connect(&self, tor: &mut Option<tor::Client>) -> Result<Client, ChainError> {
         let channel = match &self.transport {
             Transport::Direct => self.connect_direct().await?,
             Transport::Tor { tor_dir } => {
-                if conn.tor.is_none() {
-                    conn.tor = Some(self.bootstrap_tor(tor_dir).await?);
+                if tor.is_none() {
+                    *tor = Some(self.bootstrap_tor(tor_dir).await?);
                 }
-                let tor = conn.tor.as_ref().expect("set above");
+                let tor = tor.as_ref().expect("set above");
                 // A failed circuit is the common case; a client that lost its
                 // directory is re-bootstrapped by the next attempt
                 // (`ensure_bootstrapped`), so keep it.
-                tor.connect_lightwalletd_channel(self.endpoint.clone(), self.is_onion())
+                tor.connect_lightwalletd_channel(self.endpoint.clone(), is_onion(&self.endpoint))
                     .await
                     .map_err(|e| {
                         ChainError::Unreachable(format!("{} over Tor: {e}", self.endpoint))
@@ -238,8 +383,11 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         };
         let mut client = CompactTxStreamerClient::new(channel);
         self.check_endpoint(&mut client).await?;
-        conn.client = Some(client.clone());
         Ok(client)
+    }
+
+    fn set_tor_state(&self, state: TorState) {
+        *self.tor_state.write().unwrap_or_else(|e| e.into_inner()) = state;
     }
 
     async fn connect_direct(&self) -> Result<Channel, ChainError> {
@@ -297,14 +445,11 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
     /// `GetLightdInfo`: refuse an endpoint for another chain. lightwalletd
     /// reports `"main"` or `"test"`, and zaino 0.10.2 reports `"test"` on
     /// regtest too (docs/decisions.md §2.5); `"regtest"` is accepted as well.
-    async fn check_endpoint(
-        &self,
-        client: &mut CompactTxStreamerClient<Channel>,
-    ) -> Result<(), ChainError> {
+    async fn check_endpoint(&self, client: &mut Client) -> Result<(), ChainError> {
         let info = client
             .get_lightd_info(Empty {})
             .await
-            .map_err(|s| self.status_error("GetLightdInfo", s))?
+            .map_err(|s| status_error(&self.endpoint, "GetLightdInfo", s))?
             .into_inner();
         check_chain_name(
             &self.params,
@@ -320,36 +465,12 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         );
         Ok(())
     }
+}
 
-    /// Map a gRPC status onto [`ChainError`]; transport-level failures drop
-    /// the connection so the next call reconnects.
+impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
+    /// [`status_error`] at this endpoint.
     fn status_error(&self, method: &str, status: Status) -> ChainError {
-        match status.code() {
-            Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::Aborted => {
-                ChainError::Unreachable(format!(
-                    "{method} at {}: {} ({:?})",
-                    self.endpoint,
-                    status.message(),
-                    status.code()
-                ))
-            }
-            Code::Unknown if status.source().is_some() => {
-                // tonic reports a dead connection as Unknown with the
-                // transport error as its source.
-                ChainError::Unreachable(format!(
-                    "{method} at {}: {}",
-                    self.endpoint,
-                    status
-                        .source()
-                        .map_or_else(|| status.message().to_string(), ToString::to_string)
-                ))
-            }
-            code => ChainError::Rpc(format!(
-                "{method} at {}: {} ({code:?})",
-                self.endpoint,
-                status.message()
-            )),
-        }
+        status_error(&self.endpoint, method, status)
     }
 
     /// [`ArtiTorLwdBackend::status_error`], except that NotFound,
@@ -366,7 +487,7 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
 
     /// The next item of a streaming response, `None` at its end. A stream
     /// silent for [`LwdTimeouts::stream_idle`] is [`ChainError::Unreachable`]
-    /// with `stalled()`'s text, which drops the connection.
+    /// with `stalled()`'s text, which reconnects.
     async fn next_or_stall<T>(
         &self,
         stream: &mut tonic::Streaming<T>,
@@ -381,17 +502,18 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         }
     }
 
-    /// Run `f` against the client, dropping the connection when the result
-    /// is a transport failure.
+    /// Run `f` against a connected client, reporting the connection dead
+    /// when the result is a transport failure.
     async fn call<T, F, Fut>(&self, f: F) -> Result<T, ChainError>
     where
         F: FnOnce(CompactTxStreamerClient<Channel>) -> Fut,
         Fut: std::future::Future<Output = Result<T, ChainError>>,
     {
-        let client = self.client().await?;
+        let (generation, client) = self.client().await?;
         let result = f(client).await;
         if matches!(result, Err(ChainError::Unreachable(_))) {
-            self.conn.lock().await.client = None;
+            // The connection task reconnects, unless it already has.
+            self.conn().redo(generation);
         }
         result
     }
@@ -447,8 +569,8 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
     /// stream that ends early is [`ChainError::BlockUnavailable`] for the
     /// first missing height; one that skips, repeats or forks is
     /// [`ChainError::Rpc`] naming the heights; one that goes silent for
-    /// [`LwdTimeouts::stream_idle`] is [`ChainError::Unreachable`] and drops
-    /// the connection.
+    /// [`LwdTimeouts::stream_idle`] is [`ChainError::Unreachable`], which
+    /// reconnects.
     pub async fn block_range(
         &self,
         range: Range<BlockHeight>,
@@ -686,6 +808,44 @@ impl<P: Parameters + Send + Sync + 'static> ArtiTorLwdBackend<P> {
         })
         .await
     }
+}
+
+/// Map a gRPC status onto [`ChainError`]: transport-level failures are
+/// [`ChainError::Unreachable`], which reports the connection dead.
+fn status_error(endpoint: &Uri, method: &str, status: Status) -> ChainError {
+    match status.code() {
+        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::Aborted => {
+            ChainError::Unreachable(format!(
+                "{method} at {}: {} ({:?})",
+                endpoint,
+                status.message(),
+                status.code()
+            ))
+        }
+        Code::Unknown if status.source().is_some() => {
+            // tonic reports a dead connection as Unknown with the
+            // transport error as its source.
+            ChainError::Unreachable(format!(
+                "{method} at {}: {}",
+                endpoint,
+                status
+                    .source()
+                    .map_or_else(|| status.message().to_string(), ToString::to_string)
+            ))
+        }
+        code => ChainError::Rpc(format!(
+            "{method} at {}: {} ({code:?})",
+            endpoint,
+            status.message()
+        )),
+    }
+}
+
+/// Whether the endpoint host is a Tor onion service (`.onion`).
+fn is_onion(endpoint: &Uri) -> bool {
+    endpoint
+        .host()
+        .is_some_and(|h| h.to_ascii_lowercase().ends_with(".onion"))
 }
 
 /// Whether a zaino `Internal` answer to `GetTransaction` is the node's
@@ -1052,8 +1212,9 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(5));
 
-        // The connection was dropped; the next call reconnects (another
-        // GetLightdInfo) and succeeds once the endpoint behaves.
+        // The stall reported the connection dead, so it was replaced
+        // (another GetLightdInfo); the next call succeeds once the endpoint
+        // behaves.
         lwd.hang_after(None);
         let blocks = be.compact_blocks(h(1)..h(11)).await.unwrap();
         assert_eq!(blocks.len(), 10);
@@ -1064,6 +1225,128 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    fn lightd_infos(lwd: &FakeLightwalletd) -> usize {
+        lwd.calls()
+            .iter()
+            .filter(|c| c.as_str() == "GetLightdInfo")
+            .count()
+    }
+
+    /// Poll `cond` for up to 5 s: for a state the test cannot be told about.
+    async fn eventually(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A request that fails on a dead channel starts one reconnect in the
+    /// connection actor. Two requests made while it is in progress both
+    /// wait for it and are both served by it, a request still running on
+    /// the old channel fails without waiting for it, and that late failure
+    /// does not tear down the new channel.
+    #[tokio::test]
+    async fn requests_during_a_reconnect_share_it_instead_of_queueing() {
+        let node = FakeNode::start(regtest_params()).await;
+        node.mine(10);
+        let lwd = FakeLightwalletd::from_node(&node).await;
+        let be = std::sync::Arc::new(backend(&lwd));
+        be.node_bounds().await.unwrap();
+        assert_eq!(lightd_infos(&lwd), 1);
+
+        // A request in flight on the first channel, held by the endpoint.
+        lwd.hold_tree_state(5);
+        let slow = tokio::spawn({
+            let be = be.clone();
+            async move { be.chain_state(h(5)).await }
+        });
+        eventually("GetTreeState(5) held", || lwd.held_tree_states() == 1).await;
+
+        // The endpoint's backend dies: the next request fails as
+        // unreachable, which starts a reconnect, held at GetLightdInfo.
+        lwd.hold_lightd_info();
+        lwd.fail_tree_states(Some("backend gone".into()));
+        let err = be.chain_state(h(6)).await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Unreachable(m) if m.contains("backend gone")),
+            "{err}"
+        );
+        eventually("a reconnect in progress", || lwd.held_lightd_info() == 1).await;
+
+        // Two requests while the reconnect is in progress.
+        let bounds = tokio::spawn({
+            let be = be.clone();
+            async move { be.node_bounds().await }
+        });
+        let hash = tokio::spawn({
+            let be = be.clone();
+            async move { be.block_hash(h(3)).await }
+        });
+
+        // The request on the old channel fails now, and gets its answer
+        // while the reconnect is still in progress.
+        lwd.release_tree_states();
+        let err = tokio::time::timeout(Duration::from_secs(5), slow)
+            .await
+            .expect("a failure on the old channel does not wait for the reconnect")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(&err, ChainError::Unreachable(_)), "{err}");
+        assert_eq!(
+            lwd.held_lightd_info(),
+            1,
+            "the reconnect is still in progress"
+        );
+        assert!(!bounds.is_finished() && !hash.is_finished());
+
+        // The reconnect completes: both waiting requests are served by it.
+        lwd.fail_tree_states(None);
+        lwd.release_lightd_info();
+        let (bounds, hash) = tokio::time::timeout(Duration::from_secs(5), async {
+            (bounds.await.unwrap(), hash.await.unwrap())
+        })
+        .await
+        .expect("both requests are served once the reconnect completes");
+        assert_eq!(bounds.unwrap().tip_height, h(10));
+        assert_eq!(hash.unwrap(), node.block(3).unwrap().hash);
+        assert_eq!(lightd_infos(&lwd), 2, "one reconnect served both requests");
+
+        // The late failure was about the first channel: the new one stays.
+        be.chain_state(h(7)).await.unwrap();
+        assert_eq!(lightd_infos(&lwd), 2, "the late failure dropped nothing");
+    }
+
+    /// Requests waiting on one connection attempt share its outcome
+    /// instead of each trying again in turn; the next request after it
+    /// tries again.
+    #[tokio::test]
+    async fn waiters_share_one_failed_connect() {
+        let lwd = FakeLightwalletd::start("main", vec![], vec![]).await;
+        lwd.hold_lightd_info();
+        let be = backend(&lwd);
+        let release = async {
+            eventually("GetLightdInfo held", || lwd.held_lightd_info() == 1).await;
+            lwd.release_lightd_info();
+        };
+        let (a, b, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(be.node_bounds(), be.block_hash(h(1)), release)
+        })
+        .await
+        .expect("the attempt resolves");
+        for err in [a.unwrap_err(), b.unwrap_err()] {
+            assert!(
+                matches!(&err, ChainError::Rpc(m) if m.contains("serves chain \"main\"")),
+                "{err}"
+            );
+        }
+        assert_eq!(lightd_infos(&lwd), 1, "one attempt for both waiters");
+
+        // A failure is not sticky: the next request makes a new attempt.
+        be.node_bounds().await.unwrap_err();
+        assert_eq!(lightd_infos(&lwd), 2);
     }
 
     #[tokio::test]
