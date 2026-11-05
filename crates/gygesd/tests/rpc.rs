@@ -2987,6 +2987,11 @@ async fn tx_engine_shields_spends_orchard_and_pays_transparent_through_the_fake_
     .await
     .unwrap_err();
     assert_eq!(reason(&err), ErrorReason::InsufficientFunds, "{err:?}");
+    // So does a shield with nothing to shield.
+    let err = collect_events(c.shield_funds(shield_req("main")).await)
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InsufficientFunds, "{err:?}");
 
     // Argument checks happen before the stream opens.
     for (to, memo, want) in [
@@ -3922,6 +3927,19 @@ async fn two_sends_in_flight_spend_different_notes() {
     spenders.sort();
     txids.sort();
     assert_eq!(spenders, txids);
+    running.task.abort();
+}
+
+/// A shield from a key whose money is all shielded has nothing to shield:
+/// `INSUFFICIENT_FUNDS` (exit 5), not an internal error. Upstream's change
+/// strategy reports it, nested as `Change(InsufficientFunds)`.
+#[tokio::test]
+async fn a_shield_with_nothing_transparent_is_insufficient_funds() {
+    let (_node, running, mut c) = sender_and_recipient(ONE_CONF_CONFIG).await;
+    let err = collect_events(c.shield_funds(shield_req("main")).await)
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InsufficientFunds, "{err:?}");
     running.task.abort();
 }
 
