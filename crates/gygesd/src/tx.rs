@@ -586,11 +586,17 @@ pub(crate) fn cancelled() -> Status {
     Status::cancelled("client disconnected")
 }
 
-/// Wait a second between polls; `CANCELLED` once the client went away.
-async fn idle_or_closed<E>(tx: &mpsc::Sender<E>) -> Result<(), Status> {
+/// Wait a second between polls; `CANCELLED` once the client went away,
+/// `UNAVAILABLE` once the daemon is stopping (the transaction is broadcast
+/// and the wallet keeps following it).
+async fn idle_or_closed<E>(state: &DaemonState, tx: &mpsc::Sender<E>) -> Result<(), Status> {
     tokio::select! {
         () = tokio::time::sleep(Duration::from_secs(1)) => Ok(()),
         () = tx.closed() => Err(cancelled()),
+        () = state.stopped() => Err(Status::unavailable(
+            "the daemon is stopping; the transaction was broadcast and is not mined yet \
+             (`gyges tx status` follows it after the restart)",
+        )),
     }
 }
 
@@ -734,7 +740,7 @@ async fn pipeline(
                 return emit_mined(tx, 1, txid_hex, u32::from(h)).await;
             }
             state.sync.wake();
-            idle_or_closed(tx).await?;
+            idle_or_closed(state, tx).await?;
         }
     }
     Ok(())
@@ -870,6 +876,13 @@ pub(crate) async fn obtain_key<E: Send + 'static>(
                 }
             },
             () = tx.closed() => return Err(cancelled()),
+            // The session would otherwise hold `daemon stop` up until it
+            // expires; the guard ends it as the stream goes.
+            () = state.stopped() => {
+                return Err(Status::unavailable(
+                    "the daemon is stopping; nothing was signed or broadcast",
+                ));
+            }
         }
     }
 }
@@ -1049,7 +1062,7 @@ async fn tex_pipeline(
                 _ => {}
             }
             state.tex.wake();
-            idle_or_closed(tx).await?;
+            idle_or_closed(state, tx).await?;
         }
     }
     Ok(())

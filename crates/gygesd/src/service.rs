@@ -81,6 +81,10 @@ pub struct DaemonState {
     pub started_at: i64,
     /// Signalled by `Shutdown` (and by the signal handlers in `main`).
     pub(crate) shutdown: Notify,
+    /// Set once the daemon is stopping, whatever asked it to: the open-ended
+    /// streams (`StreamLogs --follow`, `WatchEvents`, `WaitSync`, a send's
+    /// `--wait`) end on it, or the server would wait for them forever.
+    pub(crate) stopping: tokio::sync::watch::Sender<bool>,
 }
 
 impl DaemonState {
@@ -114,7 +118,25 @@ impl DaemonState {
             logs,
             started_at: unix_now(),
             shutdown: Notify::new(),
+            stopping: tokio::sync::watch::Sender::new(false),
         }
+    }
+
+    /// Resolves once the daemon is stopping ([`Self::stopping`]).
+    pub(crate) fn stopped(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.stopping.subscribe();
+        async move {
+            let _ = rx.wait_for(|stopping| *stopping).await;
+        }
+    }
+
+    /// `stream`, ending when the daemon stops.
+    pub(crate) fn until_stopped<T: Send + 'static>(
+        &self,
+        stream: tonic::codegen::BoxStream<T>,
+    ) -> tonic::codegen::BoxStream<T> {
+        use futures_util::StreamExt as _;
+        Box::pin(stream.take_until(self.stopped()))
     }
 
     /// Build the `GetInfo` response from the current state.
@@ -408,7 +430,8 @@ impl Gyges for GygesService {
         &self,
         request: Request<WaitSyncRequest>,
     ) -> Result<Response<ProgressStream>, Status> {
-        sync::wait_sync(self.state.clone(), request.into_inner()).map(Response::new)
+        sync::wait_sync(self.state.clone(), request.into_inner())
+            .map(|s| Response::new(self.state.until_stopped(s)))
     }
 
     async fn run_sync(
@@ -422,7 +445,8 @@ impl Gyges for GygesService {
         &self,
         request: Request<WatchEventsRequest>,
     ) -> Result<Response<crate::events::EventStream>, Status> {
-        crate::events::watch_events(self.state.clone(), request.into_inner()).map(Response::new)
+        crate::events::watch_events(self.state.clone(), request.into_inner())
+            .map(|s| Response::new(self.state.until_stopped(s)))
     }
 
     async fn scan_mempool(
@@ -445,15 +469,20 @@ impl Gyges for GygesService {
         &self,
         request: Request<StreamLogsRequest>,
     ) -> Result<Response<LogStream>, Status> {
-        Ok(Response::new(self.state.logs.stream(request.get_ref())))
+        Ok(Response::new(
+            self.state
+                .until_stopped(self.state.logs.stream(request.get_ref())),
+        ))
     }
 
     async fn shutdown(
         &self,
         request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
-        // In-flight sends end with their streams when the server stops (a
-        // proof in progress finishes on its blocking thread and is dropped);
+        // In-flight sends end with their streams when the server stops,
+        // which it does once the open-ended streams have ended on
+        // `stopping` or the grace period is over (a proof in progress
+        // finishes on its blocking thread and is dropped);
         // the TexQueue's rows persist in `wallet.sqlite` and the next start
         // resumes them, so graceful and forced shutdown behave the same.
         tracing::info!(
