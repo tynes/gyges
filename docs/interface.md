@@ -9,7 +9,7 @@ Section numbers restart in each part. A bare § refers to the part it appears in
 
 ## CLI
 
-Every command maps to exactly one RPC in [`proto/gyges.proto`](../proto/gyges.proto); the mapping table is API §7.
+Every command maps to exactly one RPC in [`proto/gyges.proto`](../proto/gyges.proto), except the `gyges tui` dashboard (§2.7); the mapping table is API §7.
 
 ### 1. Global behaviour
 
@@ -290,6 +290,41 @@ Binary `.pczt` files use the `pczt` crate's postcard serialization; `-` means st
 - **`tx send` / `tx shield` on a terminal** scan the answer by themselves after Enter, for up to a minute, then fall back to pasted frames; Ctrl-C during the scan also switches to pasting. After a refused answer they wait for Enter (redo it on the device) before scanning again. `GYGES_NO_CAMERA=1` skips the camera.
 - **Ctrl-C** at the QR animation or the paste prompt (with or without a camera) leaves the session open and exits 4, for `qr-import` or `qr-scan --session` later.
 
+---
+
+#### 2.7 Terminal UI (`gyges tui`)
+
+##### `gyges tui [--interval <DURATION>] [--dump <COLSxROWS>]`
+A full-screen dashboard over the same socket and API as the other commands (decisions.md Q-C7). It takes the global `--socket`, `--network` and `--key` like any command; `--json` and `-q` have no effect.
+```text
+Flags:
+      --interval <DURATION>   How often to ask for the tip and sync state [default: 2s]
+      --dump <COLSxROWS>      Draw one frame to stdout after the first full load and exit (no terminal needed)
+```
+
+```text
+ gyges │ mainnet │ gygesd 0.1.0 · API 0.1
+ tip 3,141,592 00ab12cd34… │ node ● connected │ Tor ● on │ fallback ● verified via Tor
+┌ Wallets ───────────────────┐1 Overview
+│▸ main ★                    │┌ Overview ───────────────────────────────────────────────┐
+│  local-seed · locked       ││POOL         SPENDABLE ZEC      PENDING ZEC              │
+│  synced                    ││ironwood     1.50000000         0.02500000               │
+│  cold                      ││total        1.50000000         0.02500000               │
+│  keystone-qr · Keystone    ││spendable at 10 confirmations, as of height 3,141,592    │
+│  scanning 82%              ││key      main · local-seed · locked (sends ask for …)    │
+└────────────────────────────┘└─────────────────────────────────────────────────────────┘
+ 1-9 tabs  ⇥ next wallet  R refresh  ? help  q quit
+```
+
+- **Header.** The daemon's network, version and API version; the node's tip height and hash, or why it is not connected; Tor (`off`, `bootstrapping N%`, `on`, `failed`); and the archival fallback (`off`, or `untested` / `verified` / `untrusted`, `via Tor` or `direct`). A daemon whose API minor is newer than the TUI's says so here, instead of the CLI's stderr warning.
+- **Wallets.** Every key from `GetInfo`, the default marked `★`: its signing mode, lock state (`locked`, `UNLOCKED`, `Keystone`, `view only`) and sync state word (CLI §2.3) with the percentage scanned from the birthday to the tip. `Tab` / `Shift-Tab` move the selection.
+- **Overview.** The selected key's `GetBalance` table, the confirmation depth and height it is as of, the `not_spendable_reason` when the key cannot send yet, the key's pools and birthday, its sync line (scanned of tip, blocks left, blocks per second, notes awaiting witnesses, stall detail), and the count of unspent notes and transactions.
+- **Refresh.** `GetInfo` and `GetSyncStatus` every `--interval`. Balances, notes (`ListNotes`, all) and history (`ListTransactions`, latest 50) reload only when the tip hash, the set of keys or a key's sync state changes; while only a scan's height moves, at most every 10 s; and every 30 s regardless, so that a mempool arrival is seen. `R` reloads now.
+- **Degrading.** Each pane fails on its own: a refused read shows its error in its pane and the rest still draw. With no daemon the body says so and the TUI reconnects every `--interval` (it never starts one, Q-C5). Air-gapped, the wallet panes say that wallet reads are not served; a `signer-only` key has no wallet pane.
+- **Keys.** `1`–`9` tabs, `Tab` / `Shift-Tab` wallet, `R` refresh, `?` help, `q` or Ctrl-C quit.
+- **Terminal.** Raw mode and the alternate screen, restored on exit and by a panic hook. Without a terminal on stdin and stdout the command is exit 6 and points at `--dump`.
+- **`--dump`** waits up to 30 s for the first poll (or for the daemon to be found down), prints the frame as plain text and exits 0. The regtest scenarios drive the TUI this way.
+
 ## API
 
 The contract between the CLI and the daemon. The machine-readable source is
@@ -299,7 +334,7 @@ streaming semantics and the signing-session lifecycle. Where this document and
 the proto disagree, the proto wins and this part has a bug.
 
 Design inputs (`decisions.md` §1): Q-S1…S3 (sessions), Q-Y4
-(sync definitions), Q-K2/K4 (Keystone), Q-T1 (ZIP 320 queue), Q-C1…C6 (CLI
+(sync definitions), Q-K2/K4 (Keystone), Q-T1 (ZIP 320 queue), Q-C1…C7 (CLI
 behaviour), Q-O1 (logs), Q-O3 (versioning).
 
 ---
@@ -887,7 +922,7 @@ via `gyges tx sessions` / `pczt qr-import --session`).
 
 ### 7. CLI command to RPC mapping
 
-Every command maps to exactly one RPC, or to none when it is purely local.
+Every command maps to exactly one RPC, or to none when it is purely local, except `tui`.
 
 | Command | RPC | Notes |
 |---|---|---|
@@ -935,6 +970,7 @@ Every command maps to exactly one RPC, or to none when it is purely local.
 | `pczt qr-export` | — | Encodes a PCZT file as `ur:zcash-pczt` frames locally |
 | `pczt qr-scan` | `CompleteKeystoneSign` | Camera input; `--session` selects the session |
 | `pczt qr-import` | `CompleteKeystoneSign` | Frames from args, `--from-file`, or stdin; `--session` |
+| `tui` | many | The one exception: a dashboard over the read RPCs (`GetInfo`, `GetSyncStatus`, `GetBalance`, `ListNotes`, `ListTransactions`) on one long-lived connection that never unlocks (CLI §2.7, Q-C7) |
 
 The CLI distinguishes `tx abort SESSION_ID` from `tx abort TXID` by argument
 length; both are kept under one verb because that is what the review

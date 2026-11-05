@@ -191,6 +191,16 @@ Grouped by area. Each question carries the proposal written for it in the review
 
   **Proposed solution.** Embed it. ZIP 374 PCZTs carry a global `proprietary` map; `pczt create` writes `gyges.key_id`, `gyges.network` and `gyges.session_id` there, and `prove`, `sign`, `combine` and `broadcast` read the key id from the stream, using `--key` only as an assertion that fails with exit 6 on mismatch. `combine` refuses inputs whose key ids differ. The Redactor strips the proprietary map before the PCZT goes to a Keystone so no local identifiers leave the host.
 
+- [x] **Q-C7.** Is there a full-screen interface, and how does it relate to the CLI?
+
+  **Proposed solution.** `gyges tui`, a subcommand of the same binary (one artifact, the same socket resolution and handshake), built on `ratatui` and `crossterm` pinned with `=`. It is an API client in its own right, not a wrapper around the commands: the commands print to stdout and stderr, prompt with `rpassword` and wait on SIGINT, all of which break a raw-mode screen. It reuses only the pure pieces of `gyges-cli` (`Ctx::connect`, the amount grammar, the string renderers, `gyges-qr`). The rules it keeps:
+  - **It reads `config.toml` no more than the CLI does (Q-C1).** What it shows comes from the API.
+  - **One long-lived connection reads; it never unlocks.** A connection-scoped unlock (interface.md API §6.3) lives as long as its connection, and the TUI may stay open for days. Anything that signs opens a connection of its own and closes it when done.
+  - **Polling is driven by change.** `GetInfo` and `GetSyncStatus` are cheap and polled; the wallet reads reload when the tip or sync state changes, plus a slow sweep.
+  - **Each pane degrades on its own**, and the TUI never starts a daemon (Q-C5).
+
+  **Landed** as `gyges-cli`'s `tui` module (interface.md CLI §2.7): `app` (state, no I/O), `poll` (the reading connection), `ui` (drawing, no I/O) and the event loop. The header, wallet list and Overview are read-only; `--dump` draws one frame without a terminal for scripts and tests.
+
 ### Operations and testing (O)
 
 - [x] **Q-O1.** Where do logs go, how are they rotated, and are they free of sensitive data?

@@ -39,7 +39,7 @@ gyges/
 │   ├── gyges-chain/             # ChainBackend (node bounds, tree state) + CompactBlockSource: ZakuraRpcBackend (Case A), ArtiTorLwdBackend (Case B)
 │   ├── gyges-core/              # config.toml, paths, permission sweep; KeyRegistry, VaultManager, SyncScheduler, TxEngine, TexQueue
 │   ├── gygesd/                  # daemon: library (startup checks, pid lock, UDS server, policy layer, service) + thin binary
-│   └── gyges-cli/               # `gyges` binary: command router, handshake, exit codes, prompts, QR TUI
+│   └── gyges-cli/               # `gyges` binary: command router, handshake, exit codes, prompts, QR TUI, `gyges tui` dashboard (src/tui/)
 └── tests/regtest/               # gyges-regtest: end-to-end harness and scenarios (testing.md §2)
 ```
 
