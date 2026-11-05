@@ -169,6 +169,9 @@ pub struct CacheConfig {
     pub keep_historical: bool,
     pub fetch_batch: u32,
     pub scan_batch: u32,
+    /// Keys whose batches are fetched and scanned at the same time; each
+    /// has its own wallet. 1 scans one key after another.
+    pub parallel_scans: u32,
 }
 
 impl Default for CacheConfig {
@@ -179,6 +182,7 @@ impl Default for CacheConfig {
             keep_historical: false,
             fetch_batch: 100,
             scan_batch: 1000,
+            parallel_scans: 4,
         }
     }
 }

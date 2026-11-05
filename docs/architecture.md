@@ -265,7 +265,7 @@ A single `BlockFetcher` task per daemon:
 3. Fills any sub-`retained_from` range a key needs from the fallback endpoint (`ArtiTorLwdBackend` through `fill_cache`, one `cache.scan_batch` per key per tick, with the next batch downloading in the background while the current one is scanned), tagging rows `source = 'tor-lwd'` (§5).
 4. Evicts a block once every registered key has scanned past it, keeping `cache.retain_blocks` (default 1000) behind the slowest key for cheap rewinds, bounded by `cache.max_mb` (default 2048). With `cache.keep_historical = false` (default) Tor-fetched rows are dropped as soon as the key that requested them has scanned them.
 
-The node is asked for each block once regardless of how many key profiles exist.
+The node is asked for each block once regardless of how many key profiles exist. Keys are stepped concurrently, up to `cache.parallel_scans` (default 4) at a time: each has its own wallet, the cache is read through a pool of read-only connections (WAL), and fills are serialised so that keys at the same heights fetch a range once. Keys with a backfill session are stepped after the others, one at a time.
 
 ---
 
@@ -590,6 +590,7 @@ max_mb = 2048
 keep_historical = false          # true keeps Tor-fetched ranges after they are scanned
 fetch_batch = 100
 scan_batch = 1000
+parallel_scans = 4               # keys scanned at the same time (each has its own wallet)
 
 [mempool]
 scan = true

@@ -12,8 +12,10 @@
 //! the scheduler drop them once scanned (`cache.keep_historical = false`).
 
 use std::fmt;
+use std::ops::Deref;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -92,11 +94,38 @@ pub enum CacheError {
     Gap { start: u32, missing: u32 },
 }
 
-/// The open cache. Every method takes `&self`; the connection sits behind a
-/// mutex because compact-block reads and writes are short.
+/// Read-only connections per file-backed cache: scans of several keys and
+/// the scheduler's hash checks read at once.
+const READERS: usize = 4;
+
+/// The open cache. Every method takes `&self`. Writes (inserts, eviction)
+/// go through one connection behind a mutex; reads go through a small pool
+/// of read-only connections, so with the file in WAL mode they neither wait
+/// for a write nor for each other, and blocks are decoded after the
+/// connection is released. An in-memory cache (tests) has no file to share
+/// and reads through the writer.
 pub struct BlockDb {
     path: PathBuf,
     conn: Mutex<Connection>,
+    readers: Vec<Mutex<Option<Connection>>>,
+    next_reader: AtomicUsize,
+}
+
+/// A connection to read through: one of the pool's, or the writer's.
+enum ReadConn<'a> {
+    Writer(MutexGuard<'a, Connection>),
+    Reader(MutexGuard<'a, Option<Connection>>),
+}
+
+impl Deref for ReadConn<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            ReadConn::Writer(c) => c,
+            ReadConn::Reader(c) => c.as_ref().expect("opened before use"),
+        }
+    }
 }
 
 impl fmt::Debug for BlockDb {
@@ -125,7 +154,9 @@ impl BlockDb {
                 },
             )?;
         }
-        Self::new(path.to_path_buf(), conn, network)
+        let mut db = Self::new(path.to_path_buf(), conn, network)?;
+        db.readers = (0..READERS).map(|_| Mutex::new(None)).collect();
+        Ok(db)
     }
 
     /// An in-memory cache, for tests.
@@ -142,6 +173,8 @@ impl BlockDb {
         let db = Self {
             path,
             conn: Mutex::new(conn),
+            readers: Vec::new(),
+            next_reader: AtomicUsize::new(0),
         };
         db.init(network)?;
         Ok(db)
@@ -209,6 +242,38 @@ impl BlockDb {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A connection to read through: the first free one of the pool from a
+    /// rotating start (else wait for the start one), opened on first use;
+    /// the writer's for an in-memory cache.
+    fn reader(&self) -> Result<ReadConn<'_>, CacheError> {
+        if self.readers.is_empty() {
+            return Ok(ReadConn::Writer(self.lock()));
+        }
+        let start = self.next_reader.fetch_add(1, Ordering::Relaxed);
+        let n = self.readers.len();
+        let mut slot = (0..n)
+            .find_map(|i| self.readers[(start + i) % n].try_lock().ok())
+            .unwrap_or_else(|| {
+                self.readers[start % n]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+            });
+        if slot.is_none() {
+            use rusqlite::OpenFlags;
+            let conn = Connection::open_with_flags(
+                &self.path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .and_then(|c| {
+                c.busy_timeout(std::time::Duration::from_secs(5))?;
+                Ok(c)
+            })
+            .map_err(|e| self.sqlite(e))?;
+            *slot = Some(conn);
+        }
+        Ok(ReadConn::Reader(slot))
+    }
+
     fn sqlite(&self, source: rusqlite::Error) -> CacheError {
         CacheError::Sqlite {
             path: self.path.clone(),
@@ -251,7 +316,7 @@ impl BlockDb {
     /// The cached hash at `height` (internal byte order), for the per-tick
     /// reorg check against `getblockhash` (docs/architecture.md Sync §4.3).
     pub fn hash_at(&self, height: BlockHeight) -> Result<Option<[u8; 32]>, CacheError> {
-        let conn = self.lock();
+        let conn = self.reader()?;
         let hash: Option<Vec<u8>> = conn
             .query_row(
                 "SELECT hash FROM compact_blocks WHERE height = ?1",
@@ -265,7 +330,7 @@ impl BlockDb {
 
     /// Lowest and highest cached heights, `None` when empty.
     pub fn bounds(&self) -> Result<Option<(BlockHeight, BlockHeight)>, CacheError> {
-        let conn = self.lock();
+        let conn = self.reader()?;
         let (lo, hi): (Option<u32>, Option<u32>) = conn
             .query_row(
                 "SELECT MIN(height), MAX(height) FROM compact_blocks",
@@ -280,7 +345,7 @@ impl BlockDb {
 
     /// Number of cached blocks.
     pub fn len(&self) -> Result<u64, CacheError> {
-        let conn = self.lock();
+        let conn = self.reader()?;
         conn.query_row("SELECT COUNT(*) FROM compact_blocks", [], |r| r.get(0))
             .map_err(|e| self.sqlite(e))
     }
@@ -318,7 +383,7 @@ impl BlockDb {
     /// Size of the database file as SQLite accounts it (pages × page size),
     /// for the `cache.max_mb` bound.
     pub fn size_bytes(&self) -> Result<u64, CacheError> {
-        let conn = self.lock();
+        let conn = self.reader()?;
         let pages: u64 = conn
             .query_row("PRAGMA page_count", [], |r| r.get(0))
             .map_err(|e| self.sqlite(e))?;
@@ -342,43 +407,51 @@ impl BlockDb {
         from: Option<BlockHeight>,
         limit: Option<usize>,
     ) -> Result<Vec<CompactBlock>, CacheError> {
-        let conn = self.lock();
-        let start = match from {
-            Some(h) => Some(u32::from(h)),
-            None => conn
-                .query_row("SELECT MIN(height) FROM compact_blocks", [], |r| r.get(0))
-                .map_err(|e| self.sqlite(e))?,
-        };
-        let Some(start) = start else {
-            return Ok(Vec::new());
-        };
-        let limit = limit.map_or(i64::MAX, |l| i64::try_from(l).unwrap_or(i64::MAX));
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT height, data FROM compact_blocks WHERE height >= ?1 ORDER BY height LIMIT ?2",
-            )
-            .map_err(|e| self.sqlite(e))?;
-        let rows = stmt
-            .query_map(params![start, limit], |r| {
-                Ok((r.get::<_, u32>(0)?, r.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(|e| self.sqlite(e))?;
-        let mut out = Vec::new();
-        let mut expected = start;
-        for row in rows {
-            let (height, data) = row.map_err(|e| self.sqlite(e))?;
-            if height != expected {
-                break;
+        // Read the rows, release the connection, then decode: decoding a
+        // scan batch takes far longer than reading it.
+        let rows: Vec<(u32, Vec<u8>)> = {
+            let conn = self.reader()?;
+            let start = match from {
+                Some(h) => Some(u32::from(h)),
+                None => conn
+                    .query_row("SELECT MIN(height) FROM compact_blocks", [], |r| r.get(0))
+                    .map_err(|e| self.sqlite(e))?,
+            };
+            let Some(start) = start else {
+                return Ok(Vec::new());
+            };
+            let limit = limit.map_or(i64::MAX, |l| i64::try_from(l).unwrap_or(i64::MAX));
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT height, data FROM compact_blocks WHERE height >= ?1 ORDER BY height LIMIT ?2",
+                )
+                .map_err(|e| self.sqlite(e))?;
+            let mut rows = Vec::new();
+            let mut expected = start;
+            for row in stmt
+                .query_map(params![start, limit], |r| {
+                    Ok((r.get::<_, u32>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|e| self.sqlite(e))?
+            {
+                let (height, data) = row.map_err(|e| self.sqlite(e))?;
+                if height != expected {
+                    break;
+                }
+                rows.push((height, data));
+                expected = height.wrapping_add(1);
             }
-            let block = CompactBlock::decode(&data[..]).map_err(|source| CacheError::Decode {
-                path: self.path.clone(),
-                height,
-                source,
-            })?;
-            out.push(block);
-            expected = height.wrapping_add(1);
-        }
-        Ok(out)
+            rows
+        };
+        rows.into_iter()
+            .map(|(height, data)| {
+                CompactBlock::decode(&data[..]).map_err(|source| CacheError::Decode {
+                    path: self.path.clone(),
+                    height,
+                    source,
+                })
+            })
+            .collect()
     }
 }
 
@@ -407,7 +480,7 @@ impl BlockSource for BlockDb {
 #[async_trait]
 impl BlockCache for BlockDb {
     fn get_tip_height(&self, range: Option<&ScanRange>) -> Result<Option<BlockHeight>, CacheError> {
-        let conn = self.lock();
+        let conn = self.reader()?;
         let (lo, hi) = range.map_or((0, i64::MAX), |range| {
             let Range { start, end } = range.block_range();
             (i64::from(u32::from(*start)), i64::from(u32::from(*end)))
@@ -434,7 +507,7 @@ impl BlockCache for BlockDb {
         if !blocks.is_empty() && blocks.len() < wanted {
             // Something exists after the gap? Then it is a hole, not the end.
             let next_missing = u32::from(start) + blocks.len() as u32;
-            let conn = self.lock();
+            let conn = self.reader()?;
             let later: Option<u32> = conn
                 .query_row(
                     "SELECT MIN(height) FROM compact_blocks WHERE height > ?1 AND height < ?2",
@@ -495,6 +568,38 @@ mod tests {
             BlockHeight::from_u32(start)..BlockHeight::from_u32(end),
             ScanPriority::Historic,
         )
+    }
+
+    /// A file-backed cache reads through its read-only pool: every read
+    /// sees the writes committed before it, from any thread, and reads run
+    /// while another reader is held.
+    #[test]
+    fn file_backed_reads_see_committed_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlockDb::open(&dir.path().join("blocks.sqlite"), "regtest").unwrap();
+        assert_eq!(db.readers.len(), READERS);
+        db.insert_from(Source::Node, &(1..=5).map(block).collect::<Vec<_>>())
+            .unwrap();
+        let held = db.reader().unwrap();
+        assert_eq!(
+            db.bounds().unwrap(),
+            Some((BlockHeight::from_u32(1), BlockHeight::from_u32(5)))
+        );
+        drop(held);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    let blocks = db
+                        .contiguous_from(Some(BlockHeight::from_u32(2)), None)
+                        .unwrap();
+                    assert_eq!(blocks.len(), 4);
+                });
+            }
+        });
+        db.insert_from(Source::Node, &[block(6)]).unwrap();
+        assert_eq!(db.hash_at(BlockHeight::from_u32(6)).unwrap(), Some([6; 32]));
+        db.evict_below(BlockHeight::from_u32(3)).unwrap();
+        assert_eq!(db.len().unwrap(), 4);
     }
 
     #[tokio::test]
