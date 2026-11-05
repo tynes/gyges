@@ -33,6 +33,7 @@ tonic-prost = { workspace = true, optional = true }  # codec of the generated fa
 rusqlite = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
+arc-swap = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

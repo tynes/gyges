@@ -334,7 +334,7 @@ pub(crate) fn input_choices(
     Ok((pools, inputs))
 }
 
-pub(crate) fn send_transaction(
+pub(crate) async fn send_transaction(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
     req: SendTransactionRequest,
@@ -378,7 +378,7 @@ pub(crate) fn send_transaction(
         .into_status());
     }
     if keystone && !req.dry_run {
-        refuse_if_pending(&prepared)?;
+        refuse_if_pending(&prepared).await?;
     }
     let (spend_pools, inputs) = input_choices(
         &prepared.key.profile().spend_pools,
@@ -429,8 +429,8 @@ fn is_keystone(prepared: &Prepared) -> bool {
 
 /// One Keystone session per key at a time: until it is completed or
 /// aborted, another proposal could pick the same notes.
-fn refuse_if_pending(prepared: &Prepared) -> Result<(), Status> {
-    if let Some(session_id) = crate::keystone::pending_for(&prepared.key)? {
+async fn refuse_if_pending(prepared: &Prepared) -> Result<(), Status> {
+    if let Some(session_id) = crate::keystone::pending_for(&prepared.key).await? {
         let key_id = prepared.key.key_id();
         return Err(GygesError::new(
             ErrorReason::SignatureRequired,
@@ -449,7 +449,7 @@ fn refuse_if_pending(prepared: &Prepared) -> Result<(), Status> {
 
 /// `ShieldFunds` (docs/interface.md API §4.1): the same stream for a transparent → Orchard
 /// proposal.
-pub(crate) fn shield_funds(
+pub(crate) async fn shield_funds(
     state: Arc<DaemonState>,
     conn: Option<ConnInfo>,
     req: ShieldFundsRequest,
@@ -469,7 +469,7 @@ pub(crate) fn shield_funds(
         u64::try_from(req.threshold).map_err(|_| invalid("the threshold must not be negative"))?;
     let keystone = is_keystone(&prepared);
     if keystone && !req.dry_run {
-        refuse_if_pending(&prepared)?;
+        refuse_if_pending(&prepared).await?;
     }
     let min_confirmations = prepared.min_confirmations;
     let dry_run = req.dry_run;

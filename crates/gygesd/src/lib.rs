@@ -74,14 +74,6 @@ pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub(crate) fn read<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    l.read().unwrap_or_else(|e| e.into_inner())
-}
-
-pub(crate) fn write<T>(l: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    l.write().unwrap_or_else(|e| e.into_inner())
-}
-
 /// The error a wallet task returns when the profile has no wallet or the
 /// blocking task fails.
 pub(crate) trait WalletTaskError: Send + 'static {
@@ -122,6 +114,23 @@ pub(crate) async fn with_wallet<T: Send + 'static, E: WalletTaskError>(
             .wallet()
             .ok_or_else(|| E::wallet_task("this profile has no wallet".into()))?;
         f(&mut wallet)
+    })
+    .await
+}
+
+/// [`with_wallet`] for work that moves the key's scan position (scans,
+/// rewinds) or reads it fresh (`WalletView::read`): the position the key
+/// publishes for `ListKeys` and `GetInfo` is refreshed before the lock is
+/// released, whatever `f` returned.
+pub(crate) async fn with_scan_wallet<T: Send + 'static, E: WalletTaskError>(
+    key: &Arc<gyges_core::KeyEntry>,
+    f: impl FnOnce(&mut gyges_core::registry::Wallet) -> Result<T, E> + Send + 'static,
+) -> Result<T, E> {
+    let entry = key.clone();
+    with_wallet(key, move |w| {
+        let out = f(w);
+        entry.refresh_scan_position(w);
+        out
     })
     .await
 }

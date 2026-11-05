@@ -37,9 +37,10 @@ use std::fmt;
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::RwLock;
+use std::sync::Arc;
 use std::time::SystemTime;
 
+use arc_swap::ArcSwap;
 use zcash_client_backend::data_api::chain::{ChainState, CommitmentTreeRoot};
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_protocol::ShieldedPool;
@@ -100,13 +101,15 @@ pub struct NodeStatus {
     pub last_polled: Option<SystemTime>,
 }
 
-/// A backend's [`NodeStatus`], refreshed by every bounds poll.
+/// A backend's [`NodeStatus`], refreshed by every bounds poll. Read on
+/// every `GetInfo` and by the scheduler; readers take no lock, and the one
+/// writer (the poll) swaps in a new snapshot.
 #[derive(Debug, Default)]
-pub(crate) struct StatusCell(RwLock<NodeStatus>);
+pub(crate) struct StatusCell(ArcSwap<NodeStatus>);
 
 impl StatusCell {
     pub(crate) fn get(&self) -> NodeStatus {
-        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+        NodeStatus::clone(&self.0.load())
     }
 
     /// Record a poll's outcome (the bounds and whether the source is
@@ -115,9 +118,9 @@ impl StatusCell {
         &self,
         outcome: Result<(NodeBounds, bool), ChainError>,
     ) -> Result<NodeBounds, ChainError> {
-        let mut status = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut status = self.get();
         status.last_polled = Some(SystemTime::now());
-        match outcome {
+        let result = match outcome {
             Ok((bounds, pruned)) => {
                 status.connected = true;
                 status.bounds = Some(bounds.clone());
@@ -130,7 +133,9 @@ impl StatusCell {
                 status.last_error = e.to_string();
                 Err(e)
             }
-        }
+        };
+        self.0.store(Arc::new(status));
+        result
     }
 }
 
