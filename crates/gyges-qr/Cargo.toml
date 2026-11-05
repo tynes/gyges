@@ -24,6 +24,12 @@ camera = ["dep:nokhwa"]
 
 [dev-dependencies]
 hex = { workspace = true }
+criterion = { workspace = true }
+
+# Frame splitting, rendering, detection and reassembly (docs/testing.md §9).
+[[bench]]
+name = "qr"
+harness = false
 
 [lints]
 workspace = true
