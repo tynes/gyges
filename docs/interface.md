@@ -299,7 +299,7 @@ A full-screen dashboard over the same socket and API as the other commands (deci
 ```text
 Flags:
       --interval <DURATION>   How often to ask for the tip and sync state [default: 2s]
-      --tab <NAME>            The tab to open on: overview, notes, transactions, addresses, endpoints [default: overview]
+      --tab <NAME>            The tab to open on: overview, notes, transactions, addresses, endpoints, logs [default: overview]
       --dump <COLSxROWS>      Draw one frame to stdout after the first full load and exit (no terminal needed)
 ```
 
@@ -328,10 +328,11 @@ Flags:
 - **Copy** (`c`). Puts the shown address on the clipboard with the OSC 52 escape sequence, which works over SSH but which some terminals refuse or ask about first. A toast says it was sent.
 - Air-gapped daemons and `signer-only` keys do not receive: the keys do nothing and the tab says why.
 - **Endpoints** (tab 5). Everything the daemon is attached to, from `GetInfo` (API §2, 0.2): the socket the TUI uses and the daemon's version; the node's JSON-RPC URL with its connection, tip and pruning window; the indexer gRPC URL and whether its stream is in use; the archival fallback's URL, trust and route (over Tor or direct); where broadcasts go (the node, or the fallback over Tor with `broadcast_via_tor`); and the embedded Tor client's state. The daemon strips credentials from the URLs. A daemon older than API 0.2 sends no node URLs, and the row says so. Long paths are cut in the middle, keeping both ends.
+- **Logs** (tab 6, or `L` from anywhere). The daemon log streamed live, as `daemon logs --follow` would print it: time (UTC), level, target, message and fields. The stream (`StreamLogs { lines: 200, follow: true }`, on a connection of its own) runs only while the tab is open; reopening it replays the last 200 entries, so nothing is lost in between. The TUI keeps the newest 1,000 entries, as the daemon does. `v` cycles the minimum level (the daemon's own filter, then error, warn, info, debug, trace), `a` switches between the daemon log and the audit log, and either restarts the stream. `↑` `↓` / `PgUp` `PgDn` / `Home` scroll back and hold the view still while new entries arrive; `End` follows again. A stream that fails (the daemon went away) says so in the title and is reopened when the daemon answers again. Under `--dump` the stream replays without following and the frame is drawn when the replay ends.
 - **Notifications.** Each history reload is compared with the last one for that key. The first load of a key only records what is there, so history is never announced. After it, a new txid with a positive net value raises a toast (`+0.50000000 ZEC received by main (pending)`) and rings the terminal bell; a known txid that becomes mined raises a quieter toast (received, confirmed at height N; or sent, mined at height N). Toasts stack in the top-right corner for 8 s (`Esc` clears them). They stay inside the TUI: there are no desktop notifications, so no amount leaves the terminal. A mempool arrival is seen by the next reload (at most 30 s later).
 - **Refresh.** `GetInfo` and `GetSyncStatus` every `--interval`. Balances, notes (`ListNotes`, all) and history (`ListTransactions`, latest 50) reload only when the tip hash, the set of keys or a key's sync state changes; while only a scan's height moves, at most every 10 s; and every 30 s regardless, so that a mempool arrival is seen. `R` reloads now.
 - **Degrading.** Each pane fails on its own: a refused read shows its error in its pane and the rest still draw. With no daemon the body says so and the TUI reconnects every `--interval` (it never starts one, Q-C5). Air-gapped, the wallet panes say that wallet reads are not served; a `signer-only` key has no wallet pane.
-- **Keys.** `1`–`9` tabs, `Tab` / `Shift-Tab` wallet, `↑` `↓` (or `k` `j`, `PgUp` `PgDn`, `Home` `End`) move in a list, `f` note filter, `r` receive (QR), `n` new address, `c` copy the address, `p` address form, `Esc` close a modal or clear notifications, `R` refresh, `?` help, `q` or Ctrl-C quit.
+- **Keys.** `1`–`9` tabs, `Tab` / `Shift-Tab` wallet, `↑` `↓` (or `k` `j`, `PgUp` `PgDn`, `Home` `End`) move in a list, `f` note filter, `r` receive (QR), `n` new address, `c` copy the address, `p` address form, `L` logs, `v` / `a` log level / audit log, `Esc` close a modal or clear notifications, `R` refresh, `?` help, `q` or Ctrl-C quit.
 - **Terminal.** Raw mode and the alternate screen, restored on exit and by a panic hook. Without a terminal on stdin and stdout the command is exit 6 and points at `--dump`.
 - **`--dump`** waits up to 30 s for the first poll (or for the daemon to be found down), prints the frame as plain text and exits 0. The regtest scenarios drive the TUI this way.
 
@@ -987,7 +988,7 @@ Every command maps to exactly one RPC, or to none when it is purely local, excep
 | `pczt qr-export` | — | Encodes a PCZT file as `ur:zcash-pczt` frames locally |
 | `pczt qr-scan` | `CompleteKeystoneSign` | Camera input; `--session` selects the session |
 | `pczt qr-import` | `CompleteKeystoneSign` | Frames from args, `--from-file`, or stdin; `--session` |
-| `tui` | many | The one exception: a dashboard over the read RPCs (`GetInfo`, `GetSyncStatus`, `GetBalance`, `ListNotes`, `ListTransactions`) on one long-lived connection that never unlocks, plus `GetCurrentAddress` and `NewAddress` on short-lived connections of their own (CLI §2.7, Q-C7) |
+| `tui` | many | The one exception: a dashboard over the read RPCs (`GetInfo`, `GetSyncStatus`, `GetBalance`, `ListNotes`, `ListTransactions`) on one long-lived connection that never unlocks, plus `GetCurrentAddress` and `NewAddress` on short-lived connections of their own and `StreamLogs` on one while the Logs tab is open (CLI §2.7, Q-C7) |
 
 The CLI distinguishes `tx abort SESSION_ID` from `tx abort TXID` by argument
 length; both are kept under one verb because that is what the review
