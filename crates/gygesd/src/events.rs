@@ -2,11 +2,11 @@
 //! for clients that would otherwise poll (`gyges tui`).
 //!
 //! Each stream is a task that compares the daemon's state with what it last
-//! sent. It wakes on every sync-progress change and once a second
+//! sent. It wakes when a scheduler tick completes and once a second
 //! otherwise. The node's tip, Tor's state and each key's state word are
 //! cheap to read and are compared every wake. History is read (the newest
-//! `HISTORY` rows per key) only when a scheduler tick has completed or the
-//! tip moved, since that is when a mempool pass or a block can have found a
+//! `HISTORY` rows per key) only when a tick has completed or the tip moved,
+//! since that is when a mempool pass or a block can have found a
 //! transaction.
 //!
 //! The stream opens with the current tip, Tor state and each key's sync
@@ -28,18 +28,22 @@ use crate::service::DaemonState;
 
 /// History rows compared per key.
 const HISTORY: u32 = 50;
-/// Heartbeat between progress changes.
+/// Heartbeat between scheduler ticks.
 const IDLE: Duration = Duration::from_secs(1);
 
 pub(crate) type EventStream = tonic::codegen::BoxStream<WalletEvent>;
 
 /// What a key's sync state is compared on: not the scanned height, which
 /// moves every batch.
-fn sync_mark(s: &KeySyncStatus) -> (i32, i32, bool, bool) {
+type SyncMark = (i32, i32, bool, bool);
+/// What Tor's state is compared on.
+type TorMark = (i32, u32, String);
+
+fn sync_mark(s: &KeySyncStatus) -> SyncMark {
     (s.state, s.stall_reason, s.scanned, s.spendable)
 }
 
-fn tor_mark(t: &TorStatus) -> (i32, u32, String) {
+fn tor_mark(t: &TorStatus) -> TorMark {
     (t.state, t.bootstrap_percent, t.last_error.clone())
 }
 
@@ -58,10 +62,11 @@ pub(crate) fn watch_events(
     };
     let (tx, rx) = mpsc::channel::<Result<WalletEvent, Status>>(32);
     tokio::spawn(async move {
-        let mut changes = state.sync.subscribe();
+        // Counts completed scheduler ticks.
+        let mut ticks = state.sync.subscribe();
         let mut tip: Option<(u32, String)> = None;
-        let mut tor: Option<(i32, u32, String)> = None;
-        let mut sync: HashMap<String, (i32, i32, bool, bool)> = HashMap::new();
+        let mut tor: Option<TorMark> = None;
+        let mut sync: HashMap<String, SyncMark> = HashMap::new();
         // txid -> mined, per key; absent until the key's first read.
         let mut seen: HashMap<String, HashMap<String, bool>> = HashMap::new();
         let mut ticks_done = None;
@@ -80,8 +85,9 @@ pub(crate) fn watch_events(
             }
 
             let t = crate::backfill::tor_status(&state);
-            if tor.as_ref() != Some(&tor_mark(&t)) {
-                tor = Some(tor_mark(&t));
+            let mark = tor_mark(&t);
+            if tor.as_ref() != Some(&mark) {
+                tor = Some(mark);
                 out.push(wallet_event::Event::Tor(t));
             }
 
@@ -93,13 +99,14 @@ pub(crate) fn watch_events(
                 .collect();
             for key_id in &keys {
                 let s = crate::sync::to_proto(&state.sync.progress(key_id));
-                if sync.get(key_id) != Some(&sync_mark(&s)) {
-                    sync.insert(key_id.clone(), sync_mark(&s));
+                let mark = sync_mark(&s);
+                if sync.get(key_id) != Some(&mark) {
+                    sync.insert(key_id.clone(), mark);
                     out.push(wallet_event::Event::Sync(s));
                 }
             }
 
-            let done = state.sync.ticks().1;
+            let done = *ticks.borrow_and_update();
             if tip_moved || ticks_done != Some(done) {
                 ticks_done = Some(done);
                 for key_id in &keys {
@@ -114,7 +121,7 @@ pub(crate) fn watch_events(
                 }
             }
             tokio::select! {
-                changed = changes.changed() => if changed.is_err() { return },
+                changed = ticks.changed() => if changed.is_err() { return },
                 () = tokio::time::sleep(IDLE) => {}
                 () = tx.closed() => return,
             }

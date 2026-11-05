@@ -16,12 +16,13 @@
 //! the TUI stays open; sends get a connection of their own.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gyges_proto::v1::gyges_client::GygesClient;
 use gyges_proto::v1::{
     GetBalanceRequest, GetInfoRequest, GetInfoResponse, GetSyncStatusRequest, KeySyncStatus,
-    ListNotesRequest, ListTransactionsRequest, SigningMode, SpentFilter,
+    ListNotesRequest, ListTransactionsRequest, SigningMode, SpentFilter, WatchEventsRequest,
 };
 use tokio::sync::{Notify, mpsc};
 use tonic::transport::Channel;
@@ -168,8 +169,10 @@ impl Poller {
         }
     }
 
-    /// One poll. An `Err` means the daemon is unreachable (or the handshake
-    /// failed): the connection is dropped and rebuilt next time.
+    /// One poll: `Ok(true)` when the daemon is air-gapped (it serves none of
+    /// the wallet reads, nor `WatchEvents`). An `Err` means the daemon is
+    /// unreachable (or the handshake failed): the connection is dropped and
+    /// rebuilt next time.
     async fn cycle(
         &self,
         client: &mut Option<GygesClient<Channel>>,
@@ -247,19 +250,19 @@ struct Watcher {
     task: Option<tokio::task::JoinHandle<()>>,
     /// The daemon answered `UNIMPLEMENTED` (older than API 0.3): do not ask
     /// again until it reconnects.
-    unsupported: Arc<std::sync::atomic::AtomicBool>,
+    unsupported: Arc<AtomicBool>,
 }
 
 impl Watcher {
+    /// Start the stream unless it runs, or this daemon never serves it.
     fn ensure(&mut self, ctx: &Ctx, tx: &mpsc::UnboundedSender<Event>, refresh: &Arc<Notify>) {
-        use std::sync::atomic::Ordering;
         if self.unsupported.load(Ordering::Relaxed)
             || self.task.as_ref().is_some_and(|t| !t.is_finished())
         {
             return;
         }
         let (ctx, tx, refresh) = (ctx.clone(), tx.clone(), refresh.clone());
-        // The task replaces it with what it learns.
+        // The task records whether this daemon serves `WatchEvents` at all.
         let unsupported = self.unsupported.clone();
         self.task = Some(tokio::spawn(async move {
             let (mode, never) = watch(&ctx, &tx, &refresh).await;
@@ -268,20 +271,18 @@ impl Watcher {
         }));
     }
 
+    /// Stop the stream and forget what this daemon serves.
     fn reset(&mut self) {
         if let Some(t) = self.task.take() {
             t.abort();
         }
-        self.unsupported
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.unsupported.store(false, Ordering::Relaxed);
     }
 }
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        if let Some(t) = self.task.take() {
-            t.abort();
-        }
+        self.reset();
     }
 }
 
@@ -299,7 +300,7 @@ async fn watch(
     };
     let mut stream = match conn
         .client
-        .watch_events(gyges_proto::v1::WatchEventsRequest::default())
+        .watch_events(WatchEventsRequest::default())
         .await
     {
         Ok(s) => s.into_inner(),

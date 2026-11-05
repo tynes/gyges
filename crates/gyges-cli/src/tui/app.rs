@@ -428,9 +428,16 @@ impl App {
                 self.sync = Ok(Vec::new());
                 self.wallets.clear();
                 self.book.clear();
+                // The poller stops the stream; a daemon that comes back
+                // reports afresh.
+                self.events = EventsMode::Unknown;
             }
             Event::Info(info) => {
                 self.daemon = Daemon::Up;
+                if info.airgapped {
+                    // The poller never opens `WatchEvents` air-gapped.
+                    self.events = EventsMode::Polling("not served air-gapped".into());
+                }
                 self.info = Some(*info);
                 self.fix_selection();
                 if self.tab == Tab::Addresses || self.modal == Some(Modal::Qr) {
@@ -892,11 +899,22 @@ pub(crate) mod tests {
             ..Default::default()
         }])));
         assert!(app.sync_for("main").is_some());
+        app.on_event(Event::Events(EventsMode::Streaming));
         app.on_event(Event::Down {
             error: "gygesd is not running".into(),
         });
         assert!(app.settled());
         assert!(app.info.is_none() && app.sync_for("main").is_none());
+        assert_eq!(app.events, EventsMode::Unknown, "not left streaming");
+        // Back air-gapped: the stream is never opened, and the tab says why.
+        app.on_event(Event::Info(Box::new(GetInfoResponse {
+            airgapped: true,
+            ..info_with(Vec::new())
+        })));
+        assert_eq!(
+            app.events,
+            EventsMode::Polling("not served air-gapped".into())
+        );
     }
 
     #[test]

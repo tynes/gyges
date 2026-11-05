@@ -69,17 +69,15 @@ async fn watch_events_opens_with_the_state_and_announces_a_payment() {
     assert_eq!(detected.txid.len(), 64);
 
     // Nothing else is announced for the old payment while idle.
-    let quiet = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(wallet_event::Event::Detected(d)) =
-                next(&mut events, Duration::from_secs(3)).await
-            {
-                return d;
-            }
-        }
-    })
-    .await;
-    assert!(quiet.is_err(), "{quiet:?}");
+    let until = std::time::Instant::now() + Duration::from_secs(3);
+    while let Some(ev) = next(
+        &mut events,
+        until.saturating_duration_since(std::time::Instant::now()),
+    )
+    .await
+    {
+        assert!(!matches!(ev, wallet_event::Event::Detected(_)), "{ev:?}");
+    }
 
     // One key: an unknown one is refused before the stream opens.
     let err = c
