@@ -392,7 +392,7 @@ impl KeyRegistry {
         let reg = Self {
             home,
             network,
-            params: network.consensus_params(),
+            params: config.consensus_params(network),
             scrypt_work_factor: config.vault.scrypt_work_factor,
             default_key: RwLock::new(config.default_key.clone()),
             keys: RwLock::new(BTreeMap::new()),

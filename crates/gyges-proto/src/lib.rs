@@ -48,12 +48,13 @@ pub const API_MAJOR: u32 = 0;
 ///
 /// - 0.2: `NodeStatus.rpc_url` / `indexer_url`, `FallbackStatus.broadcast_via_tor`.
 /// - 0.3: `WatchEvents`.
-pub const API_MINOR: u32 = 3;
+/// - 0.4: `NodeStatus.warning`.
+pub const API_MINOR: u32 = 4;
 
 /// `"<major>.<minor>"`, the `schema_version` value in `--json` output.
 pub const fn schema_version() -> &'static str {
     // Kept in step with API_MAJOR / API_MINOR by `tests::schema_version_matches`.
-    "0.3"
+    "0.4"
 }
 
 /// Type URL of the one detail every failed Gyges RPC carries (docs/interface.md API §3).

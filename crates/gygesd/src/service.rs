@@ -239,6 +239,11 @@ impl DaemonState {
             node_version: String::new(),
             rpc_url: without_userinfo(&self.config.zakura_rpc.url),
             indexer_url: without_userinfo(&self.config.zakura_rpc.indexer_url),
+            warning: if st.connected {
+                st.warning
+            } else {
+                String::new()
+            },
         }
     }
 }

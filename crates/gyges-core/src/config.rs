@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use zcash_protocol::consensus::BlockHeight;
 
-use crate::network::Network;
+use crate::network::{ConsensusParams, Network};
 
 /// The whole daemon configuration.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -33,6 +34,19 @@ pub struct Config {
     pub mempool: MempoolConfig,
     pub tex: TexConfig,
     pub policy: PolicyConfig,
+    pub regtest: RegtestConfig,
+}
+
+/// `[regtest]`: the activation heights a regtest chain may choose. Mainnet
+/// and testnet heights are the pinned `zakura-protocol` constants, so
+/// setting any of these on them is refused.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RegtestConfig {
+    /// NU7's activation height; 0 (the default) never activates it. Must
+    /// equal the node's `NU7` under
+    /// `[network.testnet_parameters.activation_heights]`.
+    pub nu7_activation_height: u32,
 }
 
 /// `[daemon]`
@@ -272,6 +286,10 @@ pub enum ConfigError {
     SocketPathRelative(String),
     #[error("[vault] scrypt_work_factor must be between 10 and 30 (log2 N), got {0}")]
     ScryptWorkFactor(u8),
+    #[error(
+        "[regtest] nu7_activation_height is for regtest only; {0} activates NU7 at the height the network schedules"
+    )]
+    RegtestOnly(Network),
 }
 
 /// The commented `config.toml` the daemon writes on first start when none
@@ -411,7 +429,22 @@ impl Config {
         if !(10..=30).contains(&wf) {
             return Err(ConfigError::ScryptWorkFactor(wf));
         }
+        if self.regtest != RegtestConfig::default() && directory != Network::Regtest {
+            return Err(ConfigError::RegtestOnly(directory));
+        }
         Ok(())
+    }
+
+    /// The consensus parameters of `network` under this configuration:
+    /// the upstream constants, with `[regtest]`'s heights on regtest.
+    pub fn consensus_params(&self, network: Network) -> ConsensusParams {
+        match network {
+            Network::Regtest => ConsensusParams::regtest(
+                (self.regtest.nu7_activation_height != 0)
+                    .then(|| BlockHeight::from_u32(self.regtest.nu7_activation_height)),
+            ),
+            other => other.consensus_params(),
+        }
     }
 
     /// `daemon.socket_path` with `~` expanded; `None` for the default.
@@ -611,6 +644,27 @@ mod tests {
             Err(ConfigError::BroadcastViaTorUnavailable)
         ));
         cfg.validate(Network::Regtest).unwrap();
+    }
+
+    #[test]
+    fn regtest_nu7_height_is_regtest_only() {
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters as _};
+        let cfg = Config::parse("[regtest]\nnu7_activation_height = 20\n").unwrap();
+        cfg.validate(Network::Regtest).unwrap();
+        for net in [Network::Mainnet, Network::Testnet] {
+            assert!(matches!(
+                cfg.validate(net),
+                Err(ConfigError::RegtestOnly(n)) if n == net
+            ));
+        }
+        let nu7 = |c: &Config, n| {
+            c.consensus_params(n)
+                .activation_height(NetworkUpgrade::Nu7)
+                .map(u32::from)
+        };
+        assert_eq!(nu7(&cfg, Network::Regtest), Some(20));
+        assert_eq!(nu7(&Config::default(), Network::Regtest), None);
+        assert_eq!(nu7(&Config::default(), Network::Mainnet), Some(3_543_405));
     }
 
     #[test]

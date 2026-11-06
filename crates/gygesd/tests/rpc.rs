@@ -6735,3 +6735,221 @@ async fn sapling_notes_are_keyed_proven_and_signed_inside_the_send_stream() {
 
 #[path = "rpc/events.rs"]
 mod events;
+
+// ---------------------------------------------------------------------------
+// NU7 (docs/testing.md §3): a regtest chain that activates it part-way up,
+// on both the fake node and the daemon (`[regtest] nu7_activation_height`).
+// ---------------------------------------------------------------------------
+
+/// Where the NU7 tests activate it: a few blocks above the funding.
+const NU7_AT: u32 = 30;
+
+/// [`ONE_CONF_CONFIG`] with NU7 at [`NU7_AT`].
+fn nu7_config() -> String {
+    format!("{ONE_CONF_CONFIG}[regtest]\nnu7_activation_height = {NU7_AT}\n")
+}
+
+/// A fake node that activates NU7 at [`NU7_AT`], with `blocks` mined.
+async fn nu7_node(blocks: u32) -> FakeNode {
+    let node = FakeNode::start(gyges_chain::testing::regtest_params_with_nu7(NU7_AT)).await;
+    node.mine(blocks);
+    node
+}
+
+/// The consensus branch the node mined `txid` (display hex) under.
+fn mined_branch(node: &FakeNode, txid: &str) -> (u32, zcash_protocol::consensus::BranchId) {
+    let id = gyges_chain::parse_display_hash(txid).unwrap();
+    let (tip, _) = node.tip();
+    for height in 1..=tip {
+        let block = node.block(height).unwrap();
+        if let Some(i) = block.txids.iter().position(|t| *t == id) {
+            let tx = zcash_primitives::transaction::Transaction::read(
+                &block.tx_raw[i][..],
+                zcash_protocol::consensus::BranchId::Nu7,
+            )
+            .unwrap();
+            return (height, tx.consensus_branch_id());
+        }
+    }
+    panic!("{txid} is not mined");
+}
+
+/// A send the node refuses just before NU7 stays in the wallet as unmined
+/// until it expires, holding the note it spends. Its expiry is capped at
+/// the block before NU7 (it can never be mined after), so the note is
+/// spendable again once NU7 is next instead of 40 blocks later; the send
+/// after NU7 commits to the NU7 branch, gets the scaled 120-block expiry,
+/// and is mined.
+#[tokio::test]
+async fn a_send_refused_before_nu7_frees_its_note_when_nu7_is_next() {
+    use gyges_proto::v1::Pool;
+    let node = nu7_node(10).await;
+    let (running, mut c) = start_on(&node, &nu7_config()).await;
+    let state = &running.state;
+    init_key(&mut c, "main").await;
+    wait_spendable(&mut c, "main").await;
+    let events = fund_and_shield(&node, state, &mut c, "main", 100_000_000).await;
+    let ironwood = 100_000_000 - proposal_of(&events).total_fee;
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    let t = t_recipient();
+
+    node.set_reject_broadcasts(Some("refused by the test".into()));
+    let dry = collect_events(
+        c.send_transaction(SendTransactionRequest {
+            dry_run: true,
+            ..send_req("main", &t, 10_000_000)
+        })
+        .await,
+    )
+    .await
+    .unwrap();
+    let p = proposal_of(&dry);
+    assert_eq!(node.tip().0, 14);
+    assert_eq!(
+        p.expiry_height,
+        NU7_AT - 1,
+        "target 15 + 40 would cross NU7: {p:?}"
+    );
+    let err = collect_events(c.send_transaction(send_req("main", &t, 10_000_000)).await)
+        .await
+        .unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::NodeRejected, "{err:?}");
+    let b = balance(&mut c, "main").await;
+    assert_eq!(
+        balance_of(&b, Pool::Ironwood).0,
+        0,
+        "the refused send holds the note: {b:?}"
+    );
+    node.set_reject_broadcasts(None);
+
+    // While the next block could still include it, the note stays held.
+    node.mine(NU7_AT - 2 - 14);
+    wait_spendable(&mut c, "main").await;
+    let b = balance(&mut c, "main").await;
+    assert_eq!(balance_of(&b, Pool::Ironwood).0, 0, "{b:?}");
+    // With NU7 next, it can never be mined: the note is back.
+    node.mine(1);
+    wait_spendable(&mut c, "main").await;
+    let b = balance(&mut c, "main").await;
+    assert_eq!(
+        balance_of(&b, Pool::Ironwood),
+        (ironwood, 0),
+        "spendable again before NU7: {b:?}"
+    );
+
+    // After NU7: the scaled expiry, the NU7 branch, mined.
+    node.mine(1);
+    wait_spendable(&mut c, "main").await;
+    let events = collect_events(c.send_transaction(send_req("main", &t, 10_000_000)).await)
+        .await
+        .unwrap();
+    let p = proposal_of(&events);
+    let target = NU7_AT + 1;
+    assert_eq!(p.expiry_height, target + 120, "{p:?}");
+    let txid = broadcast_txid(&events);
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    assert_eq!(
+        mined_branch(&node, &txid),
+        (target, zcash_protocol::consensus::BranchId::Nu7)
+    );
+    let b = balance(&mut c, "main").await;
+    assert_eq!(
+        b.total_spendable,
+        ironwood - 10_000_000 - p.total_fee,
+        "{b:?}"
+    );
+
+    // The node knows NU7, so `GetInfo` has no warning for it.
+    let info = c.get_info(GetInfoRequest {}).await.unwrap().into_inner();
+    let n = info.node.unwrap();
+    assert!(n.connected && n.warning.is_empty(), "{n:?}");
+    running.task.abort();
+}
+
+/// Shielding, a `pczt create` file and Ironwood sends on both sides of
+/// NU7. A file made before NU7 expires before it (not a day later); signed
+/// before and broadcast after, it is refused as one to build again
+/// (exit 6) and nothing reaches the node. After NU7 the same pipeline works
+/// and the file gets about a day of 25-second blocks.
+#[tokio::test]
+async fn shield_pczt_and_send_across_nu7() {
+    use gyges_proto::v1::Pool;
+    let node = nu7_node(10).await;
+    let (running, mut c) = start_on(&node, &nu7_config()).await;
+    let state = &running.state;
+    init_key(&mut c, "main").await;
+    wait_spendable(&mut c, "main").await;
+    let events = fund_and_shield(&node, state, &mut c, "main", 100_000_000).await;
+    let shield = proposal_of(&events);
+    assert_eq!(shield.expiry_height, NU7_AT - 1, "{shield:?}");
+    let shield_txid = broadcast_txid(&events);
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    assert_eq!(
+        mined_branch(&node, &shield_txid),
+        (13, zcash_protocol::consensus::BranchId::Nu6_3)
+    );
+    let ironwood = 100_000_000 - shield.total_fee;
+    let b = balance(&mut c, "main").await;
+    assert_eq!(balance_of(&b, Pool::Ironwood), (ironwood, 0), "{b:?}");
+    lock(&mut c, "main").await;
+
+    // Before NU7: the file's long expiry stops at the block before it.
+    let t = t_recipient();
+    let created = c
+        .create_pczt(create_req("main", &t, 5_000_000))
+        .await
+        .unwrap()
+        .into_inner();
+    let p = created.proposal.unwrap();
+    assert_eq!(p.expiry_height, NU7_AT - 1, "{p:?}");
+    let proven = prove(&mut c, created.pczts[0].clone()).await.unwrap();
+    let (signed, _) = sign_pczt_with_session(&mut c, proven, "pw").await.unwrap();
+
+    // Across NU7, the signed file can no longer be mined.
+    node.mine(NU7_AT + 1 - node.tip().0);
+    wait_spendable(&mut c, "main").await;
+    let err = broadcast(&mut c, signed).await.unwrap_err();
+    assert_eq!(reason(&err), ErrorReason::InvalidArgument, "{err:?}");
+    assert!(err.message().contains("build it again"), "{err:?}");
+    assert!(node.mempool().is_empty());
+
+    // After NU7: an Ironwood spend proves, signs and is mined under NU7.
+    unlock_daemon(&mut c, "main").await;
+    let events = collect_events(c.send_transaction(send_req("main", &t, 20_000_000)).await)
+        .await
+        .unwrap();
+    let p = proposal_of(&events);
+    assert_eq!(p.steps[0].inputs[0].pool(), Pool::Ironwood, "{p:?}");
+    let target = NU7_AT + 2;
+    assert_eq!(p.expiry_height, target + 120, "{p:?}");
+    let txid = broadcast_txid(&events);
+    node.mine(2);
+    wait_spendable(&mut c, "main").await;
+    assert_eq!(
+        mined_branch(&node, &txid),
+        (target, zcash_protocol::consensus::BranchId::Nu7)
+    );
+    let b = balance(&mut c, "main").await;
+    assert_eq!(
+        b.total_spendable,
+        ironwood - 20_000_000 - p.total_fee,
+        "{b:?}"
+    );
+
+    // And a file made after NU7 gets a day of 25-second blocks.
+    let created = c
+        .create_pczt(create_req("main", &t, 5_000_000))
+        .await
+        .unwrap()
+        .into_inner();
+    let p = created.proposal.unwrap();
+    assert!(
+        p.expiry_height >= p.anchor_height + 3 * gygesd::PCZT_EXPIRY_BLOCKS
+            && p.expiry_height < p.anchor_height + 3 * gygesd::PCZT_EXPIRY_BLOCKS + 20,
+        "{p:?}"
+    );
+    running.task.abort();
+}

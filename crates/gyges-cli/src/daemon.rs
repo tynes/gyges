@@ -278,6 +278,9 @@ pub fn render_status(info: &GetInfoResponse) -> String {
                 n.retained_from,
                 pruning(n)
             );
+            if !n.warning.is_empty() {
+                let _ = writeln!(s, "  node warning: {}", n.warning);
+            }
         }
         Some(n) => {
             let _ = writeln!(

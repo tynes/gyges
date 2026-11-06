@@ -47,20 +47,16 @@ use crate::{blocking, wallet_rpc, with_wallet};
 /// The server-streaming response type for `SignPczt`.
 pub(crate) type SignStream = tonic::codegen::BoxStream<SignPcztEvent>;
 
-/// How far past the proposal's target height a `pczt create` transaction
-/// may still be mined. A file travels on removable media and waits for a
-/// person (docs/architecture.md Components §3.5), so the default `target + 40` of `tx send`
-/// (fifty minutes on mainnet) would expire most of them; this is about a
-/// day of 75-second blocks, the window `vault.signing_session_ttl` gives a
-/// passphrase session.
-pub const PCZT_EXPIRY_BLOCKS: u32 = 1152;
-
 /// The expiry of a transaction that waits for a person: a `pczt create`
 /// file, or a Keystone send, which may wait across a restart for up to
-/// `vault.signing_session_ttl`. [`PCZT_EXPIRY_BLOCKS`] past the proposal's
-/// target height instead of `tx send`'s 40.
-pub(crate) fn long_expiry(min_target: impl Into<BlockHeight>) -> BlockHeight {
-    min_target.into() + PCZT_EXPIRY_BLOCKS
+/// `vault.signing_session_ttl`. About a day past the proposal's target
+/// height instead of `tx send`'s fifty minutes, never past the next network
+/// upgrade (`gyges_core::tx::long_expiry`).
+pub(crate) fn long_expiry(
+    params: &gyges_core::ConsensusParams,
+    min_target: impl Into<BlockHeight>,
+) -> BlockHeight {
+    core_tx::long_expiry(params, min_target)
 }
 
 /// Parse the bytes, read the tags, and apply the two checks every PCZT RPC
@@ -201,7 +197,7 @@ pub(crate) async fn create_pczt(
                     .into(),
             ));
         }
-        let expiry = Some(long_expiry(proposal.min_target_height()));
+        let expiry = Some(long_expiry(&params, proposal.min_target_height()));
         let summary = core_tx::summarize(&params, &proposal, min_confirmations, expiry);
         let (expected, pczt) =
             core_tx::build_single_step(wallet, &params, account, &proposal, expiry)?;

@@ -4,7 +4,8 @@
 //! in `versions.toml` downloaded into `target/regtest-bin/` and verified
 //! against its sha256 (Linux only: Zakura publishes no other binaries).
 //! [`Node`] runs it in regtest from a temporary directory with proof of work
-//! disabled, every network upgrade through NU6.3 active at height 1, the
+//! disabled, every network upgrade through NU6.3 active at height 1 (NU7
+//! where [`NodeOpts::nu7_activation_height`] says), the
 //! smallest retention window the node accepts, cookie authentication and a
 //! configurable coinbase recipient, and drives it over JSON-RPC.
 //!
@@ -136,6 +137,11 @@ pub struct NodeOpts {
     /// node's default `archive`); `tx_retention` is then ignored. The
     /// archival node behind zaino ([`crate::Fallback`]) runs this way.
     pub archive: bool,
+    /// NU7's activation height (`NU7` under
+    /// `[network.testnet_parameters.activation_heights]`); `None` never
+    /// activates it. A daemon on this node needs the same height as
+    /// `[regtest] nu7_activation_height`.
+    pub nu7_activation_height: Option<u32>,
 }
 
 impl Default for NodeOpts {
@@ -144,6 +150,7 @@ impl Default for NodeOpts {
             miner_address: BURN_MINER_ADDRESS.into(),
             tx_retention: MIN_TX_RETENTION,
             archive: false,
+            nu7_activation_height: None,
         }
     }
 }
@@ -296,7 +303,7 @@ NU6 = 1
 "NU6.1" = 1
 "NU6.2" = 1
 "NU6.3" = 1
-
+{nu7}
 [state]
 cache_dir = "{d}/state"
 {storage}
@@ -319,6 +326,10 @@ use_color = false
             zakura = self.zakura_port,
             rpc = self.rpc_port,
             miner = self.opts.miner_address,
+            nu7 = self
+                .opts
+                .nu7_activation_height
+                .map_or(String::new(), |h| format!("NU7 = {h}\n")),
         );
         fs::write(self.config_path(), config)?;
         Ok(())

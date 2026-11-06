@@ -33,7 +33,7 @@ use zcash_client_backend::data_api::chain::ChainState;
 use zcash_client_backend::proto::compact_formats::CompactBlock;
 use zcash_client_backend::proto::service::TreeState;
 use zcash_protocol::ShieldedPool;
-use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
+use zcash_protocol::consensus::{BlockHeight, NetworkType, NetworkUpgrade, Parameters};
 
 use crate::compact::{self, TreeSizes};
 use crate::{
@@ -431,7 +431,14 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
             &info.chain,
             format_args!("the node at {}", self.url),
         )?;
-        self.check_upgrades(&info, network)?;
+        let warning = self.check_upgrades(&info, network)?;
+        if self.status.set_warning(warning.clone()) {
+            if warning.is_empty() {
+                tracing::info!(url = %self.url, "the node now knows every scheduled network upgrade");
+            } else {
+                tracing::warn!(url = %self.url, "{warning}");
+            }
+        }
         Ok(info)
     }
 
@@ -439,9 +446,29 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
     /// consensus parameters: a mismatched height, an upgrade the daemon
     /// expects by the node's tip that the node never activated (a regtest
     /// without `[network.testnet_parameters.activation_heights]`), or rules
-    /// in force on the node that this daemon does not know. Pending upgrades
-    /// above the tip on either side are not an error.
-    fn check_upgrades(&self, info: &BlockchainInfo, network: &str) -> Result<(), ChainError> {
+    /// in force on the node that this daemon does not know. An upgrade the
+    /// daemon schedules above the tip that the node does not list is a
+    /// warning, returned (empty when there is none): such a node release
+    /// does not know the upgrade and stops following the chain at its
+    /// activation (Zakura releases before v1.7.0 halt before NU7). An
+    /// upgrade the node schedules above the tip that the daemon does not
+    /// know is not checked.
+    fn check_upgrades(&self, info: &BlockchainInfo, network: &str) -> Result<String, ChainError> {
+        let regtest_hint = |nu: NetworkUpgrade| {
+            if self.params.network_type() != NetworkType::Regtest {
+                String::new()
+            } else if nu == NetworkUpgrade::Nu7 {
+                " (set the same height as [regtest] nu7_activation_height in gygesd's \
+                 config.toml and as NU7 under [network.testnet_parameters.activation_heights] \
+                 in zakura.toml)"
+                    .into()
+            } else {
+                " (a regtest node needs it under \
+                 [network.testnet_parameters.activation_heights] in zakura.toml)"
+                    .into()
+            }
+        };
+        let mut warning = String::new();
         for nu in UPGRADES {
             let expected = self.params.activation_height(nu).map(u32::from);
             let node = info
@@ -450,15 +477,34 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
                 .map(|u| u.activationheight);
             let problem = match (expected, node) {
                 (Some(e), Some(n)) if e != n => format!(
-                    "activates {nu:?} at height {n}, this daemon's {network} parameters expect {e}"
+                    "activates {nu:?} at height {n}, this daemon's {network} parameters expect {e}{}",
+                    regtest_hint(nu)
                 ),
                 (Some(e), None) if e <= info.blocks => format!(
                     "has not activated {nu:?}, which this daemon's {network} parameters expect at \
-                     height {e} (a regtest node needs it under \
-                     [network.testnet_parameters.activation_heights] in zakura.toml)"
+                     height {e}{}",
+                    regtest_hint(nu)
                 ),
+                (Some(e), None) => {
+                    if warning.is_empty() {
+                        warning = format!(
+                            "the node at {} does not know {nu:?}, which activates at height {e} \
+                             ({} blocks above its tip); a node release without it stops \
+                             following the chain there, so upgrade zakurad before then{}",
+                            self.url,
+                            e - info.blocks,
+                            if nu == NetworkUpgrade::Nu7 {
+                                " (v1.7.0 or later follows NU7)"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                    continue;
+                }
                 (None, Some(n)) if n <= info.blocks => format!(
-                    "has activated {nu:?} at height {n}, which this daemon does not support"
+                    "has activated {nu:?} at height {n}, which this daemon does not support{}",
+                    regtest_hint(nu)
                 ),
                 _ => continue,
             };
@@ -467,7 +513,7 @@ impl<P: Parameters + Send + Sync + 'static> ZakuraRpcBackend<P> {
                 self.url
             )));
         }
-        Ok(())
+        Ok(warning)
     }
 
     /// `getrawtransaction(txid, 1)`; `None` for a txid the node has neither
@@ -815,7 +861,7 @@ impl<P: Parameters + Send + Sync + 'static> ChainBackend for ZakuraRpcBackend<P>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeNode, h, regtest_params};
+    use crate::testing::{FakeNode, h, regtest_params, regtest_params_with_nu7};
     use transparent::address::TransparentAddress;
 
     fn backend(node: &FakeNode) -> ZakuraRpcBackend<zcash_protocol::local_consensus::LocalNetwork> {
@@ -1118,5 +1164,87 @@ mod tests {
                 && m.contains("activation_heights")),
             "{err}"
         );
+    }
+
+    /// A node release that does not know NU7 halts before it (Zakura before
+    /// v1.7.0 on mainnet): while NU7 is pending the backend keeps working but
+    /// says so in `NodeStatus.warning`; once the tip reaches the activation
+    /// the node is refused.
+    #[tokio::test]
+    async fn a_node_that_does_not_know_a_pending_nu7_is_a_warning_then_an_error() {
+        let node = FakeNode::start(regtest_params()).await;
+        node.mine(10);
+        let be = ZakuraRpcBackend::new(node.url(), None, regtest_params_with_nu7(20)).unwrap();
+        be.node_bounds().await.unwrap();
+        let st = be.status();
+        assert!(st.connected && st.last_error.is_empty(), "{st:?}");
+        assert!(
+            st.warning.contains("does not know Nu7")
+                && st.warning.contains("height 20")
+                && st.warning.contains("10 blocks above its tip")
+                && st.warning.contains("v1.7.0"),
+            "{st:?}"
+        );
+        node.mine(10);
+        let err = be.node_bounds().await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Rpc(m) if m.contains("has not activated Nu7")
+                && m.contains("nu7_activation_height")),
+            "{err}"
+        );
+
+        // A node that knows it: no warning, before or after activation.
+        let node = FakeNode::start(regtest_params_with_nu7(20)).await;
+        node.mine(10);
+        let be = ZakuraRpcBackend::new(node.url(), None, regtest_params_with_nu7(20)).unwrap();
+        be.node_bounds().await.unwrap();
+        assert_eq!(be.status().warning, "");
+        node.mine(15);
+        be.node_bounds().await.unwrap();
+        assert_eq!(be.status().warning, "");
+
+        // A daemon without NU7 follows a node that schedules it until the
+        // node activates it; then the hint names the config key.
+        let be = backend(&node);
+        let err = be.node_bounds().await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Rpc(m) if m.contains("has activated Nu7 at height 20")
+                && m.contains("[regtest] nu7_activation_height")),
+            "{err}"
+        );
+        // Heights that disagree are refused at once.
+        let be = ZakuraRpcBackend::new(node.url(), None, regtest_params_with_nu7(30)).unwrap();
+        let err = be.node_bounds().await.unwrap_err();
+        assert!(
+            matches!(&err, ChainError::Rpc(m) if m.contains("activates Nu7 at height 20")
+                && m.contains("expect 30")),
+            "{err}"
+        );
+    }
+
+    /// Blocks on both sides of NU7 parse, cross-check against the node and
+    /// carry the branch each was built under; tree states keep working.
+    #[tokio::test]
+    async fn compact_blocks_and_tree_states_across_nu7() {
+        use zcash_protocol::consensus::BranchId;
+        let params = regtest_params_with_nu7(6);
+        let node = FakeNode::start(params).await;
+        node.mine(10);
+        let be = ZakuraRpcBackend::new(node.url(), None, params).unwrap();
+        be.node_bounds().await.unwrap();
+        for height in 1..=10 {
+            let block = be.compact_block(h(height)).await.unwrap();
+            assert_eq!(block.height, u64::from(height));
+            let want = if height >= 6 {
+                BranchId::Nu7
+            } else {
+                BranchId::Nu6_3
+            };
+            for raw in node.block(height).unwrap().tx_raw {
+                let tx = zcash_primitives::transaction::Transaction::read(&raw[..], want).unwrap();
+                assert_eq!(tx.consensus_branch_id(), want, "block {height}");
+            }
+            be.chain_state(h(height)).await.unwrap();
+        }
     }
 }

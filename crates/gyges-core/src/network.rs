@@ -55,12 +55,14 @@ impl Network {
     }
 
     /// The consensus parameters `zcash_keys` and `zcash_client_sqlite` need
-    /// (address encodings, coin type, activation heights).
+    /// (address encodings, coin type, activation heights). Regtest never
+    /// activates NU7 here; [`ConsensusParams::regtest`] takes a height
+    /// (`[regtest] nu7_activation_height`, `Config::consensus_params`).
     pub const fn consensus_params(self) -> ConsensusParams {
         match self {
             Network::Mainnet => ConsensusParams::Main,
             Network::Testnet => ConsensusParams::Test,
-            Network::Regtest => ConsensusParams::Regtest,
+            Network::Regtest => ConsensusParams::regtest(None),
         }
     }
 }
@@ -68,21 +70,33 @@ impl Network {
 /// `zcash_protocol::consensus::Parameters` for the three networks.
 ///
 /// Mainnet and testnet are the upstream constants. Regtest activates every
-/// network upgrade at height 1; a regtest `zakurad` does so only when its
+/// network upgrade through NU6.3 at height 1, and NU7 at `nu7` when set; a
+/// regtest `zakurad` does so only when its
 /// `[network.testnet_parameters.activation_heights]` says so (docs/decisions.md
-/// §4.3). The heights a node reports (`getblockchaininfo.upgrades`) are
+/// §2.3). The heights a node reports (`getblockchaininfo.upgrades`) are
 /// checked against this table when the node backend connects
 /// (`ZakuraRpcBackend::check_upgrades`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsensusParams {
     Main,
     Test,
-    Regtest,
+    Regtest {
+        /// NU7's activation height, `None` for a chain that never activates it.
+        nu7: Option<BlockHeight>,
+    },
+}
+
+impl ConsensusParams {
+    /// Regtest with NU7 at `nu7` (never when `None`).
+    pub const fn regtest(nu7: Option<BlockHeight>) -> Self {
+        ConsensusParams::Regtest { nu7 }
+    }
 }
 
 const REGTEST_ACTIVATION: BlockHeight = BlockHeight::from_u32(1);
 
-/// Every upgrade active from height 1.
+/// Every upgrade through NU6.3 active from height 1; NU7 comes from the
+/// variant.
 const REGTEST: LocalNetwork = LocalNetwork {
     overwinter: Some(REGTEST_ACTIVATION),
     sapling: Some(REGTEST_ACTIVATION),
@@ -102,7 +116,7 @@ impl Parameters for ConsensusParams {
         match self {
             ConsensusParams::Main => NetworkType::Main,
             ConsensusParams::Test => NetworkType::Test,
-            ConsensusParams::Regtest => NetworkType::Regtest,
+            ConsensusParams::Regtest { .. } => NetworkType::Regtest,
         }
     }
 
@@ -110,7 +124,11 @@ impl Parameters for ConsensusParams {
         match self {
             ConsensusParams::Main => MAIN_NETWORK.activation_height(nu),
             ConsensusParams::Test => TEST_NETWORK.activation_height(nu),
-            ConsensusParams::Regtest => REGTEST.activation_height(nu),
+            ConsensusParams::Regtest { nu7 } => LocalNetwork {
+                nu7: *nu7,
+                ..REGTEST
+            }
+            .activation_height(nu),
         }
     }
 }
@@ -169,6 +187,27 @@ mod tests {
             Network::Regtest.consensus_params().network_type(),
             NetworkType::Regtest
         );
+    }
+
+    /// NU7 is scheduled on both public networks by the pinned
+    /// `zakura-protocol` (mainnet at ZIP 259's height), and on regtest only
+    /// when asked for.
+    #[test]
+    fn nu7_activates_where_the_networks_schedule_it() {
+        let nu7 = |p: ConsensusParams| p.activation_height(NetworkUpgrade::Nu7).map(u32::from);
+        assert_eq!(nu7(Network::Mainnet.consensus_params()), Some(3_543_405));
+        assert_eq!(nu7(Network::Testnet.consensus_params()), Some(4_465_026));
+        assert_eq!(nu7(Network::Regtest.consensus_params()), None);
+        let p = ConsensusParams::regtest(Some(BlockHeight::from_u32(20)));
+        assert_eq!(nu7(p), Some(20));
+        assert_eq!(p.network_type(), NetworkType::Regtest);
+        // The other upgrades are unchanged by the NU7 height.
+        for nu in [NetworkUpgrade::Sapling, NetworkUpgrade::Nu6_3] {
+            assert_eq!(
+                p.activation_height(nu),
+                Network::Regtest.consensus_params().activation_height(nu)
+            );
+        }
     }
 
     #[test]

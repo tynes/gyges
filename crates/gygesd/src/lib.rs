@@ -59,9 +59,9 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
+pub use gyges_core::tx::LONG_EXPIRY_PRE_NU7_BLOCKS as PCZT_EXPIRY_BLOCKS;
 pub use keys::AUDIT_TARGET;
 pub use logs::LogHub;
-pub use roles::PCZT_EXPIRY_BLOCKS;
 pub use service::DaemonState;
 pub use sync::SyncHub;
 
@@ -346,7 +346,7 @@ impl Daemon {
                 ZakuraRpcBackend::new(
                     config.zakura_rpc.url.clone(),
                     config.zakura_cookie_path(),
-                    network.consensus_params(),
+                    registry.params(),
                 )
                 .context("cannot set up the node backend")?,
             )),
@@ -367,9 +367,8 @@ impl Daemon {
                 );
                 Transport::Direct
             };
-            let backend =
-                ArtiTorLwdBackend::new(&fb.grpc_url, transport, network.consensus_params())
-                    .context("cannot set up the fallback endpoint backend")?;
+            let backend = ArtiTorLwdBackend::new(&fb.grpc_url, transport, registry.params())
+                .context("cannot set up the fallback endpoint backend")?;
             if fb.use_tor && !backend.is_onion() {
                 tracing::info!(
                     endpoint = %fb.grpc_url,

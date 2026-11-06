@@ -11,9 +11,10 @@ use std::time::Duration;
 use gyges_chain::{ChainBackend as _, ChainError, ZakuraRpcBackend};
 use gyges_regtest::{
     BURN_MINER_ADDRESS, Fixture, NODE_CONFIG, Node, NodeOpts, PASSPHRASE, Run, balance,
-    funded_wallet, parse_tex_txids, poll_until, regtest, send, shield, spendable, start_daemon,
-    sweep_logs, sync_wait, sync_wait_within, test_key_miner, test_key_transparent,
-    test_key_transparent_address, tex_row, wait_balance, wait_for_txid, wait_tex_state,
+    funded_wallet, funded_wallet_with, parse_tex_txids, poll_until, regtest, send, shield,
+    spendable, start_daemon, sweep_logs, sync_wait, sync_wait_within, test_key_miner,
+    test_key_transparent, test_key_transparent_address, tex_row, wait_balance, wait_for_txid,
+    wait_tex_state,
 };
 use transparent::address::TransparentAddress;
 
@@ -573,5 +574,156 @@ fn sapling_spend_against_the_real_node() {
     sweep_logs(
         &fx.network_dir().join("logs"),
         &[&shield_txid, &pay, &spend, &bob_sapling, PASSPHRASE],
+    );
+}
+
+/// The consensus branch id a v5/v6 transaction commits to (header bytes
+/// 8..12, little-endian, as `getblockchaininfo.upgrades` keys it) and its
+/// `nExpiryHeight`, from the node.
+fn branch_and_expiry(node: &Node, txid: &str) -> (String, u32) {
+    let raw = hex::decode(node.raw_transaction(txid)).unwrap();
+    let branch = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+    let v: serde_json::Value = node.call("getrawtransaction", serde_json::json!([txid, 1]));
+    let expiry = v["expiryheight"].as_u64().expect("expiryheight") as u32;
+    (format!("{branch:08x}"), expiry)
+}
+
+/// NU6.3's and NU7's consensus branch ids.
+const NU6_3_BRANCH: &str = "37a5165b";
+const NU7_BRANCH: &str = "77190ad9";
+
+/// NU7 activates part-way up the real node's chain (docs/testing.md §3,
+/// NU7 row). The daemon follows it with no warning; a shield and a send
+/// built before it are capped to expire the block before it and mined under
+/// NU6.3; after it a send commits to the NU7 branch with the 120-block
+/// expiry and is mined; and a reorg that unwinds below the activation
+/// re-mines everything with the balances back.
+#[test]
+fn a_wallet_crosses_nu7_against_the_real_node() {
+    const NU7: u32 = 110;
+    let nu7 = |o: NodeOpts| NodeOpts {
+        nu7_activation_height: Some(NU7),
+        ..o
+    };
+    let wallet_taddr = test_key_transparent_address();
+    let Some(mut node) = Node::start_or_skip(nu7(test_key_miner())) else {
+        return;
+    };
+    node.mine(2);
+    node.restart(nu7(NodeOpts::default())).unwrap();
+    node.mine(100);
+    let log = node.log_path();
+    let config = format!("{NODE_CONFIG}[regtest]\nnu7_activation_height = {NU7}\n");
+    let (fx, pw, _) = funded_wallet_with(&node, &config);
+    let status = fx.gyges(&["daemon", "status"]).ok();
+    assert!(!status.stdout.contains("node warning"), "{status:?}");
+
+    // Before NU7: expiries capped at NU7 - 1, the NU6.3 branch.
+    let (shield_txid, _) = shield(&fx, &pw, &log, |_| {
+        node.mine(2);
+    });
+    assert_eq!(node.mined_height(&shield_txid), Some(103));
+    assert_eq!(
+        branch_and_expiry(&node, &shield_txid),
+        (NU6_3_BRANCH.to_string(), NU7 - 1),
+        "target 103 + 40 would cross NU7"
+    );
+    let pre = send(&fx, &pw, &log, &wallet_taddr, "0.5")
+        .stdout
+        .trim()
+        .to_string();
+    node.mine(2);
+    assert_eq!(node.mined_height(&pre), Some(105));
+    assert_eq!(
+        branch_and_expiry(&node, &pre),
+        (NU6_3_BRANCH.to_string(), NU7 - 1)
+    );
+    wait_for_txid(&fx, "main", &pre, 1);
+
+    // Across NU7: the daemon follows the node.
+    node.mine(NU7 + 1 - node.tip_height());
+    sync_wait(&fx, "main", &["--until", "spendable"]);
+    let run = fx.gyges(&["sync", "status", "--json"]).run();
+    assert_eq!(
+        run.json()["keys"][0]["scanned_tip"],
+        NU7 + 1,
+        "{}",
+        run.stdout
+    );
+    let status = fx.gyges(&["daemon", "status"]).ok();
+    assert!(!status.stdout.contains("node warning"), "{status:?}");
+
+    // After NU7: the NU7 branch and target + 120.
+    let post = send(&fx, &pw, &log, &wallet_taddr, "0.25")
+        .stdout
+        .trim()
+        .to_string();
+    node.mine(2);
+    let post_height = node.mined_height(&post).expect("mined");
+    assert_eq!(post_height, NU7 + 2);
+    assert_eq!(
+        branch_and_expiry(&node, &post),
+        (NU7_BRANCH.to_string(), NU7 + 2 + 120)
+    );
+    wait_for_txid(&fx, "main", &post, 1);
+    // Transparent funds go first: the send spent the 0.5 UTXO, paid 0.25
+    // back to the same address and put its change in Ironwood.
+    let before_reorg = wait_balance(&fx, "main", |b| {
+        spendable(b, "POOL_TRANSPARENT") == 25_000_000
+    });
+
+    // A reorg from below the activation: NU7's block is replaced. The node
+    // drops the post-NU7 send, which no pre-NU7 block can include; offered
+    // again above the activation, it is mined under NU7.
+    let raw = node.raw_transaction(&post);
+    let tip = node.tip_height();
+    let fork = NU7 - 2;
+    node.invalidate_block(&node.block_hash(fork));
+    assert_eq!(node.tip_height(), fork - 1);
+    node.mine(tip - fork + 2);
+    let remined = ensure_mined(&node, &post, &raw);
+    assert!(remined >= NU7, "{remined}");
+    node.mine(1);
+    sync_wait(&fx, "main", &[]);
+    wait_for_txid(&fx, "main", &post, 1);
+    let after = wait_balance(&fx, "main", |b| {
+        spendable(b, "POOL_TRANSPARENT") == 25_000_000
+            && spendable(b, "POOL_IRONWOOD") == spendable(&before_reorg, "POOL_IRONWOOD")
+    });
+    assert_eq!(after["pools"], before_reorg["pools"], "{after}");
+}
+
+/// A node release that does not know NU7 (Zakura before v1.7.0 halts
+/// before it): `daemon status` warns while it is ahead, and the node is
+/// refused once its tip reaches the height the daemon expects.
+#[test]
+fn a_node_that_does_not_know_nu7_is_flagged_against_the_real_node() {
+    let Some(node) = Node::start_or_skip(NodeOpts::default()) else {
+        return;
+    };
+    node.mine(3);
+    let mut fx = Fixture::new("regtest");
+    fx.write_config(&format!(
+        "{NODE_CONFIG}[regtest]\nnu7_activation_height = 20\n"
+    ));
+    start_daemon(&mut fx, &node);
+    fx.gyges(&["daemon", "status"])
+        .ok()
+        .stdout_has("connected, tip 3")
+        .stdout_has("node warning")
+        .stdout_has("does not know Nu7, which activates at height 20 (17 blocks above its tip)");
+    node.mine(17);
+    poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+        "the node is refused",
+        || {
+            let run = fx.gyges(&["daemon", "status"]).run();
+            if run.stdout.contains("has not activated Nu7") {
+                Ok(())
+            } else {
+                Err(run.stdout)
+            }
+        },
     );
 }

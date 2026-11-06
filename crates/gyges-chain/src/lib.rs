@@ -99,6 +99,10 @@ pub struct NodeStatus {
     pub last_error: String,
     /// When the last poll finished, successful or not.
     pub last_polled: Option<SystemTime>,
+    /// Set while the node is connected but not ready for a network upgrade
+    /// this daemon's parameters schedule above its tip (a node release
+    /// that does not know NU7 halts before it); empty otherwise.
+    pub warning: String,
 }
 
 /// A backend's [`NodeStatus`], refreshed by every bounds poll. Read on
@@ -110,6 +114,17 @@ pub(crate) struct StatusCell(ArcSwap<NodeStatus>);
 impl StatusCell {
     pub(crate) fn get(&self) -> NodeStatus {
         NodeStatus::clone(&self.0.load())
+    }
+
+    /// Replace [`NodeStatus::warning`], returning whether it changed.
+    pub(crate) fn set_warning(&self, warning: String) -> bool {
+        let mut status = self.get();
+        if status.warning == warning {
+            return false;
+        }
+        status.warning = warning;
+        self.0.store(Arc::new(status));
+        true
     }
 
     /// Record a poll's outcome (the bounds and whether the source is

@@ -444,6 +444,7 @@ Minors so far:
 | 0.1 | The first contract. |
 | 0.2 | `NodeStatus.rpc_url` and `indexer_url`, `FallbackStatus.broadcast_via_tor`, for `gyges tui`'s Endpoints tab (CLI §2.7). `GetInfo` reports the node URLs as configured (`[zakura_rpc] url`, or `gygesd --zakura-rpc`), and every URL it reports, `FallbackStatus.grpc_url` included, with any `user:password@` removed. Air-gapped, the node URLs are empty and `broadcast_via_tor` is false. |
 | 0.3 | `WatchEvents` (§4.8), the TUI's change feed. |
+| 0.4 | `NodeStatus.warning`: set while the node does not know a network upgrade the daemon schedules above its tip (a `zakurad` before v1.7.0 does not know NU7 and halts before it). `gyges daemon status` prints it as `node warning:`. |
 
 ---
 
@@ -511,6 +512,17 @@ Mined { step, txid, height }*            only if wait_for_mined
 
 Rules:
 
+- **Expiry.** `Proposed.expiry_height` is `target + 40` blocks before NU7
+  and `target + 120` from it (ZIP 218 divides the block spacing by three, so
+  both are about fifty minutes); a transaction that waits for a person (a
+  `pczt create` file, a Keystone send) gets about a day, `target + 1152` or
+  `target + 3456`. Neither ever reaches a network upgrade: a transaction
+  built before one commits to the old consensus branch and can never be
+  mined from its activation, so its expiry is the block before it and a
+  refused or unmined one frees its inputs at the upgrade. A proposal, PCZT or
+  Keystone session that an upgrade overtook anyway is refused with
+  `INVALID_ARGUMENT` ("build it again"), as is a transaction too large for
+  ZIP 218's per-block shielded limits from NU7.
 - **Prove before unlock.** Orchard and transparent proving need no secret, so
   the proposal is proven while the vault is locked and `SignatureRequired` is
   emitted as late as possible (Q-S3). The exception is a step with Sapling
@@ -570,8 +582,10 @@ the proofs and once after. A `WATCH_ONLY` profile answers
 `INVALID_ARGUMENT`. A `KEYSTONE_QR` profile pauses on a Keystone
 `SignatureRequired` (§6): the batch kind when the
 transaction has no transparent inputs, the single-PCZT kind otherwise. Its
-transaction gets the expiry of a PCZT file (`target + 1152` blocks, about a
-day), since it waits for a person and a device; a `tex1` recipient is
+transaction gets the expiry of a PCZT file (about a day: `target + 1152`
+blocks before NU7, `target + 3456` of its 25-second blocks after, never past
+the block before a network upgrade; §4.1), since it waits for a person and a
+device; a `tex1` recipient is
 refused with `HARDWARE_SIGNER` until the device's handling of ZIP 320 is
 verified (security.md §6 item 7); and while one of its Keystone sessions
 awaits the device, another spend from the key is refused with
@@ -918,7 +932,8 @@ Two completions of one session cannot run together: the second gets
 then emits `Signed` and `Broadcast`. If the node refuses the broadcast, the
 transaction is already in the wallet as unmined (as for any send, §4.1) and
 its inputs stay unspendable until its expiry height. For a Keystone send that
-height is about a day away (`target + 1152`), and no rebroadcast of a
+height is about a day away (or the block before the next network upgrade,
+whichever is sooner), and no rebroadcast of a
 completed session exists yet, so the funds wait that long. The `SIGN_PCZT` purpose is not built:
 `pczt sign` refuses a Keystone key.
 

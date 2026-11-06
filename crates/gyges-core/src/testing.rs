@@ -596,6 +596,7 @@ impl ChainBackend for MemChain {
             pruned: false,
             last_error: String::new(),
             last_polled: Some(SystemTime::now()),
+            warning: String::new(),
         }
     }
 

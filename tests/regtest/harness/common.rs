@@ -266,10 +266,16 @@ pub fn sweep_logs(dir: &Path, secrets: &[&str]) {
 /// blocks 1 and 2 (mined to [`test_key_miner`], mature by now) are
 /// spendable. The fixture, its passphrase file and those coinbases' value.
 pub fn funded_wallet(node: &Node) -> (Fixture, PathBuf, u64) {
+    funded_wallet_with(node, NODE_CONFIG)
+}
+
+/// [`funded_wallet`] with the daemon under `config` instead of
+/// [`NODE_CONFIG`].
+pub fn funded_wallet_with(node: &Node, config: &str) -> (Fixture, PathBuf, u64) {
     let funded = node.coinbase_value(1) + node.coinbase_value(2);
     assert!(funded > 0, "coinbases pay the transparent pool");
     let mut fx = Fixture::new("regtest");
-    fx.write_config(NODE_CONFIG);
+    fx.write_config(config);
     start_daemon(&mut fx, node);
     let pw = fx.passphrase_file(PASSPHRASE);
     let run = fx
