@@ -59,7 +59,7 @@ use zcash_client_backend::data_api::{
     CoinbaseFilter, InputSource as _, OutputLockStore as _, WalletRead as _,
 };
 use zcash_client_backend::fees::standard::SingleOutputChangeStrategy;
-use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule};
+use zcash_client_backend::fees::{ChangeError, DustOutputPolicy, StandardFeeRule};
 use zcash_client_backend::proposal::{Proposal, ProposalError, Step, StepOutputIndex};
 use zcash_client_backend::wallet::{
     Note, OutputRef, OvkPolicy, TransparentAddressSource, WalletTransparentOutput,
@@ -566,6 +566,10 @@ fn change_strategy() -> SingleOutputChangeStrategy<Wallet> {
 /// Map an upstream wallet error to ours: `not_synced` is the detail for a
 /// missing anchor, `what` names the step for anything else. The upstream
 /// type is generic over six error parameters, so only its shape is matched.
+/// Too little money comes back two ways: from input selection, and from the
+/// change strategy (`Change(InsufficientFunds)`), which is what a shield
+/// with nothing to shield and a send whose inputs cover the payment but not
+/// the fee return. Both are `InsufficientFunds`.
 fn wallet_api_error<D, C, S, F, Ch, N>(
     e: WalletApiError<D, C, S, F, Ch, N>,
     not_synced: &str,
@@ -578,7 +582,11 @@ where
         WalletApiError::InsufficientFunds {
             available,
             required,
-        } => TxError::InsufficientFunds {
+        }
+        | WalletApiError::Change(ChangeError::InsufficientFunds {
+            available,
+            required,
+        }) => TxError::InsufficientFunds {
             available: available.into_u64(),
             required: required.into_u64(),
         },
