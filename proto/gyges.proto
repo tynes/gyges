@@ -318,6 +318,10 @@ message NodeStatus {
   // `[zakura_rpc] indexer_url` with any userinfo removed; empty when unset or
   // air-gapped. Since API 0.2.
   string indexer_url = 11;
+  // Set while connected to a node that does not know a network upgrade this
+  // daemon schedules above its tip (a zakurad release that does not know NU7
+  // halts before it); empty otherwise. Since API 0.4.
+  string warning = 12;
 }
 
 enum TorState {

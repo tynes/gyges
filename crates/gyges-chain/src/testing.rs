@@ -69,6 +69,36 @@ pub fn regtest_params() -> LocalNetwork {
     }
 }
 
+/// [`regtest_params`] with NU7 activating at `nu7`, the table
+/// `ConsensusParams::regtest(Some(nu7))` uses (`[regtest]
+/// nu7_activation_height`).
+pub fn regtest_params_with_nu7(nu7: u32) -> LocalNetwork {
+    LocalNetwork {
+        nu7: Some(BlockHeight::from_u32(nu7)),
+        ..regtest_params()
+    }
+}
+
+/// Whether a block at `height` may include the serialised transaction:
+/// it commits to the consensus branch active there (v5 and later carry it)
+/// and has not expired. The texts are zcashd's reject reasons, which the
+/// node passes through.
+fn mineable_at<P: Parameters>(params: &P, height: BlockHeight, raw: &[u8]) -> Result<(), String> {
+    let branch = BranchId::for_height(params, height);
+    let tx = Transaction::read(raw, branch).map_err(|e| format!("TX decode failed: {e}"))?;
+    if tx.consensus_branch_id() != branch {
+        return Err(format!(
+            "bad-tx-consensus-branch-id: the transaction commits to {:?}, {branch:?} is active at {height}",
+            tx.consensus_branch_id()
+        ));
+    }
+    let expiry = tx.expiry_height();
+    if u32::from(expiry) != 0 && expiry < height {
+        return Err(format!("tx-expired: expiry {expiry} is below {height}"));
+    }
+    Ok(())
+}
+
 /// Where the fake coinbase pays.
 pub const COINBASE_ADDRESS: TransparentAddress = TransparentAddress::PublicKeyHash([0xc0; 20]);
 
@@ -350,6 +380,13 @@ impl State {
         let (tip, prev) = self.tip();
         let height = tip + 1;
         let time = 1_700_000_000 + height * 75 + self.forks * 7;
+        // Like zakurad, a block includes no transaction that expired or
+        // that commits to another consensus branch (one built before a
+        // network upgrade that activates at this block): they are evicted.
+        let at = BlockHeight::from_u32(height);
+        let params = &self.params;
+        self.mempool
+            .retain(|(_, raw)| mineable_at(params, at, raw).is_ok());
         let spec = BlockSpec {
             height: BlockHeight::from_u32(height),
             prev_hash: prev,
@@ -914,6 +951,8 @@ fn dispatch(st: &mut State, method: &str, params: &[Value]) -> RpcResult {
             let branch = BranchId::for_height(&st.params, BlockHeight::from_u32(tip + 1));
             let tx = Transaction::read(&raw[..], branch)
                 .map_err(|e| (-22, format!("TX decode failed: {e}")))?;
+            mineable_at(&st.params, BlockHeight::from_u32(tip + 1), &raw)
+                .map_err(|reason| (-26, reason))?;
             if let Some(reason) = &st.reject_broadcasts {
                 return Err((-26, reason.clone()));
             }

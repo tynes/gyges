@@ -113,7 +113,7 @@ When the recipient parses as a TEX address (`zcash_address::ZcashAddress::try_fr
 #### 3.5 Air-gapped PCZT flow (`signer-only`, `gygesd --airgapped`)
 A PCZT produced online after the Constructor and Updater roles carries, per spend, the note, `rseed`, Merkle witness and anchor, so the offline box needs no chain state and no `wallet.sqlite`. Transport is a binary `.pczt` file (postcard serialization) on removable media: `gyges pczt create … -o tx.pczt` online → `gyges pczt prove tx.pczt | gyges pczt sign -o tx.signed.pczt` offline → `gyges pczt broadcast tx.signed.pczt` online, where the online side runs Verifier first. QR transport works but a proven Orchard action is several kilobytes, so it is documented as slow. PCZTs carry `gyges.key_id`, `gyges.network` and `gyges.session_id` in the ZIP 374 global `proprietary` map; `--key` is only an assertion.
 
-*Landed as `gygesd::roles`, `gyges_core::pczt_io` and `gyges_core::db::sessions`.* `CreatePczt` writes the tags through the Updater role and stores the approved proposal, reduced to what the Verifier checks, in the key's `ext_gyges_signing_sessions` row under the session id (Data model §5.2); `BroadcastPczt` finds that row by the tag and runs the Verifier against it before the Spend Finalizer and Transaction Extractor, so the online side never trusts the file's own amounts. The file gets `target + 1152` blocks of expiry (about a day), since it waits for a person; the anchors it carries stay valid. `InspectPczt` works from the file alone: the amounts, recipients, fee and expiry it implies, and the roles whose footprints are present (proofs, signatures, finalised inputs), read through the Verifier role's parsed bundles. The `signer-only` half landed with the second M4 item: `SignPczt` on an `--airgapped` daemon resolves each transparent input's key from the BIP 44 derivation the file carries (upstream writes one on every input of an HD account), checked against the profile's seed fingerprint and account, so no wallet is needed; the Signer role then refuses a key that does not match the input's script.
+*Landed as `gygesd::roles`, `gyges_core::pczt_io` and `gyges_core::db::sessions`.* `CreatePczt` writes the tags through the Updater role and stores the approved proposal, reduced to what the Verifier checks, in the key's `ext_gyges_signing_sessions` row under the session id (Data model §5.2); `BroadcastPczt` finds that row by the tag and runs the Verifier against it before the Spend Finalizer and Transaction Extractor, so the online side never trusts the file's own amounts. The file gets about a day of expiry (`target + 1152` blocks before NU7, `target + 3456` after, never past the block before a network upgrade; `gyges_core::tx::long_expiry`), since it waits for a person; the anchors it carries stay valid. `InspectPczt` works from the file alone: the amounts, recipients, fee and expiry it implies, and the roles whose footprints are present (proofs, signatures, finalised inputs), read through the Verifier role's parsed bundles. The `signer-only` half landed with the second M4 item: `SignPczt` on an `--airgapped` daemon resolves each transparent input's key from the BIP 44 derivation the file carries (upstream writes one on every input of an HD account), checked against the profile's seed fingerprint and account, so no wallet is needed; the Signer role then refuses a key that does not match the input's script.
 
 #### 3.6 Daemon lifecycle
 - **Start.** `gyges daemon start` (or the `launchd`/`systemd --user` unit written by `gyges daemon install`, `gyges_cli::service`, which restarts the daemon only after a failure; reinstalling is the upgrade step). The CLI does not auto-start the daemon (exit 3 with the fix) unless `GYGES_AUTOSTART=1`. Startup refuses to run if `~/.gyges/<network>` has permissions wider than 0700/0600. Before anything else the daemon sets its umask to 077 and `RLIMIT_CORE` to zero (a core dump would hold key material; `security.md` §6 item 10). The first successful node poll warns once when `zakura_rpc.url` is not `localhost` or a loopback address (§6 item 12).
@@ -603,6 +603,9 @@ max_attempts = 0                 # 0 = retry until expiry_height
 
 [policy]
 min_confirmations = 10           # anchor depth used for "Spendable" and note selection; a note needs N + 1 confirmations
+
+[regtest]
+nu7_activation_height = 0        # regtest only: NU7's height, as NU7 in zakura.toml; 0 = never
 ```
 
 Rules:
@@ -610,6 +613,7 @@ Rules:
 - Durations are `humantime` strings (`60s`, `5m`, `24h`).
 - `fallback_lightwalletd.grpc_url` must be `https://` or an `.onion` host; `http://` is rejected unless `network = "regtest"`.
 - Unknown keys are an error (`serde(deny_unknown_fields)`), so a typo cannot silently fall back to a default.
+- `[regtest]` is refused on mainnet and testnet, whose activation heights are the pinned `zakura-protocol` constants (NU7: mainnet 3,543,405, testnet 4,465,026). On regtest every upgrade through NU6.3 is at height 1 and NU7 is at `nu7_activation_height`, which must match the node's (`ZakuraRpcBackend::check_upgrades` refuses a mismatch and names both keys).
 - `gyges daemon start --zakura-rpc`, `--zakura-cookie`, `--fallback-lwd`, `--no-tor`, `--airgapped` override the corresponding keys for that process only.
 
 ---

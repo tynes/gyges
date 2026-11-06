@@ -45,7 +45,7 @@ use pczt::roles::verifier::Verifier;
 use prost::Message as _;
 use secrecy::ExposeSecret as _;
 use transparent::keys::{NonHardenedChildIndex, TransparentKeyScope};
-use zcash_client_backend::data_api::error::Error as WalletApiError;
+use zcash_client_backend::data_api::error::{AcceptanceError, Error as WalletApiError};
 use zcash_client_backend::data_api::locking::{LockError, LockOwner, LockedInputPolicy};
 use zcash_client_backend::data_api::wallet::input_selection::{
     CoinbasePolicy, GreedyInputSelector, NonEmptyBTreeSet, NoteSelection, SpendPolicy,
@@ -60,7 +60,7 @@ use zcash_client_backend::data_api::{
 };
 use zcash_client_backend::fees::standard::SingleOutputChangeStrategy;
 use zcash_client_backend::fees::{DustOutputPolicy, StandardFeeRule};
-use zcash_client_backend::proposal::{Proposal, Step, StepOutputIndex};
+use zcash_client_backend::proposal::{Proposal, ProposalError, Step, StepOutputIndex};
 use zcash_client_backend::wallet::{
     Note, OutputRef, OvkPolicy, TransparentAddressSource, WalletTransparentOutput,
 };
@@ -73,7 +73,9 @@ use zcash_primitives::transaction::builder::{
 };
 use zcash_primitives::transaction::components::orchard::bundle_version_for_branch;
 use zcash_proofs::prover::LocalTxProver;
-use zcash_protocol::consensus::{BlockHeight, BranchId, NetworkUpgrade, Parameters as _};
+use zcash_protocol::consensus::{
+    BlockHeight, BranchId, NU7_POW_TARGET_SPACING_RATIO, NetworkUpgrade, Parameters as _,
+};
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, ShieldedPool, TxId};
@@ -581,6 +583,45 @@ where
             required: required.into_u64(),
         },
         WalletApiError::ScanRequired => TxError::NotSynced(not_synced.into()),
+        // A proposal, PCZT or transaction built before a network upgrade
+        // (NU7) commits to the old consensus branch and can no longer be
+        // mined; one that expired cannot either. Neither is a daemon
+        // failure: building it again from the current tip works.
+        WalletApiError::Proposal(ProposalError::ObsoleteConsensusBranch { proposed, current }) => {
+            TxError::InvalidArgument(format!(
+                "this transaction was proposed for {proposed:?}, but {current:?} is now active \
+                 (a network upgrade activated); propose it again"
+            ))
+        }
+        WalletApiError::Acceptance(AcceptanceError::ObsoleteConsensusBranch {
+            declared,
+            current,
+        }) => TxError::InvalidArgument(format!(
+            "this transaction commits to consensus branch {declared:08x}, but {current:?} is \
+             now active (a network upgrade activated since it was built), so it can never be \
+             mined; build it again and sign the new one"
+        )),
+        WalletApiError::Acceptance(AcceptanceError::Expired {
+            expiry_height,
+            target_height,
+        }) => TxError::InvalidArgument(format!(
+            "this transaction expired at height {expiry_height}, below the next block \
+             {target_height}; build it again and sign the new one"
+        )),
+        WalletApiError::Acceptance(AcceptanceError::UnsupportedVersion { version, current }) => {
+            TxError::InvalidArgument(format!(
+                "transaction version {version} is not valid under {current:?}; build it again"
+            ))
+        }
+        // ZIP 218's per-block shielded limits from NU7: a transaction that
+        // cannot fit in any block.
+        WalletApiError::Proposal(ProposalError::ShieldedBudget(reason))
+        | WalletApiError::Acceptance(AcceptanceError::ShieldedBudget(reason)) => {
+            TxError::InvalidArgument(format!(
+                "the transaction is too large for an NU7 block ({reason}); send a smaller \
+                 amount or consolidate notes in several smaller sends first"
+            ))
+        }
         other => TxError::Internal(format!("{what} failed: {other}")),
     }
 }
@@ -830,15 +871,58 @@ fn pool_of(p: PoolType) -> Pool {
     }
 }
 
-/// The default expiry `create_pczt_from_proposal` applies when none is
-/// given: `target + 40` blocks (or the NU7-scaled delta once NU7 is active).
-pub fn default_expiry(params: &ConsensusParams, target: BlockHeight) -> BlockHeight {
-    let delta = if params.is_nu_active(NetworkUpgrade::Nu7, target) {
-        NU7_DEFAULT_TX_EXPIRY_DELTA
+/// The expiry of a transaction for `target` that should last `pre_nu7_blocks`
+/// 75-second blocks: that many blocks after `target`, times NU7's
+/// block-spacing ratio once NU7 is active at `target` so the time stays the
+/// same (ZIP 218). It never reaches the next network upgrade: from the
+/// upgrade's activation the transaction's consensus branch is obsolete and
+/// no block can include it, so a later expiry would only keep its inputs
+/// locked (zcashd caps its expiry the same way). Every builder passes the
+/// result to upstream explicitly, so the PCZT, the Verifier's [`Expected`]
+/// and the summary the user approves agree.
+pub fn expiry_after(
+    params: &ConsensusParams,
+    target: BlockHeight,
+    pre_nu7_blocks: u32,
+) -> BlockHeight {
+    let blocks = if params.is_nu_active(NetworkUpgrade::Nu7, target) {
+        pre_nu7_blocks * NU7_POW_TARGET_SPACING_RATIO
     } else {
-        PRE_NU7_DEFAULT_TX_EXPIRY_DELTA
+        pre_nu7_blocks
     };
-    target + delta
+    let expiry = target + blocks;
+    let next_upgrade = BranchId::for_height(params, target)
+        .height_bounds(params)
+        .and_then(|(_, end)| end);
+    match next_upgrade {
+        Some(activation) if activation <= expiry => activation - 1,
+        _ => expiry,
+    }
+}
+
+/// The expiry of an ordinary send: upstream's default `target + 40` blocks
+/// (`target + 120` once NU7 is active), capped below the next network
+/// upgrade ([`expiry_after`]).
+pub fn default_expiry(params: &ConsensusParams, target: BlockHeight) -> BlockHeight {
+    debug_assert_eq!(
+        NU7_DEFAULT_TX_EXPIRY_DELTA,
+        PRE_NU7_DEFAULT_TX_EXPIRY_DELTA * NU7_POW_TARGET_SPACING_RATIO
+    );
+    expiry_after(params, target, PRE_NU7_DEFAULT_TX_EXPIRY_DELTA)
+}
+
+/// How long a transaction that waits for a person may wait, in 75-second
+/// blocks: a `pczt create` file travels on removable media, and a Keystone
+/// send may wait across a restart for up to `vault.signing_session_ttl`
+/// (docs/architecture.md Components §3.5). 1152 blocks is about a day, the
+/// default of that setting; [`long_expiry`] scales it once NU7 is active.
+pub const LONG_EXPIRY_PRE_NU7_BLOCKS: u32 = 1152;
+
+/// The expiry of a transaction that waits for a person: about a day past
+/// `target` ([`LONG_EXPIRY_PRE_NU7_BLOCKS`], 3456 blocks once NU7 is
+/// active), capped below the next network upgrade ([`expiry_after`]).
+pub fn long_expiry(params: &ConsensusParams, target: impl Into<BlockHeight>) -> BlockHeight {
+    expiry_after(params, target.into(), LONG_EXPIRY_PRE_NU7_BLOCKS)
 }
 
 fn summarize_step<N>(proposal: &Proposal<StandardFeeRule, N>, step: &Step<N>) -> StepSummary {
@@ -994,8 +1078,13 @@ pub fn build_single_step<N: fmt::Display>(
 
 /// Step 3: Creator, Constructor, IO Finalizer and Updater (anchors and
 /// witnesses from the wallet). Only single-step proposals can become one
-/// PCZT, which is every proposal except ZIP 320's. `expiry` overrides the
-/// default `target + 40` (`pczt create` gives a file time to travel).
+/// PCZT, which is every proposal except ZIP 320's. `expiry` overrides
+/// [`default_expiry`] (`pczt create` gives a file time to travel). Without
+/// one, upstream applies its own default, which is ours except within one
+/// expiry delta of a network upgrade, where ours is capped below it: there
+/// the capped height is passed explicitly, because the Verifier holds the
+/// PCZT to it. (Upstream refuses an explicit expiry for a ZIP 318 canonical
+/// crossing, so the default case leaves it to upstream.)
 pub fn build_pczt<N: fmt::Display>(
     wallet: &mut Wallet,
     params: &ConsensusParams,
@@ -1003,6 +1092,13 @@ pub fn build_pczt<N: fmt::Display>(
     proposal: &Proposal<StandardFeeRule, N>,
     expiry: Option<BlockHeight>,
 ) -> Result<Pczt, TxError> {
+    let target = BlockHeight::from(proposal.min_target_height());
+    let expiry = expiry.or_else(|| {
+        let ours = default_expiry(params, target);
+        let upstream = target
+            + zcash_primitives::transaction::builder::default_tx_expiry_delta(params, target);
+        (ours != upstream).then_some(ours)
+    });
     create_pczt_from_proposal::<_, _, Infallible, _, Infallible, N>(
         wallet,
         params,
@@ -2093,7 +2189,13 @@ pub fn extract_and_store(
         sapling_vks.as_ref().map(|(s, o)| (s, o)),
         Some(orchard_vk),
     )
-    .map_err(|e| internal("extracting the transaction failed", e))?;
+    .map_err(|e| {
+        wallet_api_error(
+            e,
+            "no chain tip to check the transaction against",
+            "extracting the transaction",
+        )
+    })?;
     let (_, raw) = stored_transaction(wallet, txid)?;
     Ok((txid, raw))
 }
@@ -2552,6 +2654,122 @@ mod tests {
             default_expiry(&p, BlockHeight::from_u32(100)),
             BlockHeight::from_u32(140)
         );
+    }
+
+    /// ZIP 218 makes blocks three times as frequent from NU7, so the expiry
+    /// deltas triple to keep the same time; a transaction built before NU7
+    /// expires the block before it, since it can never be mined after.
+    #[test]
+    fn expiries_scale_at_nu7_and_never_cross_it() {
+        fn upstream_delta(p: &ConsensusParams, t: u32) -> u32 {
+            zcash_primitives::transaction::builder::default_tx_expiry_delta(
+                p,
+                BlockHeight::from_u32(t),
+            )
+        }
+        let h = BlockHeight::from_u32;
+        let e = |p: &ConsensusParams, t| u32::from(default_expiry(p, h(t)));
+        let l = |p: &ConsensusParams, t| u32::from(long_expiry(p, h(t)));
+        let p = ConsensusParams::regtest(Some(h(1000)));
+        // Far from activation: 40 blocks (75 s each) and a day of them.
+        assert_eq!(e(&p, 100), 140);
+        let far = ConsensusParams::regtest(Some(h(10_000)));
+        assert_eq!(l(&far, 100), 100 + 1152);
+        assert_eq!(l(&p, 100), 999, "a day would cross NU7");
+        // Within one delta of it: the block before activation.
+        assert_eq!(e(&p, 960), 999);
+        assert_eq!(e(&p, 999), 999);
+        assert_eq!(l(&p, 900), 999);
+        // One delta before is the first height that is capped.
+        assert_eq!(e(&p, 959), 999);
+        assert_eq!(e(&p, 958), 998);
+        // From activation: 120 blocks (25 s each) and 3456 for a day.
+        assert_eq!(e(&p, 1000), 1120);
+        assert_eq!(e(&p, 5000), 5120);
+        assert_eq!(l(&p, 1000), 1000 + 3456);
+        assert_eq!(upstream_delta(&p, 1000), 120);
+        assert_eq!(upstream_delta(&p, 999), 40);
+
+        // Mainnet, the day before NU7 (ZIP 259: 3,543,405).
+        let main = Network::Mainnet.consensus_params();
+        assert_eq!(e(&main, 3_542_707), 3_542_747);
+        assert_eq!(e(&main, 3_543_390), 3_543_404);
+        assert_eq!(l(&main, 3_542_707), 3_543_404);
+        assert_eq!(e(&main, 3_543_405), 3_543_525);
+        assert_eq!(l(&main, 3_543_405), 3_543_405 + 3456);
+        // Testnet's NU7 is 4,465,026.
+        let test = Network::Testnet.consensus_params();
+        assert_eq!(e(&test, 4_465_000), 4_465_025);
+        assert_eq!(e(&test, 4_465_026), 4_465_146);
+        // A chain with no upgrade ahead is never capped.
+        assert_eq!(e(&params(), 1_000_000), 1_000_040);
+    }
+
+    /// NU7 keeps NU6.3's Orchard protocol revision, so the one proving key
+    /// this build makes (`PostNu6_3`) proves both pools after NU7 too.
+    #[test]
+    fn nu7_proves_with_the_post_nu6_3_circuit() {
+        for pool in [orchard::ValuePool::Orchard, orchard::ValuePool::Ironwood] {
+            for branch in [BranchId::Nu6_3, BranchId::Nu7] {
+                let version = bundle_version_for_branch(branch, pool).expect("a bundle version");
+                assert_eq!(
+                    version.circuit_version(),
+                    OrchardCircuitVersion::PostNu6_3,
+                    "{branch:?} {pool:?}"
+                );
+            }
+        }
+    }
+
+    /// The refusals upstream gives a proposal or PCZT that an upgrade (or
+    /// its expiry) overtook, and ZIP 218's size limits, are the client's to
+    /// fix by building again (exit 6), not daemon failures.
+    #[test]
+    fn upgrade_and_budget_refusals_are_invalid_arguments() {
+        type E =
+            WalletApiError<Infallible, Infallible, Infallible, Infallible, Infallible, Infallible>;
+        let h = BlockHeight::from_u32;
+        let cases: Vec<(E, &str)> = vec![
+            (
+                E::Acceptance(AcceptanceError::ObsoleteConsensusBranch {
+                    declared: u32::from(BranchId::Nu6_3),
+                    current: BranchId::Nu7,
+                }),
+                "37a5165b, but Nu7 is now active",
+            ),
+            (
+                E::Proposal(ProposalError::ObsoleteConsensusBranch {
+                    proposed: BranchId::Nu6_3,
+                    current: BranchId::Nu7,
+                }),
+                "proposed for Nu6_3, but Nu7 is now active",
+            ),
+            (
+                E::Acceptance(AcceptanceError::Expired {
+                    expiry_height: h(999),
+                    target_height: h(1001),
+                }),
+                "expired at height 999",
+            ),
+            (
+                E::Proposal(ProposalError::ShieldedBudget("too many")),
+                "too large for an NU7 block (too many)",
+            ),
+            (
+                E::Acceptance(AcceptanceError::ShieldedBudget("too many")),
+                "too large for an NU7 block",
+            ),
+        ];
+        for (e, want) in cases {
+            match wallet_api_error(e, "x", "y") {
+                TxError::InvalidArgument(m) => assert!(m.contains(want), "{m}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(matches!(
+            wallet_api_error(E::ScanRequired, "x", "y"),
+            TxError::NotSynced(_)
+        ));
     }
 
     #[test]

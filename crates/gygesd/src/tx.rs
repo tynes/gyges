@@ -402,7 +402,8 @@ pub(crate) async fn send_transaction(
             min_confirmations,
             &inputs,
         )?;
-        let expiry = keystone.then(|| crate::roles::long_expiry(proposal.min_target_height()));
+        let expiry =
+            keystone.then(|| crate::roles::long_expiry(&params, proposal.min_target_height()));
         let summary = core_tx::summarize(&params, &proposal, min_confirmations, expiry);
         if dry_run {
             return Ok((summary, None, None));
@@ -486,7 +487,8 @@ pub(crate) async fn shield_funds(
         let account = core_tx::account_of(wallet)?;
         let proposal =
             core_tx::propose_shield(wallet, &params, account, threshold, min_confirmations)?;
-        let expiry = keystone.then(|| crate::roles::long_expiry(proposal.min_target_height()));
+        let expiry =
+            keystone.then(|| crate::roles::long_expiry(&params, proposal.min_target_height()));
         let summary = core_tx::summarize(&params, &proposal, min_confirmations, expiry);
         if dry_run {
             return Ok((summary, None, None));

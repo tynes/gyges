@@ -280,6 +280,7 @@ impl ChainBackend for FixedChain {
             pruned: self.retained_from > 0,
             last_error: String::new(),
             last_polled: Some(std::time::SystemTime::now()),
+            warning: String::new(),
         }
     }
 
