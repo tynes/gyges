@@ -35,10 +35,7 @@ pub struct Tags {
 
 /// A fresh session id: 16 random bytes, hex.
 pub fn new_session_id() -> String {
-    use rand::Rng as _;
-    let mut id = [0u8; 16];
-    rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut id);
-    hex::encode(id)
+    hex::encode(crate::random_bytes::<16>())
 }
 
 /// The Updater role, writing the three tags.

@@ -217,7 +217,7 @@ Proposes, proves, signs and broadcasts. The proposal summary (inputs per pool, o
 - **Inline unlock (`local-seed`):** on `SignatureRequired`, prompts for the passphrase, creates a connection-scoped session and continues; the key is dropped after signing. A send that spends Sapling notes asks before `proving …` rather than after, because the Sapling proofs need the key.
 - **Keystone (`keystone-qr`):** renders the animated UR QR (batch protocol for shielded-only sends, single-PCZT when transparent inputs are present) and reads the result from the camera (`qr-scan`), a file, stdin or pasted frames.
 - **Input pools (`--from-pool`, `--consolidate`):** by default the proposer spends transparent funds first (when the profile allows them), then the payment's own pool, then the others. `--from-pool ironwood` (comma-separated, any of `ironwood,orchard,sapling,transparent`) funds the send from those pools only, never falling back to others (exit 5 when they cannot cover it), and `--amount max` then means everything in them. It narrows the profile's `spend_pools`; a pool the profile does not spend from is exit 6. `--consolidate` lets a few spare notes of the funding pool ride along when the fee and shape stay the same.
-- **Explicit inputs (`--input`):** `--input <TXID:INDEX>` (repeatable; `POOL:TXID:INDEX` when two pools' outputs share an index) spends exactly the notes and UTXOs named, as `gyges notes` lists them: the proposer uses as many of them as the payment needs, exit 5 when they cannot cover it, and `--amount max` sends everything in them. `--allow-extra-inputs` spends them first and lets the proposer add others.
+- **Explicit inputs (`--input`):** `--input <TXID:INDEX>` (repeatable; `POOL:TXID:INDEX` when two pools' outputs share an index) spends exactly the notes and UTXOs named, as `gyges notes` lists them: the proposer uses as many of them as the payment needs, exit 5 when they cannot cover it, and `--amount max` sends everything in them. `--allow-extra-inputs` spends them first and lets the proposer add others. Exit 7 (`INPUTS_RESERVED`) when another send in progress holds one of the outputs; retry once it finishes.
 - **Output pool (`--pool`):** by default the address decides (a unified address with an Orchard receiver is paid into Ironwood). `--pool sapling` or `--pool transparent` pays that receiver of a unified address instead; a recipient without one is refused (exit 6). There is no `--pool orchard`: the Orchard turnstile forbids new Orchard outputs since NU6.3. `pczt create` takes the same flag (API §4.1, `SpendOptions`).
 - **ZIP 320 (`tex1`):** runs the two-step plan through the durable `TexQueue`; the passphrase prompt comes before proving (both steps are built together, API §9), each step's txid goes to stdout as the node takes it, and `tex pending (step 2 of 2): <step1> then <step2>` goes to stderr. A node that will not take Step 2 while Step 1 is unmined leaves one txid on stdout; the queue finishes the transfer and `tx sessions` shows its state.
 ```text
@@ -478,7 +478,7 @@ codes are chosen.
 | 4 | authorization required and non-interactive, or refused | `VAULT_LOCKED`, `SIGNATURE_REQUIRED`, `SEED_EXPORT_DISABLED`, `CONFIRMATION_REQUIRED`, `INVALID_PASSPHRASE`, `RATE_LIMITED`, `PERMISSION_DENIED` |
 | 5 | insufficient funds | `INSUFFICIENT_FUNDS` |
 | 6 | invalid argument or mismatch | `INVALID_ARGUMENT`, `NETWORK_MISMATCH`, `KEY_MISMATCH`, `KEY_NOT_FOUND`, `KEY_EXISTS`, `SESSION_NOT_FOUND`, `UNSUPPORTED_POOL`, `API_VERSION_MISMATCH` |
-| 7 | not ready | `NOT_SYNCED`, `NODE_UNREACHABLE`, `AIRGAPPED`, `FALLBACK_UNAVAILABLE` |
+| 7 | not ready | `NOT_SYNCED`, `NODE_UNREACHABLE`, `AIRGAPPED`, `FALLBACK_UNAVAILABLE`, `INPUTS_RESERVED` |
 | 8 | cancelled by user | `CANCELLED`, SIGINT during a prompt or stream |
 | 9 | hardware signer error | `HARDWARE_SIGNER` |
 | 10 | node rejected transaction | `NODE_REJECTED` |
@@ -646,7 +646,11 @@ work through upstream's output locks: for the length of the proposal the
 daemon locks every other unspent output of the key (or, with
 `allow_extra_inputs`, the chosen ones, which upstream's `PreferLocked` then
 spends first) under a fresh owner for at most three blocks past the tip,
-and releases the locks once the proposal is made or refused.
+and releases the locks once the proposal is made or refused. When another
+spend in progress already holds one of the outputs this one must lock, the
+send is `INPUTS_RESERVED` (exit 7) and can be retried once that spend
+finishes; a reservation left by a crash expires within the same three
+blocks. Errors name an input by its position (`input 2`), never by txid.
 
 **Sends in flight hold their inputs.** Every `SendTransaction` and
 `ShieldFunds` that is not a dry run locks the outputs its proposal spends,

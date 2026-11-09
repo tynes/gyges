@@ -197,6 +197,10 @@ enum ErrorReason {
   ERROR_REASON_NODE_REJECTED = 23;
   // Exit 4: the connecting process failed the peer-credential check.
   ERROR_REASON_PERMISSION_DENIED = 24;
+  // Exit 7: an output the send needs is reserved by another spend in
+  // progress (`SpendOptions.inputs`); retry once it finishes. A reservation
+  // left by a crash expires within three blocks.
+  ERROR_REASON_INPUTS_RESERVED = 25;
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,7 +1043,8 @@ message SpendOptions {
   // transparent|sapling|orchard|ironwood). Only these are eligible; the
   // proposer uses as many of them as the payment needs. INVALID_ARGUMENT
   // for an outpoint that is not an unspent, mined output of the key;
-  // UNSUPPORTED_POOL for one outside the send's pools.
+  // UNSUPPORTED_POOL for one outside the send's pools; INPUTS_RESERVED when
+  // another spend in progress holds an output this one must lock.
   repeated string inputs = 4;
   // With `inputs`: they go first, and the proposer may add other outputs
   // when they do not cover the payment and fee.
