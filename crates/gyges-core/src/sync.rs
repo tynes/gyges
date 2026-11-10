@@ -256,8 +256,12 @@ impl WalletView {
     }
 
     /// The next batch: the highest-priority pending range, cut to `batch`
-    /// blocks (docs/architecture.md Sync §4.1 step 2).
+    /// blocks (docs/architecture.md Sync §4.1 step 2). A `batch` of 0 is
+    /// taken as 1, as the fetchers take `cache.fetch_batch`: cutting at the
+    /// range's own start splits nothing off, and the whole range would
+    /// come back as one batch.
     pub fn next_range(&self, batch: usize) -> Option<ScanRange> {
+        let batch = batch.max(1);
         let first = self.pending().next()?;
         if first.len() <= batch {
             return Some(first.clone());
@@ -758,6 +762,8 @@ mod tests {
             &(BlockHeight::from_u32(100)..BlockHeight::from_u32(1100))
         );
         assert_eq!(next.priority(), ScanPriority::Historic);
+        // `scan_batch = 0` is one block at a time, not the whole range.
+        assert_eq!(v.next_range(0).unwrap().len(), 1);
         // A range shorter than the batch is taken whole.
         let v = view(vec![r(100, 105, ScanPriority::ChainTip)], None);
         assert_eq!(v.next_range(1000).unwrap().len(), 5);
