@@ -99,6 +99,8 @@ pub struct Assembler {
     ur_type: Option<String>,
     decoder: ur::Decoder,
     single: Option<Vec<u8>>,
+    /// A multi-part frame has been taken by `decoder`.
+    multipart: bool,
 }
 
 impl fmt::Debug for Assembler {
@@ -129,9 +131,24 @@ impl Assembler {
             });
         }
         let (kind, data) = ur::decode(&frame).map_err(ur_error)?;
+        // A single-part frame is a whole payload on its own, so it only ever
+        // repeats itself: a different one, or one next to the parts of an
+        // animation, belongs to another message and must not replace this
+        // one. (The fountain decoder makes the same check between parts.)
         match kind {
-            ur::ur::Kind::SinglePart => self.single = Some(data),
-            ur::ur::Kind::MultiPart => self.decoder.receive(&frame).map_err(ur_error)?,
+            ur::ur::Kind::SinglePart => {
+                if self.multipart || self.single.as_ref().is_some_and(|s| *s != data) {
+                    return Err(another_message());
+                }
+                self.single = Some(data);
+            }
+            ur::ur::Kind::MultiPart => {
+                if self.single.is_some() {
+                    return Err(another_message());
+                }
+                self.decoder.receive(&frame).map_err(ur_error)?;
+                self.multipart = true;
+            }
         }
         self.ur_type = Some(ur_type.to_string());
         Ok(())
@@ -181,6 +198,10 @@ pub(crate) fn ur_type_of(frame: &str) -> Option<&str> {
 
 fn ur_error(e: ur::ur::Error) -> QrError {
     QrError::Ur(e.to_string())
+}
+
+fn another_message() -> QrError {
+    QrError::Ur("the frame belongs to a different message than the frames before it".into())
 }
 
 #[cfg(test)]
@@ -303,6 +324,41 @@ pub(crate) mod tests {
         ));
         // The refusals left the assembler as it was.
         assert_eq!(asm.ur_type(), Some("zcash-pczt"));
+        assert!(!asm.is_complete());
+    }
+
+    #[test]
+    fn a_frame_of_another_message_does_not_replace_the_first() {
+        let single = |data: &[u8]| {
+            Frames::new(ur_types::ZCASH_PCZT, data, 100)
+                .unwrap()
+                .next_frame()
+                .unwrap()
+        };
+        let first = single(b"first");
+
+        // A second, different single-part frame is refused; a repeat is not.
+        let mut asm = Assembler::new();
+        asm.receive(&first).unwrap();
+        asm.receive(&first).unwrap();
+        assert!(matches!(
+            asm.receive(&single(b"second")),
+            Err(QrError::Ur(_))
+        ));
+        assert_eq!(
+            asm.message().unwrap(),
+            Some(("zcash-pczt".to_string(), b"first".to_vec()))
+        );
+
+        // Nor does a part of an animation join a complete single frame, or
+        // a single frame complete an animation that is still being read.
+        let mut parts = Frames::new(ur_types::ZCASH_PCZT, &Rng::new(3).bytes(1000), 100).unwrap();
+        let part = parts.next_frame().unwrap();
+        assert!(matches!(asm.receive(&part), Err(QrError::Ur(_))));
+
+        let mut asm = Assembler::new();
+        asm.receive(&part).unwrap();
+        assert!(matches!(asm.receive(&first), Err(QrError::Ur(_))));
         assert!(!asm.is_complete());
     }
 

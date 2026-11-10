@@ -112,7 +112,7 @@ pub fn render(r: &ListNotesResponse) -> String {
             height,
             flags(n),
             format!("{}:{}", n.txid, n.output_index),
-            n.memo_preview.replace(['\n', '\r', '\t'], " "),
+            printable(&n.memo_preview),
         );
     }
     let total: i64 = r.notes.iter().filter(|n| !n.spent).map(|n| n.value).sum();
@@ -125,9 +125,38 @@ pub fn render(r: &ListNotesResponse) -> String {
     s
 }
 
+/// A memo is text its sender chose, so nothing in it may drive the terminal:
+/// control characters (line breaks, and the ESC that starts an escape
+/// sequence) and the bidirectional overrides that reorder the rest of the
+/// row each become a space.
+pub(crate) fn printable(memo: &str) -> String {
+    memo.chars()
+        .map(|c| match c {
+            c if c.is_control() => ' ',
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => ' ',
+            c => c,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_memo_cannot_drive_the_terminal() {
+        // CSI and OSC sequences, a C1 control, and a right-to-left override.
+        let memo = "pay\x1b[2Jme\x1b]0;title\x07 \u{9b}31m \u{202e}now\tplease";
+        let shown = printable(memo);
+        assert_eq!(shown, "pay [2Jme ]0;title   31m  now please");
+        let r = ListNotesResponse {
+            notes: vec![Note {
+                memo_preview: memo.into(),
+                ..Default::default()
+            }],
+        };
+        assert!(!render(&r).contains(['\x1b', '\x07', '\u{9b}', '\u{202e}']));
+    }
 
     #[test]
     fn table_shows_pool_value_state_and_memo() {

@@ -22,6 +22,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // instead of failing to compile; the service struct implements only
         // what has been built so far.
         .generate_default_stubs(true)
+        // prost ignores `[debug_redact = true]`, so the messages with such a
+        // field get their `Debug` from `src/redact.rs`, which leaves the
+        // secret out, and not from the derive, which would print it.
+        .skip_debug([
+            ".gyges.v1.InitKeyRequest",
+            ".gyges.v1.InitKeyResponse",
+            ".gyges.v1.RestoreKeyRequest",
+            ".gyges.v1.UnlockKeyRequest",
+            ".gyges.v1.UnlockKeyResponse",
+            ".gyges.v1.ExportSeedRequest",
+            ".gyges.v1.ExportSeedResponse",
+            ".gyges.v1.SendTransactionRequest",
+            ".gyges.v1.ShieldFundsRequest",
+            ".gyges.v1.ResumeTexTransferRequest",
+            ".gyges.v1.ProvePcztRequest",
+            ".gyges.v1.SignPcztRequest",
+        ])
         .file_descriptor_set_path(&descriptor_path)
         .compile_protos(&[proto], &["../../proto"])?;
 

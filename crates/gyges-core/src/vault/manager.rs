@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use age::secrecy::SecretString;
@@ -131,6 +131,9 @@ struct Backoff {
 struct Inner {
     unlocks: Vec<Unlock>,
     backoff: HashMap<String, Backoff>,
+    /// One gate per key, held for the length of a passphrase attempt (see
+    /// `verify_passphrase_at`).
+    attempts: HashMap<String, Arc<Mutex<()>>>,
 }
 
 /// See the module documentation.
@@ -184,8 +187,8 @@ impl VaultManager {
     }
 
     /// Decrypt `seed.age` with `passphrase`, honouring the per-key back-off.
-    /// The scrypt work runs outside the lock. On success the key's back-off
-    /// state is cleared.
+    /// The scrypt work runs outside the manager's lock, one attempt per key
+    /// at a time. On success the key's back-off state is cleared.
     pub fn verify_passphrase(
         &self,
         key: &KeyEntry,
@@ -204,6 +207,14 @@ impl VaultManager {
             return Err(VaultError::NoSeed);
         }
         let key_id = key.key_id();
+        // One attempt per key at a time: checking the back-off, the scrypt
+        // work and recording a failure are one step. Were they not, every
+        // guess that arrived while another was being worked on would pass
+        // the check before any of them had counted. A caller that waited
+        // here still carries the `now` it arrived with, so it is refused by
+        // the back-off of the failure it waited for.
+        let gate = Arc::clone(self.inner().attempts.entry(key_id.to_string()).or_default());
+        let _attempt = gate.lock().unwrap_or_else(|e| e.into_inner());
         {
             let inner = self.inner();
             if let Some(b) = inner.backoff.get(key_id)
@@ -562,6 +573,31 @@ mod tests {
             },
             t0
         ));
+    }
+
+    /// Guesses made at the same moment count as one after another: the
+    /// first is worked on and fails, the rest meet its back-off.
+    #[test]
+    fn concurrent_wrong_passphrases_get_one_guess_between_them() {
+        let (_d, key, vault, _e) = setup();
+        let t0 = Instant::now();
+        let outcomes: Vec<_> = std::thread::scope(|s| {
+            let guesses: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| vault.unlock_at(&key, pass("nope"), Scope::Daemon, None, t0)))
+                .collect();
+            guesses.into_iter().map(|g| g.join().unwrap()).collect()
+        });
+        let wrong = outcomes
+            .iter()
+            .filter(|o| matches!(o, Err(VaultError::WrongPassphrase)))
+            .count();
+        let limited = outcomes
+            .iter()
+            .filter(|o| matches!(o, Err(VaultError::RateLimited(_))))
+            .count();
+        assert_eq!((wrong, limited), (1, 7));
+        // One failure was recorded, not eight.
+        assert_eq!(rate_limited(&vault, &key, t0), Duration::from_secs(1));
     }
 
     #[test]

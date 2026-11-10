@@ -4001,6 +4001,49 @@ async fn pay_bob_unmined(node: &FakeNode, c: &mut GygesClient<Channel>, amount: 
     txid
 }
 
+/// docs/interface.md API §4.1: a transaction the wallet has recorded is
+/// broadcast even when the client hangs up before `Signed` reaches it.
+/// Recorded and never sent, it would hold its notes until it expired.
+#[tokio::test]
+async fn a_signed_send_is_broadcast_after_the_client_hangs_up() {
+    let (node, _running, mut c) = sender_and_recipient(ONE_CONF_CONFIG).await;
+    let to = current_address(&mut c, "bob").await;
+    let mut s = c
+        .send_transaction(send_req("main", &to, 10_000_000))
+        .await
+        .unwrap()
+        .into_inner();
+    // Every pool reports its proofs started, then every pool reports them
+    // done; the last of those is the last event before the signature.
+    let (mut started, mut done) = (0, 0);
+    while started == 0 || done < started {
+        let ev = tokio::time::timeout(Duration::from_secs(60), s.next())
+            .await
+            .expect("a send event within 60 s")
+            .expect("the stream ended before the proofs")
+            .unwrap();
+        if let Some(send_event::Event::Proving(p)) = &ev.event {
+            if p.actions_done == 0 {
+                started += 1;
+            } else {
+                done += 1;
+            }
+        }
+    }
+    drop(s);
+
+    poll_until(
+        "the send to reach the mempool",
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+        async || match node.mempool() {
+            pool if pool.len() == 1 => Ok(()),
+            pool => Err(pool),
+        },
+    )
+    .await;
+}
+
 /// docs/architecture.md Sync §7 with `mempool.scan` on (the default): a payment to another
 /// key of the daemon shows as pending for it while still in the mempool,
 /// and becomes spendable once mined. `ScanMempool` reports the pass.

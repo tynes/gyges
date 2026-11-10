@@ -9,11 +9,15 @@
 //!   `grpc-status-details-bin` (docs/interface.md API §3);
 //! * the `google.rpc.Status` envelope those details travel in;
 //! * [`uds::connect`], the Unix-domain-socket connector (docs/interface.md API §1.1);
-//! * [`v1::Network`] name conversions shared by the CLI flags and the daemon.
+//! * [`v1::Network`] name conversions shared by the CLI flags and the daemon;
+//! * `Debug` for the messages that carry a passphrase, mnemonic or session
+//!   token, with the secret left out (`redact`).
 
 #![forbid(unsafe_code)]
 
 use prost::Message;
+
+mod redact;
 
 /// Generated `gyges.v1` package: messages, `gyges_server::Gyges` trait,
 /// `gyges_client::GygesClient`, and `serde` implementations for every message
