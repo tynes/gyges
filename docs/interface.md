@@ -550,8 +550,11 @@ Rules:
   proposal's anchor is still valid; otherwise the stream fails with
   `NOT_SYNCED` and the client must start over.
 - **Client disconnect** after `SignatureRequired` leaves the session alive
-  (§6.3). Disconnect after `Broadcast` has no effect on the daemon; the
-  `tex_queue` finishes a ZIP 320 transfer without any client.
+  (§6.3). Once a transaction is signed the wallet has recorded it, so it is
+  broadcast even if the client disconnects before `Signed` reaches it.
+  Disconnect after `Broadcast` has no effect on the daemon; the `tex_queue`
+  finishes a ZIP 320 transfer without any client, from the moment both steps
+  are built.
 - **`dry_run`** emits `Proposed` and ends. No session is created and nothing
   is stored.
 - **`session_token`** supplied up front (from `gyges key unlock`) suppresses

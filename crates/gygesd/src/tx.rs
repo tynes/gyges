@@ -784,8 +784,13 @@ async fn after_proposal(
         let provers = state.provers.clone();
         let (txid, raw) =
             wallet_rpc(key, move |w| core_tx::extract_and_store(w, pczt, &provers)).await?;
-        emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
+        // The wallet holds the transaction from here and counts its inputs
+        // as spent, so it goes to the node whether or not the client is
+        // still there to be told: one that has hung up is answered with
+        // `CANCELLED` only after the broadcast.
+        let signed = emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await;
         broadcast::broadcast(state, key, prepared.chain()?, route, raw, txid, None).await?;
+        signed?;
         txid
     };
     let txid_hex = txid.to_string();
@@ -988,17 +993,17 @@ async fn tex_pipeline(
         core_tx::create_tex_transactions(w, &params, account, &proposal, usk, &provers)
     })
     .await?;
-    emit_proving(tx, &pools, true).await?;
     tracing::info!(
         key_id,
         ms = t0.elapsed().as_millis(),
         "zip 320 transactions built"
     );
-    emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
-    emit(tx, send_event::Event::Signed(v1::StepSigned { step: 2 })).await?;
 
-    // Persist before the first broadcast, so a crash between the two leaves
-    // a row the queue finishes (docs/testing.md §3 row 12).
+    // Persist before anything else. The wallet holds both transactions
+    // already, so the row is written before the client is told anything (it
+    // may have hung up, which ends this function at the next event) and
+    // before the first broadcast (a crash between the two leaves a row the
+    // queue finishes, docs/testing.md §3 row 12).
     let id = *built.step1_txid.as_ref();
     let row = TexRow {
         step1_txid: id,
@@ -1018,6 +1023,18 @@ async fn tex_pipeline(
     };
     wallet_rpc(key, move |w| Ok(core_tex::insert(w, &row)?)).await?;
     tracing::info!(target: AUDIT_TARGET, key_id, event = "tex_queued");
+    // The queue owns the row now. However this function ends from here on,
+    // the queue looks at the row at once and not at its next interval.
+    struct WakeOnDrop<'a>(&'a tex::TexHub);
+    impl Drop for WakeOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.wake();
+        }
+    }
+    let _wake_queue = WakeOnDrop(&state.tex);
+    emit_proving(tx, &pools, true).await?;
+    emit(tx, send_event::Event::Signed(v1::StepSigned { step: 1 })).await?;
+    emit(tx, send_event::Event::Signed(v1::StepSigned { step: 2 })).await?;
     let step1_hex = built.step1_txid.to_string();
     let step2_hex = built.step2_txid.to_string();
 
