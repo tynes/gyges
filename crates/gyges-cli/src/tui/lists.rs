@@ -109,7 +109,7 @@ pub fn draw_notes(f: &mut Frame, area: Rect, app: &App) {
                 .right_aligned(),
                 Line::from(state),
                 Line::raw(format!("{}:{}", short(&n.txid), n.output_index)),
-                Line::raw(n.memo_preview.clone()),
+                Line::raw(crate::notes::printable(&n.memo_preview)),
             ])
         })
         .collect();
