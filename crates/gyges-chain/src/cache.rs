@@ -380,17 +380,19 @@ impl BlockDb {
         .map_err(|e| self.sqlite(e))
     }
 
-    /// Size of the database file as SQLite accounts it (pages × page size),
-    /// for the `cache.max_mb` bound.
+    /// Bytes the cached blocks occupy as SQLite accounts them (pages in use
+    /// × page size), for the `cache.max_mb` bound. Pages freed by an
+    /// eviction are not counted: SQLite keeps them in the file and fills
+    /// them again before the file grows, so counting them would leave the
+    /// cache over its bound for good once it had been over it once.
     pub fn size_bytes(&self) -> Result<u64, CacheError> {
         let conn = self.reader()?;
-        let pages: u64 = conn
-            .query_row("PRAGMA page_count", [], |r| r.get(0))
-            .map_err(|e| self.sqlite(e))?;
-        let page_size: u64 = conn
-            .query_row("PRAGMA page_size", [], |r| r.get(0))
-            .map_err(|e| self.sqlite(e))?;
-        Ok(pages * page_size)
+        let pragma = |name: &str| -> Result<u64, CacheError> {
+            conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+                .map_err(|e| self.sqlite(e))
+        };
+        let in_use = pragma("page_count")?.saturating_sub(pragma("freelist_count")?);
+        Ok(in_use * pragma("page_size")?)
     }
 
     /// `PRAGMA wal_checkpoint(TRUNCATE)`, run on daemon stop (docs/architecture.md Sync §8).
@@ -699,6 +701,26 @@ mod tests {
         // Re-inserting a height replaces the row.
         db.insert_from(Source::Node, &[block(3)]).unwrap();
         assert_eq!(db.len().unwrap(), 2);
+    }
+
+    /// The `cache.max_mb` check must see an eviction, or a cache that was
+    /// over its bound once would be emptied on every tick after it.
+    #[test]
+    fn the_size_shrinks_when_blocks_are_evicted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = BlockDb::open(&dir.path().join("blocks.sqlite"), "regtest").unwrap();
+        let empty = db.size_bytes().unwrap();
+        let blocks: Vec<CompactBlock> = (1..=4000).map(block).collect();
+        db.insert_from(Source::Node, &blocks).unwrap();
+        let full = db.size_bytes().unwrap();
+        assert!(full > empty * 4, "{empty} -> {full}");
+
+        assert_eq!(db.evict_below(BlockHeight::from_u32(4001)).unwrap(), 4000);
+        let evicted = db.size_bytes().unwrap();
+        assert!(evicted < full / 4, "{full} -> {evicted}");
+        // The freed pages are used again before the file grows.
+        db.insert_from(Source::Node, &blocks).unwrap();
+        assert!(db.size_bytes().unwrap() <= full);
     }
 
     #[test]
